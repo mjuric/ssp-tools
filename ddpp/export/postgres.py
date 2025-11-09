@@ -97,10 +97,10 @@ def main():
     # --- COPY CSV to temp file ---
     with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
         cur.execute(f"SELECT * FROM ({SQL}) t LIMIT 0")
-        colnames = [d.name for d in cur.description]
+        colnames = [d.name for d in cur.description] # type: ignore
         column_types = {
             name: arrow_type_for_oid(d.type_code)
-            for name, d in zip(colnames, cur.description)
+            for name, d in zip(colnames, cur.description) # type: ignore
         }
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
