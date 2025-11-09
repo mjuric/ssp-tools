@@ -23,7 +23,7 @@ dev = [
 ]
 
 [project.scripts]
-export-table = "ddpp.export:main"
+fast-export = "ddpp.export:main"
 
 [tool.pytest.ini_options]
 addopts = "-q"

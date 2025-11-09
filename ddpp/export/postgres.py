@@ -8,12 +8,6 @@ import pyarrow as pa
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 
-DEFAULT_DSN = (
-    "host=localhost port=5432 dbname=your_database user=your_user "
-    "options='-c extra_float_digits=3'"   # IEEE-754 round-trip for float8 in CSV
-)
-DEFAULT_SQL = "SELECT * FROM your_table"          # project/filter as needed
-DEFAULT_PARQUET_OUT = "export.parquet"
 DEFAULT_ROW_GROUP_SIZE = 1_000_000                # rows per Parquet row-group
 DEFAULT_BLOCK_SIZE = 1 << 26                      # ~67MB
 
@@ -55,11 +49,14 @@ def build_dsn(args: argparse.Namespace) -> str:
         return dsn
 
     # Next: parts from flags or env
-    host = args.host or os.getenv("PGHOST") or "localhost"
-    port = args.port or os.getenv("PGPORT") or "5432"
-    dbname = args.dbname or os.getenv("PGDATABASE") or "your_database"
-    user = args.user or os.getenv("PGUSER") or "your_user"
+    host = args.host or os.getenv("PGHOST")
+    port = args.port or os.getenv("PGPORT")
+    dbname = args.dbname or os.getenv("PGDATABASE")
+    user = args.user or os.getenv("PGUSER")
     password = args.password or os.getenv("PGPASSWORD")
+
+    if not all([host, port, dbname, user]):
+        raise ValueError("Database connection parameters must be provided via --dsn, CLI flags, or environment variables (PGHOST, PGPORT, PGDATABASE, PGUSER)")
 
     parts = [
         f"host={host}",
@@ -79,13 +76,13 @@ def main():
     # Connection
     parser.add_argument("--dsn", help="Full Postgres DSN string (overrides other connection flags)")
     parser.add_argument("--host", help="Postgres host (env PGHOST)")
-    parser.add_argument("--port", help="Postgres port (env PGPORT)")
+    parser.add_argument("--port", default="5432", help="Postgres port (default: 5432, env PGPORT)")
     parser.add_argument("--dbname", help="Postgres database name (env PGDATABASE)")
     parser.add_argument("--user", help="Postgres user (env PGUSER)")
     parser.add_argument("--password", help="Postgres password (env PGPASSWORD)")
     # Export config
-    parser.add_argument("--sql", default=DEFAULT_SQL, help="SQL SELECT to export")
-    parser.add_argument("--out", default=DEFAULT_PARQUET_OUT, dest="parquet_out", help="Output Parquet file path")
+    parser.add_argument("--sql", required=True, help="SQL SELECT to export")
+    parser.add_argument("--out", required=True, dest="parquet_out", help="Output Parquet file path")
     parser.add_argument("--row-group-size", type=int, default=DEFAULT_ROW_GROUP_SIZE, help="Rows per Parquet row group")
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE, help="Arrow CSV block size in bytes")
     parser.add_argument("--keep-temp", action="store_true", help="Keep the intermediate CSV for debugging")
@@ -120,6 +117,8 @@ def main():
         convert_options=pacsv.ConvertOptions(
             column_types=column_types,
             null_values=["", "NULL"],
+            true_values=["t"],
+            false_values=["f"],
             strings_can_be_null=True,
             quoted_strings_can_be_null=True,
         ),

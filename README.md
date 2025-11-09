@@ -40,12 +40,12 @@ Alternatively, use CLI flags (`--host`, `--port`, `--dbname`, `--user`, `--passw
 
 Export a full table:
 ```bash
-export-table --sql "SELECT * FROM schema.table" --out output.parquet
+fast-export --sql "SELECT * FROM schema.table" --out output.parquet
 ```
 
 Export with filtering and projection:
 ```bash
-export-table \
+fast-export \
   --sql "SELECT col1, col2, col3 FROM schema.table WHERE updated_at >= '2025-01-01'" \
   --out filtered_export.parquet \
   --row-group-size 500000
@@ -63,7 +63,7 @@ export-table \
 
 Keep the intermediate CSV file for inspection:
 ```bash
-export-table --sql "SELECT * FROM table" --out output.parquet --keep-temp
+fast-export --sql "SELECT * FROM table" --out output.parquet --keep-temp
 ```
 
 ## Type Mapping
@@ -78,7 +78,7 @@ Postgres types are automatically mapped to Arrow types:
 - `timestamptz` → `timestamp('us', tz='UTC')`
 - Unknown types → `string()` (fallback)
 
-Extend `PGOID_TO_ARROW` in `ddpp/export/table.py` for additional types.
+Extend `PGOID_TO_ARROW` in `ddpp/export/postgres.py` for additional types.
 
 ## Development
 

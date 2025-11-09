@@ -7,7 +7,7 @@ Guidance for exporting arbitrary large Postgres tables to Parquet via streaming 
 - Goals: bounded memory, faithful types (PG OID → Arrow), high throughput.
 
 ## Key files
-- `ddpp/export/table.py`: Core extractor (DSN builder, `SQL`, OID map, CSV reader, Parquet writer).
+- `ddpp/export/postgres.py`: Core extractor (DSN builder, `SQL`, OID map, CSV reader, Parquet writer).
 - `ddpp/export/__init__.py`: Public API exports.
 - `README.md`: Usage documentation and configuration guide.
 
@@ -43,7 +43,7 @@ Guidance for exporting arbitrary large Postgres tables to Parquet via streaming 
 ## CLI usage
 ```bash
 export PGHOST=your.postgres.host PGDATABASE=your_db PGUSER=your_user PGPASSWORD=your_pass
-export-table --sql "SELECT * FROM schema.table WHERE updated > '2025-01-01'" --out table.parquet --row-group-size 500000
+fast-export --sql "SELECT * FROM schema.table WHERE updated > '2025-01-01'" --out table.parquet --row-group-size 500000
 ```
 
 Keep this file updated when adjusting batching, compression, or type maps.
