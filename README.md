@@ -51,6 +51,46 @@ fast-export \
   --row-group-size 500000
 ```
 
+### Butler Catalog Extraction
+
+`extract-catalog` streams LSST Butler dataset tables into a single Parquet file (one row group per dataset, e.g. per visit). This complements `fast-export` for Postgres sources by enabling efficient extraction of Science Pipelines data products.
+
+Basic invocation (shows a progress bar by default):
+```bash
+extract-catalog output.parquet /repo/main SOME/COLLECTION/NAME
+```
+
+Positional arguments:
+- `output.parquet` – destination Parquet file (created/overwritten)
+- `/repo/main` – Butler repository root
+- `SOME/COLLECTION/NAME` – collection (e.g. `LSSTCam/runs/DRP/FL/w_2025_19/DM-50795`)
+
+Key options:
+- `--dataset-type dia_source_visit` (default) dataset type to stream
+- `--filter-ids ids.parquet` Parquet file whose first (or specified) column contains int64‑convertible IDs used to filter rows
+- `--filter-column obssubid` Column name inside the filter Parquet (if omitted, first column is used)
+- `--target-column diaSourceId` Column in each Butler table matched against the filter IDs (default `diaSourceId`)
+- `--compression zstd` Parquet compression codec (default `zstd`)
+- `--silent` Disable the progress bar
+
+Filter file requirement: all IDs must be convertible to int64 or the tool exits with an error.
+
+Example: extract DIA sources limited to IDs listed in `obs_sbn.parquet`:
+```bash
+extract-catalog dia_sources.parquet /repo/main \
+  LSSTCam/runs/DRP/FL/w_2025_19/DM-50795 \
+  --filter-ids=obs_sbn.parquet \
+  --filter-column=obssubid
+```
+
+Silent (no progress bar):
+```bash
+extract-catalog dia_sources.parquet /repo/main LSSTCam/runs/DRP/FL/w_2025_19/DM-50795 \
+  --filter-ids=obs_sbn.parquet --filter-column=obssubid --silent
+```
+
+The resulting Parquet file is optimized for downstream columnar analytics (Arrow / DuckDB / Spark) and predicate pushdown.
+
 ### Performance Tuning
 
 - `--row-group-size`: Rows per Parquet row group (default: 1,000,000)

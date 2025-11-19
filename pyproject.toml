@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 fast-export = "ddpp.export:main"
+extract-catalog = "ddpp.export.butler:main"
 
 [tool.pytest.ini_options]
 addopts = "-q"
