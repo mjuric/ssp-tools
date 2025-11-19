@@ -1,0 +1,18 @@
+[
+  {
+    "sql": "SELECT * FROM current_identifications",
+    "out": "current_identifications.parquet"
+  },
+  {
+    "sql": "SELECT * FROM mpc_orbits",
+    "out": "mpc_orbits.parquet"
+  },
+  {
+    "sql": "SELECT * FROM numbered_identifications",
+    "out": "numbered_identifications.parquet"
+  },
+  {
+    "sql": "SELECT * FROM obs_sbn WHERE stn='X05'",
+    "out": "obs_sbn.parquet"
+  }
+]

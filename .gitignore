@@ -111,6 +111,11 @@ ENV/
 env.bak/
 venv.bak/
 
+# PostgreSQL credentials (never commit!)
+.pgpass
+.pg_service.conf
+pgpass.conf
+
 # Spyder project settings
 .spyderproject
 .spyproject

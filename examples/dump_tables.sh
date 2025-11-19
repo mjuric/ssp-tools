@@ -6,7 +6,7 @@
 set -e  # Exit on any error
 
 # Database connection parameters
-HOST="172.24.5.226"
+HOST="mpc-usdf.sp.mjuric.org"
 DBNAME="mpc_sbn"
 USER="rubin"
 

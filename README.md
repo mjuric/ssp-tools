@@ -24,6 +24,48 @@ pip install -e ".[dev]"
 
 ### Database Connection
 
+There are multiple ways to configure database connections:
+
+#### Option 1: PostgreSQL Service File (Recommended)
+
+Use a `pg_service.conf` file to define named connection profiles:
+
+1. Copy the example service file:
+   ```bash
+   cp examples/pg_service.conf ~/.pg_service.conf
+   chmod 600 ~/.pg_service.conf
+   ```
+
+2. Edit `~/.pg_service.conf` to add your database credentials:
+   ```ini
+   [mpc_sbn]
+   host=mpc-usdf.sp.mjuric.org
+   port=5432
+   dbname=mpc_sbn
+   user=rubin
+   ```
+
+3. Store your password in `~/.pgpass`:
+   ```bash
+   echo "mpc-usdf.sp.mjuric.org:5432:mpc_sbn:rubin:your_password" >> ~/.pgpass
+   chmod 600 ~/.pgpass
+   ```
+
+4. Use the service name with fast-export:
+   ```bash
+   fast-export --service mpc_sbn --sql "SELECT * FROM table" --out output.parquet
+   ```
+
+   Or set the `PGSERVICE` environment variable:
+   ```bash
+   export PGSERVICE=mpc_sbn
+   fast-export --sql "SELECT * FROM table" --out output.parquet
+   ```
+
+**Benefits**: Centralized configuration, no credentials in scripts, works with all PostgreSQL tools.
+
+#### Option 2: Environment Variables
+
 Set connection parameters via environment variables:
 
 ```bash
@@ -34,9 +76,13 @@ export PGUSER=your_user
 export PGPASSWORD=your_password  # or use ~/.pgpass
 ```
 
-Alternatively, use CLI flags (`--host`, `--port`, `--dbname`, `--user`, `--password`) or provide a full DSN string with `--dsn`.
+#### Option 3: CLI Flags
+
+Use CLI flags (`--host`, `--port`, `--dbname`, `--user`, `--password`) or provide a full DSN string with `--dsn`.
 
 ### Basic Usage
+
+#### Single Table Export
 
 Export a full table:
 ```bash
@@ -49,6 +95,42 @@ fast-export \
   --sql "SELECT col1, col2, col3 FROM schema.table WHERE updated_at >= '2025-01-01'" \
   --out filtered_export.parquet \
   --row-group-size 500000
+```
+
+#### Batch Export (Multiple Tables in Single Transaction)
+
+For exporting multiple tables consistently, use a YAML or JSON config file:
+
+**examples/exports.yaml:**
+```yaml
+- sql: "SELECT * FROM current_identifications"
+  out: "current_identifications.parquet"
+
+- sql: "SELECT * FROM mpc_orbits"
+  out: "mpc_orbits.parquet"
+  row_group_size: 500000  # Optional: override default per export
+
+- sql: "SELECT * FROM obs_sbn WHERE stn='X05'"
+  out: "obs_sbn.parquet"
+```
+
+Then run:
+```bash
+fast-export --config examples/exports.yaml --host your.host --dbname your_db --user your_user
+```
+
+**Key benefits of batch mode:**
+- All exports execute within a **single database transaction** (REPEATABLE READ isolation)
+- Ensures consistent snapshot across all tables
+- Reduces database connection overhead
+- Simplifies operational workflows
+
+**JSON format is also supported:**
+```json
+[
+  {"sql": "SELECT * FROM table1", "out": "table1.parquet"},
+  {"sql": "SELECT * FROM table2", "out": "table2.parquet"}
+]
 ```
 
 ### Butler Catalog Extraction
