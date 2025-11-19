@@ -11,6 +11,19 @@ Efficient streaming export of large Postgres tables to Parquet format using PyAr
 
 ## Installation
 
+### Option 1: Conda Environment (Recommended)
+
+Create and activate the development environment:
+
+```bash
+conda env create -f environment.yml
+conda activate ddpp-dev
+```
+
+This installs all dependencies including dev tools (pytest, ipython).
+
+### Option 2: Pip Install
+
 ```bash
 pip install -e .
 ```

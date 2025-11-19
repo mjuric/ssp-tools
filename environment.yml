@@ -1,0 +1,16 @@
+name: ddpp-dev
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.9
+  - pip
+  - psycopg2
+  - pyarrow>=14
+  - pyyaml
+  - pytest>=8
+  - tqdm
+  # Development tools
+  - ipython
+  - pip:
+    - -e .

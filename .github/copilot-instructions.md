@@ -149,3 +149,4 @@ fast-export --sql "SELECT * FROM table" --out output.parquet --keep-temp
 3. **Butler changes**: Remember the Science Pipelines dependency constraint
 4. **CLI flags**: Both postgres and butler modules have independent argparse configurations
 5. **Transaction behavior**: Batch mode semantics (single transaction) are critical for consistency guarantees
+6. **Dependencies**: When updating `requirements.txt` or `pyproject.toml` dependencies, also update `environment.yml` to keep conda environment in sync
