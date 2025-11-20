@@ -159,7 +159,7 @@ def phase_angle_deg(r_obj_sun, r_obs_sun):
 def hg_V_mag(H, G, r, delta, phase_deg):
     """
     Compute apparent V magnitude from the IAU H–G system.
-    
+
     Parameters
     ----------
     H : float or ndarray

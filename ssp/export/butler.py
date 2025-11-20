@@ -150,12 +150,12 @@ def _read_filter_ids_from_parquet(path: str, column: Optional[str] = None) -> np
         Parquet file path containing ID values.
     column : str, optional
         Column name to read. If not provided, the first column is used.
-    
+
     Returns
     -------
     numpy.ndarray
         Array of int64 IDs.
-    
+
     Raises
     ------
     ValueError
@@ -262,7 +262,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     ----------------
     extract-catalog dia_sources.parquet /repo/main LSSTCam/runs/DRP/FL/w_2025_19/DM-50795 \
         --filter-ids=obs_sbn.parquet \
-        --filter-column=obssubid 
+        --filter-column=obssubid
     """
     args = _build_argument_parser().parse_args(list(argv) if argv is not None else None)
 

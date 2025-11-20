@@ -55,7 +55,7 @@ def compute_ssobject_entry(row, sss):
     # FIXME: here I assume we discover everything 7 days after first obsv. we should really pull this out of the obs_sbn table.
     row["discoverySubmissionDate"] = row["firstObservationDate"] + 7.
     row["arc"] = np.ptp(sss["dia_midpointMjdTai"])
-    provID = row["unpacked_primary_provisional_designation"] = sss["unpacked_primary_provisional_designation"].iloc[0]
+    row["unpacked_primary_provisional_designation"] = sss["unpacked_primary_provisional_designation"].iloc[0]
 
     # observation counts
     row["nObs"] = len(sss)

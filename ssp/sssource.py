@@ -18,7 +18,6 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
     assert np.all(dia["ssObjectId"] == dia["ssObjectId"].iloc[0])
     assert np.all(sss["ssObjectId"] == sss["ssObjectId"][0])
     assert len(dia) == len(sss)
-    nobs = len(sss)
 
     provID = sss["unpacked_primary_provisional_designation"][0]
     ephTimes = Time(dia["midpointMjdTai"].values, format="mjd", scale="tai")

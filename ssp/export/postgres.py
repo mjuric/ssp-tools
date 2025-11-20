@@ -84,7 +84,7 @@ def export_query_to_parquet(
     keep_temp: bool = False,
 ):
     """Export a single SQL query to a Parquet file using the provided cursor.
-    
+
     Args:
         cur: Active psycopg2 cursor within a transaction
         sql: SQL SELECT query to export
@@ -237,7 +237,7 @@ def main():
 
 def load_config(config_path: str) -> list:
     """Load export configuration from YAML or JSON file.
-    
+
     Returns a list of dicts, each with keys: 'sql', 'out', and optionally 'row_group_size'.
     """
     with open(config_path, 'r') as f:
