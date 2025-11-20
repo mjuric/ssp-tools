@@ -1,4 +1,4 @@
-# LSST Daily Data Products Pipeline
+# LSST Solar System Pipeline Support Tools
 
 Efficient streaming export of large Postgres tables to Parquet format using PyArrow.
 
