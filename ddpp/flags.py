@@ -1,0 +1,15 @@
+#
+# All flags used by the SSP DDPP pipeline
+#
+
+FLAG_ORBIT_FAIL  = 1
+FLAG_PHOT_U_FAIL = 2
+FLAG_PHOT_G_FAIL = 4
+FLAG_PHOT_R_FAIL = 8
+FLAG_PHOT_I_FAIL = 16
+FLAG_PHOT_Z_FAIL = 32
+FLAG_PHOT_Y_FAIL = 64
+
+flags_phot = {'u' : FLAG_PHOT_U_FAIL, 'g' : FLAG_PHOT_G_FAIL, 'r': FLAG_PHOT_R_FAIL, 
+              'i' : FLAG_PHOT_I_FAIL, 'z' : FLAG_PHOT_Z_FAIL, 'y': FLAG_PHOT_Y_FAIL}
+
