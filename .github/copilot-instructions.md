@@ -157,3 +157,4 @@ fast-export --sql "SELECT * FROM table" --out output.parquet --keep-temp
 4. **CLI flags**: Both postgres and butler modules have independent argparse configurations
 5. **Transaction behavior**: Batch mode semantics (single transaction) are critical for consistency guarantees
 6. **Dependencies**: When updating `requirements.txt` or `pyproject.toml` dependencies, also update `environment.yml` to keep conda environment in sync
+7. **CLI Development**: Always add a `--reraise` flag to CLI tools for debugging purposes (re-raises exceptions instead of exiting gracefully)

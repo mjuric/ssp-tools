@@ -187,6 +187,11 @@ Examples:
         required=True,
         help="Path to output SSObject Parquet file"
     )
+    parser.add_argument(
+        "--reraise",
+        action="store_true",
+        help="Re-raise exceptions instead of exiting gracefully (for debugging)"
+    )
     
     args = parser.parse_args()
     
@@ -228,6 +233,8 @@ Examples:
         
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
+        if args.reraise:
+            raise
         sys.exit(1)
 
 if __name__ == "__main__":
