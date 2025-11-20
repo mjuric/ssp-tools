@@ -186,6 +186,26 @@ extract-catalog dia_sources.parquet /repo/main LSSTCam/runs/DRP/FL/w_2025_19/DM-
 
 The resulting Parquet file is optimized for downstream columnar analytics (Arrow / DuckDB / Spark) and predicate pushdown.
 
+### SSObject Table Construction
+
+`ssp-build-ssobject` constructs SSObject tables from SSSource, DiaSource, and MPC orbit data. This tool processes photometric and orbital data to create comprehensive solar system object catalogs with fitted parameters.
+
+Basic usage:
+```bash
+ssp-build-ssobject sssource.parquet dia_sources.parquet mpc_orbits.parquet --output ssobject.parquet
+```
+
+Arguments:
+- `sssource.parquet` – SSSource Parquet file containing solar system source detections
+- `dia_sources.parquet` – DiaSource Parquet file with photometric measurements
+- `mpc_orbits.parquet` – MPC orbit Parquet file with orbital elements
+- `--output ssobject.parquet` – Output SSObject Parquet file
+
+The tool performs:
+- Photometric fitting (H/G12 parameters) for each band (ugrizy)
+- Orbital analysis including Tisserand parameter and MOID calculations
+- Quality metrics and observation statistics per object
+
 ### Performance Tuning
 
 - `--row-group-size`: Rows per Parquet row group (default: 1,000,000)

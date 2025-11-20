@@ -98,6 +98,7 @@ All exports in a config file run in **a single transaction** for consistency.
 Defined in `pyproject.toml`:
 - `fast-export` → `ssp.export:main` (Postgres exports)
 - `extract-catalog` → `ssp.export.butler:main` (Butler datasets)
+- `ssp-build-ssobject` → `ssp.ssobject:main` (SSObject table construction)
 
 ### Error Handling for Butler Filtering
 
@@ -108,6 +109,7 @@ Defined in `pyproject.toml`:
 - `ssp/export/postgres.py`: Core Postgres→Parquet logic, type mapping, CLI for fast-export
 - `ssp/export/butler.py`: Butler dataset extraction, requires Science Pipelines environment
 - `ssp/export/__init__.py`: Public API exports for postgres module
+- `ssp/ssobject.py`: SSObject table construction from SSSource, DiaSource, and MPC orbit data
 - `examples/`: Sample configs (exports.yaml, pg_service.conf) and validation scripts
 - `tests/`: Unit tests for type mapping and Parquet structure validation
 
@@ -129,6 +131,11 @@ extract-catalog output.parquet /repo/main COLLECTION_NAME \
   --filter-ids=filter.parquet \
   --filter-column=id_column \
   --target-column=diaSourceId
+```
+
+### Build SSObject table
+```bash
+ssp-build-ssobject sssource.parquet dia_sources.parquet mpc_orbits.parquet --output ssobject.parquet
 ```
 
 ### Debug mode (keep CSV)
