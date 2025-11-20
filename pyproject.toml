@@ -27,6 +27,9 @@ dependencies = [
 dev = [
   "pytest>=8",
 ]
+all = [
+  "jorbit",
+]
 
 [project.scripts]
 fast-export = "ssp.export:main"

@@ -33,6 +33,11 @@ Or with dev dependencies:
 pip install -e ".[dev]"
 ```
 
+Or with all optional dependencies (includes jorbit, requires JAX):
+```bash
+pip install -e ".[all]"
+```
+
 ## Configuration
 
 ### Database Connection
