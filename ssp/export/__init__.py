@@ -1,6 +1,6 @@
 """Export utilities for streaming Postgres tables to Parquet format."""
 
-from ddpp.export.postgres import (
+from ssp.export.postgres import (
     PGOID_TO_ARROW,
     arrow_type_for_oid,
     build_dsn,

@@ -1,4 +1,4 @@
-# LSST Daily Data Products Pipeline (ddpp) - AI Coding Assistant Guide
+# LSST Daily Data Products Pipeline (ssp) - AI Coding Assistant Guide
 
 ## Project Overview
 
@@ -21,14 +21,14 @@ This design avoids loading entire tables into memory and leverages Postgres's op
 
 ### Key Implementation Details
 
-- **Type mapping**: `ddpp/export/postgres.py::PGOID_TO_ARROW` maps Postgres OIDs to Arrow types. Extend this dict for custom types; unknown OIDs default to `pa.string()`.
+- **Type mapping**: `ssp/export/postgres.py::PGOID_TO_ARROW` maps Postgres OIDs to Arrow types. Extend this dict for custom types; unknown OIDs default to `pa.string()`.
 - **Transaction isolation**: Batch exports use `ISOLATION_LEVEL_REPEATABLE_READ` to ensure consistent snapshots across multiple tables.
 - **Row groups**: Default 1M rows per group. Reduce for very wide tables (memory pressure), increase for narrow tables (scan performance).
 - **Float precision**: DSN automatically includes `options='-c extra_float_digits=3'` to preserve numeric precision.
 
 ### Butler Integration (extract-catalog)
 
-The Butler extraction tool (`ddpp/export/butler.py`) streams LSST Science Pipelines datasets:
+The Butler extraction tool (`ssp/export/butler.py`) streams LSST Science Pipelines datasets:
 - **Dependency**: Requires `lsst.daf.butler` (only available in Science Pipelines environment)
 - **Pattern**: One Parquet row-group per Butler dataset (e.g., per visit)
 - **Filtering**: Supports ID-based filtering via `--filter-ids` (must be int64-convertible)
@@ -68,7 +68,7 @@ See `examples/pg_service.conf` for template. Never commit credentials.
 
 ### Adding New Postgres Types
 
-Extend `PGOID_TO_ARROW` in `ddpp/export/postgres.py`:
+Extend `PGOID_TO_ARROW` in `ssp/export/postgres.py`:
 
 ```python
 PGOID_TO_ARROW = {
@@ -96,8 +96,8 @@ All exports in a config file run in **a single transaction** for consistency.
 ### CLI Entry Points
 
 Defined in `pyproject.toml`:
-- `fast-export` → `ddpp.export:main` (Postgres exports)
-- `extract-catalog` → `ddpp.export.butler:main` (Butler datasets)
+- `fast-export` → `ssp.export:main` (Postgres exports)
+- `extract-catalog` → `ssp.export.butler:main` (Butler datasets)
 
 ### Error Handling for Butler Filtering
 
@@ -105,9 +105,9 @@ Defined in `pyproject.toml`:
 
 ## File Organization
 
-- `ddpp/export/postgres.py`: Core Postgres→Parquet logic, type mapping, CLI for fast-export
-- `ddpp/export/butler.py`: Butler dataset extraction, requires Science Pipelines environment
-- `ddpp/export/__init__.py`: Public API exports for postgres module
+- `ssp/export/postgres.py`: Core Postgres→Parquet logic, type mapping, CLI for fast-export
+- `ssp/export/butler.py`: Butler dataset extraction, requires Science Pipelines environment
+- `ssp/export/__init__.py`: Public API exports for postgres module
 - `examples/`: Sample configs (exports.yaml, pg_service.conf) and validation scripts
 - `tests/`: Unit tests for type mapping and Parquet structure validation
 

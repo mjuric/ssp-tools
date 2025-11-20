@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ddpp"
+name = "ssp"
 version = "0.1.0"
 description = "LSST Daily Data Products Pipeline - Streaming export of Postgres tables to Parquet via Arrow"
 authors = [
@@ -23,12 +23,12 @@ dev = [
 ]
 
 [project.scripts]
-fast-export = "ddpp.export:main"
-extract-catalog = "ddpp.export.butler:main"
+fast-export = "ssp.export:main"
+extract-catalog = "ssp.export.butler:main"
 
 [tool.pytest.ini_options]
 addopts = "-q"
 python_files = ["test_*.py", "*_test.py", "tests/test_*.py"]
 
 [tool.setuptools]
-packages = ["ddpp", "ddpp.export"]
+packages = ["ssp", "ssp.export"]

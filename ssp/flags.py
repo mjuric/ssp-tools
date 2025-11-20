@@ -1,5 +1,5 @@
 #
-# All flags used by the SSP DDPP pipeline
+# All flags used by the SSP pipeline
 #
 
 FLAG_ORBIT_FAIL  = 1

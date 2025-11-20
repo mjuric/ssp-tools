@@ -4,7 +4,7 @@ Efficient streaming export of large Postgres tables to Parquet format using PyAr
 
 ## Overview
 
-`ddpp` provides tools for exporting arbitrary Postgres tables to columnar Parquet files with:
+`ssp` provides tools for exporting arbitrary Postgres tables to columnar Parquet files with:
 - **Memory efficiency**: Streaming batches, bounded memory footprint
 - **Type fidelity**: Automatic OID→Arrow type mapping
 - **High throughput**: Postgres COPY → temp CSV → Arrow streaming → zstd-compressed Parquet
@@ -17,7 +17,7 @@ Create and activate the development environment:
 
 ```bash
 conda env create -f environment.yml
-conda activate ddpp-dev
+conda activate ssp-dev
 ```
 
 This installs all dependencies including dev tools (pytest, ipython).
@@ -213,7 +213,7 @@ Postgres types are automatically mapped to Arrow types:
 - `timestamptz` → `timestamp('us', tz='UTC')`
 - Unknown types → `string()` (fallback)
 
-Extend `PGOID_TO_ARROW` in `ddpp/export/postgres.py` for additional types.
+Extend `PGOID_TO_ARROW` in `ssp/export/postgres.py` for additional types.
 
 ## Development
 

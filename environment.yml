@@ -1,4 +1,4 @@
-name: ddpp-dev
+name: ssp-dev
 channels:
   - conda-forge
   - defaults
