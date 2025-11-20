@@ -8,9 +8,37 @@ from .moid import MOIDSolver, earth_orbit_J2000
 import astropy.units as u
 
 def nJy_to_mag(f_njy):
+    """
+    Convert flux density in nanoJanskys (nJy) to AB magnitude.
+
+    Parameters
+    ----------
+    f_njy : float or array-like
+        Flux density in nanoJanskys.
+
+    Returns
+    -------
+    float or array-like
+        AB magnitude corresponding to the input flux density.
+    """
     return 31.4 - 2.5 * np.log10(f_njy)
 
 def nJy_err_to_mag_err(f_njy, f_err_njy):
+    """
+    Convert flux error in nanoJanskys to magnitude error.
+
+    Parameters
+    ----------
+    f_njy : float
+        Flux in nanoJanskys.
+    f_err_njy : float
+        Flux error in nanoJanskys.
+
+    Returns
+    -------
+    float
+        Magnitude error.
+    """
     return 1.085736 * (f_err_njy / f_njy)
 
 def compute_ssobject_entry(row, sss):
