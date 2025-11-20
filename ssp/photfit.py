@@ -1,4 +1,4 @@
-import numpy as np 
+import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.optimize import leastsq
 import warnings
@@ -33,29 +33,29 @@ phi_3 = CubicSpline(alpha_3, phi_3_sp, bc_type=((1,phi_3_derivs[0]),(1,phi_3_der
 def HG_model(phase, params):
     sin_a = np.sin(phase)
     tan_ah = np.tan(phase/2)
-    
-    W = np.exp(-90.56 * tan_ah * tan_ah)    
+
+    W = np.exp(-90.56 * tan_ah * tan_ah)
     scale_sina = sin_a/(0.119 + 1.341*sin_a - 0.754*sin_a*sin_a)
-    
+
     phi_1_S = 1 - C[0] * scale_sina
     phi_2_S = 1 - C[1] * scale_sina
-    
+
     phi_1_L = np.exp(-A[0] * np.power(tan_ah, B[0]))
     phi_2_L = np.exp(-A[1] * np.power(tan_ah, B[1]))
-    
+
     phi_1 = W * phi_1_S + (1-W) * phi_1_L
     phi_2 = W * phi_2_S + (1-W) * phi_2_L
-    return params[0] - 2.5*np.log10((1-params[1])* phi_1 + (params[1]) * phi_2) 
+    return params[0] - 2.5*np.log10((1-params[1])* phi_1 + (params[1]) * phi_2)
 
 
 def HG1G2_model(phase, params):
-    phi_1_ev = phi_1(phase)  
-    phi_2_ev = phi_2(phase)  
-    phi_3_ev = phi_3(phase)  
+    phi_1_ev = phi_1(phase)
+    phi_2_ev = phi_2(phase)
+    phi_3_ev = phi_3(phase)
 
     msk = phase < 7.5 * np.pi/180
 
-    phi_1_ev[msk] = 1-6*phase[msk]/np.pi 
+    phi_1_ev[msk] = 1-6*phase[msk]/np.pi
     phi_2_ev[msk] = 1- 9 * phase[msk]/(5*np.pi)
 
     phi_3_ev[phase > np.pi/6] = 0
@@ -63,12 +63,12 @@ def HG1G2_model(phase, params):
 
     return params[0] - 2.5 * np.log10(params[1] * phi_1_ev + params[2] * phi_2_ev + (1-params[1]-params[2]) * phi_3_ev)
 
-def HG12_model(phase, params): 
+def HG12_model(phase, params):
     if params[1] >= 0.2:
-        G1 = +0.9529*params[1] + 0.02162 
+        G1 = +0.9529*params[1] + 0.02162
         G2 = -0.6125*params[1] + 0.5572
     else:
-        G1 = +0.7527*params[1] + 0.06164  
+        G1 = +0.7527*params[1] + 0.06164
         G2 = -0.9612*params[1] + 0.6270
 
     return HG1G2_model(phase, [params[0], G1, G2])
@@ -76,7 +76,7 @@ def HG12_model(phase, params):
 def HG12star_model(phase, params):
     G1 = 0 + params[1] * 0.84293649
     G2 = 0.53513350 - params[1] * 0.53513350
-    
+
     return HG1G2_model(phase, [params[0], G1, G2])
 
 def chi2(params, mag, phase, mag_err, model):
@@ -108,14 +108,14 @@ def fitHG12(mag, magSigma, phaseAngle, tdist, rdist):
         warnings.simplefilter("ignore")
 
         sol = fit(mag, phaseAngle, magSigma)
-        if sol[-1] in [1,2,3] and sol[1] is not None: #least squares solver flags       
+        if sol[-1] in [1,2,3] and sol[1] is not None: #least squares solver flags
             chi2 = np.sum(sol[2]['fvec']**2)
             H = sol[0][0]
             G = sol[0][1]
             H_err = np.sqrt(sol[1][0,0])
             G_err = np.sqrt(sol[1][1,1])
             HG_cov = sol[1][0,1]
-            
+
             return H, G, H_err, G_err, HG_cov, chi2/(nobsv-2), nobsv
         else:
             # fit failed

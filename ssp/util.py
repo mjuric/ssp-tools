@@ -11,20 +11,20 @@ def assoc_validate(dia, assoc):
     obs = astropy.coordinates.SkyCoord(ra=dia["ra"].values, dec=dia["dec"].values, unit="deg")
     mpc = astropy.coordinates.SkyCoord(ra=assoc["mpc_ra"].values, dec=assoc["mpc_dec"].values, unit="deg")
     sep = obs.separation(mpc)
-    
+
     print ("Separation diffeerence range (arcsec): ", sep.min().arcsec, sep.max().arcsec)
     assert sep.min().arcsec >= 0
     assert sep.max().arcsec <= 0.005  ## FIXME: this should be further tightened once we start submitting extra precision to the MPC
-    
+
     # verify times match
     t_utc = Time(dia["midpointMjdTai"].to_numpy(), format="mjd", scale="tai").utc
     midpoint_utc = pd.to_datetime(t_utc.to_datetime())
     mpc_time = pd.to_datetime(assoc["mpc_obstime"])
     delta_sec = (mpc_time - midpoint_utc).dt.total_seconds()
     delta_sec
-    
+
     print ("Time diffeerence range (sec):          ", delta_sec.min(), delta_sec.max())
-    
+
     # FIXME: this was relaxed as USDF replica's obstime datatype is borked
     # and rounds (or truncates?) the timestamps to 1 second. E-mailed Dan S.
     # to get it fixed.
@@ -66,9 +66,7 @@ def packed_ascii_to_uint64_le(mpc_packed):
     # Step 7: Interpret every 8 bytes as a little-endian uint64
     return np.frombuffer(buf, dtype="<u8")
 
-import numpy as np
 import astropy.units as u
-from astropy.time import Time
 from astropy.coordinates import get_sun, angular_separation
 
 def solar_elongation_ndarray(ra_deg, dec_deg, t):
@@ -192,10 +190,7 @@ def group_by(arrs, key, func, out=None, check_grouped=True):
 
     return results
 
-import numpy as np
 import numpy.ma as ma
-import astropy.units as u
-from astropy.time import Time
 from astropy.constants import R_earth
 from astropy.coordinates import (
     EarthLocation,
@@ -287,10 +282,8 @@ def observatory_barycentric_posvel(obscode: str, obstime: Time):
 ### Serialization
 ###
 
-import math
 from typing import Optional
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 

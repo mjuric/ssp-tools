@@ -1,17 +1,12 @@
 import jax
 jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
 from astropy.time import Time
 import numpy as np
 
 def _aux_compute_ephemerides(provID, ephTimes, mpcorb):
     import astropy.units as u
-    from astropy.coordinates import SkyCoord
     kms = u.km/u.s
-    
-    import jorbit
-    from jorbit.utils.states import KeplerianState
-    from jorbit.data.constants import SPEED_OF_LIGHT
+
     from jorbit import Particle
 
     # Ephemerides

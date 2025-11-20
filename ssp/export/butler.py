@@ -171,10 +171,10 @@ def _read_filter_ids_from_parquet(path: str, column: Optional[str] = None) -> np
             col = t.column(column)
         except KeyError as e:
             raise ValueError(f"Column '{column}' not found in {path}") from e
-    
+
     # Convert to numpy
     ids = col.to_numpy(zero_copy_only=False)
-    
+
     # Require int64 conversion for ID filtering
     try:
         ids = ids.astype(np.int64, copy=False)
@@ -184,7 +184,7 @@ def _read_filter_ids_from_parquet(path: str, column: Optional[str] = None) -> np
             f"must be convertible to int64. Got dtype: {ids.dtype}. "
             f"Conversion error: {e}"
         ) from e
-    
+
     return ids
 
 

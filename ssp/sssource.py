@@ -1,7 +1,5 @@
 import pandas as pd
 import numpy as np
-import astropy, astropy.coordinates
-import matplotlib.pyplot as plt
 from astropy.time import Time
 
 from . import util, schema
@@ -185,14 +183,14 @@ if __name__ == "__main__":
 
 
 
-    mpcorb = pd.read_parquet(f'{input_dir}/mpc_orbits.parquet', engine="pyarrow",  dtype_backend="pyarrow", 
+    mpcorb = pd.read_parquet(f'{input_dir}/mpc_orbits.parquet', engine="pyarrow",  dtype_backend="pyarrow",
                          columns=["unpacked_primary_provisional_designation", "packed_primary_provisional_designation", "a", "q", "e", "i", "node", "argperi", "peri_time",
                                   "mean_anomaly", "epoch_mjd", "h", "g"]
              ).reset_index(drop=True)
 
 
     from functools import partial
-    util.group_by([sss, assoc], "ssObjectId", partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia));
+    util.group_by([sss, assoc], "ssObjectId", partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia))
 
 
     totalNumObjects = np.unique(sss["ssObjectId"]).size

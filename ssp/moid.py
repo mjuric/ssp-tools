@@ -7,7 +7,6 @@ from collections import namedtuple
 AU_KM = AU_CONST.to_value(u.km)
 
 
-from collections import namedtuple
 
 EarthElements = namedtuple(
     "EarthElements",

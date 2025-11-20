@@ -4,7 +4,7 @@ import tempfile
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ssp.export import PGOID_TO_ARROW, arrow_type_for_oid
+from ssp.export import arrow_type_for_oid
 
 
 def test_oid_mapping_basic():

@@ -1,7 +1,6 @@
 # pip install psycopg2-binary pyarrow
 
 import os
-import sys
 import argparse
 import tempfile
 import psycopg2
@@ -49,7 +48,7 @@ def build_dsn(args: argparse.Namespace) -> str:
             opt = "options='-c extra_float_digits=3'"
             dsn = f"{dsn} {opt}" if "options=" not in dsn else f"{dsn} -c extra_float_digits=3"
         return dsn
-    
+
     # Next: service name from ~/.pg_service.conf
     if args.service:
         return f"service={args.service} options='-c extra_float_digits=3'"
@@ -159,7 +158,7 @@ def export_query_to_parquet(
 def main():
     """CLI entry point for exporting Postgres tables to Parquet."""
     parser = argparse.ArgumentParser(description="Stream Postgres table to Parquet via Arrow")
-    
+
     # Connection options
     conn_group = parser.add_argument_group('connection options')
     conn_group.add_argument("--service", help="PostgreSQL service name from ~/.pg_service.conf (recommended)")
@@ -169,7 +168,7 @@ def main():
     conn_group.add_argument("--dbname", help="Postgres database name (env PGDATABASE)")
     conn_group.add_argument("--user", help="Postgres user (env PGUSER)")
     conn_group.add_argument("--password", help="Postgres password (env PGPASSWORD)")
-    
+
     # Export config
     parser.add_argument("--sql", help="SQL SELECT to export (required for single export)")
     parser.add_argument("--out", dest="parquet_out", help="Output Parquet file path (required for single export)")
@@ -195,19 +194,19 @@ def main():
     if args.config:
         # Batch export mode: multiple exports in a single transaction
         exports = load_config(args.config)
-        
+
         with psycopg2.connect(DSN) as conn:
             # Start explicit transaction
             conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ)
             with conn.cursor() as cur:
                 # BEGIN transaction implicitly started
                 print(f"Starting batch export of {len(exports)} tables in single transaction...")
-                
+
                 for i, export_spec in enumerate(exports, 1):
                     sql = export_spec["sql"]
                     out = export_spec["out"]
                     row_group_size = export_spec.get("row_group_size", args.row_group_size)
-                    
+
                     print(f"[{i}/{len(exports)}] Exporting to {out}...")
                     export_query_to_parquet(
                         cur=cur,
@@ -218,7 +217,7 @@ def main():
                         keep_temp=args.keep_temp,
                     )
                     print(f"✓ Exported to {out}")
-                
+
                 # Commit transaction
                 conn.commit()
                 print(f"All {len(exports)} exports completed successfully in single transaction!")
@@ -248,17 +247,17 @@ def load_config(config_path: str) -> list:
         else:
             # Assume YAML (also handles .yml, .yaml)
             data = yaml.safe_load(f)
-    
+
     if not isinstance(data, list):
         raise ValueError("Config file must contain a list of export specifications")
-    
+
     # Validate each export spec
     for i, spec in enumerate(data):
         if not isinstance(spec, dict):
             raise ValueError(f"Export spec {i} must be a dictionary")
         if "sql" not in spec or "out" not in spec:
             raise ValueError(f"Export spec {i} must have 'sql' and 'out' keys")
-    
+
     return data
 
 

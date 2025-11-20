@@ -5,7 +5,6 @@ from . import util
 from . import schema
 from .flags import flags_phot
 from .moid import MOIDSolver, earth_orbit_J2000
-import astropy.units as u
 import argparse
 import sys
 
@@ -169,13 +168,13 @@ Examples:
   ssp-build-ssobject sssource.parquet dia_sources.parquet mpc_orbits.parquet --output ssobject.parquet
         """
     )
-    
+
     parser.add_argument(
         "sssource_parquet",
         help="Path to SSSource Parquet file"
     )
     parser.add_argument(
-        "diasource_parquet", 
+        "diasource_parquet",
         help="Path to DiaSource Parquet file"
     )
     parser.add_argument(
@@ -192,45 +191,45 @@ Examples:
         action="store_true",
         help="Re-raise exceptions instead of exiting gracefully (for debugging)"
     )
-    
+
     args = parser.parse_args()
-    
+
     try:
         # Load SSSource
         print(f"Loading SSSource from {args.sssource_parquet}...")
         sss = pd.read_parquet(args.sssource_parquet, engine="pyarrow", dtype_backend="pyarrow").reset_index(drop=True)
         num = len(sss)
         print(f"Loaded {num:,} SSSource rows")
-        
+
         # Load DiaSource with required columns
         dia_columns = ["diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness", "band", "psfFlux", "psfFluxErr"]
         print(f"Loading DiaSource from {args.diasource_parquet}...")
         dia = pd.read_parquet(args.diasource_parquet, engine="pyarrow", dtype_backend="pyarrow", columns=dia_columns).reset_index(drop=True)
         print(f"Loaded {len(dia):,} DiaSource rows")
-        
+
         # Ensure diaSourceId is uint64
         assert np.all(dia["diaSourceId"] >= 0)
         dia["diaSourceId"] = dia["diaSourceId"].astype("uint64[pyarrow]")
-        
+
         # Load MPC orbits
         mpcorb_columns = ["unpacked_primary_provisional_designation", "a", "q", "e", "i", "node", "argperi", "peri_time",
                          "mean_anomaly", "epoch_mjd", "h", "g"]
         print(f"Loading MPC orbits from {args.mpcorb_parquet}...")
-        mpcorb = pd.read_parquet(args.mpcorb_parquet, engine="pyarrow", dtype_backend="pyarrow", 
+        mpcorb = pd.read_parquet(args.mpcorb_parquet, engine="pyarrow", dtype_backend="pyarrow",
                                 columns=mpcorb_columns).reset_index(drop=True)
         print(f"Loaded {len(mpcorb):,} MPC orbit rows")
-        
+
         # Compute SSObject
         print("Computing SSObject data...")
         obj = compute_ssobject(sss, dia, mpcorb)
-        
+
         # Save result
         print(f"Saving {len(obj):,} SSObject rows to {args.output}...")
         util.struct_to_parquet(obj, args.output)
-        
+
         print(f"Success! Created SSObject with {len(obj):,} objects")
         print(f"Row size: {obj.dtype.itemsize:,} bytes, Total size: {obj.nbytes:,} bytes")
-        
+
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         if args.reraise:
@@ -258,7 +257,7 @@ if __name__ == "__main__":
     dia["diaSourceId"] = dia["diaSourceId"].astype("uint64[pyarrow]")
 
     # Load mpcorb
-    mpcorb = pd.read_parquet(f'{input_dir}/mpc_orbits.parquet', engine="pyarrow",  dtype_backend="pyarrow", 
+    mpcorb = pd.read_parquet(f'{input_dir}/mpc_orbits.parquet', engine="pyarrow",  dtype_backend="pyarrow",
                              columns=["unpacked_primary_provisional_designation", "a", "q", "e", "i", "node", "argperi", "peri_time",
                                       "mean_anomaly", "epoch_mjd", "h", "g"]
             ).reset_index(drop=True)
@@ -267,7 +266,7 @@ if __name__ == "__main__":
     # Business logic
     #
     obj = compute_ssobject(sss, dia, mpcorb)
-    
+
     #
     # Save
     #
