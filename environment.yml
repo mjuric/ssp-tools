@@ -7,9 +7,13 @@ dependencies:
   - pip
   - psycopg2
   - pyarrow>=14
-  - pyyaml
+  - pandas>=1.5
+  - numpy>=1.21
+  - astropy>=5.0
+  - scipy>=1.7
+  - pyyaml>=6.0
+  - tqdm>=4.0
   - pytest>=8
-  - tqdm
   # Development tools
   - ipython
   - pip:
