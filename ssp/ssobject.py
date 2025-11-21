@@ -142,17 +142,21 @@ def compute_ssobject(sss, dia, mpcorb):
     #
 
     # Tisserand J
-    vals = obj["unpacked_primary_provisional_designation"].astype("U")  # bytes → unicode str
-    mask = mpcorb["unpacked_primary_provisional_designation"].isin(vals)
-    q, e, i, node, argperi = util.unpack(mpcorb["q e i node argperi".split()][mask])
+    oidx, midx = util.argjoin(obj["unpacked_primary_provisional_designation"].astype("U"),
+                         mpcorb["unpacked_primary_provisional_designation"].to_numpy().astype("U")
+                        )
+    assert np.all(mpcorb["unpacked_primary_provisional_designation"].take(midx) ==
+                obj["unpacked_primary_provisional_designation"][oidx].astype("U"))
+
+    q, e, i, node, argperi = util.unpack(mpcorb["q e i node argperi".split()].take(midx))
     a = q / (1. - e)
-    obj["tisserand_J"] = util.tisserand_jupiter(a, e, i)
+    obj["tisserand_J"][oidx] = util.tisserand_jupiter(a, e, i)
 
     # MOID computation
     solver = MOIDSolver()
     for i, el_obj in enumerate(zip(a, e, i, node, argperi)):
         (moid, deltaV, eclon, trueEarth, trueObject) = solver.compute(earth_orbit_J2000(), el_obj)
-        row = obj[i]
+        row = obj[oidx[i]]
         row["MOIDEarth"] = moid
         row["MOIDEarthDeltaV"] = deltaV
         row["MOIDEarthEclipticLongitude"] = eclon

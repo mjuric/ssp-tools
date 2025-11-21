@@ -416,3 +416,85 @@ def unpack(df, to_numpy=True):
         return tuple(df[col].to_numpy() for col in df.columns)
     else:
         return tuple(df[col] for col in df.columns)
+
+
+def argjoin(a, v):
+    """
+    Perform an efficient inner join between two 1-D NumPy arrays, returning
+    the index pairs that match by value.
+
+    Parameters
+    ----------
+    a : ndarray
+        The left-hand array to join on. Must be 1-dimensional.
+    v : ndarray
+        The right-hand array to join on. Must be 1-dimensional.
+
+    Returns
+    -------
+    aidx : ndarray (int)
+        Indices into `a` selecting the rows that participate in the join.
+    vidx : ndarray (int)
+        Indices into `v` selecting the corresponding matching rows.
+
+        After the join:
+            a[aidx] == v[vidx]
+        is guaranteed to be true for all elements.
+
+    Notes
+    -----
+    This function implements a pure NumPy equivalent of an SQL-style
+    INNER JOIN on the key columns `a` and `v`.
+
+    The algorithm:
+
+    1. Sort `a` to produce a permutation `i` so that `a[i]` is sorted.
+    2. Use `np.searchsorted(a[i], v)` to find, for each element of `v`,
+       the candidate matching location in the sorted array.
+    3. Map these positions back to the coordinates of the original array `a`
+       using the permutation `i`.
+    4. Filter out non-matches (values in `v` not present in `a`).
+       The remaining pairs form the inner join.
+
+    Complexity
+    ----------
+    Sorting:      O(len(a) log len(a))
+    Searching:    O(len(v) log len(a))
+    Total:        O(n log n)
+
+    This is optimal for join-like operations on unsorted arrays in NumPy.
+
+    Examples
+    --------
+    >>> a = np.array(["b", "a", "c", "b"])
+    >>> v = np.array(["a", "b", "x", "b"])
+
+    >>> aidx, vidx = argjoin(a, v)
+    >>> a[aidx]
+    array(['a', 'b', 'b'])
+    >>> v[vidx]
+    array(['a', 'b', 'b'])
+
+    """
+    # 1. Sort a, remembering the permutation
+    i = np.argsort(a)
+    ai = a[i]
+
+    # 2. Locate each element of v within the sorted array
+    idx = np.searchsorted(ai, v)
+
+    # Clip to avoid out-of-range indices when v contains values > max(a)
+    idx = np.clip(idx, 0, len(ai) - 1)
+
+    # 3. Map positions in sorted array back to original array indices
+    aidx_candidate = i[idx]
+
+    # 4. Keep only true matches (this implements an INNER JOIN)
+    mask = ai[idx] == v
+    vidx = np.flatnonzero(mask)
+
+    # Final matched indices in a
+    aidx = aidx_candidate[vidx]
+
+    assert np.all(a[aidx] == v[vidx])
+    return aidx, vidx
