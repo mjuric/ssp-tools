@@ -1,7 +1,8 @@
 """Utilities and CLI for extracting LSST Butler catalogs to Parquet.
 
 This module provides:
-- query_tables_generator_and_count: stream Butler tables with optional ID filtering
+- query_tables_generator_and_count: stream Butler tables with optional
+  ID filtering
 - write_tables_to_parquet: stream-append tables into a single Parquet file
 - main(): CLI entry-point `extract-catalog`
 
@@ -49,7 +50,8 @@ def write_tables_to_parquet(
 
     for table in table_generator:
         try:
-            # Convert and write when non-empty; still count as processed even if empty
+            # Convert and write when non-empty; still count as processed
+            # even if empty
             if len(table) > 0:
                 arrow_table = astropy_to_arrow(table)
 
@@ -98,7 +100,8 @@ def query_catalogs(
     repo : str
         Path to Butler repository (e.g., "/repo/main").
     collection : str
-        Butler collection name (e.g., "LSSTCam/runs/DRP/FL/w_2025_19/DM-50795").
+        Butler collection name (e.g.,
+        "LSSTCam/runs/DRP/FL/w_2025_19/DM-50795").
     datasetType : str
         Dataset type to query (e.g., "dia_source_visit").
     filter_ids : numpy.ndarray, optional
@@ -112,14 +115,16 @@ def query_catalogs(
     Returns
     -------
     generator
-        Generator that yields Astropy Table-like objects (potentially filtered).
+        Generator that yields Astropy Table-like objects
+        (potentially filtered).
     int
         Total number of datasets that will be yielded (for progress bars).
 
     Notes
     -----
     - The registry query is executed immediately to determine the total count.
-    - Each dataset is loaded lazily via ``butler.get()`` as the generator is consumed.
+    - Each dataset is loaded lazily via ``butler.get()`` as the generator is
+      consumed.
     - ID filtering uses vectorized ``numpy.isin()`` for performance.
     """
     import lsst.daf.butler as dafButler
@@ -208,7 +213,9 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--filter-ids",
         dest="filter_ids",
-        help="Optional Parquet file containing IDs to filter on (IDs must be int64-convertible; first column will be used unless --filter-column is specified)",
+        help="Optional Parquet file containing IDs to filter on (IDs must be "
+             "int64-convertible; first column will be used unless "
+             "--filter-column is specified)",
     )
     parser.add_argument(
         "--filter-column",
@@ -260,7 +267,8 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
 
     Usage (examples)
     ----------------
-    extract-catalog dia_sources.parquet /repo/main LSSTCam/runs/DRP/FL/w_2025_19/DM-50795 \
+    extract-catalog dia_sources.parquet /repo/main \
+        LSSTCam/runs/DRP/FL/w_2025_19/DM-50795 \
         --filter-ids=obs_sbn.parquet \
         --filter-column=obssubid
     """

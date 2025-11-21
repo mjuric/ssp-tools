@@ -50,7 +50,9 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
     sss["heliocentricX"] = xx[0] - hx
     sss["heliocentricY"] = xx[1] - hy
     sss["heliocentricZ"] = xx[2] - hz
-    sss["heliocentricDist"] = np.sqrt(sss["heliocentricX"]**2 + sss["heliocentricY"]**2 + sss["heliocentricZ"]**2)
+    sss["heliocentricDist"] = np.sqrt(sss["heliocentricX"]**2 +
+                                      sss["heliocentricY"]**2 +
+                                      sss["heliocentricZ"]**2)
 
     sss["topocentricX"] = xx[0] - obs[0]
     sss["topocentricY"] = xx[1] - obs[1]
@@ -60,7 +62,9 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
     sss["heliocentricVX"] = vv[0] - hvx
     sss["heliocentricVY"] = vv[1] - hvy
     sss["heliocentricVZ"] = vv[2] - hvz
-    sss["heliocentricV"] = np.sqrt(sss["heliocentricVX"]**2 + sss["heliocentricVY"]**2 + sss["heliocentricVZ"]**2)
+    sss["heliocentricV"] = np.sqrt(sss["heliocentricVX"]**2 +
+                                   sss["heliocentricVY"]**2 +
+                                   sss["heliocentricVZ"]**2)
 
     sss["topocentricVX"] = vv[0] - vobs[0]
     sss["topocentricVY"] = vv[1] - vobs[1]
@@ -71,32 +75,41 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
 
     sss["ephVmag"] = hg_V_mag(H, G, sss["heliocentricDist"], sss["topocentricDist"], phase_deg)
 
-    print(f"{provID}: max/median separation: {np.max(sss["ephOffset"]):.4f}, {np.median(sss["ephOffset"]):.4f} arcsec")
+    max_sep = np.max(sss['ephOffset'])
+    med_sep = np.median(sss['ephOffset'])
+    print(f"{provID}: max/median separation: {max_sep:.4f}, {med_sep:.4f} arcsec")
 
 
 if __name__ == "__main__":
     input_dir = "./analysis/inputs"
     output_dir = "./analysis/outputs"
 
-    dia = pd.read_parquet(f'{input_dir}/dia_sources.parquet', engine="pyarrow",  dtype_backend="pyarrow").reset_index(drop=True)
+    dia = pd.read_parquet(f'{input_dir}/dia_sources.parquet',
+                          engine="pyarrow", dtype_backend="pyarrow"
+                          ).reset_index(drop=True)
     # DEBUG: while debugging, remove some indices and resort the array
     dia = dia.sample(frac=0.9, random_state=42).reset_index(drop=True)
 
 
 
 
-    det = pd.read_parquet(f'{input_dir}/obs_sbn.parquet', engine="pyarrow",  dtype_backend="pyarrow").reset_index()
+    det = pd.read_parquet(f'{input_dir}/obs_sbn.parquet',
+                          engine="pyarrow", dtype_backend="pyarrow"
+                          ).reset_index()
 
     # DEBUG: cut this down to a much smaller table
     sampled_provids = det['provid'].drop_duplicates().sample(10, random_state=42)
     det = det[det['provid'].isin(sampled_provids)].reset_index()
     print(len(det))
 
-    # FIXME: this will have to check if the ID's are IAU-style (with string prefixes)
+    # FIXME: this will have to check if the ID's are IAU-style
+    # (with string prefixes)
     det["obssubid"] = det["obssubid"].astype(int)
-    det = det[["trksub", "obssubid", "provid", "permid", "submission_id", "ra", "dec", "obstime", "designation_asterisk"]].copy()
+    det = det[["trksub", "obssubid", "provid", "permid", "submission_id",
+               "ra", "dec", "obstime", "designation_asterisk"]].copy()
 
-    # verify types didn't get mangled somewhere along the way from the database to here
+    # verify types didn't get mangled somewhere along the way
+    # from the database to here
     expect_dtypes = dict(
         trksub="string[pyarrow]",
         obssubid="int64",
@@ -115,7 +128,9 @@ if __name__ == "__main__":
 
 
     # create the association side table
-    assoc = dia[["diaSourceId"]].reset_index().merge(det.add_prefix("mpc_"), left_on="diaSourceId", right_on="mpc_obssubid", how="inner")
+    assoc = dia[["diaSourceId"]].reset_index().merge(
+        det.add_prefix("mpc_"), left_on="diaSourceId",
+        right_on="mpc_obssubid", how="inner")
     assoc.rename(columns={'index': 'dia_index'}, inplace=True)
 
     # verify all went well
@@ -128,21 +143,37 @@ if __name__ == "__main__":
 
 
 
-    numid = pd.read_parquet(f'{input_dir}/numbered_identifications.parquet', engine="pyarrow", columns=["permid", "unpacked_primary_provisional_designation"], dtype_backend="pyarrow").reset_index(drop=True)
-    curid = pd.read_parquet(f'{input_dir}/current_identifications.parquet', engine="pyarrow",  dtype_backend="pyarrow", columns=["unpacked_primary_provisional_designation", "unpacked_secondary_provisional_designation", "packed_primary_provisional_designation"]).reset_index(drop=True)
+    numid = pd.read_parquet(
+        f'{input_dir}/numbered_identifications.parquet',
+        engine="pyarrow",
+        columns=["permid", "unpacked_primary_provisional_designation"],
+        dtype_backend="pyarrow").reset_index(drop=True)
+    curid = pd.read_parquet(
+        f'{input_dir}/current_identifications.parquet',
+        engine="pyarrow", dtype_backend="pyarrow",
+        columns=["unpacked_primary_provisional_designation",
+                 "unpacked_secondary_provisional_designation",
+                 "packed_primary_provisional_designation"]
+        ).reset_index(drop=True)
 
-    # First step: some numbered objects in `obs_sbn` don't have their provID set. Restore it.
+    # First step: some numbered objects in `obs_sbn` don't have their
+    # provID set. Restore it.
     df = assoc[["mpc_provid", "mpc_permid"]].merge(numid, left_on="mpc_permid", right_on="permid", how="left")
     assert len(df) == len(assoc)
 
-    assoc["mpc_provid"] = assoc["mpc_provid"].where(assoc["mpc_provid"].notna(), df["unpacked_primary_provisional_designation"])
+    assoc["mpc_provid"] = assoc["mpc_provid"].where(
+        assoc["mpc_provid"].notna(),
+        df["unpacked_primary_provisional_designation"])
 
     assert not assoc["mpc_provid"].isna().any()
     assert len(assoc) == totalNumObs
 
     # Second step: update provisional designations with the primary ones.
 
-    df = assoc[["mpc_provid"]].merge(curid, left_on="mpc_provid", right_on="unpacked_secondary_provisional_designation", how="inner")
+    df = assoc[["mpc_provid"]].merge(
+        curid, left_on="mpc_provid",
+        right_on="unpacked_secondary_provisional_designation",
+        how="inner")
     assoc["mpc_provid"] = df["unpacked_primary_provisional_designation"]
     assoc["mpc_packed"] = df["packed_primary_provisional_designation"]
 
@@ -163,7 +194,9 @@ if __name__ == "__main__":
     sss["unpacked_primary_provisional_designation"] = assoc["mpc_provid"]
 
     df = dia[["ra", "dec", "midpointMjdTai"]].iloc[assoc["dia_index"]]
-    ra, dec, t = df["ra"].to_numpy(), df["dec"].to_numpy(), Time(df["midpointMjdTai"].to_numpy(), format="mjd", scale="tai")
+    ra, dec, t = (df["ra"].to_numpy(), df["dec"].to_numpy(),
+                  Time(df["midpointMjdTai"].to_numpy(),
+                       format="mjd", scale="tai"))
 
     sss["elongation"] = util.solar_elongation_ndarray(ra, dec, t)
 
@@ -182,10 +215,14 @@ if __name__ == "__main__":
 
 
 
-    mpcorb = pd.read_parquet(f'{input_dir}/mpc_orbits.parquet', engine="pyarrow",  dtype_backend="pyarrow",
-                         columns=["unpacked_primary_provisional_designation", "packed_primary_provisional_designation", "a", "q", "e", "i", "node", "argperi", "peri_time",
-                                  "mean_anomaly", "epoch_mjd", "h", "g"]
-             ).reset_index(drop=True)
+    mpcorb = pd.read_parquet(
+        f'{input_dir}/mpc_orbits.parquet', engine="pyarrow",
+        dtype_backend="pyarrow",
+        columns=["unpacked_primary_provisional_designation",
+                 "packed_primary_provisional_designation", "a", "q", "e",
+                 "i", "node", "argperi", "peri_time", "mean_anomaly",
+                 "epoch_mjd", "h", "g"]
+        ).reset_index(drop=True)
 
 
     from functools import partial

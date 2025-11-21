@@ -34,12 +34,14 @@ PGOID_TO_ARROW = {
 
 
 def arrow_type_for_oid(oid):
-    """Map Postgres OID to Arrow type, defaulting to string for unknown types."""
+    """Map Postgres OID to Arrow type, defaulting to string for unknown
+    types."""
     return PGOID_TO_ARROW.get(oid, pa.string())
 
 
 def build_dsn(args: argparse.Namespace) -> str:
-    """Build a Postgres DSN string from args/env, ensuring extra_float_digits=3."""
+    """Build a Postgres DSN string from args/env, ensuring
+    extra_float_digits=3."""
     # Highest priority: explicit --dsn
     if args.dsn:
         dsn = args.dsn.strip()
@@ -61,7 +63,11 @@ def build_dsn(args: argparse.Namespace) -> str:
     password = args.password or os.getenv("PGPASSWORD")
 
     if not all([host, dbname, user]):
-        raise ValueError("Database connection parameters must be provided via --service, --dsn, CLI flags, or environment variables (PGHOST, PGDATABASE, PGUSER)")
+        raise ValueError(
+            "Database connection parameters must be provided via --service, "
+            "--dsn, CLI flags, or environment variables "
+            "(PGHOST, PGDATABASE, PGUSER)"
+        )
 
     parts = [
         f"host={host}",
@@ -171,10 +177,19 @@ def main():
 
     # Export config
     parser.add_argument("--sql", help="SQL SELECT to export (required for single export)")
-    parser.add_argument("--out", dest="parquet_out", help="Output Parquet file path (required for single export)")
+    parser.add_argument(
+        "--out", dest="parquet_out",
+        help="Output Parquet file path (required for single export)"
+    )
     parser.add_argument("--config", help="YAML or JSON config file for batch exports")
-    parser.add_argument("--row-group-size", type=int, default=DEFAULT_ROW_GROUP_SIZE, help="Rows per Parquet row group (default for all exports)")
-    parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE, help="Arrow CSV block size in bytes")
+    parser.add_argument(
+        "--row-group-size", type=int, default=DEFAULT_ROW_GROUP_SIZE,
+        help="Rows per Parquet row group (default for all exports)"
+    )
+    parser.add_argument(
+        "--block-size", type=int, default=DEFAULT_BLOCK_SIZE,
+        help="Arrow CSV block size in bytes"
+    )
     parser.add_argument("--keep-temp", action="store_true", help="Keep the intermediate CSV for debugging")
 
     args = parser.parse_args()
@@ -238,7 +253,8 @@ def main():
 def load_config(config_path: str) -> list:
     """Load export configuration from YAML or JSON file.
 
-    Returns a list of dicts, each with keys: 'sql', 'out', and optionally 'row_group_size'.
+    Returns a list of dicts, each with keys: 'sql', 'out', and optionally
+    'row_group_size'.
     """
     with open(config_path, 'r') as f:
         if config_path.endswith('.json'):

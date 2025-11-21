@@ -21,7 +21,12 @@ phi_2_derivs = [-5.7295780e-1, -8.6573138e-8]
 
 alpha_3 = np.deg2rad([0.0, 0.3, 1., 2., 4., 8., 12., 20., 30.])
 
-phi_3_sp = [1., 8.3381185e-1, 5.7735424e-1, 4.2144772e-1, 2.3174230e-1, 1.0348178e-1, 6.1733473e-2, 1.6107006e-2, 0.]
+phi_3_sp = [
+    1., 8.3381185e-1, 5.7735424e-1, 4.2144772e-1,
+    2.3174230e-1, 1.0348178e-1, 6.1733473e-2,
+    1.6107006e-2, 0.
+]
+
 phi_3_derivs = [-1.0630097, 0]
 
 
@@ -61,7 +66,8 @@ def HG1G2_model(phase, params):
     phi_3_ev[phase > np.pi/6] = 0
 
 
-    return params[0] - 2.5 * np.log10(params[1] * phi_1_ev + params[2] * phi_2_ev + (1-params[1]-params[2]) * phi_3_ev)
+    return params[0] - 2.5 * np.log10(params[1] * phi_1_ev + params[2] * phi_2_ev +
+           (1-params[1]-params[2]) * phi_3_ev)
 
 def HG12_model(phase, params):
     if params[1] >= 0.2:

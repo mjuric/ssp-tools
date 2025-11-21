@@ -1,7 +1,8 @@
 import jax
-jax.config.update("jax_enable_x64", True)
 from astropy.time import Time
 import numpy as np
+
+jax.config.update("jax_enable_x64", True)
 
 def _aux_compute_ephemerides(provID, ephTimes, mpcorb):
     import astropy.units as u
@@ -10,7 +11,11 @@ def _aux_compute_ephemerides(provID, ephTimes, mpcorb):
     from jorbit import Particle
 
     # Ephemerides
-    (packed, a, e, i, node, argperi, M, epoch, H, G) = mpcorb.query("unpacked_primary_provisional_designation == @provID", engine="python")["packed_primary_provisional_designation a e i node argperi mean_anomaly epoch_mjd h g".split()].iloc[0]
+    (packed, a, e, i, node, argperi, M, epoch, H, G) = (
+        mpcorb.query("unpacked_primary_provisional_designation == @provID", engine="python")
+        ["packed_primary_provisional_designation a e i node argperi mean_anomaly epoch_mjd h g".split()]\
+            .iloc[0]
+    )
 
     # FIXME: hack until jorbit is fixed (https://github.com/ben-cassese/jorbit/issues/26)
     p = Particle.from_horizons(name=packed, time=Time(epoch, format="mjd", scale="tdb"))

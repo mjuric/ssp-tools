@@ -2,6 +2,19 @@ import numpy as np
 import astropy
 from astropy.time import Time
 import pandas as pd
+import astropy.units as u
+from astropy.coordinates import get_sun, angular_separation
+import numpy.ma as ma
+from astropy.constants import R_earth
+from astropy.coordinates import (
+    EarthLocation,
+    solar_system_ephemeris,
+    get_body_barycentric_posvel,
+)
+from astroquery.mpc import MPC
+from typing import Optional
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 def assoc_validate(dia, assoc):
     # verify coordinates and times match
@@ -14,7 +27,8 @@ def assoc_validate(dia, assoc):
 
     print ("Separation diffeerence range (arcsec): ", sep.min().arcsec, sep.max().arcsec)
     assert sep.min().arcsec >= 0
-    assert sep.max().arcsec <= 0.005  ## FIXME: this should be further tightened once we start submitting extra precision to the MPC
+    assert sep.max().arcsec <= 0.005  ## FIXME: this should be further
+    ## tightened once we start submitting extra precision to the MPC
 
     # verify times match
     t_utc = Time(dia["midpointMjdTai"].to_numpy(), format="mjd", scale="tai").utc
@@ -65,9 +79,6 @@ def packed_ascii_to_uint64_le(mpc_packed):
 
     # Step 7: Interpret every 8 bytes as a little-endian uint64
     return np.frombuffer(buf, dtype="<u8")
-
-import astropy.units as u
-from astropy.coordinates import get_sun, angular_separation
 
 def solar_elongation_ndarray(ra_deg, dec_deg, t):
     """
@@ -190,15 +201,6 @@ def group_by(arrs, key, func, out=None, check_grouped=True):
 
     return results
 
-import numpy.ma as ma
-from astropy.constants import R_earth
-from astropy.coordinates import (
-    EarthLocation,
-    solar_system_ephemeris,
-    get_body_barycentric_posvel,
-)
-from astroquery.mpc import MPC
-
 
 def earthlocation_from_obscode(obscode: str) -> EarthLocation:
     """
@@ -239,8 +241,8 @@ def earthlocation_from_obscode(obscode: str) -> EarthLocation:
 
 def observatory_barycentric_posvel(obscode: str, obstime: Time):
     """
-    Barycentric (ICRS) position and velocity of an observatory given an MPC obscode,
-    using JPL DE440 for the Earth ephemeris.
+    Barycentric (ICRS) position and velocity of an observatory given an
+    MPC obscode, using JPL DE440 for the Earth ephemeris.
 
     Returns
     -------
@@ -281,12 +283,6 @@ def observatory_barycentric_posvel(obscode: str, obstime: Time):
 ###
 ### Serialization
 ###
-
-from typing import Optional
-
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 
 def struct_to_parquet(
     arr: np.ndarray,
@@ -372,7 +368,6 @@ def struct_to_parquet(
         if writer is not None:
             writer.close()
 
-import numpy as np
 
 # Jupiter's semimajor axis in AU (J2000-ish)
 A_JUP = 5.2044

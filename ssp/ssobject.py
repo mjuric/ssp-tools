@@ -52,7 +52,8 @@ def compute_ssobject_entry(row, sss):
     # Metadata columns
     row["ssObjectId"] = sss["ssObjectId"].iloc[0]
     row["firstObservationDate"] = sss["dia_midpointMjdTai"].min()
-    # FIXME: here I assume we discover everything 7 days after first obsv. we should really pull this out of the obs_sbn table.
+    # FIXME: here I assume we discover everything 7 days after first obsv.
+    # we should really pull this out of the obs_sbn table.
     row["discoverySubmissionDate"] = row["firstObservationDate"] + 7.
     row["arc"] = np.ptp(sss["dia_midpointMjdTai"])
     row["unpacked_primary_provisional_designation"] = sss["unpacked_primary_provisional_designation"].iloc[0]
@@ -81,11 +82,15 @@ def compute_ssobject_entry(row, sss):
             row[f"{band}_phaseAngleMax"] = paMax
 
             if nBandObs > 1:
-                # do the absmag/slope fits, if there are at least two data points
+                # do the absmag/slope fits, if there are at least two
+                # data points
                 H, G12, sigmaH, sigmaG12, covHG12, chi2dof, nobsv = \
-                    photfit.fitHG12(df["dia_psfMag"], df["dia_psfMagErr"], df["phaseAngle"], df["topocentricDist"], df["heliocentricDist"])
+                    photfit.fitHG12(df["dia_psfMag"], df["dia_psfMagErr"],
+                                    df["phaseAngle"], df["topocentricDist"],
+                                    df["heliocentricDist"])
                 nDof = 2
-                #print(provID, band, H, G12, sigmaH, sigmaG12, covHG12, chi2dof, nobsv)
+                # print(provID, band, H, G12, sigmaH, sigmaG12, covHG12,
+                #       chi2dof, nobsv)
 
                 # mark the fit failure
                 if np.isnan(G12):
@@ -158,7 +163,8 @@ def compute_ssobject(sss, dia, mpcorb):
 
 def main():
     """
-    CLI entry point for building SSObject table from SSSource, DiaSource, and MPC orbit data.
+    CLI entry point for building SSObject table from SSSource,
+    DiaSource, and MPC orbit data.
     """
     parser = argparse.ArgumentParser(
         description="Build SSObject table from SSSource, DiaSource, and MPC orbit Parquet files",
@@ -197,14 +203,20 @@ Examples:
     try:
         # Load SSSource
         print(f"Loading SSSource from {args.sssource_parquet}...")
-        sss = pd.read_parquet(args.sssource_parquet, engine="pyarrow", dtype_backend="pyarrow").reset_index(drop=True)
+        sss = pd.read_parquet(args.sssource_parquet, engine="pyarrow",
+                              dtype_backend="pyarrow").reset_index(drop=True)
         num = len(sss)
         print(f"Loaded {num:,} SSSource rows")
 
         # Load DiaSource with required columns
-        dia_columns = ["diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness", "band", "psfFlux", "psfFluxErr"]
+        dia_columns = [
+            "diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness",
+            "band", "psfFlux", "psfFluxErr"
+        ]
         print(f"Loading DiaSource from {args.diasource_parquet}...")
-        dia = pd.read_parquet(args.diasource_parquet, engine="pyarrow", dtype_backend="pyarrow", columns=dia_columns).reset_index(drop=True)
+        dia = pd.read_parquet(args.diasource_parquet, engine="pyarrow",
+                              dtype_backend="pyarrow", columns=dia_columns
+                              ).reset_index(drop=True)
         print(f"Loaded {len(dia):,} DiaSource rows")
 
         # Ensure diaSourceId is uint64
@@ -212,11 +224,14 @@ Examples:
         dia["diaSourceId"] = dia["diaSourceId"].astype("uint64[pyarrow]")
 
         # Load MPC orbits
-        mpcorb_columns = ["unpacked_primary_provisional_designation", "a", "q", "e", "i", "node", "argperi", "peri_time",
-                         "mean_anomaly", "epoch_mjd", "h", "g"]
+        mpcorb_columns = [
+            "unpacked_primary_provisional_designation", "a", "q", "e", "i",
+            "node", "argperi", "peri_time", "mean_anomaly", "epoch_mjd", "h", "g"
+        ]
         print(f"Loading MPC orbits from {args.mpcorb_parquet}...")
-        mpcorb = pd.read_parquet(args.mpcorb_parquet, engine="pyarrow", dtype_backend="pyarrow",
-                                columns=mpcorb_columns).reset_index(drop=True)
+        mpcorb = pd.read_parquet(args.mpcorb_parquet, engine="pyarrow",
+                                 dtype_backend="pyarrow", columns=mpcorb_columns
+                                 ).reset_index(drop=True)
         print(f"Loaded {len(mpcorb):,} MPC orbit rows")
 
         # Compute SSObject
@@ -245,22 +260,33 @@ if __name__ == "__main__":
     #
 
     # load SSObject
-    sss = pd.read_parquet(f'{output_dir}/sssource.parquet', engine="pyarrow",  dtype_backend="pyarrow").reset_index(drop=True)
+    sss = pd.read_parquet(f'{output_dir}/sssource.parquet',
+                          engine="pyarrow", dtype_backend="pyarrow"
+                          ).reset_index(drop=True)
     num = len(sss)
 
     # load corresponding DiaSource
-    dia_columns = ["diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness", "band", "psfFlux", "psfFluxErr"]
-    dia = pd.read_parquet(f'{input_dir}/dia_sources.parquet', engine="pyarrow",  dtype_backend="pyarrow", columns=dia_columns).reset_index(drop=True)
+    dia_columns = [
+        "diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness",
+        "band", "psfFlux", "psfFluxErr"
+    ]
+    dia = pd.read_parquet(f'{input_dir}/dia_sources.parquet',
+                          engine="pyarrow", dtype_backend="pyarrow",
+                          columns=dia_columns).reset_index(drop=True)
 
-    # FIXME: I'm not sure why the datatype is int and not uint here. Investigate upstream...
+    # FIXME: I'm not sure why the datatype is int and not uint here.
+    # Investigate upstream...
     assert np.all(dia["diaSourceId"] >= 0)
     dia["diaSourceId"] = dia["diaSourceId"].astype("uint64[pyarrow]")
 
     # Load mpcorb
-    mpcorb = pd.read_parquet(f'{input_dir}/mpc_orbits.parquet', engine="pyarrow",  dtype_backend="pyarrow",
-                             columns=["unpacked_primary_provisional_designation", "a", "q", "e", "i", "node", "argperi", "peri_time",
-                                      "mean_anomaly", "epoch_mjd", "h", "g"]
-            ).reset_index(drop=True)
+    mpcorb = pd.read_parquet(f'{input_dir}/mpc_orbits.parquet',
+                             engine="pyarrow", dtype_backend="pyarrow",
+                             columns=[
+                                 "unpacked_primary_provisional_designation",
+                                 "a", "q", "e", "i", "node", "argperi",
+                                 "peri_time", "mean_anomaly", "epoch_mjd", "h", "g"
+                             ]).reset_index(drop=True)
 
     #
     # Business logic
