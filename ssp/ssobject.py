@@ -116,10 +116,18 @@ def compute_ssobject(sss, dia, mpcorb):
     # Construct a joined/expanded SSSource table
     #
 
+    # assert that sss is pre-grouped by ssObjectId
+    assert util.values_grouped(sss["ssObjectId"]), (
+        "SSSource table must be pre-grouped by ssObjectId. "
+        "An easy way to do this is to sort by ssObjectId before calling compute_ssobject(). "
+        "The grouping is required for correct per-object computations, and since SSSource is "
+        "typically large and we want to avoid copies, it's not done internally."
+    )
+
     # join DiaSource bits
     num = len(sss)
     sss = sss.merge(dia.add_prefix("dia_"), left_on="diaSourceId", right_on="dia_diaSourceId", how="inner")
-    assert num == len(sss), f"Mismatch in number of SSSource rows after DiaSource join {num} vs {len(sss)}"
+    assert num == len(sss), f"{num - len(sss)} DiaSources found missing."
     del sss["dia_diaSourceId"]
 
     # add magnitude columns

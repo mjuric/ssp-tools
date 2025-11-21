@@ -202,6 +202,27 @@ def group_by(arrs, key, func, out=None, check_grouped=True):
     return results
 
 
+def values_grouped(a: np.ndarray) -> bool:
+    """
+    Return True if each distinct value in 1D array `a`
+    appears in a single contiguous block (all duplicates grouped).
+    """
+    a = np.asarray(a)
+    if a.ndim != 1:
+        raise ValueError("a must be 1D")
+    if a.size == 0:
+        return True
+
+    # 1) True where a new group starts: first element, or value != previous
+    group_starts = np.concatenate(([True], a[1:] != a[:-1]))
+
+    # 2) Values for each group (one per contiguous block)
+    group_vals = a[group_starts]
+
+    # 3) Check that no value appears in more than one group
+    #    i.e., all group_vals are unique
+    return np.unique(group_vals).size == group_vals.size
+
 def earthlocation_from_obscode(obscode: str) -> EarthLocation:
     """
     Convert an MPC observatory code (e.g. 'X05') to an EarthLocation,
