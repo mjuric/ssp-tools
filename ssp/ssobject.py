@@ -112,9 +112,52 @@ def compute_ssobject_entry(row, sss):
     row["extendednessMedian"] = sss["dia_extendedness"].median()
 
 def compute_ssobject(sss, dia, mpcorb):
-    #
-    # Construct a joined/expanded SSSource table
-    #
+    """
+    Compute solar system object properties by joining and processing
+    SSSource, DiaSource, and MPC orbit data.
+
+    This function takes a pre-grouped SSSource table, joins it with
+    DiaSource data, computes per-object quantities, and calculates
+    additional orbital parameters like Tisserand J and Minimum Orbit
+    Intersection Distance (MOID) with Earth for matching objects.
+
+    Parameters
+    ----------
+    sss : pandas.DataFrame
+        SSSource table, pre-grouped by 'ssObjectId'. Must be sorted by
+        'ssObjectId' for correct grouping. Contains columns like
+        'ssObjectId', 'diaSourceId', etc.
+    dia : pandas.DataFrame
+        DiaSource table with columns prefixed as 'dia_' in the join.
+        Must include 'dia_diaSourceId', 'dia_psfFlux', 'dia_psfFluxErr',
+        etc.
+    mpcorb : pandas.DataFrame
+        MPC orbit data with columns like
+        'unpacked_primary_provisional_designation', 'q', 'e', 'i',
+        'node', 'argperi'.
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of ssObject records with dtype schema.ssObjectDtype,
+        containing computed properties for each unique ssObjectId,
+        including magnitudes, orbital elements, Tisserand J, and
+        MOID-related values.
+
+    Raises
+    ------
+    AssertionError
+        If 'sss' is not pre-grouped by 'ssObjectId', or if DiaSources
+        are missing after join.
+
+    Notes
+    -----
+    - The function assumes 'sss' is large and avoids internal
+      sorting/copying for efficiency.
+    - Tisserand J and MOID are computed only for objects matching
+      designations in 'mpcorb'.
+    - MOID computation uses a MOIDSolver for each matched object.
+    """
 
     # assert that sss is pre-grouped by ssObjectId
     assert util.values_grouped(sss["ssObjectId"]), (
@@ -124,7 +167,7 @@ def compute_ssobject(sss, dia, mpcorb):
         "typically large and we want to avoid copies, it's not done internally."
     )
 
-    # join DiaSource bits
+    # Join the DiaSource parts we're interested in to our SSSource table
     num = len(sss)
     sss = sss.merge(dia.add_prefix("dia_"), left_on="diaSourceId", right_on="dia_diaSourceId", how="inner")
     assert num == len(sss), f"{num - len(sss)} DiaSources found missing."
@@ -134,22 +177,22 @@ def compute_ssobject(sss, dia, mpcorb):
     sss["dia_psfMag"] = nJy_to_mag(sss["dia_psfFlux"])
     sss["dia_psfMagErr"] = nJy_err_to_mag_err(sss["dia_psfFlux"], sss["dia_psfFluxErr"])
 
-    #
     # Pre-create the empty array
-    #
     totalNumObjects = np.unique(sss["ssObjectId"]).size
     obj = np.zeros(totalNumObjects, dtype=schema.ssObjectDtype)
 
-    #
     # compute per-object quantities
-    #
     util.group_by([sss], "ssObjectId", compute_ssobject_entry, out=obj)
 
     #
     # compute columns that can be efficiently computed in a vector fashon
     #
-
     # Tisserand J
+
+    # inner join by provisional designation. We allow for some objects to be
+    # missing from mpcorb (this should not happen often, but it did in DP1).
+    # FIXME: at some point require that no objects are missing. I _think_ that
+    # shouldn't happen in normal operations.
     oidx, midx = util.argjoin(obj["unpacked_primary_provisional_designation"].astype("U"),
                          mpcorb["unpacked_primary_provisional_designation"].to_numpy().astype("U")
                         )
