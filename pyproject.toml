@@ -35,6 +35,7 @@ all = [
 fast-export = "ssp.export:main"
 extract-catalog = "ssp.export.butler:main"
 ssp-build-ssobject = "ssp.ssobject:main"
+ssp-generate-dtypes = "ssp.felis:main"
 
 [tool.pytest.ini_options]
 addopts = "-q"

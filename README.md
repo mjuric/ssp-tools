@@ -211,6 +211,45 @@ The tool performs:
 - Orbital analysis including Tisserand parameter and MOID calculations
 - Quality metrics and observation statistics per object
 
+### NumPy Dtype Generation from Felis Schema
+
+`ssp-generate-dtypes` generates pretty-printed NumPy dtype definitions from Felis YAML table schemas. This utility converts table specifications into Python code suitable for defining structured arrays, with automatic type mapping and metadata preservation. The typical use is to regenerate the `ssp/schema.py` file.
+
+Basic usage:
+```bash
+ssp-generate-dtypes schema.yaml > ssp/schema.py
+```
+
+Generate dtypes for specific tables:
+```bash
+ssp-generate-dtypes schema.yaml SSObject SSSource > some-table-dtypes.py
+```
+
+Arguments:
+- `schema.yaml` – Felis YAML schema file containing table definitions
+- `table_names` – Optional list of table names to process (default: SSObject, SSSource, mpc_orbits, current_identifications, numbered_identifications)
+
+The output includes:
+- Generated file header with command provenance
+- Import statements
+- Pretty-formatted dtype assignments with comments
+- Table descriptions and column metadata
+
+Example output:
+```python
+# ***** GENERATED FILE, DO NOT EDIT BY HAND *****
+# generated with ssp-generate-dtypes schema.yaml SSObject
+import numpy as np
+
+## table: SSObject
+# SSObject table description...
+SSObjectDtype = np.dtype([
+    ('id', '<i8'),                    # Unique object identifier
+    ('ra', '<f8'),                    # Right ascension [deg]
+    # ... more fields
+])
+```
+
 ### Performance Tuning
 
 - `--row-group-size`: Rows per Parquet row group (default: 1,000,000)
