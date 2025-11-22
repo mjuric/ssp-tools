@@ -46,9 +46,6 @@ def compute_ssobject_entry(row, sss):
     # just verify we didn't screw up something
     assert sss["ssObjectId"].nunique() == 1
 
-    # start out optimistic
-    row['flags'] = 0
-
     # Metadata columns
     row["ssObjectId"] = sss["ssObjectId"].iloc[0]
     row["firstObservationDate"] = sss["dia_midpointMjdTai"].min()
@@ -65,7 +62,7 @@ def compute_ssobject_entry(row, sss):
     for band in "ugrizy":
         df = sss[sss["dia_band"] == band]
 
-        # set defaults for this band (NULL)
+        # set defaults for this band (equivalents of NULL)
         row[f'{band}_Chi2'] = -1
         row[f'{band}_G12'] = np.nan
         row[f'{band}_G12Err'] = np.nan
@@ -92,9 +89,9 @@ def compute_ssobject_entry(row, sss):
                 # print(provID, band, H, G12, sigmaH, sigmaG12, covHG12,
                 #       chi2dof, nobsv)
 
-                # mark the fit failure
+                # mark if the fit failed
                 if np.isnan(G12):
-                    row['flags'] |= flags_phot[band]
+                    row[f'{band}_slope_fit_failed'] = True
 
                 row[f'{band}_Chi2'] = chi2dof * nDof
                 row[f'{band}_G12'] = G12
@@ -179,7 +176,7 @@ def compute_ssobject(sss, dia, mpcorb):
 
     # Pre-create the empty array
     totalNumObjects = np.unique(sss["ssObjectId"]).size
-    obj = np.zeros(totalNumObjects, dtype=schema.ssObjectDtype)
+    obj = np.zeros(totalNumObjects, dtype=schema.SSObjectDtype)
 
     # compute per-object quantities
     util.group_by([sss], "ssObjectId", compute_ssobject_entry, out=obj)
