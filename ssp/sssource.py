@@ -47,6 +47,7 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
     sss["ephOffsetRa"]  = (dia["ra"].to_numpy() - sss["ephRa"]) * np.cos(np.deg2rad(sss["ephDec"])) * 3600
     sss["ephOffset"]    = eph.separation(obsv).arcsec
 
+    # Compute heliocentric position components
     sss["heliocentricX"] = xx[0] - hx
     sss["heliocentricY"] = xx[1] - hy
     sss["heliocentricZ"] = xx[2] - hz
@@ -54,22 +55,38 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
                                       sss["heliocentricY"]**2 +
                                       sss["heliocentricZ"]**2)
 
+    # Compute heliocentric velocity components
+    sss["heliocentricVX"] = vv[0] - hvx
+    sss["heliocentricVY"] = vv[1] - hvy
+    sss["heliocentricVZ"] = vv[2] - hvz
+    sss["heliocentricVtot"] = np.sqrt(sss["heliocentricVX"]**2 +
+                                   sss["heliocentricVY"]**2 +
+                                   sss["heliocentricVZ"]**2)
+
+    # Compute heliocentric radial velocity: dot product of velocity
+    # and unit position vector
+    sss["heliocentricVrad"] = (sss["heliocentricVX"] * sss["heliocentricX"] +
+                               sss["heliocentricVY"] * sss["heliocentricY"] +
+                               sss["heliocentricVZ"] * sss["heliocentricZ"]) / sss["heliocentricDist"]
+
+    # Compute topocentric position components
     sss["topocentricX"] = xx[0] - obs[0]
     sss["topocentricY"] = xx[1] - obs[1]
     sss["topocentricZ"] = xx[2] - obs[2]
     sss["topocentricDist"] = np.sqrt(sss["topocentricX"]**2 + sss["topocentricY"]**2 + sss["topocentricZ"]**2)
 
-    sss["heliocentricVX"] = vv[0] - hvx
-    sss["heliocentricVY"] = vv[1] - hvy
-    sss["heliocentricVZ"] = vv[2] - hvz
-    sss["heliocentricV"] = np.sqrt(sss["heliocentricVX"]**2 +
-                                   sss["heliocentricVY"]**2 +
-                                   sss["heliocentricVZ"]**2)
-
+    # Compute topocentric velocity components
     sss["topocentricVX"] = vv[0] - vobs[0]
     sss["topocentricVY"] = vv[1] - vobs[1]
     sss["topocentricVZ"] = vv[2] - vobs[2]
-    sss["topocentricV"] = np.sqrt(sss["topocentricVX"]**2 + sss["topocentricVY"]**2 + sss["topocentricVZ"]**2)
+    sss["topocentricVtot"] = np.sqrt(
+        sss["topocentricVX"]**2 + sss["topocentricVY"]**2 + sss["topocentricVZ"]**2
+    )
+    # Compute topocentric radial velocity: dot product of velocity
+    # and unit position vector
+    sss["topocentricVrad"] = (sss["topocentricVX"] * sss["topocentricX"] +
+                              sss["topocentricVY"] * sss["topocentricY"] +
+                              sss["topocentricVZ"] * sss["topocentricZ"]) / sss["topocentricDist"]
 
     sss["phaseAngle"] = phase_deg = phase_angle_deg(xx, obs)
 
@@ -183,7 +200,7 @@ if __name__ == "__main__":
     assoc.sort_values(["mpc_provid"], inplace=True)
 
     # create the output array for SSSource
-    sss = np.zeros(totalNumObs, dtype=schema.ssSourceDtype)
+    sss = np.zeros(totalNumObs, dtype=schema.SSSourceDtype)
     sss.dtype.itemsize, len(sss), f"{sss.nbytes:,}"
 
     #

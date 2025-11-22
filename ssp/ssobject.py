@@ -3,10 +3,15 @@ import numpy as np
 from . import photfit
 from . import util
 from . import schema
-from .flags import flags_phot
 from .moid import MOIDSolver, earth_orbit_J2000
 import argparse
 import sys
+
+# The only columns we need from DiaSource.
+DIA_COLUMNS = [
+    "diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness",
+    "band", "psfFlux", "psfFluxErr"
+]
 
 def nJy_to_mag(f_njy):
     """
@@ -166,9 +171,17 @@ def compute_ssobject(sss, dia, mpcorb):
 
     # Join the DiaSource parts we're interested in to our SSSource table
     num = len(sss)
-    sss = sss.merge(dia.add_prefix("dia_"), left_on="diaSourceId", right_on="dia_diaSourceId", how="inner")
+    dia_tmp = dia[DIA_COLUMNS].add_prefix("dia_")  # FIXME: does this cause unnececessary copy?
+    # FIXME: The diaSourceId should really be uint64. But Felis doesn't speak
+    # uint64, but only knows about int64. Yet the pipeline produces uint64
+    # diaSourceId in the dia_source dataset. So we have to cast here to int64
+    # to make the join work (otherwise pyarrow tries to cast to float64, and
+    # the whole thing gloriously explodes).
+    dia_tmp["dia_diaSourceId"] = dia_tmp["dia_diaSourceId"].astype("int64[pyarrow]")
+    sss = sss.merge(dia_tmp, left_on="diaSourceId", right_on="dia_diaSourceId", how="inner")
     assert num == len(sss), f"{num - len(sss)} DiaSources found missing."
     del sss["dia_diaSourceId"]
+    del dia_tmp
 
     # add magnitude columns
     sss["dia_psfMag"] = nJy_to_mag(sss["dia_psfFlux"])
@@ -318,13 +331,9 @@ if __name__ == "__main__":
     num = len(sss)
 
     # load corresponding DiaSource
-    dia_columns = [
-        "diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness",
-        "band", "psfFlux", "psfFluxErr"
-    ]
     dia = pd.read_parquet(f'{input_dir}/dia_sources.parquet',
                           engine="pyarrow", dtype_backend="pyarrow",
-                          columns=dia_columns).reset_index(drop=True)
+                          columns=DIA_COLUMNS).reset_index(drop=True)
 
     # FIXME: I'm not sure why the datatype is int and not uint here.
     # Investigate upstream...
