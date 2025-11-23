@@ -59,9 +59,8 @@ def compute_ssobject_entry(row, sss):
         # FIXME: here I arbitrarily guess we discover everything 7 days
         # after first obsv. we should really pull this out of the obs_sbn tbl.
         row["discoverySubmissionDate"] = row["firstObservationMjdTai"] + 7.
-        row["arc"] = np.ptp(sss["dia_midpointMjdTai"])
-        row["unpacked_primary_provisional_designation"] = \
-            sss["unpacked_primary_provisional_designation"].iloc[0]
+    row["arc"] = np.ptp(sss["dia_midpointMjdTai"])
+    row["designation"] = sss["designation"].iloc[0]
 
     # observation counts
     row["nObs"] = len(sss)
@@ -207,12 +206,11 @@ def compute_ssobject(sss, dia, mpcorb):
     # missing from mpcorb (this should not happen often, but it did in DP1).
     # FIXME: at some point require that no objects are missing. I _think_ that
     # shouldn't happen in normal operations.
-    oidx, midx = util.argjoin(obj["unpacked_primary_provisional_designation"].astype("U"),
+    oidx, midx = util.argjoin(obj["designation"].astype("U"),
                          mpcorb["unpacked_primary_provisional_designation"].to_numpy().astype("U")
                         )
     assert np.all(mpcorb["unpacked_primary_provisional_designation"].take(midx) ==
-                obj["unpacked_primary_provisional_designation"][oidx].astype("U"))
-
+                obj["designation"][oidx].astype("U"))
     q, e, i, node, argperi = util.unpack(mpcorb["q e i node argperi".split()].take(midx))
     a = q / (1. - e)
     obj["tisserand_J"][oidx] = util.tisserand_jupiter(a, e, i)

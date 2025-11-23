@@ -19,7 +19,7 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
     assert np.all(sss["ssObjectId"] == sss["ssObjectId"][0])
     assert len(dia) == len(sss)
 
-    provID = sss["unpacked_primary_provisional_designation"][0]
+    provID = sss["designation"][0]
     ephTimes = Time(dia["midpointMjdTai"].values, format="mjd", scale="tai")
     eph, (H, G), xx, vv, obs, mu_lon, mu_lat, mu = _aux_compute_ephemerides(provID, ephTimes, mpcorb)
 
@@ -205,7 +205,7 @@ if __name__ == "__main__":
     #
     sss["diaSourceId"] = assoc["diaSourceId"].values
     sss["ssObjectId"] = util.packed_ascii_to_uint64_le(assoc["mpc_packed"])
-    sss["unpacked_primary_provisional_designation"] = assoc["mpc_provid"]
+    sss["designation"] = assoc["mpc_provid"]
 
     df = dia[["ra", "dec", "midpointMjdTai"]].iloc[assoc["dia_index"]]
     ra, dec, t = (df["ra"].to_numpy(), df["dec"].to_numpy(),

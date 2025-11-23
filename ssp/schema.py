@@ -7,8 +7,7 @@ import numpy as np
 # SSObject: LSST-computed per-object quantities.
 SSObjectDtype = np.dtype([
     ('ssObjectId', '<i8'),          # Unique identifier.
-    ('unpacked_primary_provisional_designation', '<U16'), # The primary provisional designation for this
-                                                          # object (unpacked form).
+    ('designation', '<U16'),        # The unpacked primary provisional designation for this object.
     ('nObs', '<i4'),                # Total number of LSST observations of this object.
     ('arc', '<f4'),                 # [d] Timespan ("arc") of all LSST observations, t_{last} - t_{first}
     ('firstObservationMjdTai', '<f8'), # [d] The time of the first LSST observation of this object (could be
@@ -94,8 +93,7 @@ SSObjectDtype = np.dtype([
 SSSourceDtype = np.dtype([
     ('diaSourceId', '<i8'),         # Unique identifier of the observation (matching DiaSource.diaSourceId).
     ('ssObjectId', '<i8'),          # Unique LSST identifier of the Solar System object.
-    ('unpacked_primary_provisional_designation', '<U16'), # Primary MPC provisional designation for this
-                                                          # object, in unpacked form.
+    ('designation', '<U16'),        # The unpacked primary provisional designation for this object.
     ('eclLambda', '<f8'),           # [deg] Ecliptic longitude, converted from the observed coordinates.
     ('eclBeta', '<f8'),             # [deg] Ecliptic latitude, converted from the observed coordinates.
     ('galLon', '<f8'),              # [deg] Galactic longitude, converted from the observed coordinates.
@@ -148,6 +146,7 @@ SSSourceDtype = np.dtype([
 # the RSP.
 mpc_orbitsDtype = np.dtype([
     ('id', '<i4'),                  # Internal ID (generally not seen/used by the user)
+    ('designation', '<U16'),        # The primary provisional designation in unpacked form (e.g. 2008 AB).
     ('packed_primary_provisional_designation', '<U16'), # The primary provisional designation in packed form
                                                         # (e.g. K08A00B)
     ('unpacked_primary_provisional_designation', '<U16'), # The primary provisional designation in unpacked
