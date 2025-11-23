@@ -7,139 +7,139 @@ import numpy as np
 # SSObject: LSST-computed per-object quantities.
 SSObjectDtype = np.dtype([
     ('ssObjectId', '<i8'),          # Unique identifier.
+    ('unpacked_primary_provisional_designation', '<U16'), # The primary provisional designation for this
+                                                          # object (unpacked form).
     ('nObs', '<i4'),                # Total number of LSST observations of this object.
-    ('discoverySubmissionDate', '<f8'), # [d] The date the LSST first linked and submitted the discovery
-                                        # observations to the MPC. May be NULL if not an LSST discovery. T...
-    ('firstObservationDate', '<f8'),    # [d] The time of the first LSST observation of this object (could be
-                                        # precovered) as Modified Julian Date, International Atomic Time.
     ('arc', '<f4'),                 # [d] Timespan ("arc") of all LSST observations, t_{last} - t_{first}
-    ('g_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (g band).
-    ('g_G12', '<f4'),               # Best fit G12 slope parameter (g band).
-    ('g_G12Err', '<f4'),            # Error in the estimate of G12 (g band).
-    ('g_H', '<f4'),                 # [mag] Best fit absolute magnitude (g band).
-    ('g_H_g_G12_Cov', '<f4'),       # [mag**2] H–G12 covariance (g band).
-    ('g_HErr', '<f4'),              # [mag] Error in the estimate of H (g band).
-    ('g_nObsUsed', '<i4'),          # The number of data points used to fit the phase curve (g band).
-    ('i_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (i band).
-    ('i_G12', '<f4'),               # Best fit G12 slope parameter (i band).
-    ('i_G12Err', '<f4'),            # Error in the estimate of G12 (i band).
-    ('i_H', '<f4'),                 # [mag] Best fit absolute magnitude (i band).
-    ('i_H_i_G12_Cov', '<f4'),       # [mag**2] H–G12 covariance (i band).
-    ('i_HErr', '<f4'),              # [mag] Error in the estimate of H (i band).
-    ('i_nObsUsed', '<i4'),          # The number of data points used to fit the phase curve (i band).
-    ('extendednessMax', '<f4'),     # Maximum `extendedness` value from the DiaSource.
-    ('extendednessMedian', '<f4'),  # Median `extendedness` value from the DiaSource.
-    ('extendednessMin', '<f4'),     # Minimum `extendedness` value from the DiaSource.
+    ('firstObservationMjdTai', '<f8'), # [d] The time of the first LSST observation of this object (could be
+                                       # precovered), TAI.
     ('MOIDEarth', '<f4'),           # [AU] Minimum orbit intersection distance to Earth.
     ('MOIDEarthDeltaV', '<f4'),     # [km/s] DeltaV at the MOID point.
     ('MOIDEarthEclipticLongitude', '<f4'), # [deg] Ecliptic longitude of the MOID point (Earth's orbit).
     ('MOIDEarthTrueAnomaly', '<f4'),       # [deg] True anomaly of the MOID point on Earth's orbit.
     ('MOIDEarthTrueAnomalyObject', '<f4'), # [deg] True anomaly of the MOID point on the object's orbit.
-    ('r_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (r band).
-    ('r_G12', '<f4'),               # Best fit G12 slope parameter (r band).
-    ('r_G12Err', '<f4'),            # Error in the estimate of G12 (r band).
-    ('r_H', '<f4'),                 # [mag] Best fit absolute magnitude (r band).
-    ('r_H_r_G12_Cov', '<f4'),       # [mag**2] H–G12 covariance (r band).
-    ('r_HErr', '<f4'),              # [mag] Error in the estimate of H (r band).
-    ('r_nObsUsed', '<i4'),          # The number of data points used to fit the phase curve (r band).
-    ('u_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (u band).
+    ('tisserand_J', '<f4'),         # Tisserand parameter with respect to Jupiter (T_J).
+    ('extendednessMax', '<f4'),     # Maximum `extendedness` value from the DiaSource.
+    ('extendednessMedian', '<f4'),  # Median `extendedness` value from the DiaSource.
+    ('extendednessMin', '<f4'),     # Minimum `extendedness` value from the DiaSource.
+    ('u_nObs', '<i4'),              # Total number of data points (u band).
+    ('u_H', '<f4'),                 # [mag] Best fit absolute magnitude (u band).
+    ('u_HErr', '<f4'),              # [mag] Error in the estimate of H (u band).
     ('u_G12', '<f4'),               # Best fit G12 slope parameter (u band).
     ('u_G12Err', '<f4'),            # Error in the estimate of G12 (u band).
-    ('u_H', '<f4'),                 # [mag] Best fit absolute magnitude (u band).
     ('u_H_u_G12_Cov', '<f4'),       # [mag**2] H–G12 covariance (u band).
-    ('u_HErr', '<f4'),              # [mag] Error in the estimate of H (u band).
     ('u_nObsUsed', '<i4'),          # The number of data points used to fit the phase curve (u band).
-    ('y_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (y band).
-    ('y_G12', '<f4'),               # Best fit G12 slope parameter (y band).
-    ('y_G12Err', '<f4'),            # Error in the estimate of G12 (y band).
-    ('y_H', '<f4'),                 # [mag] Best fit absolute magnitude (y band).
-    ('y_H_y_G12_Cov', '<f4'),       # [mag**2] H–G12 covariance (y band).
-    ('y_HErr', '<f4'),              # [mag] Error in the estimate of H (y band).
-    ('y_nObsUsed', '<i4'),          # The number of data points used to fit the phase curve (y band).
-    ('z_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (z band).
-    ('z_G12', '<f4'),               # Best fit G12 slope parameter (z band).
-    ('z_G12Err', '<f4'),            # Error in the estimate of G12 (z band).
-    ('z_H', '<f4'),                 # [mag] Best fit absolute magnitude (z band).
-    ('z_H_z_G12_Cov', '<f4'),       # [mag**2] H–G12 covariance (z band).
-    ('z_HErr', '<f4'),              # [mag] Error in the estimate of H (z band).
-    ('z_nObsUsed', '<i4'),          # The number of data points used to fit the phase curve (z band).
-    ('unpacked_primary_provisional_designation', '<U16'), # The primary provisional designation for this
-                                                          # object (unpacked form).
-    ('tisserand_J', '<f4'),         # Tisserand parameter with respect to Jupiter (T_J).
-    ('u_slope_fit_failed', '|b1'),  # G12 fit failed in u band. G12 contains a fiducial value used to fit H.
-    ('g_slope_fit_failed', '|b1'),  # G12 fit failed in g band. G12 contains a fiducial value used to fit H.
-    ('r_slope_fit_failed', '|b1'),  # G12 fit failed in r band. G12 contains a fiducial value used to fit H.
-    ('i_slope_fit_failed', '|b1'),  # G12 fit failed in i band. G12 contains a fiducial value used to fit H.
-    ('z_slope_fit_failed', '|b1'),  # G12 fit failed in z band. G12 contains a fiducial value used to fit H.
-    ('y_slope_fit_failed', '|b1'),  # G12 fit failed in y band. G12 contains a fiducial value used to fit H.
-    ('u_nObs', '<i4'),              # Total number of data points (u band).
-    ('g_nObs', '<i4'),              # Total number of data points (g band).
-    ('r_nObs', '<i4'),              # Total number of data points (r band).
-    ('i_nObs', '<i4'),              # Total number of data points (i band).
-    ('z_nObs', '<i4'),              # Total number of data points (z band).
-    ('y_nObs', '<i4'),              # Total number of data points (y band).
+    ('u_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (u band).
     ('u_phaseAngleMin', '<f4'),     # [deg] Minimum phase angle observed (u band).
     ('u_phaseAngleMax', '<f4'),     # [deg] Maximum phase angle observed (u band).
+    ('u_slope_fit_failed', '|b1'),  # G12 fit failed in u band. G12 contains a fiducial value used to fit H.
+    ('g_nObs', '<i4'),              # Total number of data points (g band).
+    ('g_H', '<f4'),                 # [mag] Best fit absolute magnitude (g band).
+    ('g_HErr', '<f4'),              # [mag] Error in the estimate of H (g band).
+    ('g_G12', '<f4'),               # Best fit G12 slope parameter (g band).
+    ('g_G12Err', '<f4'),            # Error in the estimate of G12 (g band).
+    ('g_H_g_G12_Cov', '<f4'),       # [mag**2] H–G12 covariance (g band).
+    ('g_nObsUsed', '<i4'),          # The number of data points used to fit the phase curve (g band).
+    ('g_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (g band).
     ('g_phaseAngleMin', '<f4'),     # [deg] Minimum phase angle observed (g band).
     ('g_phaseAngleMax', '<f4'),     # [deg] Maximum phase angle observed (g band).
+    ('g_slope_fit_failed', '|b1'),  # G12 fit failed in g band. G12 contains a fiducial value used to fit H.
+    ('r_nObs', '<i4'),              # Total number of data points (r band).
+    ('r_H', '<f4'),                 # [mag] Best fit absolute magnitude (r band).
+    ('r_HErr', '<f4'),              # [mag] Error in the estimate of H (r band).
+    ('r_G12', '<f4'),               # Best fit G12 slope parameter (r band).
+    ('r_G12Err', '<f4'),            # Error in the estimate of G12 (r band).
+    ('r_H_r_G12_Cov', '<f4'),       # [mag**2] H–G12 covariance (r band).
+    ('r_nObsUsed', '<i4'),          # The number of data points used to fit the phase curve (r band).
+    ('r_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (r band).
     ('r_phaseAngleMin', '<f4'),     # [deg] Minimum phase angle observed (r band).
     ('r_phaseAngleMax', '<f4'),     # [deg] Maximum phase angle observed (r band).
+    ('r_slope_fit_failed', '|b1'),  # G12 fit failed in r band. G12 contains a fiducial value used to fit H.
+    ('i_nObs', '<i4'),              # Total number of data points (i band).
+    ('i_H', '<f4'),                 # [mag] Best fit absolute magnitude (i band).
+    ('i_HErr', '<f4'),              # [mag] Error in the estimate of H (i band).
+    ('i_G12', '<f4'),               # Best fit G12 slope parameter (i band).
+    ('i_G12Err', '<f4'),            # Error in the estimate of G12 (i band).
+    ('i_H_i_G12_Cov', '<f4'),       # [mag**2] H–G12 covariance (i band).
+    ('i_nObsUsed', '<i4'),          # The number of data points used to fit the phase curve (i band).
+    ('i_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (i band).
     ('i_phaseAngleMin', '<f4'),     # [deg] Minimum phase angle observed (i band).
     ('i_phaseAngleMax', '<f4'),     # [deg] Maximum phase angle observed (i band).
+    ('i_slope_fit_failed', '|b1'),  # G12 fit failed in i band. G12 contains a fiducial value used to fit H.
+    ('z_nObs', '<i4'),              # Total number of data points (z band).
+    ('z_H', '<f4'),                 # [mag] Best fit absolute magnitude (z band).
+    ('z_HErr', '<f4'),              # [mag] Error in the estimate of H (z band).
+    ('z_G12', '<f4'),               # Best fit G12 slope parameter (z band).
+    ('z_G12Err', '<f4'),            # Error in the estimate of G12 (z band).
+    ('z_H_z_G12_Cov', '<f4'),       # [mag**2] H–G12 covariance (z band).
+    ('z_nObsUsed', '<i4'),          # The number of data points used to fit the phase curve (z band).
+    ('z_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (z band).
     ('z_phaseAngleMin', '<f4'),     # [deg] Minimum phase angle observed (z band).
     ('z_phaseAngleMax', '<f4'),     # [deg] Maximum phase angle observed (z band).
+    ('z_slope_fit_failed', '|b1'),  # G12 fit failed in z band. G12 contains a fiducial value used to fit H.
+    ('y_nObs', '<i4'),              # Total number of data points (y band).
+    ('y_H', '<f4'),                 # [mag] Best fit absolute magnitude (y band).
+    ('y_HErr', '<f4'),              # [mag] Error in the estimate of H (y band).
+    ('y_G12', '<f4'),               # Best fit G12 slope parameter (y band).
+    ('y_G12Err', '<f4'),            # Error in the estimate of G12 (y band).
+    ('y_H_y_G12_Cov', '<f4'),       # [mag**2] H–G12 covariance (y band).
+    ('y_nObsUsed', '<i4'),          # The number of data points used to fit the phase curve (y band).
+    ('y_Chi2', '<f4'),              # Chi^2 statistic of the phase curve fit (y band).
     ('y_phaseAngleMin', '<f4'),     # [deg] Minimum phase angle observed (y band).
     ('y_phaseAngleMax', '<f4'),     # [deg] Maximum phase angle observed (y band).
+    ('y_slope_fit_failed', '|b1'),  # G12 fit failed in y band. G12 contains a fiducial value used to fit H.
 ])
 
 # SSSource: LSST-computed per-source quantities. 1:1 relationship with DiaSource.
 SSSourceDtype = np.dtype([
-    ('phaseAngle', '<f4'),          # [deg] Phase angle between the Sun, object, and observer.
-    ('heliocentricDist', '<f4'),    # [AU] Heliocentric distance at light-emission time.
-    ('topocentricDist', '<f4'),     # [AU] Topocentric distance at light-emission time.
-    ('heliocentricX', '<f4'),       # [AU] Cartesian heliocentric X coordinate at light-emission time (ICRS).
-    ('heliocentricY', '<f4'),       # [AU] Cartesian heliocentric Y coordinate at light-emission time (ICRS).
-    ('heliocentricZ', '<f4'),       # [AU] Cartesian heliocentric Z coordinate at light-emission time (ICRS).
-    ('heliocentricVX', '<f4'),      # [km/s] Cartesian heliocentric X velocity at light-emission time (ICRS).
-    ('heliocentricVY', '<f4'),      # [km/s] Cartesian heliocentric Y velocity at light-emission time (ICRS).
-    ('heliocentricVZ', '<f4'),      # [km/s] Cartesian heliocentric Z velocity at light-emission time (ICRS).
-    ('topocentricX', '<f4'),        # [AU] Cartesian topocentric X coordinate at light-emission time (ICRS).
-    ('topocentricY', '<f4'),        # [AU] Cartesian topocentric Y coordinate at light-emission time (ICRS).
-    ('topocentricZ', '<f4'),        # [AU] Cartesian topocentric Z coordinate at light-emission time (ICRS).
-    ('topocentricVX', '<f4'),       # [km/s] Cartesian topocentric X velocity at light-emission time (ICRS).
-    ('topocentricVY', '<f4'),       # [km/s] Cartesian topocentric Y velocity at light-emission time (ICRS).
-    ('topocentricVZ', '<f4'),       # [km/s] Cartesian topocentric Z velocity at light-emission time (ICRS).
-    ('ssObjectId', '<i8'),          # Unique LSST identifier of the Solar System object.
-    ('ephOffsetRa', '<f8'),         # [arcsec] Offset between observed and predicted position in the R.A.
-                                    # direction (includes cos(dec) term).
-    ('ephOffsetDec', '<f8'),        # [arcsec] Offset between observed and predicted position in declination.
     ('diaSourceId', '<i8'),         # Unique identifier of the observation (matching DiaSource.diaSourceId).
-    ('galacticL', '<f8'),           # [deg] Galactic longitude, converted from the observed coordinates.
-    ('galacticB', '<f8'),           # [deg] Galactic latitude, converted from the observed coordinates.
-    ('eclipticLambda', '<f8'),      # [deg] Ecliptic longitude, converted from the observed coordinates.
-    ('eclipticBeta', '<f8'),        # [deg] Ecliptic latitude, converted from the observed coordinates.
+    ('ssObjectId', '<i8'),          # Unique LSST identifier of the Solar System object.
     ('unpacked_primary_provisional_designation', '<U16'), # Primary MPC provisional designation for this
                                                           # object, in unpacked form.
-    ('ephVmag', '<f4'),             # [mag] Predicted magnitude in V band, computed from mpc_orbits data
-                                    # including the mpc_orbits-provided (H, G) estimates
+    ('eclLambda', '<f8'),           # [deg] Ecliptic longitude, converted from the observed coordinates.
+    ('eclBeta', '<f8'),             # [deg] Ecliptic latitude, converted from the observed coordinates.
+    ('galLon', '<f8'),              # [deg] Galactic longitude, converted from the observed coordinates.
+    ('galLat', '<f8'),              # [deg] Galactic latitude, converted from the observed coordinates.
+    ('elongation', '<f4'),          # [deg] Solar elongation of the object at the time of observation.
+    ('phaseAngle', '<f4'),          # [deg] Phase angle between the Sun, object, and observer.
+    ('topoRange', '<f4'),           # [AU] Topocentric distance (delta) at light-emission time.
+    ('topoRangeRate', '<f4'),       # [km/s] Topocentric radial (line-of-sight) velocity (deldot); positive
+                                    # values indicate motion away from the observer.
+    ('helioRange', '<f4'),          # [AU] Heliocentric distance (r) at light-emission time.
+    ('helioRangeRate', '<f4'),      # [km/s] Heliocentric radial velocity (rdot); positive values indicate
+                                    # motion away from the Sun.
     ('ephRa', '<f8'),               # [deg] Predicted ICRS right ascension from the orbit in mpc_orbits.
     ('ephDec', '<f8'),              # [deg] Predicted ICRS declination from the orbit in mpc_orbits.
+    ('ephVmag', '<f4'),             # [mag] Predicted magnitude in V band, computed from mpc_orbits data
+                                    # including the mpc_orbits-provided (H, G) estimates
     ('ephRate', '<f4'),             # [deg/d] Total predicted on-sky angular rate of motion.
     ('ephRateRa', '<f4'),           # [deg/d] Predicted on-sky angular rate in the R.A. direction (includes
                                     # the cos(dec) factor).
     ('ephRateDec', '<f4'),          # [deg/d] Predicted on-sky angular rate in the declination direction.
     ('ephOffset', '<f4'),           # [arcsec] Total observed versus predicted angular separation on the sky.
-    ('topocentricVrad', '<f4'),     # [km/s] Topocentric radial (line-of-sight) velocity; positive values
-                                    # indicate motion away from the observer.
-    ('heliocentricVrad', '<f4'),    # [km/s] Heliocentric radial velocity; positive values indicate motion
-                                    # away from the Sun.
-    ('topocentricVtot', '<f4'),     # [km/s] The magnitude of the topocentric velocity vector.
-    ('heliocentricVtot', '<f4'),    # [km/s] The magnitude of the heliocentric velocity vector.
+    ('ephOffsetRa', '<f8'),         # [arcsec] Offset between observed and predicted position in the R.A.
+                                    # direction (includes cos(dec) term).
+    ('ephOffsetDec', '<f8'),        # [arcsec] Offset between observed and predicted position in declination.
     ('ephOffsetAlongTrack', '<f4'), # [arcsec] Offset between observed and predicted position in the
                                     # along-track direction on the sky.
     ('ephOffsetCrossTrack', '<f4'), # [arcsec] Offset between observed and predicted position in the
                                     # cross-track direction on the sky.
-    ('elongation', '<f4'),          # [deg] Solar elongation of the object at the time of observation.
+    ('helio_x', '<f4'),             # [AU] Cartesian heliocentric X coordinate at light-emission time (ICRS).
+    ('helio_y', '<f4'),             # [AU] Cartesian heliocentric Y coordinate at light-emission time (ICRS).
+    ('helio_z', '<f4'),             # [AU] Cartesian heliocentric Z coordinate at light-emission time (ICRS).
+    ('helio_vx', '<f4'),            # [km/s] Cartesian heliocentric X velocity at light-emission time (ICRS).
+    ('helio_vy', '<f4'),            # [km/s] Cartesian heliocentric Y velocity at light-emission time (ICRS).
+    ('helio_vz', '<f4'),            # [km/s] Cartesian heliocentric Z velocity at light-emission time (ICRS).
+    ('helio_vtot', '<f4'),          # [km/s] The magnitude of the heliocentric velocity vector, sqrt(vx*vx +
+                                    # vy*vy + vz*vz).
+    ('topo_x', '<f4'),              # [AU] Cartesian topocentric X coordinate at light-emission time (ICRS).
+    ('topo_y', '<f4'),              # [AU] Cartesian topocentric Y coordinate at light-emission time (ICRS).
+    ('topo_z', '<f4'),              # [AU] Cartesian topocentric Z coordinate at light-emission time (ICRS).
+    ('topo_vx', '<f4'),             # [km/s] Cartesian topocentric X velocity at light-emission time (ICRS).
+    ('topo_vy', '<f4'),             # [km/s] Cartesian topocentric Y velocity at light-emission time (ICRS).
+    ('topo_vz', '<f4'),             # [km/s] Cartesian topocentric Z velocity at light-emission time (ICRS).
+    ('topo_vtot', '<f4'),           # [km/s] The magnitude of the topocentric velocity vector, sqrt(vx*vx +
+                                    # vy*vy + vz*vz).
 ])
 
 # mpc_orbits: Table of orbital elements and related information of known (sun-orbiting and unbound) Solar

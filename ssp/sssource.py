@@ -48,49 +48,46 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
     sss["ephOffset"]    = eph.separation(obsv).arcsec
 
     # Compute heliocentric position components
-    sss["heliocentricX"] = xx[0] - hx
-    sss["heliocentricY"] = xx[1] - hy
-    sss["heliocentricZ"] = xx[2] - hz
-    sss["heliocentricDist"] = np.sqrt(sss["heliocentricX"]**2 +
-                                      sss["heliocentricY"]**2 +
-                                      sss["heliocentricZ"]**2)
+    sss["helio_x"] = xx[0] - hx
+    sss["helio_y"] = xx[1] - hy
+    sss["helio_z"] = xx[2] - hz
+    sss["helioRange"] = np.sqrt(sss["helio_x"]**2 +
+                                      sss["helio_y"]**2 +
+                                      sss["helio_z"]**2)
 
     # Compute heliocentric velocity components
-    sss["heliocentricVX"] = vv[0] - hvx
-    sss["heliocentricVY"] = vv[1] - hvy
-    sss["heliocentricVZ"] = vv[2] - hvz
-    sss["heliocentricVtot"] = np.sqrt(sss["heliocentricVX"]**2 +
-                                   sss["heliocentricVY"]**2 +
-                                   sss["heliocentricVZ"]**2)
+    sss["helio_vx"] = vv[0] - hvx
+    sss["helio_vy"] = vv[1] - hvy
+    sss["helio_vz"] = vv[2] - hvz
+    sss["helio_vtot"] = np.sqrt(sss["helio_vx"]**2 + sss["helio_vy"]**2 + sss["helio_vz"]**2)
 
     # Compute heliocentric radial velocity: dot product of velocity
     # and unit position vector
-    sss["heliocentricVrad"] = (sss["heliocentricVX"] * sss["heliocentricX"] +
-                               sss["heliocentricVY"] * sss["heliocentricY"] +
-                               sss["heliocentricVZ"] * sss["heliocentricZ"]) / sss["heliocentricDist"]
+    sss["helioRangeRate"] = (sss["helio_vx"] * sss["helio_x"] +
+                               sss["helio_vy"] * sss["helio_y"] +
+                               sss["helio_vz"] * sss["helio_z"]) / sss["helioRange"]
 
     # Compute topocentric position components
-    sss["topocentricX"] = xx[0] - obs[0]
-    sss["topocentricY"] = xx[1] - obs[1]
-    sss["topocentricZ"] = xx[2] - obs[2]
-    sss["topocentricDist"] = np.sqrt(sss["topocentricX"]**2 + sss["topocentricY"]**2 + sss["topocentricZ"]**2)
+    sss["topo_x"] = xx[0] - obs[0]
+    sss["topo_y"] = xx[1] - obs[1]
+    sss["topo_z"] = xx[2] - obs[2]
+    sss["topoRange"] = np.sqrt(sss["topo_x"]**2 + sss["topo_y"]**2 + sss["topo_z"]**2)
 
     # Compute topocentric velocity components
-    sss["topocentricVX"] = vv[0] - vobs[0]
-    sss["topocentricVY"] = vv[1] - vobs[1]
-    sss["topocentricVZ"] = vv[2] - vobs[2]
-    sss["topocentricVtot"] = np.sqrt(
-        sss["topocentricVX"]**2 + sss["topocentricVY"]**2 + sss["topocentricVZ"]**2
-    )
+    sss["topo_vx"] = vv[0] - vobs[0]
+    sss["topo_vy"] = vv[1] - vobs[1]
+    sss["topo_vz"] = vv[2] - vobs[2]
+    sss["topo_vtot"] = np.sqrt(sss["topo_vx"]**2 + sss["topo_vy"]**2 + sss["topo_vz"]**2)
+
     # Compute topocentric radial velocity: dot product of velocity
     # and unit position vector
-    sss["topocentricVrad"] = (sss["topocentricVX"] * sss["topocentricX"] +
-                              sss["topocentricVY"] * sss["topocentricY"] +
-                              sss["topocentricVZ"] * sss["topocentricZ"]) / sss["topocentricDist"]
+    sss["topoRangeRate"] = (sss["topo_vx"] * sss["topo_x"] +
+                              sss["topo_vy"] * sss["topo_y"] +
+                              sss["topo_vz"] * sss["topo_z"]) / sss["topoRange"]
 
     sss["phaseAngle"] = phase_deg = phase_angle_deg(xx, obs)
 
-    sss["ephVmag"] = hg_V_mag(H, G, sss["heliocentricDist"], sss["topocentricDist"], phase_deg)
+    sss["ephVmag"] = hg_V_mag(H, G, sss["helioRange"], sss["topoRange"], phase_deg)
 
     max_sep = np.max(sss['ephOffset'])
     med_sep = np.median(sss['ephOffset'])
@@ -225,10 +222,10 @@ if __name__ == "__main__":
     p = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, distance=1*u.au, frame='icrs')
     gal = p.transform_to('galactic')
 
-    sss["eclipticLambda"] = ecl.lon
-    sss["eclipticBeta"] = ecl.lat
-    sss["galacticL"] = gal.l
-    sss["galacticB"] = gal.b
+    sss["eclLambda"] = ecl.lon
+    sss["eclBeta"] = ecl.lat
+    sss["galLon"] = gal.l
+    sss["galLat"] = gal.b
 
 
 

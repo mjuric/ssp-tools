@@ -53,12 +53,15 @@ def compute_ssobject_entry(row, sss):
 
     # Metadata columns
     row["ssObjectId"] = sss["ssObjectId"].iloc[0]
-    row["firstObservationDate"] = sss["dia_midpointMjdTai"].min()
-    # FIXME: here I assume we discover everything 7 days after first obsv.
-    # we should really pull this out of the obs_sbn table.
-    row["discoverySubmissionDate"] = row["firstObservationDate"] + 7.
-    row["arc"] = np.ptp(sss["dia_midpointMjdTai"])
-    row["unpacked_primary_provisional_designation"] = sss["unpacked_primary_provisional_designation"].iloc[0]
+    row["firstObservationMjdTai"] = sss["dia_midpointMjdTai"].min()
+
+    if "discoverySubmissionDate" in row.dtype.names: # DP2 does not have this field
+        # FIXME: here I arbitrarily guess we discover everything 7 days
+        # after first obsv. we should really pull this out of the obs_sbn tbl.
+        row["discoverySubmissionDate"] = row["firstObservationMjdTai"] + 7.
+        row["arc"] = np.ptp(sss["dia_midpointMjdTai"])
+        row["unpacked_primary_provisional_designation"] = \
+            sss["unpacked_primary_provisional_designation"].iloc[0]
 
     # observation counts
     row["nObs"] = len(sss)
@@ -88,8 +91,8 @@ def compute_ssobject_entry(row, sss):
                 # data points
                 H, G12, sigmaH, sigmaG12, covHG12, chi2dof, nobsv = \
                     photfit.fitHG12(df["dia_psfMag"], df["dia_psfMagErr"],
-                                    df["phaseAngle"], df["topocentricDist"],
-                                    df["heliocentricDist"])
+                                    df["phaseAngle"], df["topoRange"],
+                                    df["helioRange"])
                 nDof = 2
                 # print(provID, band, H, G12, sigmaH, sigmaG12, covHG12,
                 #       chi2dof, nobsv)
@@ -97,6 +100,9 @@ def compute_ssobject_entry(row, sss):
                 # mark if the fit failed
                 if np.isnan(G12):
                     row[f'{band}_slope_fit_failed'] = True
+                    # FIXME: if fitting fails, we should revert to simple
+                    # estimation of H using a fiducial G12 value, storing
+                    # that G12 as well.
 
                 row[f'{band}_Chi2'] = chi2dof * nDof
                 row[f'{band}_G12'] = G12
@@ -105,8 +111,6 @@ def compute_ssobject_entry(row, sss):
                 row[f'{band}_H_{band}_G12_Cov'] = covHG12
                 row[f'{band}_HErr'] = sigmaH
                 row[f'{band}_nObsUsed'] = nobsv
-            else:
-                row[f'{band}_nObsUsed'] = 0
 
     # Extendedness
     row["extendednessMin"] = sss["dia_extendedness"].min()
