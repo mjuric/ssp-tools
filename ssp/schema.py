@@ -89,7 +89,7 @@ SSObjectDtype = np.dtype([
     ('y_slope_fit_failed', '|b1'),  # G12 fit failed in y band. G12 contains a fiducial value used to fit H.
 ])
 
-# SSSource: LSST-computed per-source quantities. 1:1 relationship with DiaSource.
+# SSSource: LSST-computed per-source quantities. 1::1 relationship with DiaSource.
 SSSourceDtype = np.dtype([
     ('diaSourceId', '<i8'),         # Unique identifier of the observation (matching DiaSource.diaSourceId).
     ('ssObjectId', '<i8'),          # Unique LSST identifier of the Solar System object.
@@ -138,7 +138,7 @@ SSSourceDtype = np.dtype([
     ('topo_vz', '<f4'),             # [km/s] Cartesian topocentric Z velocity at light-emission time (ICRS).
     ('topo_vtot', '<f4'),           # [km/s] The magnitude of the topocentric velocity vector, sqrt(vx*vx +
                                     # vy*vy + vz*vz).
-    ('diaDistanceRank', '<i4'),     # The rank of the diaSourceId-identified source in terms of its closeness
+    ('diaDistanceRank', '<i2'),     # The rank of the diaSourceId-identified source in terms of its closeness
                                     # to the predicted SSO position. If diaSourceId is the nearest DiaSour...
 ])
 
