@@ -138,6 +138,8 @@ SSSourceDtype = np.dtype([
     ('topo_vz', '<f4'),             # [km/s] Cartesian topocentric Z velocity at light-emission time (ICRS).
     ('topo_vtot', '<f4'),           # [km/s] The magnitude of the topocentric velocity vector, sqrt(vx*vx +
                                     # vy*vy + vz*vz).
+    ('diaDistanceRank', '<i4'),     # The rank of the diaSourceId-identified source in terms of its closeness
+                                    # to the predicted SSO position. If diaSourceId is the nearest DiaSour...
 ])
 
 # mpc_orbits: Table of orbital elements and related information of known (sun-orbiting and unbound) Solar
