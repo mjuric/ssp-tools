@@ -13,11 +13,24 @@ from ssp.ephem_assist import (
     C_AU_PER_DAY,
     OBLIQUITY_J2000,
     solve_kepler,
+    solve_kepler_hyperbolic,
     kepler_to_helio_ecliptic,
+    cometary_to_helio_ecliptic,
     ecliptic_to_equatorial,
+    _emission_state,
     _light_time_correct,
     _vector_to_radec,
 )
+
+
+def _state_to_q_e(X, V):
+    """Perihelion distance and eccentricity from a heliocentric state."""
+    r = np.linalg.norm(X)
+    h = np.cross(X, V)
+    evec = np.cross(V, h) / GM_SUN - X / r
+    e = float(np.linalg.norm(evec))
+    q = float(np.dot(h, h)) / (GM_SUN * (1.0 + e))
+    return q, e
 
 
 class TestKepler(unittest.TestCase):
@@ -85,6 +98,77 @@ class TestKepler(unittest.TestCase):
             self.assertAlmostEqual(e_back, e, places=10)
 
 
+class TestCometary(unittest.TestCase):
+
+    def test_hyperbolic_solver(self):
+        for e in (1.0001, 1.2, 3.0, 20.0):
+            M = np.linspace(-50.0, 50.0, 201)
+            H = solve_kepler_hyperbolic(M, e)
+            residual = e * np.sinh(H) - H - M
+            self.assertLess(np.max(np.abs(residual)), 1e-10)
+
+    def test_matches_classical_elements(self):
+        """For elliptic orbits, (q, e, t - tp) must reproduce the (a, e, M)
+        conversion."""
+        rng = np.random.default_rng(2)
+        for _ in range(50):
+            a = rng.uniform(0.6, 60.0)
+            e = rng.uniform(0.0, 0.95)
+            inc, Om, om = rng.uniform(0.0, np.pi), rng.uniform(0, 2 * np.pi), rng.uniform(0, 2 * np.pi)
+            dt = rng.uniform(-2e4, 2e4)
+            n = np.sqrt(GM_SUN / a ** 3)
+            X1, V1 = kepler_to_helio_ecliptic(a, e, inc, Om, om, n * dt)
+            X2, V2 = cometary_to_helio_ecliptic(a * (1 - e), e, inc, Om, om, dt)
+            np.testing.assert_allclose(X2, X1, rtol=0, atol=1e-11 * a)
+            np.testing.assert_allclose(V2, V1, rtol=0, atol=1e-11 * np.linalg.norm(V1))
+
+    def test_at_perihelion(self):
+        for e in (0.0, 0.5, 0.9999, 1.0001, 2.5):
+            q = 1.3
+            X, V = cometary_to_helio_ecliptic(q, e, 0.0, 0.0, 0.0, 0.0)
+            v = np.sqrt(GM_SUN * (1.0 + e) / q)
+            np.testing.assert_allclose(X, [q, 0.0, 0.0], atol=1e-13)
+            np.testing.assert_allclose(V, [0.0, v, 0.0], atol=1e-13)
+
+    def test_recovers_q_and_e(self):
+        """Including near-parabolic and hyperbolic orbits, as in mpc_orbits."""
+        rng = np.random.default_rng(3)
+        for e in (0.3, 0.97, 0.9995, 1.0005, 1.005, 1.5):
+            for _ in range(10):
+                q = rng.uniform(0.2, 8.0)
+                inc, Om, om = rng.uniform(0.0, np.pi), rng.uniform(0, 2 * np.pi), rng.uniform(0, 2 * np.pi)
+                dt = rng.uniform(-3000.0, 3000.0)
+                X, V = cometary_to_helio_ecliptic(q, e, inc, Om, om, dt)
+                q_back, e_back = _state_to_q_e(X, V)
+                self.assertAlmostEqual(q_back / q, 1.0, places=9)
+                self.assertAlmostEqual(e_back, e, places=9)
+
+    def test_matches_rebound(self):
+        """Cross-check against REBOUND's element conversion, elliptic and
+        hyperbolic."""
+        import rebound
+        rng = np.random.default_rng(4)
+        for e in (0.1, 0.8, 1.3, 4.0):
+            for _ in range(10):
+                q = rng.uniform(0.3, 10.0)
+                inc, Om, om = rng.uniform(0.0, np.pi), rng.uniform(0, 2 * np.pi), rng.uniform(0, 2 * np.pi)
+                dt = rng.uniform(-1000.0, 1000.0)
+                a = q / (1.0 - e)
+                M = np.sqrt(GM_SUN / abs(a) ** 3) * dt
+                sim = rebound.Simulation()
+                sim.G = GM_SUN
+                sim.add(m=1.0)
+                sim.add(primary=sim.particles[0], m=0.0, a=a, e=e, inc=inc, Omega=Om, omega=om, M=M)
+                p = sim.particles[1]
+                X, V = cometary_to_helio_ecliptic(q, e, inc, Om, om, dt)
+                np.testing.assert_allclose(X, [p.x, p.y, p.z], rtol=0, atol=1e-10 * np.linalg.norm(X))
+                np.testing.assert_allclose(V, [p.vx, p.vy, p.vz], rtol=0, atol=1e-10 * np.linalg.norm(V))
+
+    def test_parabolic_rejected(self):
+        with self.assertRaises(ValueError):
+            cometary_to_helio_ecliptic(1.0, 1.0, 0.0, 0.0, 0.0, 10.0)
+
+
 class TestObliquity(unittest.TestCase):
 
     def test_obliquity_value(self):
@@ -133,6 +217,25 @@ class TestLightTime(unittest.TestCase):
         self.assertAlmostEqual(rho[0], 1.0, places=8)
         self.assertAlmostEqual(rho[1], -0.0172 * dt_lt_expected, places=10)
         self.assertAlmostEqual(rho[2], 0.0, places=12)
+
+
+    def test_emission_state_matches_two_body(self):
+        """The Taylor-expanded emission-time state must match exact two-body
+        propagation back by tau, for a light time of 5.5 h (a TNO)."""
+        a, e = 40.0, 0.2
+        X, V = kepler_to_helio_ecliptic(a, e, 0.3, 1.0, 2.0, 1.0)
+        X_t, V_t = X.reshape(3, 1), V.reshape(3, 1)
+        sun = np.zeros((3, 1))
+        r_obs = np.array([[1.0], [0.0], [0.0]])
+        X_em, V_em, tau = _emission_state(X_t, V_t, sun, r_obs)
+        self.assertAlmostEqual(
+            tau[0], np.linalg.norm(X_em[:, 0] - r_obs[:, 0]) / C_AU_PER_DAY, places=12
+        )
+        n = np.sqrt(GM_SUN / a ** 3)
+        X_ex, V_ex = kepler_to_helio_ecliptic(a, e, 0.3, 1.0, 2.0, 1.0 - n * tau[0])
+        np.testing.assert_allclose(X_em[:, 0], X_ex, rtol=0, atol=1e-12)
+        # 1e-12 AU/day ~ 2 um/s: the dropped (1/2) jerk tau^2 velocity term
+        np.testing.assert_allclose(V_em[:, 0], V_ex, rtol=0, atol=1e-12)
 
 
 class TestVectorToRaDec(unittest.TestCase):

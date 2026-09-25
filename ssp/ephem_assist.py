@@ -15,6 +15,7 @@ importing the package does not require a JPL planet ephemeris file on disk.
 
 from __future__ import annotations
 
+import os
 from collections import namedtuple
 from typing import Optional
 
@@ -51,14 +52,26 @@ EphResult = namedtuple(
         # Per-epoch arrays, all shape (N,) unless noted.
         "ra_deg",        # astrometric ICRF, light-time corrected
         "dec_deg",
-        "xx",            # (3, N) barycentric ICRF position [AU]
-        "vv",            # (3, N) barycentric ICRF velocity [km/s]
+        "xx",            # (3, N) geometric barycentric ICRF position at observation time [AU]
+        "vv",            # (3, N) geometric barycentric ICRF velocity at observation time [km/s]
         "obs",           # (3, N) observer barycentric ICRF position [AU]
         "mu_lon",        # cos(dec)·dRA/dt   [deg/day]
         "mu_lat",        # dDec/dt           [deg/day]
         "mu_total",      # great-circle rate [deg/day]
         "H",             # absolute mag (scalar)
         "G",             # slope param  (scalar)
+        # Light-emission-time geometry, following the JPL Horizons observer
+        # table conventions (quantities 19, 20, 24): the object is evaluated
+        # at emission time t - tau; the topocentric vector is relative to the
+        # observer at observation time t (Horizons "delta"); the heliocentric
+        # vector is relative to the *apparent* Sun, i.e. the Sun at the time
+        # the light reflected at emission left it (Horizons "r", S-T-O).
+        "helio_pos",     # (3, N) object - apparent Sun [AU]
+        "helio_vel",     # (3, N) [km/s]
+        "topo_pos",      # (3, N) object - observer [AU]; points at (ra_deg, dec_deg)
+        "topo_vel",      # (3, N) [km/s]
+        "light_time",    # (N,) down-leg light time tau [day]
+        "phase_angle",   # (N,) Sun-target-observer phase angle [deg], Horizons "phi"
     ],
 )
 
@@ -76,8 +89,8 @@ def solve_kepler(M: np.ndarray, e: float, tol: float = 1e-14, max_iter: int = 50
     """
     M = np.atleast_1d(np.asarray(M, dtype=np.float64))
     M = np.mod(M + np.pi, 2 * np.pi) - np.pi  # wrap to [-pi, pi]
-    # Initial guess (Danby 1988, good even for high e)
-    E = M + e * np.sin(M)
+    # Initial guess (Danby 1988), converges even for e -> 1 at small M
+    E = M + 0.85 * e * np.sign(np.sin(M))
     for _ in range(max_iter):
         f = E - e * np.sin(E) - M
         fp = 1.0 - e * np.cos(E)
@@ -117,22 +130,26 @@ def kepler_to_helio_ecliptic(
     vx_pf = -fac * sinnu
     vy_pf = fac * (e + cosnu)
 
-    # Rotation perifocal → J2000 ecliptic: R3(-Omega) R1(-i) R3(-omega)
+    R = _perifocal_to_ecliptic(inc_rad, Omega_rad, omega_rad)
+    pos_pf = np.array([x_pf, y_pf, 0.0])
+    vel_pf = np.array([vx_pf, vy_pf, 0.0])
+
+    return R @ pos_pf, R @ vel_pf
+
+
+def _perifocal_to_ecliptic(inc_rad: float, Omega_rad: float, omega_rad: float) -> np.ndarray:
+    """Rotation perifocal (P toward perihelion) → J2000 ecliptic:
+    R3(-Omega) R1(-i) R3(-omega)."""
     cosO, sinO = np.cos(Omega_rad), np.sin(Omega_rad)
     cosw, sinw = np.cos(omega_rad), np.sin(omega_rad)
     cosi, sini = np.cos(inc_rad), np.sin(inc_rad)
 
     # Direct multiplication of the three rotations
-    R = np.array([
+    return np.array([
         [cosO * cosw - sinO * sinw * cosi, -cosO * sinw - sinO * cosw * cosi,  sinO * sini],
         [sinO * cosw + cosO * sinw * cosi, -sinO * sinw + cosO * cosw * cosi, -cosO * sini],
         [sinw * sini,                       cosw * sini,                       cosi       ],
     ])
-
-    pos_pf = np.array([x_pf, y_pf, 0.0])
-    vel_pf = np.array([vx_pf, vy_pf, 0.0])
-
-    return R @ pos_pf, R @ vel_pf
 
 
 def ecliptic_to_equatorial(v: np.ndarray) -> np.ndarray:
@@ -148,18 +165,75 @@ def ecliptic_to_equatorial(v: np.ndarray) -> np.ndarray:
     return R @ v
 
 
-def elements_row_to_bary_icrf(row, sun_pos_au, sun_vel_au_day):
-    """Take one mpcorb row (heliocentric ecliptic mean elements) plus the Sun's
-    barycentric ICRF state at the same epoch. Return barycentric ICRF (X, V).
+def solve_kepler_hyperbolic(M: np.ndarray, e: float, tol: float = 1e-14, max_iter: int = 100) -> np.ndarray:
+    """Solve the hyperbolic Kepler equation e sinh H - H = M for e > 1."""
+    M = np.atleast_1d(np.asarray(M, dtype=np.float64))
+    H = np.arcsinh(M / e)  # good initial guess for all M
+    for _ in range(max_iter):
+        f = e * np.sinh(H) - H - M
+        fp = e * np.cosh(H) - 1.0
+        dH = -f / fp
+        H = H + dH
+        if np.all(np.abs(dH) < tol * np.maximum(1.0, np.abs(H))):
+            break
+    return H
+
+
+def cometary_to_helio_ecliptic(
+    q: float, e: float, inc_rad: float,
+    Omega_rad: float, omega_rad: float, dt_peri_days: float,
+    mu: float = GM_SUN,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Heliocentric J2000 *ecliptic* state from cometary elements.
+
+    Uses (q, e, time since perihelion), the canonical MPC/Horizons element
+    set, so it works for every orbit with e != 1 (elliptic and hyperbolic).
+    Returns (X [AU], V [AU/day]), both shape (3,).
     """
-    a = float(row["a"])
+    if abs(1.0 - e) < 1e-10:
+        raise ValueError(f"parabolic orbit (e={e!r}) not supported")
+    a = q / (1.0 - e)               # negative for hyperbolic orbits
+    n = np.sqrt(mu / abs(a) ** 3)   # mean motion [rad/day]
+    M = n * dt_peri_days
+    if e < 1.0:
+        E = solve_kepler(np.array([M]), e)[0]
+        cosE, sinE = np.cos(E), np.sin(E)
+        Edot = n / (1.0 - e * cosE)
+        b = a * np.sqrt(1.0 - e * e)
+        pos_pf = np.array([a * (cosE - e), b * sinE, 0.0])
+        vel_pf = np.array([-a * sinE * Edot, b * cosE * Edot, 0.0])
+    else:
+        H = solve_kepler_hyperbolic(np.array([M]), e)[0]
+        coshH, sinhH = np.cosh(H), np.sinh(H)
+        Hdot = n / (e * coshH - 1.0)
+        aa = -a
+        b = aa * np.sqrt(e * e - 1.0)
+        pos_pf = np.array([aa * (e - coshH), b * sinhH, 0.0])
+        vel_pf = np.array([-aa * sinhH * Hdot, b * coshH * Hdot, 0.0])
+
+    R = _perifocal_to_ecliptic(inc_rad, Omega_rad, omega_rad)
+    return R @ pos_pf, R @ vel_pf
+
+
+def elements_row_to_bary_icrf(row, sun_pos_au, sun_vel_au_day):
+    """Take one mpcorb row (heliocentric ecliptic osculating elements) plus
+    the Sun's barycentric ICRF state at the same epoch. Return barycentric
+    ICRF (X, V).
+
+    Uses the canonical cometary elements (q, e, i, node, argperi,
+    peri_time), which are what the MPC orbit JSON (`COM` block) stores. The
+    derived `a` and `mean_anomaly` columns of mpc_orbits are NaN for ~54% of
+    objects and inconsistent with (q, e, peri_time) for tens of thousands
+    more, so they are not used. `peri_time` and `epoch_mjd` are both TT MJD.
+    """
+    q = float(row["q"])
     e = float(row["e"])
     inc = np.deg2rad(float(row["i"]))
     Om = np.deg2rad(float(row["node"]))
     om = np.deg2rad(float(row["argperi"]))
-    M = np.deg2rad(float(row["mean_anomaly"]))
+    dt_peri = float(row["epoch_mjd"]) - float(row["peri_time"])
 
-    X_hel_ecl, V_hel_ecl = kepler_to_helio_ecliptic(a, e, inc, Om, om, M)
+    X_hel_ecl, V_hel_ecl = cometary_to_helio_ecliptic(q, e, inc, Om, om, dt_peri)
     X_hel = ecliptic_to_equatorial(X_hel_ecl)
     V_hel = ecliptic_to_equatorial(V_hel_ecl)
 
@@ -170,12 +244,21 @@ def elements_row_to_bary_icrf(row, sun_pos_au, sun_vel_au_day):
 # ASSIST integration
 # ---------------------------------------------------------------------------
 
-def _open_ephem(planets_path: Optional[str], asteroids_path: Optional[str]):
+def open_ephem(planets_path: Optional[str] = None, asteroids_path: Optional[str] = None):
     """Lazy import of assist + open Ephem. Caller is responsible for keeping
     the returned object alive for the duration of a benchmark/run.
+
+    Paths default to the ``SSP_ASSIST_PLANETS`` and ``SSP_ASSIST_ASTEROIDS``
+    environment variables (the JPL DE440/441 planet file and the ASSIST
+    sb441-n16 asteroid file).
     """
     import assist  # noqa: F401  (lazy)
+    planets_path = planets_path or os.environ.get("SSP_ASSIST_PLANETS")
+    asteroids_path = asteroids_path or os.environ.get("SSP_ASSIST_ASTEROIDS")
     return assist.Ephem(planets_path=planets_path, asteroids_path=asteroids_path)
+
+
+_open_ephem = open_ephem
 
 
 def _propagate_one(
@@ -239,16 +322,18 @@ def _propagate_one(
 # Light-time correction (analytic 2nd-order Taylor)
 # ---------------------------------------------------------------------------
 
-def _light_time_correct(X_t, V_t, sun_pos_t, r_obs_t, n_iter: int = 3):
-    """Compute the apparent observer→target vector with light-time correction.
+def _emission_state(X_t, V_t, sun_pos_t, r_obs_t, n_iter: int = 3):
+    """Object state at light-emission time for an observer at ``r_obs_t``.
 
-    The astrometric observer-target vector is X(t - dt_lt) - r_obs(t), where
-    dt_lt = |X(t - dt_lt) - r_obs(t)| / c. We Taylor-expand X about t to
-    second order using the heliocentric Kepler acceleration; the Sun
-    dominates over planetary perturbations on the ~500 s light-time scale to
-    well below microarcsec.
+    The emission time is t - tau with tau = |X(t - tau) - r_obs(t)| / c. We
+    Taylor-expand the state about t using the heliocentric Kepler
+    acceleration: X(t - tau) = X - tau V + tau^2 a / 2 and
+    V(t - tau) = V - tau a. The neglected terms (jerk, planetary
+    accelerations) are < 1e-12 AU even for NEOs at lunar distance and
+    TNOs with multi-hour light times.
 
-    All inputs may be (3,) or (3, N).
+    All inputs may be (3,) or (3, N). Returns (X_em, V_em, tau) with tau in
+    days.
     """
     X_hel = X_t - sun_pos_t
     r_hel = np.sqrt(np.sum(X_hel * X_hel, axis=0))
@@ -260,7 +345,60 @@ def _light_time_correct(X_t, V_t, sun_pos_t, r_obs_t, n_iter: int = 3):
         rho = X_em - r_obs_t
         dt_lt = np.sqrt(np.sum(rho * rho, axis=0)) / C_AU_PER_DAY
     X_em = X_t - dt_lt * V_t + 0.5 * dt_lt ** 2 * a_t
+    V_em = V_t - dt_lt * a_t
+    return X_em, V_em, dt_lt
+
+
+def _light_time_correct(X_t, V_t, sun_pos_t, r_obs_t, n_iter: int = 3):
+    """Compute the apparent observer→target vector with light-time correction.
+
+    The astrometric observer-target vector is X(t - tau) - r_obs(t); see
+    `_emission_state`. All inputs may be (3,) or (3, N).
+    """
+    X_em, _, _ = _emission_state(X_t, V_t, sun_pos_t, r_obs_t, n_iter)
     return X_em - r_obs_t   # observer → target, light-time corrected
+
+
+def _apparent_sun(X_em, t_em_assist, ephem, n_iter: int = 3):
+    """Barycentric Sun state as seen from the object at emission time.
+
+    Solves t_refl = t_em - |X_em - X_sun(t_refl)| / c per epoch, i.e. the Sun
+    at the time the light reflected by the object at ``t_em`` left the Sun
+    (Horizons' "apparent" Sun for r, rdot and S-T-O). Returns
+    (pos [AU], vel [AU/day]), each (3, N).
+    """
+    t_em = np.atleast_1d(np.asarray(t_em_assist, dtype=np.float64))
+    pos = np.empty((3, len(t_em)))
+    vel = np.empty((3, len(t_em)))
+    for k, t in enumerate(t_em):
+        t_refl = t
+        for _ in range(n_iter):
+            s = ephem.get_particle("Sun", float(t_refl))
+            d = np.array([X_em[0, k] - s.x, X_em[1, k] - s.y, X_em[2, k] - s.z])
+            t_refl = t - np.sqrt(d @ d) / C_AU_PER_DAY
+        s = ephem.get_particle("Sun", float(t_refl))
+        pos[:, k] = (s.x, s.y, s.z)
+        vel[:, k] = (s.vx, s.vy, s.vz)
+    return pos, vel
+
+
+def _phase_angle_deg(helio_pos, topo_pos, helio_vel_au_day):
+    """Phase angle at the target between the Sun and the observer [deg].
+
+    Matches JPL Horizons' true phase angle "phi" (observer quantity 43): the
+    direction to the observer is the astrometric one, and the direction to
+    the Sun is where sunlight arrives from in the target's rest frame, i.e.
+    aberrated (first order in v/c) by the target's heliocentric velocity.
+    This differs from the purely geometric angle by up to v/c (~20").
+    Verified against Horizons to Horizons' printed precision (0.2").
+    """
+    u_sun = -helio_pos / np.linalg.norm(helio_pos, axis=0)
+    u_obs = -topo_pos / np.linalg.norm(topo_pos, axis=0)
+    beta = helio_vel_au_day / C_AU_PER_DAY
+    u_sun = u_sun + beta - np.sum(u_sun * beta, axis=0) * u_sun
+    u_sun = u_sun / np.linalg.norm(u_sun, axis=0)
+    cosph = np.clip(np.sum(u_sun * u_obs, axis=0), -1.0, 1.0)
+    return np.degrees(np.arccos(cosph))
 
 
 def _vector_to_radec(rho):
@@ -333,9 +471,20 @@ def compute_ephemerides_one(
     r_obs = r_obs_q.to(u.au).value          # (3, N)
     v_obs = v_obs_q.to(u.km / u.s).value    # (3, N)
 
-    # Apparent astrometric ICRF positions --------------------------------
-    rho = _light_time_correct(X, V, sun_pos, r_obs)
+    # Light-emission-time state and apparent astrometric ICRF positions ---
+    X_em, V_em, tau = _emission_state(X, V, sun_pos, r_obs)
+    rho = X_em - r_obs
     ra_deg, dec_deg = _vector_to_radec(rho)
+
+    # Heliocentric/topocentric geometry at emission time (Horizons r/delta
+    # conventions; see EphResult).
+    sun_app_pos, sun_app_vel = _apparent_sun(X_em, t_assist - tau, ephem)
+    au_day_to_km_s = (1.0 * u.au / u.day).to_value(u.km / u.s)
+    helio_pos = X_em - sun_app_pos
+    helio_vel = (V_em - sun_app_vel) * au_day_to_km_s
+    topo_pos = rho
+    topo_vel = V_em * au_day_to_km_s - v_obs
+    phase_angle = _phase_angle_deg(helio_pos, topo_pos, V_em - sun_app_vel)
 
     # Rates of motion via central difference at +- dt/2 ------------------
     dt_day = rate_dt_seconds / 86400.0
@@ -376,6 +525,12 @@ def compute_ephemerides_one(
         mu_total=mu_total,
         H=H,
         G=G,
+        helio_pos=helio_pos,
+        helio_vel=helio_vel,
+        topo_pos=topo_pos,
+        topo_vel=topo_vel,
+        light_time=tau,
+        phase_angle=phase_angle,
     )
 
 
@@ -392,7 +547,7 @@ def compute_ephemerides_batch(
     Loads the ASSIST ephemeris exactly once and reuses it across every
     object. Returns ``{provID: EphResult}``.
     """
-    ephem = _open_ephem(planets_path, asteroids_path)
+    ephem = open_ephem(planets_path, asteroids_path)
     out = {}
     for provID, eph_times in schedule.items():
         out[provID] = compute_ephemerides_one(

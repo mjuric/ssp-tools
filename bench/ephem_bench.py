@@ -5,10 +5,14 @@ Three sections, each independently runnable:
   1. Accuracy gate (ASSIST vs Horizons, same elements). Pass criterion:
      <1 mas RMS great-circle separation.
 
-  2. Drop-in equivalence (ASSIST vs current ssp.ephem.jorbit path). Just
-     reports residuals; does not gate on them.
+  2. Geometry (ASSIST light-emission-time r, rdot, delta, deldot, light
+     time and phase angle vs Horizons, same elements). Gated.
 
-  3. Performance (jorbit vs ASSIST vs two-body Kepler). Reports object·epoch
+  3. Drop-in equivalence (ASSIST vs the former jorbit path). Just reports
+     residuals; does not gate on them. jorbit is no longer a dependency;
+     install it separately (uv pip install jorbit) to run this section.
+
+  4. Performance (jorbit vs ASSIST vs two-body Kepler). Reports object·epoch
      throughput end-to-end including the ~500 ms ASSIST cold start.
 
 Run with --help for options. Sensible defaults:
@@ -24,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.parse
@@ -37,10 +42,9 @@ from astropy.time import Time
 import astropy.units as u
 
 from ssp.ephem_assist import (
-    GM_SUN,
     compute_ephemerides_one,
     elements_row_to_bary_icrf,
-    kepler_to_helio_ecliptic,
+    cometary_to_helio_ecliptic,
     ecliptic_to_equatorial,
     _light_time_correct,
     _vector_to_radec,
@@ -96,10 +100,13 @@ def angular_residual(ra1, dec1, ra2, dec2):
 
 def pick_random_objects(mpcorb: pd.DataFrame, n: int, rng) -> pd.DataFrame:
     """Sample n objects from mpcorb, preferring well-conditioned orbits."""
+    # Select on the canonical cometary elements (q, e, peri_time); the
+    # derived a / mean_anomaly columns are NaN for over half of mpc_orbits.
     keep = (
         (mpcorb["e"] < 0.85)
-        & (mpcorb["a"] > 0.5) & (mpcorb["a"] < 50.0)
+        & (mpcorb["q"] > 0.3) & (mpcorb["q"] < 50.0)
         & mpcorb["epoch_mjd"].notna()
+        & mpcorb["peri_time"].notna()
     )
     pool = mpcorb[keep]
     if len(pool) < n:
@@ -142,20 +149,21 @@ def run_assist(rows, schedule, ephem):
 
 
 # ---------------------------------------------------------------------------
-# Method 2: jorbit (current ssp.ephem._aux_compute_ephemerides)
+# Method 2: jorbit (the former ssp.ephem._aux_compute_ephemerides path)
 # ---------------------------------------------------------------------------
 
 def run_jorbit(rows, schedule):
-    """Runs the jorbit path the way ssp.ephem._aux_compute_ephemerides does:
-    fetch the state from JPL Horizons by packed designation, then compute the
+    """Runs the jorbit path the way the removed ssp.ephem module did: fetch
+    the state from JPL Horizons by packed designation, then compute the
     ephemeris at the requested times plus a second call at t+dt for rates.
 
-    Calls jorbit directly rather than through _aux_compute_ephemerides, whose
-    ``eph, xx, vv, obs = p.ephemeris(...)`` unpacking does not match any
-    released jorbit (1.0-1.7 all return a bare SkyCoord).
+    jorbit is optional (not a package dependency); raises ImportError if it
+    is not installed.
     """
-    from ssp import ephem as _ephem  # noqa: F401  (enables jax x64)
+    import jax
     from jorbit import Particle
+
+    jax.config.update("jax_enable_x64", True)
 
     by_id = rows.set_index("unpacked_primary_provisional_designation", drop=False)
     out = {}
@@ -194,12 +202,9 @@ def run_two_body(rows, schedule):
         epoch_tdb_mjd = Time(epoch_tt_mjd, format="mjd", scale="tt").tdb.mjd
         t_tdb_mjd = eph_times.tdb.mjd
 
-        # Mean motion in rad/day
-        a = float(row["a"])
+        q = float(row["q"])
         e = float(row["e"])
-        n_rad_day = np.sqrt(GM_SUN / a ** 3)
-
-        M0 = np.deg2rad(float(row["mean_anomaly"]))
+        dt_peri0 = epoch_tt_mjd - float(row["peri_time"])
         inc = np.deg2rad(float(row["i"]))
         Om = np.deg2rad(float(row["node"]))
         om = np.deg2rad(float(row["argperi"]))
@@ -212,9 +217,8 @@ def run_two_body(rows, schedule):
         r_obs = r_obs_q.to(u.au).value  # (3, N)
 
         for k in range(len(t_tdb_mjd)):
-            dt = t_tdb_mjd[k] - epoch_tdb_mjd
-            M = M0 + n_rad_day * dt
-            X_ecl, V_ecl = kepler_to_helio_ecliptic(a, e, inc, Om, om, M)
+            dt_peri = dt_peri0 + (t_tdb_mjd[k] - epoch_tdb_mjd)
+            X_ecl, V_ecl = cometary_to_helio_ecliptic(q, e, inc, Om, om, dt_peri)
             X_eq = ecliptic_to_equatorial(X_ecl)
             V_eq = ecliptic_to_equatorial(V_ecl)
             # Take Sun = barycenter (worst-case control)
@@ -242,81 +246,91 @@ def run_two_body(rows, schedule):
 HORIZONS_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
 
 
-def horizons_ephem(row, eph_times: Time, observer_code: str = "X05"):
-    """Query Horizons for astrometric ICRF RA/Dec at the requested UTC
-    epochs, using the row's *own* osculating elements (so the only thing
-    being compared between Horizons and ASSIST is the propagator).
+def horizons_observer(row, eph_times: Time, quantities: str = "1",
+                      observer_code: str = "X05"):
+    """Query a Horizons observer table for the row's *own* osculating
+    elements (so the only thing being compared between Horizons and ASSIST
+    is the propagator and the geometry).
 
-    extra_prec=YES is required to get arcsec → microarcsec precision.
+    Elements are sent as Horizons' native cometary set [TP, QR] (the
+    canonical MPC set), with COMMAND=';' and ECLIP=J2000 (IAU76/80
+    obliquity). extra_prec=YES is required for sub-mas RA/Dec.
 
-    Returns (ra_deg, dec_deg) arrays aligned with eph_times.
+    Returns (columns, state): ``columns`` maps each CSV header label (e.g.
+    "R.A.___(ICRF)", "r", "deldot", "S-T-O") to a float ndarray aligned with
+    eph_times; ``state`` is the (6,) heliocentric ICRF cartesian state
+    [AU, AU/day] that Horizons derived from the input elements.
     """
-    epoch_tt_mjd = float(row["epoch_mjd"])
-    epoch_tdb_jd = Time(epoch_tt_mjd, format="mjd", scale="tt").tdb.jd
-
-    # User-supplied heliocentric ecliptic elements need COMMAND=';'. Horizons
-    # accepts [TP, QR], [MA, A] or [MA, N] pairs; we pass [MA, A]. EPOCH is
-    # JD TDB. ECLIP=J2000 means the IAU76/80 obliquity (84381.448").
-    a = float(row["a"])
-    e = float(row["e"])
-
-    tlist = ",".join(f"{t:.10f}" for t in eph_times.utc.jd)
+    def tdb_jd(tt_mjd):
+        return Time(float(tt_mjd), format="mjd", scale="tt").tdb.jd
 
     params = {
         "format": "text",
+        "COMMAND": "';'",
+        "OBJECT": "'ssp-bench'",
         "EPHEM_TYPE": "OBSERVER",
         "OBJ_DATA": "NO",
         "MAKE_EPHEM": "YES",
-        "COMMAND": "';'",
-        "OBJECT": "Test",
         "ECLIP": "J2000",
-        "EC": f"{e:.16e}",
-        "A": f"{a:.16e}",
-        "IN": f"{float(row['i']):.16e}",
+        "EPOCH": f"{tdb_jd(row['epoch_mjd']):.10f}",
+        "EC": f"{float(row['e']):.16e}",
+        "QR": f"{float(row['q']):.16e}",
+        "TP": f"{tdb_jd(row['peri_time']):.10f}",
         "OM": f"{float(row['node']):.16e}",
-        "W":  f"{float(row['argperi']):.16e}",
-        "MA": f"{float(row['mean_anomaly']):.16e}",
-        "EPOCH": f"{epoch_tdb_jd:.10f}",
+        "W": f"{float(row['argperi']):.16e}",
+        "IN": f"{float(row['i']):.16e}",
         "CENTER": f"'{observer_code}'",
-        "TLIST": tlist,
+        "TLIST": ",".join(f"{t:.10f}" for t in eph_times.utc.jd),
         "TIME_TYPE": "UT",
-        "QUANTITIES": "1",         # 1 = astrometric RA & Dec
+        "QUANTITIES": f"'{quantities}'",
         "ANG_FORMAT": "DEG",
         "extra_prec": "YES",
         "CSV_FORMAT": "YES",
         "REF_PLANE": "FRAME",
         "REF_SYSTEM": "ICRF",
     }
-    qs = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
-    url = HORIZONS_URL + "?" + qs
-
+    url = HORIZONS_URL + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": "ssp-tools-bench/0.1"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         body = resp.read().decode("utf-8", errors="replace")
 
-    # Parse the CSV between $$SOE and $$EOE
     try:
         soe = body.index("$$SOE")
         eoe = body.index("$$EOE")
     except ValueError:
         raise RuntimeError(
-            "Horizons response did not contain $$SOE/$$EOE markers:\n"
-            + body[:1000]
+            "Horizons response did not contain $$SOE/$$EOE markers:\n" + body[:1000]
         )
-    rows_text = [r for r in body[soe + 5:eoe].splitlines() if r.strip()]
 
-    ras = np.empty(len(eph_times))
-    decs = np.empty(len(eph_times))
-    for i, line in enumerate(rows_text):
-        cols = [c.strip() for c in line.split(",")]
-        # Columns: Date, , RA, Dec  (with extra_prec the angular precision
-        # is high). Schema: "Date_UT", "Sol_pres", "RA", "Dec".
-        # Find the two rightmost numeric columns ending with RA, Dec.
-        # Robust: take the last two columns with valid floats.
-        nums = [c for c in cols if _is_float(c)]
-        ras[i] = float(nums[-2])
-        decs[i] = float(nums[-1])
-    return ras, decs
+    # The CSV header is the last non-separator line before $$SOE.
+    pre = [ln for ln in body[:soe].splitlines() if ln.strip() and not ln.startswith("*")]
+    header = [h.strip() for h in pre[-1].split(",")]
+    rows_text = [r for r in body[soe + 5:eoe].splitlines() if r.strip()]
+    if len(rows_text) != len(eph_times):
+        raise RuntimeError(f"expected {len(eph_times)} rows, got {len(rows_text)}")
+
+    columns = {}
+    for j, name in enumerate(header):
+        if not name or name.startswith("Date"):
+            continue
+        vals = [ln.split(",")[j].strip() for ln in rows_text]
+        if all(_is_float(v) for v in vals):
+            columns[name] = np.array([float(v) for v in vals])
+
+    # "Equivalent ICRF heliocentric cartesian coordinates (au, au/d)"
+    state = np.full(6, np.nan)
+    for key, idx in (("X", 0), ("Y", 1), ("Z", 2), ("VX", 3), ("VY", 4), ("VZ", 5)):
+        m = re.search(rf"(?<![A-Z]){key}=\s*([-+0-9.E]+)", body[:soe])
+        if m:
+            state[idx] = float(m.group(1))
+    return columns, state
+
+
+def horizons_ephem(row, eph_times: Time, observer_code: str = "X05"):
+    """Astrometric ICRF (RA, Dec) in degrees from Horizons; see
+    `horizons_observer`."""
+    cols, _ = horizons_observer(row, eph_times, "1", observer_code)
+    return cols["R.A.___(ICRF)"], cols["DEC____(ICRF)"]
 
 
 def _is_float(s: str) -> bool:
@@ -325,6 +339,78 @@ def _is_float(s: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Emission-time geometry vs Horizons (r, rdot, delta, deldot, LT, S-T-O)
+# ---------------------------------------------------------------------------
+
+AU_KM = (1.0 * u.au).to_value(u.km)
+C_KM_S = 299792.458
+
+
+def run_geometry_check(rows, schedule, ephem):
+    """Compare ASSIST light-emission-time geometry to Horizons observer
+    quantities 19 (r, rdot), 20 (delta, deldot), 21 (light time) and 43
+    (true phase angle phi) for the same elements. Returns a dict of
+    per-quantity absolute residual arrays.
+
+    Findings this check encodes (verified against Horizons):
+      - r/rdot use the *apparent* Sun (at reflection time); using the Sun at
+        emission time instead would put r off by ~20 km.
+      - deldot is the plain dot product dhat.(V_em - V_obs), without the
+        (1 + dhat.V/c) light-time-rate factor (that variant is off by
+        ~0.5 m/s).
+      - Horizons' phi is the phase angle with the Sun direction aberrated by
+        the target's heliocentric velocity (sunlight direction in the
+        target's rest frame); ssp.ephem_assist.EphResult.phase_angle
+        implements that. The purely geometric angle differs by up to v/c.
+    """
+    res = {k: [] for k in (
+        "state_pos_km", "state_vel_mm_s", "r_km", "rdot_mm_s", "delta_km",
+        "deldot_dot_mm_s", "deldot_lt_mm_s", "lt_ms",
+        "phase_arcsec", "phase_geom_arcsec",
+    )}
+    by_id = rows.set_index("unpacked_primary_provisional_designation", drop=False)
+    for pid, eph_times in schedule.items():
+        row = by_id.loc[pid]
+        try:
+            cols, h_state = horizons_observer(row, eph_times, "1,19,20,21,43")
+        except Exception as exc:
+            print(f"  Horizons fetch failed for {pid}: {exc}")
+            continue
+
+        # Initial heliocentric ICRF state from the elements (Sun at origin).
+        X0, V0 = elements_row_to_bary_icrf(row, np.zeros(3), np.zeros(3))
+        res["state_pos_km"].append([np.linalg.norm(X0 - h_state[:3]) * AU_KM])
+        res["state_vel_mm_s"].append(
+            [np.linalg.norm(V0 - h_state[3:]) * AU_KM / 86400.0 * 1e6]
+        )
+
+        e = compute_ephemerides_one(pid, eph_times, by_id, ephem)
+        hp, hv, tp, tv = e.helio_pos, e.helio_vel, e.topo_pos, e.topo_vel
+        r = np.linalg.norm(hp, axis=0)
+        delta = np.linalg.norm(tp, axis=0)
+        rhat = hp / r
+        dhat = tp / delta
+        rdot = np.sum(rhat * hv, axis=0)
+        deldot_dot = np.sum(dhat * tv, axis=0)
+        # d|rho|/dt at the observer includes the light-time rate:
+        # D (1 + dhat.V_em / c) = dhat.(V_em - V_obs). For the v/c-sized
+        # correction factor the geometric velocity e.vv stands in for V_em.
+        deldot_lt = deldot_dot / (1.0 + np.sum(dhat * e.vv, axis=0) / C_KM_S)
+        cosg = np.sum(hp * tp, axis=0) / (r * delta)
+        phase_geom = np.degrees(np.arccos(np.clip(cosg, -1.0, 1.0)))
+
+        res["r_km"].append(np.abs(r - cols["r"]) * AU_KM)
+        res["rdot_mm_s"].append(np.abs(rdot - cols["rdot"]) * 1e6)
+        res["delta_km"].append(np.abs(delta - cols["delta"]) * AU_KM)
+        res["deldot_dot_mm_s"].append(np.abs(deldot_dot - cols["deldot"]) * 1e6)
+        res["deldot_lt_mm_s"].append(np.abs(deldot_lt - cols["deldot"]) * 1e6)
+        res["lt_ms"].append(np.abs(e.light_time * 86400e3 - cols["1-way_down_LT"] * 60e3))
+        res["phase_arcsec"].append(np.abs(e.phase_angle - cols["phi"]) * 3600.0)
+        res["phase_geom_arcsec"].append(np.abs(phase_geom - cols["phi"]) * 3600.0)
+    return {k: np.concatenate([np.atleast_1d(x) for x in v]) for k, v in res.items() if v}
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +433,7 @@ def main():
                    help="Centre TAI-MJD of the synthetic obs window.")
     p.add_argument("--span-days", type=float, default=30.0)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--section", choices=["accuracy", "drop-in", "perf", "all"],
+    p.add_argument("--section", choices=["accuracy", "geometry", "drop-in", "perf", "all"],
                    default="all")
     p.add_argument("--horizons", action="store_true",
                    help="Hit the JPL Horizons web API (needed for the accuracy section).")
@@ -430,6 +516,49 @@ def main():
                     "passed": gate_ok,
                     "assist_seconds": t_assist,
                 }
+
+    # ---- Emission-time geometry vs Horizons --------------------------------
+    if args.section in ("geometry", "all"):
+        print("\n=== GEOMETRY: ASSIST emission-time r/delta/rates/phase vs Horizons ===")
+        if not args.horizons:
+            print("  --horizons not set; skipping Horizons fetch.")
+        else:
+            g = run_geometry_check(rows, schedule, ephem)
+            labels = {
+                "state_pos_km": "initial helio state |dX| [km]",
+                "state_vel_mm_s": "initial helio state |dV| [mm/s]",
+                "r_km": "r       [km]",
+                "rdot_mm_s": "rdot    [mm/s]",
+                "delta_km": "delta   [km]",
+                "deldot_dot_mm_s": "deldot (dot product)      [mm/s]",
+                "deldot_lt_mm_s": "deldot (with light-time rate) [mm/s]",
+                "lt_ms": "light time [ms]",
+                "phase_arcsec": "phase_angle vs phi [arcsec]",
+                "phase_geom_arcsec": "(geometric phase vs phi, info) [arcsec]",
+            }
+            summary["geometry"] = {}
+            for k, lab in labels.items():
+                if k not in g:
+                    continue
+                x = g[k]
+                print(f"  {lab:45s} median={np.median(x):.3e}  max={np.max(x):.3e}  (N={len(x)})")
+                summary["geometry"][k] = {"median": float(np.median(x)), "max": float(np.max(x))}
+
+            # Gates: an order of magnitude below the float32 storage
+            # precision of the SSSource columns (~1e-7 relative), and within
+            # Horizons' printed precision where that is coarser.
+            gates = [
+                ("initial state |dX| < 1 km", np.max(g["state_pos_km"]) < 1.0),
+                ("r, delta < 1 km", max(np.max(g["r_km"]), np.max(g["delta_km"])) < 1.0),
+                ("rdot, deldot < 10 mm/s",
+                 max(np.max(g["rdot_mm_s"]), np.max(g["deldot_dot_mm_s"])) < 10.0),
+                ("light time < 1 ms", np.max(g["lt_ms"]) < 1.0),
+                # phi is printed to 1e-4 deg (0.36"), so 0.5" allows for rounding.
+                ("phase_angle vs phi < 0.5 arcsec", np.max(g["phase_arcsec"]) < 0.5),
+            ]
+            for name, ok in gates:
+                print(f"  Gate: {name:40s} {'PASS' if ok else 'FAIL'}")
+            summary["geometry"]["passed"] = all(ok for _, ok in gates)
 
     # ---- Drop-in equivalence (ASSIST vs jorbit) --------------------------
     if args.section in ("drop-in", "all"):
