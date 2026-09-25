@@ -146,12 +146,28 @@ def run_assist(rows, schedule, ephem):
 # ---------------------------------------------------------------------------
 
 def run_jorbit(rows, schedule):
-    """Runs the existing jorbit-based path. Hits JPL Horizons by name."""
-    from ssp.ephem import _aux_compute_ephemerides
-    mpcorb = rows.set_index("unpacked_primary_provisional_designation", drop=False)
+    """Runs the jorbit path the way ssp.ephem._aux_compute_ephemerides does:
+    fetch the state from JPL Horizons by packed designation, then compute the
+    ephemeris at the requested times plus a second call at t+dt for rates.
+
+    Calls jorbit directly rather than through _aux_compute_ephemerides, whose
+    ``eph, xx, vv, obs = p.ephemeris(...)`` unpacking does not match any
+    released jorbit (1.0-1.7 all return a bare SkyCoord).
+    """
+    from ssp import ephem as _ephem  # noqa: F401  (enables jax x64)
+    from jorbit import Particle
+
+    by_id = rows.set_index("unpacked_primary_provisional_designation", drop=False)
     out = {}
+    dt = 1.0 / (3600.0 + 24.0) * u.s
     for provID, eph_times in schedule.items():
-        eph, _, _, _, _, _, _, _ = _aux_compute_ephemerides(provID, eph_times, mpcorb)
+        row = by_id.loc[provID]
+        p = Particle.from_horizons(
+            name=row["packed_primary_provisional_designation"],
+            time=Time(float(row["epoch_mjd"]), format="mjd", scale="tdb"),
+        )
+        eph = p.ephemeris(times=eph_times, observer="rubin")
+        p.ephemeris(times=eph_times + dt, observer="rubin")
         out[provID] = {
             "ra_deg": np.asarray(eph.ra.deg),
             "dec_deg": np.asarray(eph.dec.deg),
@@ -238,11 +254,11 @@ def horizons_ephem(row, eph_times: Time, observer_code: str = "X05"):
     epoch_tt_mjd = float(row["epoch_mjd"])
     epoch_tdb_jd = Time(epoch_tt_mjd, format="mjd", scale="tt").tdb.jd
 
-    # Horizons accepts elements via these COMMAND fields:
-    #   EC, QR, IN, OM, W, MA (all relative to ECLIPTIC J2000) and EPOCH (JD TDB)
+    # User-supplied heliocentric ecliptic elements need COMMAND=';'. Horizons
+    # accepts [TP, QR], [MA, A] or [MA, N] pairs; we pass [MA, A]. EPOCH is
+    # JD TDB. ECLIP=J2000 means the IAU76/80 obliquity (84381.448").
     a = float(row["a"])
     e = float(row["e"])
-    qr = a * (1.0 - e)
 
     tlist = ",".join(f"{t:.10f}" for t in eph_times.utc.jd)
 
@@ -251,9 +267,11 @@ def horizons_ephem(row, eph_times: Time, observer_code: str = "X05"):
         "EPHEM_TYPE": "OBSERVER",
         "OBJ_DATA": "NO",
         "MAKE_EPHEM": "YES",
+        "COMMAND": "';'",
         "OBJECT": "Test",
+        "ECLIP": "J2000",
         "EC": f"{e:.16e}",
-        "QR": f"{qr:.16e}",
+        "A": f"{a:.16e}",
         "IN": f"{float(row['i']):.16e}",
         "OM": f"{float(row['node']):.16e}",
         "W":  f"{float(row['argperi']):.16e}",
