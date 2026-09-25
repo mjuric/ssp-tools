@@ -27,8 +27,14 @@ dependencies = [
 dev = [
   "pytest>=8",
 ]
+assist = [
+  "assist",
+  "rebound",
+]
 all = [
   "jorbit",
+  "assist",
+  "rebound",
 ]
 
 [project.scripts]
