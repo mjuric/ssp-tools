@@ -38,7 +38,7 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
     # location/velocity of the Sun
     with solar_system_ephemeris.set("de440"):
         pos, vel = get_body_barycentric_posvel("sun", ephTimes)
-    hx, hy, hz = pos.x.to(u.au).value, pos.z.to(u.au).value, pos.z.to(u.au).value
+    hx, hy, hz = pos.x.to(u.au).value, pos.y.to(u.au).value, pos.z.to(u.au).value
     hvx, hvy, hvz = vel.x.to(kms).value, vel.y.to(kms).value, vel.z.to(kms).value
 
     # location/velocity of the observer
