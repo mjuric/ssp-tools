@@ -420,22 +420,28 @@ def compute_ephemerides_one(
     ephem,
     observer_code: str = "X05",
     rate_dt_seconds: float = 60.0,
+    row=None,
 ) -> EphResult:
-    """ASSIST-based replacement for ``ssp.ephem._aux_compute_ephemerides``.
+    """Per-epoch ephemeris quantities for *one* object from its local mpcorb
+    elements (no Horizons fetch), propagated with ASSIST.
 
-    Like the original it computes per-epoch quantities for *one* object, but
-    using local mpcorb elements (no Horizons fetch). All times go through
-    astropy so TAI/UTC/TDB are handled correctly: the asteroid epoch in
-    mpcorb is treated as TT-MJD (MPC convention) and converted to TDB for
-    integration; observation times come in as TAI-MJD and are converted to
-    TDB.
+    All times go through astropy so TAI/UTC/TDB are handled correctly: the
+    asteroid epoch in mpcorb is treated as TT-MJD (MPC convention) and
+    converted to TDB for integration; observation times come in as TAI-MJD
+    and are converted to TDB.
+
+    Pass the object's mpcorb row as ``row`` when calling this for many
+    objects: otherwise it is looked up in ``mpcorb`` by ``provID`` with a
+    full-table scan (~30 ms on the full 1.5M-row table), and ``mpcorb`` may
+    be None when ``row`` is given.
     """
-    row = (
-        mpcorb.query(
-            "unpacked_primary_provisional_designation == @provID",
-            engine="python",
-        ).iloc[0]
-    )
+    if row is None:
+        row = (
+            mpcorb.query(
+                "unpacked_primary_provisional_designation == @provID",
+                engine="python",
+            ).iloc[0]
+        )
     H = float(row["h"])
     G = float(row["g"])
     epoch_tt_mjd = float(row["epoch_mjd"])

@@ -14,6 +14,10 @@ from .ephem_assist import compute_ephemerides_one, open_ephem
 
 
 def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
+    """Fill the ephemeris-derived SSSource columns for one object.
+
+    ``mpcorb`` must be indexed by unpacked_primary_provisional_designation.
+    """
 
     # extract only the subset of observations related to this object
     dia = dia.iloc[assoc["dia_index"]]
@@ -25,7 +29,7 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
 
     provID = sss["designation"][0]
     ephTimes = Time(dia["midpointMjdTai"].values, format="mjd", scale="tai")
-    e = compute_ephemerides_one(provID, ephTimes, mpcorb, ephem)
+    e = compute_ephemerides_one(provID, ephTimes, None, ephem, row=mpcorb.loc[provID])
 
     sss["ephRateRa"] = e.mu_lon
     sss["ephRateDec"] = e.mu_lat
@@ -250,7 +254,7 @@ if __name__ == "__main__":
             "h",
             "g",
         ],
-    ).reset_index(drop=True)
+    ).set_index("unpacked_primary_provisional_designation", drop=False, verify_integrity=True)
 
     # JPL planet and ASSIST asteroid ephemeris files, from the
     # SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables.
