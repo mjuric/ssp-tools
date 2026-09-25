@@ -1,6 +1,4 @@
 from astropy.coordinates import (
-    get_body_barycentric_posvel,
-    solar_system_ephemeris,
     SkyCoord,
     HeliocentricEclipticIAU76,
 )
@@ -11,13 +9,11 @@ import numpy as np
 import pandas as pd
 
 from . import util, schema
-from .photfit import hg_V_mag, phase_angle_deg
-from .ephem import _aux_compute_ephemerides
+from .photfit import hg_V_mag
+from .ephem_assist import compute_ephemerides_one, open_ephem
 
 
-def compute_sssource_entry(sss, assoc, mpcorb, dia):
-
-    kms = u.km / u.s
+def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
 
     # extract only the subset of observations related to this object
     dia = dia.iloc[assoc["dia_index"]]
@@ -29,23 +25,16 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
 
     provID = sss["designation"][0]
     ephTimes = Time(dia["midpointMjdTai"].values, format="mjd", scale="tai")
-    eph, (H, G), xx, vv, obs, mu_lon, mu_lat, mu = _aux_compute_ephemerides(provID, ephTimes, mpcorb)
+    e = compute_ephemerides_one(provID, ephTimes, mpcorb, ephem)
 
-    sss["ephRateRa"] = mu_lon.value
-    sss["ephRateDec"] = mu_lat.value
-    sss["ephRate"] = mu.value
+    sss["ephRateRa"] = e.mu_lon
+    sss["ephRateDec"] = e.mu_lat
+    sss["ephRate"] = e.mu_total
 
-    # location/velocity of the Sun
-    with solar_system_ephemeris.set("de440"):
-        pos, vel = get_body_barycentric_posvel("sun", ephTimes)
-    hx, hy, hz = pos.x.to(u.au).value, pos.y.to(u.au).value, pos.z.to(u.au).value
-    hvx, hvy, hvz = vel.x.to(kms).value, vel.y.to(kms).value, vel.z.to(kms).value
-
-    # location/velocity of the observer
-    robs, vobs = util.observatory_barycentric_posvel("X05", ephTimes)
-    robs = robs.to(u.au).value
-    vobs = vobs.to(u.km / u.s).value
-    # r_obs_sun = np.sqrt((robs * robs).sum(axis=0))
+    # Heliocentric and topocentric vectors are at light-emission time, per
+    # the SSSource schema, following JPL Horizons conventions (see
+    # ssp.ephem_assist.EphResult).
+    eph = SkyCoord(ra=e.ra_deg * u.deg, dec=e.dec_deg * u.deg, frame="icrs")
 
     sss["ephRa"] = eph.ra.deg
     sss["ephDec"] = eph.dec.deg
@@ -56,15 +45,15 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
     sss["ephOffset"] = eph.separation(obsv).arcsec
 
     # Compute heliocentric position components
-    sss["helio_x"] = xx[0] - hx
-    sss["helio_y"] = xx[1] - hy
-    sss["helio_z"] = xx[2] - hz
+    sss["helio_x"] = e.helio_pos[0]
+    sss["helio_y"] = e.helio_pos[1]
+    sss["helio_z"] = e.helio_pos[2]
     sss["helioRange"] = np.sqrt(sss["helio_x"] ** 2 + sss["helio_y"] ** 2 + sss["helio_z"] ** 2)
 
     # Compute heliocentric velocity components
-    sss["helio_vx"] = vv[0] - hvx
-    sss["helio_vy"] = vv[1] - hvy
-    sss["helio_vz"] = vv[2] - hvz
+    sss["helio_vx"] = e.helio_vel[0]
+    sss["helio_vy"] = e.helio_vel[1]
+    sss["helio_vz"] = e.helio_vel[2]
     sss["helio_vtot"] = np.sqrt(sss["helio_vx"] ** 2 + sss["helio_vy"] ** 2 + sss["helio_vz"] ** 2)
 
     # Compute heliocentric radial velocity: dot product of velocity
@@ -74,15 +63,15 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
     ) / sss["helioRange"]
 
     # Compute topocentric position components
-    sss["topo_x"] = xx[0] - obs[0]
-    sss["topo_y"] = xx[1] - obs[1]
-    sss["topo_z"] = xx[2] - obs[2]
+    sss["topo_x"] = e.topo_pos[0]
+    sss["topo_y"] = e.topo_pos[1]
+    sss["topo_z"] = e.topo_pos[2]
     sss["topoRange"] = np.sqrt(sss["topo_x"] ** 2 + sss["topo_y"] ** 2 + sss["topo_z"] ** 2)
 
     # Compute topocentric velocity components
-    sss["topo_vx"] = vv[0] - vobs[0]
-    sss["topo_vy"] = vv[1] - vobs[1]
-    sss["topo_vz"] = vv[2] - vobs[2]
+    sss["topo_vx"] = e.topo_vel[0]
+    sss["topo_vy"] = e.topo_vel[1]
+    sss["topo_vz"] = e.topo_vel[2]
     sss["topo_vtot"] = np.sqrt(sss["topo_vx"] ** 2 + sss["topo_vy"] ** 2 + sss["topo_vz"] ** 2)
 
     # Compute topocentric radial velocity: dot product of velocity
@@ -91,9 +80,9 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
         sss["topo_vx"] * sss["topo_x"] + sss["topo_vy"] * sss["topo_y"] + sss["topo_vz"] * sss["topo_z"]
     ) / sss["topoRange"]
 
-    sss["phaseAngle"] = phase_deg = phase_angle_deg(xx, obs)
+    sss["phaseAngle"] = e.phase_angle
 
-    sss["ephVmag"] = hg_V_mag(H, G, sss["helioRange"], sss["topoRange"], phase_deg)
+    sss["ephVmag"] = hg_V_mag(e.H, e.G, sss["helioRange"], sss["topoRange"], e.phase_angle)
 
     max_sep = np.max(sss["ephOffset"])
     med_sep = np.median(sss["ephOffset"])
@@ -263,7 +252,13 @@ if __name__ == "__main__":
         ],
     ).reset_index(drop=True)
 
-    util.group_by([sss, assoc], "ssObjectId", partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia))
+    # JPL planet and ASSIST asteroid ephemeris files, from the
+    # SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables.
+    ephem = open_ephem()
+
+    util.group_by(
+        [sss, assoc], "ssObjectId", partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia, ephem=ephem)
+    )
 
     totalNumObjects = np.unique(sss["ssObjectId"]).size
     print(f"{totalNumObjects:,} unique objects with {len(sss):,} total observations.")
