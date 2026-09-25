@@ -88,8 +88,8 @@ class TestKepler(unittest.TestCase):
 class TestObliquity(unittest.TestCase):
 
     def test_obliquity_value(self):
-        """IAU 2006 J2000 obliquity is 23°26'21.406"."""
-        self.assertAlmostEqual(np.rad2deg(OBLIQUITY_J2000), 23.439279444, places=6)
+        """IAU76/80 J2000 obliquity (MPC/JPL ecliptic) is 23°26'21.448"."""
+        self.assertAlmostEqual(np.rad2deg(OBLIQUITY_J2000), 84381.448 / 3600.0, places=12)
 
     def test_x_axis_invariant(self):
         """The vernal equinox direction (1,0,0) is shared by both frames."""

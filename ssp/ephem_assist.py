@@ -34,8 +34,10 @@ GM_SUN = 0.01720209895 ** 2
 # Speed of light in AU / day (IAU 2012, derived from c and AU).
 C_AU_PER_DAY = 173.144632674240
 
-# Mean obliquity of the ecliptic at J2000.0 (IAU 2006), radians.
-OBLIQUITY_J2000 = np.deg2rad(84381.406 / 3600.0)
+# Obliquity defining the J2000 ecliptic frame of MPC/JPL osculating elements:
+# IAU76/80 value 84381.448", the same one Horizons assumes for ECLIP=J2000.
+# (The IAU 2006 value, 84381.406", would rotate positions by up to 42 mas.)
+OBLIQUITY_J2000 = np.deg2rad(84381.448 / 3600.0)
 _COS_EPS = np.cos(OBLIQUITY_J2000)
 _SIN_EPS = np.sin(OBLIQUITY_J2000)
 
@@ -218,9 +220,12 @@ def _propagate_one(
     X_out = np.empty((3, n), dtype=np.float64)
     V_out = np.empty((3, n), dtype=np.float64)
 
-    p = sim.particles[0]
     for i, t in enumerate(t_sorted):
         ax.integrate_or_interpolate(float(t))
+        # Re-fetch every time: integrate_or_interpolate swaps the particle
+        # array for an interpolated copy, so a cached sim.particles[0] would
+        # keep reading the end-of-step state instead of the state at t.
+        p = sim.particles[0]
         X_out[:, i] = (p.x, p.y, p.z)
         V_out[:, i] = (p.vx, p.vy, p.vz)
 
