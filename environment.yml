@@ -10,10 +10,11 @@ dependencies:
   - pandas>=1.5
   - numpy>=1.21
   - astropy>=5.0
+  - astroquery>=0.4
+  - jplephem>=2.15
   - scipy>=1.7
   - pyyaml>=6.0
   - tqdm>=4.0
-  - jax
   - pytest>=8
   # Development tools
   - ipython

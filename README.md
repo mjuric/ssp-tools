@@ -33,9 +33,27 @@ Or with dev dependencies:
 pip install -e ".[dev]"
 ```
 
-Or with all optional dependencies (includes jorbit, requires JAX):
+Or with all optional dependencies (includes ASSIST/REBOUND for ephemerides):
 ```bash
 pip install -e ".[all]"
+```
+
+With [uv](https://docs.astral.sh/uv/), using the committed lockfile:
+```bash
+uv sync --extra dev --extra all
+uv run pytest
+```
+
+### Ephemeris data files
+
+SSSource ephemerides are computed with [ASSIST](https://assist.readthedocs.io),
+which needs the JPL DE440 planet file (`linux_p1550p2650.440`) and the ASSIST
+asteroid perturber file (`sb441-n16.bsp`). Point these environment variables
+at them:
+
+```bash
+export SSP_ASSIST_PLANETS=/path/to/linux_p1550p2650.440
+export SSP_ASSIST_ASTEROIDS=/path/to/sb441-n16.bsp
 ```
 
 ## Configuration
