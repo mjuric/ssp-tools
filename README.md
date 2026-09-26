@@ -255,7 +255,11 @@ Outputs:
   offset.
 
 `python -m ssp.sssource` links these DiaSources to obs_sbn by `obsid` (instead
-of `diaSourceId == obssubid`) and carries `collection` into SSSource;
+of `diaSourceId == obssubid`) and carries `collection` into SSSource. Detections
+of undesignated objects (unidentified tracklets) are kept with `ssObjectId` 0,
+an empty designation and NaN orbit-derived columns, as are designated objects
+with no `mpc_orbits` orbit (but with their `ssObjectId`); neither gets an
+SSObject row;
 `ssp-build-ssobject` then joins SSSource to DiaSource on
 `(collection, diaSourceId)`.
 
