@@ -281,7 +281,7 @@ def test_extract_end_to_end(tmp_path):
     assert sorted(unres) == ["o7", "o8"]
 
 
-def test_extract_double_submission(tmp_path):
+def test_extract_double_submission(tmp_path, capsys):
     # Like the real case: one detection submitted twice (two obsids, same
     # bare obssubid, obstime 4 ms apart), in two submissions. Both rows are
     # written; the earliest submission's is primary.
@@ -307,6 +307,9 @@ def test_extract_double_submission(tmp_path):
     assert (by["Lsa1early"]["trksub"], by["Ltt1late"]["trksub"]) == ("early", "late")
     assert by["Ltt1late"]["dt_ms"] == pytest.approx(-2.0, abs=1e-3)
     assert pq.read_table(tmp_path / "dia.unresolved.parquet").num_rows == 0
+    # the report lists the two rows of the doubly-claimed source, only
+    listed = [line for line in capsys.readouterr().out.splitlines() if "claimed by several" in line]
+    assert len(listed) == 2 and all("'diaSourceId': 100" in line for line in listed)
 
 
 def test_primary_flags():

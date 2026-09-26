@@ -669,7 +669,7 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     # sources claimed by more than one submission (not counting -B rows)
     nb = out.select(key + ["primary", "obsid", "submission_id", "trksub"]).filter(pa.array(~is_b))
     g = nb.group_by(key).aggregate([("obsid", "count")])
-    claimed = nb.join(g.filter(pc.greater(g["obsid_count"], 1)).select(key), key)
+    claimed = nb.join(g.filter(pc.greater(g["obsid_count"], 1)).select(key), key, join_type="inner")
 
     resolved = np.zeros(n, dtype=bool)
     resolved[rows_all] = True
