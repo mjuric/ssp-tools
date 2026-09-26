@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import pyarrow.parquet as pq
 from functools import partial
 from . import photfit
 from . import util
@@ -132,10 +133,12 @@ def compute_ssobject_entry(
                 row[f'{band}_HErr'] = sigmaH
                 row[f'{band}_nObsUsed'] = nobsv
 
-    # Extendedness
-    row["extendednessMin"] = sss["dia_extendedness"].min()
-    row["extendednessMax"] = sss["dia_extendedness"].max()
-    row["extendednessMedian"] = sss["dia_extendedness"].median()
+    # Extendedness (null for DiaSources that lack it -> NaN)
+    ext = sss["dia_extendedness"].to_numpy(dtype=float, na_value=np.nan)
+    ext = ext[~np.isnan(ext)]
+    row["extendednessMin"] = ext.min() if len(ext) else np.nan
+    row["extendednessMax"] = ext.max() if len(ext) else np.nan
+    row["extendednessMedian"] = np.median(ext) if len(ext) else np.nan
 
 def compute_ssobject(
     sss, dia, mpcorb, fixedG12=None, magSigmaFloor=0.0,
@@ -188,6 +191,20 @@ def compute_ssobject(
     - MOID computation uses a MOIDSolver for each matched object.
     """
 
+    # Sources without an orbit -- undesignated (ssObjectId 0) or with no
+    # mpc_orbits row, so with NaN ephemerides -- get no SSObject.
+    # (NaN, not null: np.isnan, as pyarrow-backed isna() misses NaN)
+    no_orbit = (sss["ssObjectId"] == 0) | np.isnan(sss["ephRa"].to_numpy(dtype=float, na_value=np.nan))
+    if no_orbit.any():
+        print(f"Skipping {no_orbit.sum():,} SSSource rows without an orbit "
+              f"({(sss['ssObjectId'] == 0).sum():,} undesignated)")
+        sss = sss[~no_orbit]
+
+    # A source claimed by several obs_sbn rows (both endpoints of a trail,
+    # repeated submissions) has several SSSource rows; count it once.
+    if "primary" in sss.columns:
+        sss = sss[sss["primary"].to_numpy(dtype=bool)]
+
     # assert that sss is pre-grouped by ssObjectId
     assert util.values_grouped(sss["ssObjectId"]), (
         "SSSource table must be pre-grouped by ssObjectId. "
@@ -196,17 +213,26 @@ def compute_ssobject(
         "typically large and we want to avoid copies, it's not done internally."
     )
 
-    # Join the DiaSource parts we're interested in to our SSSource table
+    # Join the DiaSource parts we're interested in to our SSSource table.
+    # DiaSources from extract-submitted-sources have one row per obs_sbn
+    # row and come from several collections, so neither diaSourceId nor
+    # (collection, diaSourceId) is unique; join on their key, obsid.
     num = len(sss)
-    dia_tmp = dia[DIA_COLUMNS].add_prefix("dia_")  # FIXME: does this cause unnececessary copy?
+    by_obsid = "obsid" in dia.columns and "obsid" in sss.columns and sss["obsid"].notna().all()
+    dia_cols = DIA_COLUMNS + (["obsid"] if by_obsid else [])
+    dia_tmp = dia[dia_cols].add_prefix("dia_")  # FIXME: does this cause unnececessary copy?
     # FIXME: The diaSourceId should really be uint64. But Felis doesn't speak
     # uint64, but only knows about int64. Yet the pipeline produces uint64
     # diaSourceId in the dia_source dataset. So we have to cast here to int64
     # to make the join work (otherwise pyarrow tries to cast to float64, and
     # the whole thing gloriously explodes).
     dia_tmp["dia_diaSourceId"] = dia_tmp["dia_diaSourceId"].astype("int64[pyarrow]")
-    sss = sss.merge(dia_tmp, left_on="diaSourceId", right_on="dia_diaSourceId", how="inner")
-    assert num == len(sss), f"{num - len(sss)} DiaSources found missing."
+    if by_obsid:
+        sss = sss.merge(dia_tmp, left_on="obsid", right_on="dia_obsid", how="inner")
+        del sss["dia_obsid"]
+    else:
+        sss = sss.merge(dia_tmp, left_on="diaSourceId", right_on="dia_diaSourceId", how="inner")
+    assert num == len(sss), f"{num - len(sss)} DiaSources found missing (or duplicated)."
     del sss["dia_diaSourceId"]
     del dia_tmp
 
@@ -334,11 +360,14 @@ Examples:
         num = len(sss)
         print(f"Loaded {num:,} SSSource rows")
 
-        # Load DiaSource with required columns
+        # Load DiaSource with required columns (and the obsid, for
+        # DiaSources from extract-submitted-sources)
         dia_columns = [
             "diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness",
             "band", "psfFlux", "psfFluxErr"
         ]
+        if "obsid" in pq.read_schema(args.diasource_parquet).names:
+            dia_columns.append("obsid")
         print(f"Loading DiaSource from {args.diasource_parquet}...")
         dia = pd.read_parquet(args.diasource_parquet, engine="pyarrow",
                               dtype_backend="pyarrow", columns=dia_columns

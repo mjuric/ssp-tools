@@ -51,6 +51,22 @@ def assoc_validate(dia, assoc):
     print(f"All OK, {len(assoc):,} observations.")
 
 
+def assoc_validate_recorded(dia, assoc):
+    """assoc_validate for DiaSources from extract-submitted-sources: check
+    the offsets it recorded per match (``sep_mas``, ``dt_ms``) against the
+    same tolerances as assoc_validate."""
+    rec = dia[["sep_mas", "dt_ms"]].iloc[assoc["dia_index"].values]
+    sep = rec["sep_mas"].to_numpy(dtype=float, na_value=np.nan) / 1000
+    dt = rec["dt_ms"].to_numpy(dtype=float, na_value=np.nan) / 1000
+
+    print("Separation diffeerence range (arcsec): ", sep.min(), sep.max())
+    assert sep.max() <= 0.005
+    print("Time diffeerence range (sec):          ", dt.min(), dt.max())
+    assert abs(dt).max() < 0.51
+
+    print(f"All OK, {len(assoc):,} observations.")
+
+
 def packed_ascii_to_uint64_le(mpc_packed):
     """
     Convert a pandas string[pyarrow] column of ASCII strings (<= 8 bytes)

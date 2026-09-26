@@ -23,6 +23,8 @@ dependencies = [
   "scipy>=1.7",
   "pyyaml>=6.0",
   "tqdm>=4.0",
+  "clickhouse-connect>=0.15.1",
+  "cdshealpix>=0.8.1",
 ]
 
 [project.optional-dependencies]
@@ -41,6 +43,7 @@ all = [
 [project.scripts]
 fast-export = "ssp.export:main"
 extract-catalog = "ssp.export.butler:main"
+extract-submitted-sources = "ssp.export.submittable:main"
 ssp-build-ssobject = "ssp.ssobject:main"
 ssp-generate-dtypes = "ssp.felis:main"
 

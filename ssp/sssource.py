@@ -28,7 +28,6 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
     dia = dia.iloc[assoc["dia_index"]]
 
     # just verify we didn't screw up something
-    assert np.all(dia["ssObjectId"] == dia["ssObjectId"].iloc[0])
     assert np.all(sss["ssObjectId"] == sss["ssObjectId"][0])
     assert len(dia) == len(sss)
 
@@ -131,11 +130,14 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
         det = det[det["provid"].isin(sampled_provids)].reset_index()
     print(f"{len(det):,} MPC observations")
 
-    # FIXME: this will have to check if the ID's are IAU-style
-    # (with string prefixes)
-    det["obssubid"] = det["obssubid"].astype(int)
+    # DiaSources from extract-submitted-sources carry the obs_sbn obsid
+    # they were resolved from; link on it. Otherwise (Butler extraction)
+    # obssubid is the bare diaSourceId.
+    by_obsid = "obsid" in dia.columns
+    if not by_obsid:
+        det["obssubid"] = det["obssubid"].astype(int)
     det = det[
-        [
+        (["obsid"] if by_obsid else []) + (["trkid"] if "trkid" in det.columns else []) + [
             "trksub",
             "obssubid",
             "provid",
@@ -151,8 +153,10 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # verify types didn't get mangled somewhere along the way
     # from the database to here
     expect_dtypes = dict(
+        obsid="string[pyarrow]",
+        trkid="string[pyarrow]",
         trksub="string[pyarrow]",
-        obssubid="int64",
+        obssubid="string[pyarrow]" if by_obsid else "int64",
         provid="string[pyarrow]",
         permid="string[pyarrow]",
         submission_id="string[pyarrow]",
@@ -165,19 +169,47 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     for col in det.columns:
         assert det[col].dtype == expect_dtypes[col]
 
-    # create the association side table
-    assoc = (
-        dia[["diaSourceId"]]
-        .reset_index()
-        .merge(det.add_prefix("mpc_"), left_on="diaSourceId", right_on="mpc_obssubid", how="inner")
-    )
+    # create the association side table. From extract-submitted-sources,
+    # dia has one row per obs_sbn row (obsid is unique), so each obs_sbn row
+    # gets one SSSource row; a source claimed by several (both endpoints of
+    # a trail, or repeated submissions) has one of them marked primary.
+    if by_obsid:
+        assoc = (
+            dia[["diaSourceId", "obsid"]]
+            .reset_index()
+            .merge(det.add_prefix("mpc_"), left_on="obsid", right_on="mpc_obsid", how="inner")
+        )
+    else:
+        assoc = (
+            dia[["diaSourceId"]]
+            .reset_index()
+            .merge(det.add_prefix("mpc_"), left_on="diaSourceId", right_on="mpc_obssubid", how="inner")
+        )
     assoc.rename(columns={"index": "dia_index"}, inplace=True)
 
     # verify all went well
     assert np.all(dia["diaSourceId"].iloc[assoc["dia_index"]].to_numpy() == assoc["diaSourceId"].to_numpy())
 
     # verify contents of the association table
-    util.assoc_validate(dia, assoc)
+    if by_obsid:
+        # extract-submitted-sources already verified each match against
+        # the PSF *or trail* centroid and the midpoint of -A/-B endpoint
+        # pairs, neither of which assoc_validate (PSF position vs. the
+        # submitted row) can reproduce; check its recorded offsets against
+        # the same tolerances instead.
+        util.assoc_validate_recorded(dia, assoc)
+    else:
+        util.assoc_validate(dia, assoc)
+
+    # obs_sbn also holds observations of unidentified tracklets (status
+    # 'I', no provid nor permid). They are in SSSource too -- they were
+    # sent to and accepted by the MPC -- with ssObjectId 0, no designation
+    # and no orbit-derived columns. Set them aside while resolving the
+    # designations of the rest.
+    if by_obsid:
+        undesignated = assoc["mpc_provid"].isna() & assoc["mpc_permid"].isna()
+        und = assoc[undesignated].reset_index(drop=True)
+        assoc = assoc[~undesignated].reset_index(drop=True)
 
     totalNumObs = len(assoc)
 
@@ -215,24 +247,89 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     df = assoc[["mpc_provid"]].merge(
         curid, left_on="mpc_provid", right_on="unpacked_secondary_provisional_designation", how="inner"
     )
+    # (the assignments below align on the index: a missing designation
+    # would silently shift every later row)
+    assert len(df) == len(assoc), (
+        f"{assoc['mpc_provid'].nunique() - df['mpc_provid'].nunique():,} designations "
+        f"({len(assoc) - len(df):,} observations) missing from current_identifications"
+    )
     assoc["mpc_provid"] = df["unpacked_primary_provisional_designation"]
     assoc["mpc_packed"] = df["packed_primary_provisional_designation"]
 
     assert len(assoc) == totalNumObs
 
-    # sort the association table by object
-    assoc.sort_values(["mpc_provid"], inplace=True)
+    mpcorb = pd.read_parquet(
+        f"{input_dir}/mpc_orbits.parquet",
+        engine="pyarrow",
+        dtype_backend="pyarrow",
+        columns=[
+            "unpacked_primary_provisional_designation",
+            "packed_primary_provisional_designation",
+            "a",
+            "q",
+            "e",
+            "i",
+            "node",
+            "argperi",
+            "peri_time",
+            "mean_anomaly",
+            "epoch_mjd",
+            "h",
+            "g",
+        ],
+    ).set_index("unpacked_primary_provisional_designation", drop=False, verify_integrity=True)
 
-    # create the output array for SSSource
-    sss = np.zeros(totalNumObs, dtype=schema.SSSourceDtype)
-    sss.dtype.itemsize, len(sss), f"{sss.nbytes:,}"
+    # Rows without an orbit to compute ephemerides from: the undesignated
+    # ones and, on the obsid path, designated objects missing from
+    # mpc_orbits (which the Butler path treats as an error).
+    assoc["no_orbit"] = False
+    if by_obsid:
+        assoc["no_orbit"] = ~assoc["mpc_provid"].isin(mpcorb.index)
+        missing = assoc.loc[assoc["no_orbit"], "mpc_provid"]
+        print(f"{len(und):,} observations of undesignated objects; {len(missing):,} observations of "
+              f"{missing.nunique():,} designated objects without an orbit: {sorted(missing.unique())[:10]}")
+        und["no_orbit"] = True
+        assoc = pd.concat([assoc, und], ignore_index=True)
+        totalNumObs = len(assoc)
+
+    # sort the association table by object, those without an orbit last
+    assoc.sort_values(["no_orbit", "mpc_provid"], inplace=True)
+    n_orbit = int(np.sum(~assoc["no_orbit"].to_numpy(dtype=bool)))
+
+    # create the output array for SSSource, plus the DiaSource collection
+    # (from extract-submitted-sources; null for Butler DiaSources), which
+    # together with diaSourceId identifies the source, and the submitted
+    # tracklet: (submission_id, trksub), and MPC's finer trkid. These group
+    # the detections of undesignated objects. On the obsid path also the
+    # obsid (the key SSObject joins DiaSource on) and whether this row is
+    # the primary one of its source (the one SSObject counts).
+    tracklet = ("submission_id", "trksub", "trkid")
+    sss = np.zeros(totalNumObs, dtype=np.dtype(
+        schema.SSSourceDtype.descr + [("collection", object)] + [(c, object) for c in tracklet]
+        + [("obsid", object), ("primary", bool)]))
 
     #
     # construct SSSource -- start with easily vectorizable columns
     #
     sss["diaSourceId"] = assoc["diaSourceId"].values
-    sss["ssObjectId"] = util.packed_ascii_to_uint64_le(assoc["mpc_packed"])
-    sss["designation"] = assoc["mpc_provid"]
+    # (ssObjectId 0 and an empty designation for undesignated objects)
+    has_id = assoc["mpc_packed"].notna().to_numpy(dtype=bool)
+    sss["ssObjectId"][has_id] = util.packed_ascii_to_uint64_le(assoc["mpc_packed"][has_id])
+    sss["designation"] = assoc["mpc_provid"].fillna("")
+    if "collection" in dia.columns:
+        sss["collection"] = dia["collection"].iloc[assoc["dia_index"]].to_numpy(dtype=object, na_value=None)
+    else:
+        sss["collection"] = None
+    if by_obsid:
+        sss["obsid"] = dia["obsid"].iloc[assoc["dia_index"]].to_numpy(dtype=object)
+        sss["primary"] = dia["primary"].iloc[assoc["dia_index"]].to_numpy(dtype=bool)
+    else:
+        sss["obsid"] = None
+        sss["primary"] = True
+    for c in tracklet:
+        # (on the obsid path from dia: the obs_sbn row it is linked to)
+        src = dia[c].iloc[assoc["dia_index"]] if by_obsid else assoc.get(f"mpc_{c}")
+        sss[c] = None if src is None else src.to_numpy(dtype=object, na_value=None)
 
     df = dia[["ra", "dec", "midpointMjdTai"]].iloc[assoc["dia_index"]]
     ra, dec, t = (
@@ -267,27 +364,6 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     sss["galLon"] = gal.l
     sss["galLat"] = gal.b
 
-    mpcorb = pd.read_parquet(
-        f"{input_dir}/mpc_orbits.parquet",
-        engine="pyarrow",
-        dtype_backend="pyarrow",
-        columns=[
-            "unpacked_primary_provisional_designation",
-            "packed_primary_provisional_designation",
-            "a",
-            "q",
-            "e",
-            "i",
-            "node",
-            "argperi",
-            "peri_time",
-            "mean_anomaly",
-            "epoch_mjd",
-            "h",
-            "g",
-        ],
-    ).set_index("unpacked_primary_provisional_designation", drop=False, verify_integrity=True)
-
     # JPL planet and ASSIST asteroid ephemeris files, from the
     # SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables.
     ephem = open_ephem()
@@ -295,14 +371,23 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # compute_sssource_entry slices DiaSource rows per object; give it only
     # the columns it uses, numpy-backed, as taking rows of all ~85
     # pyarrow-backed columns dominated the per-object cost.
-    dia_eph = pd.DataFrame({c: dia[c].to_numpy() for c in ("ssObjectId", "midpointMjdTai", "ra", "dec")})
+    dia_eph = pd.DataFrame({c: dia[c].to_numpy() for c in ("midpointMjdTai", "ra", "dec")})
 
+    # ephemerides for the objects with orbits (the first n_orbit rows);
+    # every orbit-derived column of the rest is NaN.
     util.group_by(
-        [sss, assoc], "ssObjectId", partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem)
+        [sss[:n_orbit], assoc.iloc[:n_orbit]], "ssObjectId",
+        partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem),
     )
+    measured = ("elongation", "eclLambda", "eclBeta", "galLon", "galLat")
+    for name in sss.dtype.names:
+        if sss.dtype[name].kind == "f" and name not in measured:
+            sss[name][n_orbit:] = np.nan
 
-    totalNumObjects = np.unique(sss["ssObjectId"]).size
-    print(f"{totalNumObjects:,} unique objects with {len(sss):,} total observations.")
+    totalNumObjects = np.unique(sss["ssObjectId"][sss["ssObjectId"] != 0]).size
+    print(f"{totalNumObjects:,} unique objects with {len(sss):,} total observations "
+          f"({np.sum(sss['ssObjectId'] == 0):,} of them undesignated, "
+          f"{len(sss) - n_orbit:,} without an orbit).")
 
     util.struct_to_parquet(sss, f"{output_dir}/sssource.parquet")
 
