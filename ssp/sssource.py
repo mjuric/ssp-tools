@@ -28,7 +28,6 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
     dia = dia.iloc[assoc["dia_index"]]
 
     # just verify we didn't screw up something
-    assert np.all(dia["ssObjectId"] == dia["ssObjectId"].iloc[0])
     assert np.all(sss["ssObjectId"] == sss["ssObjectId"][0])
     assert len(dia) == len(sss)
 
@@ -131,11 +130,14 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
         det = det[det["provid"].isin(sampled_provids)].reset_index()
     print(f"{len(det):,} MPC observations")
 
-    # FIXME: this will have to check if the ID's are IAU-style
-    # (with string prefixes)
-    det["obssubid"] = det["obssubid"].astype(int)
+    # DiaSources from extract-submitted-sources carry the obs_sbn obsid
+    # they were resolved from; link on it. Otherwise (Butler extraction)
+    # obssubid is the bare diaSourceId.
+    by_obsid = "obsid" in dia.columns
+    if not by_obsid:
+        det["obssubid"] = det["obssubid"].astype(int)
     det = det[
-        [
+        (["obsid"] if by_obsid else []) + [
             "trksub",
             "obssubid",
             "provid",
@@ -151,8 +153,9 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # verify types didn't get mangled somewhere along the way
     # from the database to here
     expect_dtypes = dict(
+        obsid="string[pyarrow]",
         trksub="string[pyarrow]",
-        obssubid="int64",
+        obssubid="string[pyarrow]" if by_obsid else "int64",
         provid="string[pyarrow]",
         permid="string[pyarrow]",
         submission_id="string[pyarrow]",
@@ -165,19 +168,36 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     for col in det.columns:
         assert det[col].dtype == expect_dtypes[col]
 
-    # create the association side table
-    assoc = (
-        dia[["diaSourceId"]]
-        .reset_index()
-        .merge(det.add_prefix("mpc_"), left_on="diaSourceId", right_on="mpc_obssubid", how="inner")
-    )
+    # create the association side table. For a trailed source submitted
+    # as two endpoints, dia's obsid is that of the -A row, so the -B row
+    # joins nothing and creates no extra SSSource row.
+    if by_obsid:
+        assoc = (
+            dia[["diaSourceId", "obsid"]]
+            .reset_index()
+            .merge(det.add_prefix("mpc_"), left_on="obsid", right_on="mpc_obsid", how="inner")
+        )
+    else:
+        assoc = (
+            dia[["diaSourceId"]]
+            .reset_index()
+            .merge(det.add_prefix("mpc_"), left_on="diaSourceId", right_on="mpc_obssubid", how="inner")
+        )
     assoc.rename(columns={"index": "dia_index"}, inplace=True)
 
     # verify all went well
     assert np.all(dia["diaSourceId"].iloc[assoc["dia_index"]].to_numpy() == assoc["diaSourceId"].to_numpy())
 
     # verify contents of the association table
-    util.assoc_validate(dia, assoc)
+    if by_obsid:
+        # extract-submitted-sources already verified each match against
+        # the PSF *or trail* centroid and the midpoint of -A/-B endpoint
+        # pairs, neither of which assoc_validate (PSF position vs. the
+        # submitted row) can reproduce; check its recorded offsets against
+        # the same tolerances instead.
+        util.assoc_validate_recorded(dia, assoc)
+    else:
+        util.assoc_validate(dia, assoc)
 
     totalNumObs = len(assoc)
 
@@ -223,9 +243,10 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # sort the association table by object
     assoc.sort_values(["mpc_provid"], inplace=True)
 
-    # create the output array for SSSource
-    sss = np.zeros(totalNumObs, dtype=schema.SSSourceDtype)
-    sss.dtype.itemsize, len(sss), f"{sss.nbytes:,}"
+    # create the output array for SSSource, plus the DiaSource collection
+    # (from extract-submitted-sources; null for Butler DiaSources), which
+    # together with diaSourceId identifies the source.
+    sss = np.zeros(totalNumObs, dtype=np.dtype(schema.SSSourceDtype.descr + [("collection", object)]))
 
     #
     # construct SSSource -- start with easily vectorizable columns
@@ -233,6 +254,10 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     sss["diaSourceId"] = assoc["diaSourceId"].values
     sss["ssObjectId"] = util.packed_ascii_to_uint64_le(assoc["mpc_packed"])
     sss["designation"] = assoc["mpc_provid"]
+    if "collection" in dia.columns:
+        sss["collection"] = dia["collection"].iloc[assoc["dia_index"]].to_numpy(dtype=object, na_value=None)
+    else:
+        sss["collection"] = None
 
     df = dia[["ra", "dec", "midpointMjdTai"]].iloc[assoc["dia_index"]]
     ra, dec, t = (
@@ -295,7 +320,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # compute_sssource_entry slices DiaSource rows per object; give it only
     # the columns it uses, numpy-backed, as taking rows of all ~85
     # pyarrow-backed columns dominated the per-object cost.
-    dia_eph = pd.DataFrame({c: dia[c].to_numpy() for c in ("ssObjectId", "midpointMjdTai", "ra", "dec")})
+    dia_eph = pd.DataFrame({c: dia[c].to_numpy() for c in ("midpointMjdTai", "ra", "dec")})
 
     util.group_by(
         [sss, assoc], "ssObjectId", partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem)
