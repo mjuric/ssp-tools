@@ -71,9 +71,19 @@ def compute_ssobject_entry(
     # observation counts
     row["nObs"] = len(sss)
 
+    # extract the columns needed for per-band fits as numpy arrays once;
+    # selecting bands on these is much cheaper than filtering the
+    # (pyarrow-backed) frame six times per object.
+    bandCol = np.asarray(sss["dia_band"])
+    fitCols = {
+        col: np.asarray(sss[col]) for col in
+        ["dia_psfMag", "dia_psfMagErr", "phaseAngle", "topoRange", "helioRange"]
+    }
+
     # per band entries
     for band in "ugrizy":
-        df = sss[sss["dia_band"] == band]
+        inBand = bandCol == band
+        df = {col: arr[inBand] for col, arr in fitCols.items()}
 
         # set defaults for this band (equivalents of NULL)
         row[f'{band}_Chi2'] = np.nan
@@ -86,10 +96,11 @@ def compute_ssobject_entry(
         row[f'{band}_phaseAngleMin'] = np.nan
         row[f'{band}_phaseAngleMax'] = np.nan
 
-        nBandObs = len(df)
+        nBandObs = len(df["phaseAngle"])
         row[f"{band}_nObs"] = nBandObs
         if nBandObs > 0:
-            paMin, paMax = df["phaseAngle"].min(), df["phaseAngle"].max()
+            # nanmin/nanmax: skip nulls, like the pandas reductions
+            paMin, paMax = np.nanmin(df["phaseAngle"]), np.nanmax(df["phaseAngle"])
             row[f"{band}_phaseAngleMin"] = paMin
             row[f"{band}_phaseAngleMax"] = paMax
 

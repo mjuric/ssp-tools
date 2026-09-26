@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from ssp.photfit import HG12_model, fitHG12
+from ssp.photfit import HG12_model, fitHG12, _HG1G2_basis, _HG12_residuals_and_jac
 
 # Independently calculated test vectors for H=17.30, G12=0.42
 # 15 observations spanning phase angles 0.8-60 degrees
@@ -244,6 +244,72 @@ class TestHG12Model(unittest.TestCase):
             mag2, sigma2, PHASE_ANGLE, TDIST, rdist2,
         )
         self.assertAlmostEqual(result.H, H_TRUE, places=4)
+
+
+class TestHG12FastModel(unittest.TestCase):
+    """The precomputed-basis residuals and analytic Jacobian used by
+    fitHG12.
+    """
+
+    # phase angles in all three regimes: < 7.5, 7.5-30, > 30 deg
+    PHASE = np.deg2rad([0.2, 1.0, 3.3, 6.9, 7.6, 12.0, 21.0, 29.5, 31.0, 45.0, 70.0, 110.0])
+    G12S = [-0.2, 0.0, 0.1, 0.19, 0.21, 0.42, 0.8, 1.1]
+
+    def setUp(self):
+        rng = np.random.RandomState(7)
+        self.basis = _HG1G2_basis(self.PHASE)
+        self.sigma = rng.uniform(0.01, 0.2, len(self.PHASE))
+        self.mag = HG12_model(self.PHASE, [17.3, 0.42]) + rng.normal(0, 0.05, len(self.PHASE))
+
+    @staticmethod
+    def numericJac(f, x, h):
+        x = np.asarray(x, dtype=float)
+        cols = []
+        for k in range(len(x)):
+            dx = np.zeros_like(x)
+            dx[k] = h
+            cols.append((f(x + dx) - f(x - dx)) / (2 * h))
+        return np.column_stack(cols)
+
+    def testResidualsMatchHG12Model(self):
+        """Fast residuals equal those computed with HG12_model."""
+        residuals, _ = _HG12_residuals_and_jac(self.basis, self.mag, self.sigma)
+        for G12 in self.G12S:
+            expected = (self.mag - HG12_model(self.PHASE, [17.3, G12])) / self.sigma
+            np.testing.assert_allclose(residuals([17.3, G12]), expected, rtol=0, atol=1e-12)
+
+    def testFixedG12ResidualsMatchHG12Model(self):
+        """Fast fixed-G12 residuals equal those computed with
+        HG12_model.
+        """
+        for G12 in self.G12S:
+            residuals, _ = _HG12_residuals_and_jac(self.basis, self.mag, self.sigma, fixedG12=G12)
+            expected = (self.mag - HG12_model(self.PHASE, [17.3, G12])) / self.sigma
+            np.testing.assert_allclose(residuals([17.3]), expected, rtol=0, atol=1e-12)
+
+    def testJacobianMatchesFiniteDifference(self):
+        """Analytic Jacobian matches central differences on both sides
+        of the G12 = 0.2 branch.
+        """
+        residuals, jac = _HG12_residuals_and_jac(self.basis, self.mag, self.sigma)
+        for G12 in self.G12S:
+            x = [17.3, G12]
+            # step small enough to stay on one side of the branch
+            J_num = self.numericJac(residuals, x, 1e-6)
+            J = jac(x)
+            self.assertEqual(J.shape, (len(self.PHASE), 2))
+            np.testing.assert_allclose(J, J_num, rtol=1e-6, atol=1e-6)
+        # dr/dG12 must be nonzero for all phases below 30 deg and above
+        self.assertTrue(np.all(jac([17.3, 0.42])[:, 1] != 0))
+
+    def testFixedG12JacobianMatchesFiniteDifference(self):
+        """Analytic fixed-G12 Jacobian matches central differences."""
+        for G12 in self.G12S:
+            residuals, jac = _HG12_residuals_and_jac(self.basis, self.mag, self.sigma, fixedG12=G12)
+            J_num = self.numericJac(residuals, [17.3], 1e-6)
+            J = jac([17.3])
+            self.assertEqual(J.shape, (len(self.PHASE), 1))
+            np.testing.assert_allclose(J, J_num, rtol=1e-6, atol=1e-6)
 
 
 if __name__ == "__main__":

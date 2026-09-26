@@ -91,6 +91,71 @@ def HG12star_model(phase, params):
 
     return HG1G2_model(phase, [params[0], G1, G2])
 
+def _HG1G2_basis(phase):
+    """Evaluate the (Phi1, Phi2, Phi3) basis functions of the H,G1,G2
+    system, with the same piecewise definitions as ``HG1G2_model``.
+    ``phase`` is in radians.
+    """
+    phi_1_ev = phi_1(phase)
+    phi_2_ev = phi_2(phase)
+    phi_3_ev = phi_3(phase)
+
+    msk = phase < 7.5 * np.pi/180
+
+    phi_1_ev[msk] = 1-6*phase[msk]/np.pi
+    phi_2_ev[msk] = 1- 9 * phase[msk]/(5*np.pi)
+
+    phi_3_ev[phase > np.pi/6] = 0
+
+    return phi_1_ev, phi_2_ev, phi_3_ev
+
+def _HG12_G1G2(G12):
+    """Map G12 to (G1, G2) as in ``HG12_model``; also return the
+    derivatives dG1/dG12 and dG2/dG12 on the active branch.
+    """
+    if G12 >= 0.2:
+        a1, a2 = +0.9529, -0.6125
+        G1 = a1*G12 + 0.02162
+        G2 = a2*G12 + 0.5572
+    else:
+        a1, a2 = +0.7527, -0.9612
+        G1 = a1*G12 + 0.06164
+        G2 = a2*G12 + 0.6270
+
+    return G1, G2, a1, a2
+
+def _HG12_basis_model(basis, H, G12):
+    """HG12 reduced magnitudes from precomputed basis functions (see
+    ``_HG1G2_basis``). Returns (mag, F, dF/dG12), where
+    mag = H - 2.5 log10(F).
+    """
+    phi_1_ev, phi_2_ev, phi_3_ev = basis
+    G1, G2, a1, a2 = _HG12_G1G2(G12)
+    d1 = phi_1_ev - phi_3_ev
+    d2 = phi_2_ev - phi_3_ev
+    F = phi_3_ev + G1 * d1 + G2 * d2
+    return H - 2.5 * np.log10(F), F, a1 * d1 + a2 * d2
+
+def _HG12_residuals_and_jac(basis, mag, magSigma, fixedG12=None):
+    """Return (residuals, jac) callables for the HG12 fit of reduced
+    magnitudes ``mag``, with residual r = (mag - model) / magSigma.
+    The parameters are [H, G12], or [H] if ``fixedG12`` is set.
+    """
+    def residuals(params):
+        G12 = params[1] if fixedG12 is None else fixedG12
+        return (mag - _HG12_basis_model(basis, params[0], G12)[0]) / magSigma
+
+    def jac(params):
+        # dr/dH = -1/sigma; dr/dG12 = +(2.5/ln 10) (dF/dG12) / (F sigma)
+        dH = -1. / magSigma
+        if fixedG12 is not None:
+            return dH[:, np.newaxis]
+        _, F, dF = _HG12_basis_model(basis, params[0], params[1])
+        dG = (2.5 / np.log(10)) * dF / (F * magSigma)
+        return np.column_stack((dH, dG))
+
+    return residuals, jac
+
 def chi2(params, mag, phase, mag_err, model):
     pred = model(phase, params)
     return (mag - pred)/mag_err
@@ -190,22 +255,17 @@ def fitHG12(
     dmag = -5. * np.log10(tdist*rdist)
     mag = mag + dmag
 
-    if fixedG12 is not None:
-        def model(phase, params):
-            return HG12_model(phase, [params[0], fixedG12])
-
-        nparams = 1
-    else:
-        model = HG12_model
-        nparams = 2
+    nparams = 1 if fixedG12 is not None else 2
 
     phase_rad = np.deg2rad(phaseAngle)
     x0 = np.array(
         [mag[0]] + ([] if fixedG12 is not None else [0.1])
     )
 
-    def residuals(params):
-        return (mag - model(phase_rad, params)) / magSigma
+    # The basis functions depend only on the phase angles, so evaluate
+    # them once per fit; residuals and the analytic Jacobian reuse them.
+    basis = _HG1G2_basis(phase_rad)
+    residuals, jac = _HG12_residuals_and_jac(basis, mag, magSigma, fixedG12)
 
     # fit, suppressing warnings
     with warnings.catch_warnings():
@@ -214,7 +274,7 @@ def fitHG12(
         if nSigmaClip is not None and nobsv > nparams + 1:
             # Stage 1: robust fit with soft_l1 loss
             sol_robust = least_squares(
-                residuals, x0, loss='soft_l1', f_scale=1.0,
+                residuals, x0, jac=jac, loss='soft_l1', f_scale=1.0,
             )
             if not sol_robust.success:
                 return HG12FitResult(*(np.nan,) * 6, nobs=0)
@@ -230,16 +290,14 @@ def fitHG12(
             if nobsv <= nparams:
                 return HG12FitResult(*(np.nan,) * 6, nobs=0)
 
-            # Redefine residuals for clipped data
-            def residuals(params):
-                return (
-                    (mag - model(phase_rad, params)) / magSigma
-                )
+            # Redefine residuals (and basis) for clipped data
+            basis = _HG1G2_basis(phase_rad)
+            residuals, jac = _HG12_residuals_and_jac(basis, mag, magSigma, fixedG12)
 
             x0 = sol_robust.x
 
         # Final fit (linear loss for proper chi2/covariance)
-        sol = least_squares(residuals, x0, loss='linear')
+        sol = least_squares(residuals, x0, jac=jac, loss='linear')
 
         if not sol.success:
             return HG12FitResult(*(np.nan,) * 6, nobs=0)
