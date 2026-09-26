@@ -1,17 +1,21 @@
 import pandas as pd
 import numpy as np
+from functools import partial
 from . import photfit
 from . import util
 from . import schema
-from .moid import MOIDSolver, earth_orbit_J2000
+from .moid import MOIDSolver, earth_orbit
 import argparse
 import sys
 
 # The only columns we need from DiaSource.
+# TODO DM-53699: These column names should be taken from and/or checked to
+# match the DiaSource table definition in sdm_schemas
 DIA_COLUMNS = [
     "diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness",
     "band", "psfFlux", "psfFluxErr"
 ]
+DIA_DTYPES = [int, float, float, float, float, str, float, float]
 
 def nJy_to_mag(f_njy):
     """
@@ -47,7 +51,9 @@ def nJy_err_to_mag_err(f_njy, f_err_njy):
     """
     return 1.085736 * (f_err_njy / f_njy)
 
-def compute_ssobject_entry(row, sss):
+def compute_ssobject_entry(
+    row, sss, fixedG12=None, magSigmaFloor=0.0, nSigmaClip=None,
+):
     # just verify we didn't screw up something
     assert sss["ssObjectId"].nunique() == 1
 
@@ -70,13 +76,15 @@ def compute_ssobject_entry(row, sss):
         df = sss[sss["dia_band"] == band]
 
         # set defaults for this band (equivalents of NULL)
-        row[f'{band}_Chi2'] = -1
+        row[f'{band}_Chi2'] = np.nan
         row[f'{band}_G12'] = np.nan
         row[f'{band}_G12Err'] = np.nan
         row[f'{band}_H'] = np.nan
         row[f'{band}_H_{band}_G12_Cov'] = np.nan
         row[f'{band}_HErr'] = np.nan
-        row[f'{band}_nObsUsed'] = -1
+        row[f'{band}_nObsUsed'] = 0
+        row[f'{band}_phaseAngleMin'] = np.nan
+        row[f'{band}_phaseAngleMax'] = np.nan
 
         nBandObs = len(df)
         row[f"{band}_nObs"] = nBandObs
@@ -88,11 +96,13 @@ def compute_ssobject_entry(row, sss):
             if nBandObs > 1:
                 # do the absmag/slope fits, if there are at least two
                 # data points
-                H, G12, sigmaH, sigmaG12, covHG12, chi2dof, nobsv = \
-                    photfit.fitHG12(df["dia_psfMag"], df["dia_psfMagErr"],
-                                    df["phaseAngle"], df["topoRange"],
-                                    df["helioRange"])
-                nDof = 2
+                H, G12, sigmaH, sigmaG12, covHG12, chi2dof, nobsv = photfit.fitHG12(
+                    df["dia_psfMag"], df["dia_psfMagErr"],
+                    df["phaseAngle"], df["topoRange"], df["helioRange"],
+                    fixedG12=fixedG12, magSigmaFloor=magSigmaFloor,
+                    nSigmaClip=nSigmaClip,
+                )
+                nDof = nBandObs - (1 if fixedG12 is not None else 2)
                 # print(provID, band, H, G12, sigmaH, sigmaG12, covHG12,
                 #       chi2dof, nobsv)
 
@@ -116,7 +126,10 @@ def compute_ssobject_entry(row, sss):
     row["extendednessMax"] = sss["dia_extendedness"].max()
     row["extendednessMedian"] = sss["dia_extendedness"].median()
 
-def compute_ssobject(sss, dia, mpcorb):
+def compute_ssobject(
+    sss, dia, mpcorb, fixedG12=None, magSigmaFloor=0.0,
+    nSigmaClip=None,
+):
     """
     Compute solar system object properties by joining and processing
     SSSource, DiaSource, and MPC orbit data.
@@ -195,36 +208,44 @@ def compute_ssobject(sss, dia, mpcorb):
     obj = np.zeros(totalNumObjects, dtype=schema.SSObjectDtype)
 
     # compute per-object quantities
-    util.group_by([sss], "ssObjectId", compute_ssobject_entry, out=obj)
+    callback = partial(
+        compute_ssobject_entry, fixedG12=fixedG12,
+        magSigmaFloor=magSigmaFloor, nSigmaClip=nSigmaClip,
+    )
+    util.group_by([sss], "ssObjectId", callback, out=obj)
 
     #
     # compute columns that can be efficiently computed in a vector fashon
     #
     # Tisserand J
 
-    # inner join by provisional designation. We allow for some objects to be
-    # missing from mpcorb (this should not happen often, but it did in DP1).
-    # FIXME: at some point require that no objects are missing. I _think_ that
-    # shouldn't happen in normal operations.
-    oidx, midx = util.argjoin(obj["designation"].astype("U"),
-                         mpcorb["unpacked_primary_provisional_designation"].to_numpy().astype("U")
-                        )
-    assert np.all(mpcorb["unpacked_primary_provisional_designation"].take(midx) ==
-                obj["designation"][oidx].astype("U"))
-    q, e, i, node, argperi = util.unpack(mpcorb["q e i node argperi".split()].take(midx))
-    a = q / (1. - e)
-    obj["tisserand_J"][oidx] = util.tisserand_jupiter(a, e, i)
+    if mpcorb is not None:
+        # inner join by provisional designation. We allow for some objects to be
+        # missing from mpcorb (this should not happen often, but it did in DP1).
+        # FIXME: at some point require that no objects are missing. I _think_ that
+        # shouldn't happen in normal operations.
+        oidx, midx = util.argjoin(obj["designation"].astype("U"),
+                             mpcorb["unpacked_primary_provisional_designation"].to_numpy().astype("U")
+                            )
+        assert np.all(mpcorb["unpacked_primary_provisional_designation"].take(midx) ==
+                    obj["designation"][oidx].astype("U"))
+        q, e, i, node, argperi, epoch_mjd = util.unpack(
+            mpcorb["q e i node argperi epoch_mjd".split()].take(midx)
+        )
+        a = q / (1. - e)
+        obj["tisserand_J"][oidx] = util.tisserand_jupiter(a, e, i)
 
-    # MOID computation
-    solver = MOIDSolver()
-    for i, el_obj in enumerate(zip(a, e, i, node, argperi)):
-        (moid, deltaV, eclon, trueEarth, trueObject) = solver.compute(earth_orbit_J2000(), el_obj)
-        row = obj[oidx[i]]
-        row["MOIDEarth"] = moid
-        row["MOIDEarthDeltaV"] = deltaV
-        row["MOIDEarthEclipticLongitude"] = eclon
-        row["MOIDEarthTrueAnomaly"] = trueEarth
-        row["MOIDEarthTrueAnomalyObject"] = trueObject
+        # MOID computation
+        solver = MOIDSolver()
+        for i, el_obj in enumerate(zip(a, e, i, node, argperi)):
+            earth = earth_orbit(epoch_mjd[i])
+            (moid, deltaV, eclon, trueEarth, trueObject) = solver.compute(earth, el_obj)
+            row = obj[oidx[i]]
+            row["MOIDEarth"] = moid
+            row["MOIDEarthDeltaV"] = deltaV
+            row["MOIDEarthEclipticLongitude"] = eclon
+            row["MOIDEarthTrueAnomaly"] = trueEarth
+            row["MOIDEarthTrueAnomalyObject"] = trueObject
 
     return obj
 
@@ -263,6 +284,33 @@ Examples:
         "--reraise",
         action="store_true",
         help="Re-raise exceptions instead of exiting gracefully (for debugging)"
+    )
+    parser.add_argument(
+        "--hg12FixedG12",
+        type=float,
+        default=None,
+        help=(
+            "If set, fix the G12 slope parameter to this value and "
+            "only fit H. If unset, both H and G12 are fit."
+        ),
+    )
+    parser.add_argument(
+        "--hg12MagSigmaFloor",
+        type=float,
+        default=0.0,
+        help=(
+            "Systematic magnitude error floor (mag) added in quadrature "
+            "to measurement errors before HG12 fitting."
+        ),
+    )
+    parser.add_argument(
+        "--hg12NSigmaClip",
+        type=float,
+        default=None,
+        help=(
+            "If set, reject outliers beyond this many sigma after an "
+            "initial robust fit. If unset, no clipping."
+        ),
     )
 
     args = parser.parse_args()
@@ -303,7 +351,12 @@ Examples:
 
         # Compute SSObject
         print("Computing SSObject data...")
-        obj = compute_ssobject(sss, dia, mpcorb)
+        obj = compute_ssobject(
+            sss, dia, mpcorb,
+            fixedG12=args.hg12FixedG12,
+            magSigmaFloor=args.hg12MagSigmaFloor,
+            nSigmaClip=args.hg12NSigmaClip,
+        )
 
         # Save result
         print(f"Saving {len(obj):,} SSObject rows to {args.output}...")

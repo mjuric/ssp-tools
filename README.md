@@ -33,9 +33,27 @@ Or with dev dependencies:
 pip install -e ".[dev]"
 ```
 
-Or with all optional dependencies (includes jorbit, requires JAX):
+Or with all optional dependencies (includes ASSIST/REBOUND for ephemerides):
 ```bash
 pip install -e ".[all]"
+```
+
+With [uv](https://docs.astral.sh/uv/), using the committed lockfile:
+```bash
+uv sync --extra dev --extra all
+uv run pytest
+```
+
+### Ephemeris data files
+
+SSSource ephemerides are computed with [ASSIST](https://assist.readthedocs.io),
+which needs the JPL DE440 planet file (`linux_p1550p2650.440`) and the ASSIST
+asteroid perturber file (`sb441-n16.bsp`). Point these environment variables
+at them:
+
+```bash
+export SSP_ASSIST_PLANETS=/path/to/linux_p1550p2650.440
+export SSP_ASSIST_ASTEROIDS=/path/to/sb441-n16.bsp
 ```
 
 ## Configuration
@@ -190,6 +208,45 @@ extract-catalog dia_sources.parquet /repo/main LSSTCam/runs/DRP/FL/w_2025_19/DM-
 ```
 
 The resulting Parquet file is optimized for downstream columnar analytics (Arrow / DuckDB / Spark) and predicate pushdown.
+
+### SSSource Table Construction
+
+`python -m ssp.sssource` builds the SSSource table (one row per DiaSource
+associated with a known solar system object). It links DiaSources to MPC
+designations through the MPC observations table, then computes per-source
+ephemerides with ASSIST from the MPC orbits: predicted positions, on-sky rates
+and offsets from the measured positions; heliocentric and topocentric
+positions, velocities and ranges at light-emission time; phase angle and
+predicted V magnitude. The geometry follows JPL Horizons conventions (see
+`ssp/ephem_assist.py`), and `bench/ephem_bench.py` checks it against Horizons.
+
+Inputs, read from `--input-dir` (default `./analysis/inputs`):
+- `dia_sources.parquet` – DiaSources (e.g. from `extract-catalog`)
+- `obs_sbn.parquet` – MPC observations from Rubin (`stn='X05'`)
+- `numbered_identifications.parquet`, `current_identifications.parquet` – MPC designation tables
+- `mpc_orbits.parquet` – MPC orbits
+
+The MPC tables can be exported with `fast-export --config examples/exports.yaml`.
+The ASSIST data files must be configured as described under
+[Ephemeris data files](#ephemeris-data-files).
+
+```bash
+python -m ssp.sssource                               # all objects -> ./analysis/outputs/sssource.parquet
+python -m ssp.sssource --max-objects 10              # quick test on 10 random objects
+python -m ssp.sssource --input-dir in/ --output-dir out/
+```
+
+Options: `--max-objects N` and `--dia-sample-frac F` subsample the inputs for
+testing (`--seed` sets the random seed); `--reraise` re-raises exceptions for
+debugging.
+
+An end-to-end run is SSSource followed by SSObject:
+
+```bash
+python -m ssp.sssource
+ssp-build-ssobject analysis/outputs/sssource.parquet analysis/inputs/dia_sources.parquet \
+  analysis/inputs/mpc_orbits.parquet --output analysis/outputs/ssobject.parquet
+```
 
 ### SSObject Table Construction
 

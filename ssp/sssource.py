@@ -1,15 +1,28 @@
-import pandas as pd
-import numpy as np
+import argparse
+import sys
+
+from astropy.coordinates import (
+    SkyCoord,
+    HeliocentricEclipticIAU76,
+)
 from astropy.time import Time
+import astropy.units as u
+from functools import partial
+import numpy as np
+import pandas as pd
 
 from . import util, schema
-from .photfit import hg_V_mag, phase_angle_deg
-from .ephem import _aux_compute_ephemerides
+from .photfit import hg_V_mag
+from .ephem_assist import compute_ephemerides_one, open_ephem
 
-def compute_sssource_entry(sss, assoc, mpcorb, dia):
-    from astropy.coordinates import get_body_barycentric_posvel, solar_system_ephemeris
-    import astropy.units as u
-    kms = u.km/u.s
+
+def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
+    """Fill the ephemeris-derived SSSource columns for one object.
+
+    ``mpcorb`` must be indexed by unpacked_primary_provisional_designation;
+    ``assoc`` must carry the observer's barycentric state per observation
+    (obs_x/y/z [AU], obs_vx/vy/vz [km/s]).
+    """
 
     # extract only the subset of observations related to this object
     dia = dia.iloc[assoc["dia_index"]]
@@ -21,106 +34,119 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia):
 
     provID = sss["designation"][0]
     ephTimes = Time(dia["midpointMjdTai"].values, format="mjd", scale="tai")
-    eph, (H, G), xx, vv, obs, mu_lon, mu_lat, mu = _aux_compute_ephemerides(provID, ephTimes, mpcorb)
+    e = compute_ephemerides_one(
+        provID,
+        ephTimes,
+        None,
+        ephem,
+        row=mpcorb.loc[provID],
+        obs_pos=assoc[["obs_x", "obs_y", "obs_z"]].to_numpy().T,
+        obs_vel=assoc[["obs_vx", "obs_vy", "obs_vz"]].to_numpy().T,
+    )
 
-    sss["ephRateRa"] = mu_lon.value
-    sss["ephRateDec"] = mu_lat.value
-    sss["ephRate"] = mu.value
+    sss["ephRateRa"] = e.mu_lon
+    sss["ephRateDec"] = e.mu_lat
+    sss["ephRate"] = e.mu_total
 
-    # location/velocity of the Sun
-    with solar_system_ephemeris.set("de440"):
-        pos, vel = get_body_barycentric_posvel("sun", ephTimes)
-    hx, hy, hz = pos.x.to(u.au).value, pos.z.to(u.au).value, pos.z.to(u.au).value
-    hvx, hvy, hvz = vel.x.to(kms).value, vel.y.to(kms).value, vel.z.to(kms).value
-
-    # location/velocity of the observer
-    robs, vobs = util.observatory_barycentric_posvel("X05", ephTimes)
-    robs = robs.to(u.au).value
-    vobs = vobs.to(u.km/u.s).value
-    #r_obs_sun = np.sqrt((robs * robs).sum(axis=0))
+    # Heliocentric and topocentric vectors are at light-emission time, per
+    # the SSSource schema, following JPL Horizons conventions (see
+    # ssp.ephem_assist.EphResult).
+    eph = SkyCoord(ra=e.ra_deg * u.deg, dec=e.dec_deg * u.deg, frame="icrs")
 
     sss["ephRa"] = eph.ra.deg
     sss["ephDec"] = eph.dec.deg
     obsv = SkyCoord(ra=dia["ra"], dec=dia["dec"], unit="deg", frame="icrs")
 
     sss["ephOffsetDec"] = (dia["dec"].to_numpy() - sss["ephDec"]) * 3600
-    sss["ephOffsetRa"]  = (dia["ra"].to_numpy() - sss["ephRa"]) * np.cos(np.deg2rad(sss["ephDec"])) * 3600
-    sss["ephOffset"]    = eph.separation(obsv).arcsec
+    sss["ephOffsetRa"] = (dia["ra"].to_numpy() - sss["ephRa"]) * np.cos(np.deg2rad(sss["ephDec"])) * 3600
+    sss["ephOffset"] = eph.separation(obsv).arcsec
 
     # Compute heliocentric position components
-    sss["helio_x"] = xx[0] - hx
-    sss["helio_y"] = xx[1] - hy
-    sss["helio_z"] = xx[2] - hz
-    sss["helioRange"] = np.sqrt(sss["helio_x"]**2 +
-                                      sss["helio_y"]**2 +
-                                      sss["helio_z"]**2)
+    sss["helio_x"] = e.helio_pos[0]
+    sss["helio_y"] = e.helio_pos[1]
+    sss["helio_z"] = e.helio_pos[2]
+    sss["helioRange"] = np.sqrt(sss["helio_x"] ** 2 + sss["helio_y"] ** 2 + sss["helio_z"] ** 2)
 
     # Compute heliocentric velocity components
-    sss["helio_vx"] = vv[0] - hvx
-    sss["helio_vy"] = vv[1] - hvy
-    sss["helio_vz"] = vv[2] - hvz
-    sss["helio_vtot"] = np.sqrt(sss["helio_vx"]**2 + sss["helio_vy"]**2 + sss["helio_vz"]**2)
+    sss["helio_vx"] = e.helio_vel[0]
+    sss["helio_vy"] = e.helio_vel[1]
+    sss["helio_vz"] = e.helio_vel[2]
+    sss["helio_vtot"] = np.sqrt(sss["helio_vx"] ** 2 + sss["helio_vy"] ** 2 + sss["helio_vz"] ** 2)
 
     # Compute heliocentric radial velocity: dot product of velocity
     # and unit position vector
-    sss["helioRangeRate"] = (sss["helio_vx"] * sss["helio_x"] +
-                               sss["helio_vy"] * sss["helio_y"] +
-                               sss["helio_vz"] * sss["helio_z"]) / sss["helioRange"]
+    sss["helioRangeRate"] = (
+        sss["helio_vx"] * sss["helio_x"] + sss["helio_vy"] * sss["helio_y"] + sss["helio_vz"] * sss["helio_z"]
+    ) / sss["helioRange"]
 
     # Compute topocentric position components
-    sss["topo_x"] = xx[0] - obs[0]
-    sss["topo_y"] = xx[1] - obs[1]
-    sss["topo_z"] = xx[2] - obs[2]
-    sss["topoRange"] = np.sqrt(sss["topo_x"]**2 + sss["topo_y"]**2 + sss["topo_z"]**2)
+    sss["topo_x"] = e.topo_pos[0]
+    sss["topo_y"] = e.topo_pos[1]
+    sss["topo_z"] = e.topo_pos[2]
+    sss["topoRange"] = np.sqrt(sss["topo_x"] ** 2 + sss["topo_y"] ** 2 + sss["topo_z"] ** 2)
 
     # Compute topocentric velocity components
-    sss["topo_vx"] = vv[0] - vobs[0]
-    sss["topo_vy"] = vv[1] - vobs[1]
-    sss["topo_vz"] = vv[2] - vobs[2]
-    sss["topo_vtot"] = np.sqrt(sss["topo_vx"]**2 + sss["topo_vy"]**2 + sss["topo_vz"]**2)
+    sss["topo_vx"] = e.topo_vel[0]
+    sss["topo_vy"] = e.topo_vel[1]
+    sss["topo_vz"] = e.topo_vel[2]
+    sss["topo_vtot"] = np.sqrt(sss["topo_vx"] ** 2 + sss["topo_vy"] ** 2 + sss["topo_vz"] ** 2)
 
     # Compute topocentric radial velocity: dot product of velocity
     # and unit position vector
-    sss["topoRangeRate"] = (sss["topo_vx"] * sss["topo_x"] +
-                              sss["topo_vy"] * sss["topo_y"] +
-                              sss["topo_vz"] * sss["topo_z"]) / sss["topoRange"]
+    sss["topoRangeRate"] = (
+        sss["topo_vx"] * sss["topo_x"] + sss["topo_vy"] * sss["topo_y"] + sss["topo_vz"] * sss["topo_z"]
+    ) / sss["topoRange"]
 
-    sss["phaseAngle"] = phase_deg = phase_angle_deg(xx, obs)
+    sss["phaseAngle"] = e.phase_angle
 
-    sss["ephVmag"] = hg_V_mag(H, G, sss["helioRange"], sss["topoRange"], phase_deg)
+    sss["ephVmag"] = hg_V_mag(e.H, e.G, sss["helioRange"], sss["topoRange"], e.phase_angle)
 
-    max_sep = np.max(sss['ephOffset'])
-    med_sep = np.median(sss['ephOffset'])
+    max_sep = np.max(sss["ephOffset"])
+    med_sep = np.median(sss["ephOffset"])
     print(f"{provID}: max/median separation: {max_sep:.4f}, {med_sep:.4f} arcsec")
 
 
-if __name__ == "__main__":
-    input_dir = "./analysis/inputs"
-    output_dir = "./analysis/outputs"
+def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0, seed=42):
+    """Build ``{output_dir}/sssource.parquet`` from the DiaSource, MPC
+    observation (obs_sbn), identification and orbit tables in ``input_dir``.
 
-    dia = pd.read_parquet(f'{input_dir}/dia_sources.parquet',
-                          engine="pyarrow", dtype_backend="pyarrow"
-                          ).reset_index(drop=True)
-    # DEBUG: while debugging, remove some indices and resort the array
-    dia = dia.sample(frac=0.9, random_state=42).reset_index(drop=True)
+    ``max_objects`` and ``dia_sample_frac`` subsample the inputs, for
+    testing.
+    """
+    dia = pd.read_parquet(
+        f"{input_dir}/dia_sources.parquet", engine="pyarrow", dtype_backend="pyarrow"
+    ).reset_index(drop=True)
+    if dia_sample_frac < 1.0:
+        # Testing aid: drop some DIA sources and shuffle the rest, to
+        # exercise the association logic with missing / unsorted indices.
+        dia = dia.sample(frac=dia_sample_frac, random_state=seed).reset_index(drop=True)
 
+    det = pd.read_parquet(
+        f"{input_dir}/obs_sbn.parquet", engine="pyarrow", dtype_backend="pyarrow"
+    ).reset_index()
 
-
-
-    det = pd.read_parquet(f'{input_dir}/obs_sbn.parquet',
-                          engine="pyarrow", dtype_backend="pyarrow"
-                          ).reset_index()
-
-    # DEBUG: cut this down to a much smaller table
-    sampled_provids = det['provid'].drop_duplicates().sample(10, random_state=42)
-    det = det[det['provid'].isin(sampled_provids)].reset_index()
-    print(len(det))
+    if max_objects is not None:
+        # Testing aid: keep only a random subset of objects.
+        sampled_provids = det["provid"].drop_duplicates().sample(max_objects, random_state=seed)
+        det = det[det["provid"].isin(sampled_provids)].reset_index()
+    print(f"{len(det):,} MPC observations")
 
     # FIXME: this will have to check if the ID's are IAU-style
     # (with string prefixes)
     det["obssubid"] = det["obssubid"].astype(int)
-    det = det[["trksub", "obssubid", "provid", "permid", "submission_id",
-               "ra", "dec", "obstime", "designation_asterisk"]].copy()
+    det = det[
+        [
+            "trksub",
+            "obssubid",
+            "provid",
+            "permid",
+            "submission_id",
+            "ra",
+            "dec",
+            "obstime",
+            "designation_asterisk",
+        ]
+    ].copy()
 
     # verify types didn't get mangled somewhere along the way
     # from the database to here
@@ -139,13 +165,13 @@ if __name__ == "__main__":
     for col in det.columns:
         assert det[col].dtype == expect_dtypes[col]
 
-
-
     # create the association side table
-    assoc = dia[["diaSourceId"]].reset_index().merge(
-        det.add_prefix("mpc_"), left_on="diaSourceId",
-        right_on="mpc_obssubid", how="inner")
-    assoc.rename(columns={'index': 'dia_index'}, inplace=True)
+    assoc = (
+        dia[["diaSourceId"]]
+        .reset_index()
+        .merge(det.add_prefix("mpc_"), left_on="diaSourceId", right_on="mpc_obssubid", how="inner")
+    )
+    assoc.rename(columns={"index": "dia_index"}, inplace=True)
 
     # verify all went well
     assert np.all(dia["diaSourceId"].iloc[assoc["dia_index"]].to_numpy() == assoc["diaSourceId"].to_numpy())
@@ -155,20 +181,22 @@ if __name__ == "__main__":
 
     totalNumObs = len(assoc)
 
-
-
     numid = pd.read_parquet(
-        f'{input_dir}/numbered_identifications.parquet',
+        f"{input_dir}/numbered_identifications.parquet",
         engine="pyarrow",
         columns=["permid", "unpacked_primary_provisional_designation"],
-        dtype_backend="pyarrow").reset_index(drop=True)
+        dtype_backend="pyarrow",
+    ).reset_index(drop=True)
     curid = pd.read_parquet(
-        f'{input_dir}/current_identifications.parquet',
-        engine="pyarrow", dtype_backend="pyarrow",
-        columns=["unpacked_primary_provisional_designation",
-                 "unpacked_secondary_provisional_designation",
-                 "packed_primary_provisional_designation"]
-        ).reset_index(drop=True)
+        f"{input_dir}/current_identifications.parquet",
+        engine="pyarrow",
+        dtype_backend="pyarrow",
+        columns=[
+            "unpacked_primary_provisional_designation",
+            "unpacked_secondary_provisional_designation",
+            "packed_primary_provisional_designation",
+        ],
+    ).reset_index(drop=True)
 
     # First step: some numbered objects in `obs_sbn` don't have their
     # provID set. Restore it.
@@ -176,8 +204,8 @@ if __name__ == "__main__":
     assert len(df) == len(assoc)
 
     assoc["mpc_provid"] = assoc["mpc_provid"].where(
-        assoc["mpc_provid"].notna(),
-        df["unpacked_primary_provisional_designation"])
+        assoc["mpc_provid"].notna(), df["unpacked_primary_provisional_designation"]
+    )
 
     assert not assoc["mpc_provid"].isna().any()
     assert len(assoc) == totalNumObs
@@ -185,9 +213,8 @@ if __name__ == "__main__":
     # Second step: update provisional designations with the primary ones.
 
     df = assoc[["mpc_provid"]].merge(
-        curid, left_on="mpc_provid",
-        right_on="unpacked_secondary_provisional_designation",
-        how="inner")
+        curid, left_on="mpc_provid", right_on="unpacked_secondary_provisional_designation", how="inner"
+    )
     assoc["mpc_provid"] = df["unpacked_primary_provisional_designation"]
     assoc["mpc_packed"] = df["packed_primary_provisional_designation"]
 
@@ -208,42 +235,117 @@ if __name__ == "__main__":
     sss["designation"] = assoc["mpc_provid"]
 
     df = dia[["ra", "dec", "midpointMjdTai"]].iloc[assoc["dia_index"]]
-    ra, dec, t = (df["ra"].to_numpy(), df["dec"].to_numpy(),
-                  Time(df["midpointMjdTai"].to_numpy(),
-                       format="mjd", scale="tai"))
+    ra, dec, t = (
+        df["ra"].to_numpy(),
+        df["dec"].to_numpy(),
+        Time(df["midpointMjdTai"].to_numpy(), format="mjd", scale="tai"),
+    )
 
     sss["elongation"] = util.solar_elongation_ndarray(ra, dec, t)
 
+    # Observer barycentric state for every observation, carried per row of
+    # assoc so compute_sssource_entry gets its object's slice. It is
+    # computed once per unique time (all sources from a visit share one
+    # midpointMjdTai) in one vectorized call: the computation costs ~65 us
+    # per time plus a large fixed overhead per call.
+    tu, inv = np.unique(t.tai.mjd, return_inverse=True)
+    robs, vobs = util.observatory_barycentric_posvel("X05", Time(tu, format="mjd", scale="tai"))
+    robs = robs.to_value(u.au)[:, inv]
+    vobs = vobs.to_value(u.km / u.s)[:, inv]
+    for k, c in enumerate("xyz"):
+        assoc[f"obs_{c}"] = robs[k]
+        assoc[f"obs_v{c}"] = vobs[k]
+
     # FIXME: verify these coordinate transforms replicate IAU76 at JPL
-    from astropy.coordinates import SkyCoord, HeliocentricEclipticIAU76
-    import astropy.units as u
-    p = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, distance=1*u.au, frame='hcrs')
+    p = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, distance=1 * u.au, frame="hcrs")
     ecl = p.transform_to(HeliocentricEclipticIAU76)
-    p = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, distance=1*u.au, frame='icrs')
-    gal = p.transform_to('galactic')
+    p = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, distance=1 * u.au, frame="icrs")
+    gal = p.transform_to("galactic")
 
     sss["eclLambda"] = ecl.lon
     sss["eclBeta"] = ecl.lat
     sss["galLon"] = gal.l
     sss["galLat"] = gal.b
 
-
-
     mpcorb = pd.read_parquet(
-        f'{input_dir}/mpc_orbits.parquet', engine="pyarrow",
+        f"{input_dir}/mpc_orbits.parquet",
+        engine="pyarrow",
         dtype_backend="pyarrow",
-        columns=["unpacked_primary_provisional_designation",
-                 "packed_primary_provisional_designation", "a", "q", "e",
-                 "i", "node", "argperi", "peri_time", "mean_anomaly",
-                 "epoch_mjd", "h", "g"]
-        ).reset_index(drop=True)
+        columns=[
+            "unpacked_primary_provisional_designation",
+            "packed_primary_provisional_designation",
+            "a",
+            "q",
+            "e",
+            "i",
+            "node",
+            "argperi",
+            "peri_time",
+            "mean_anomaly",
+            "epoch_mjd",
+            "h",
+            "g",
+        ],
+    ).set_index("unpacked_primary_provisional_designation", drop=False, verify_integrity=True)
 
+    # JPL planet and ASSIST asteroid ephemeris files, from the
+    # SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables.
+    ephem = open_ephem()
 
-    from functools import partial
-    util.group_by([sss, assoc], "ssObjectId", partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia))
+    # compute_sssource_entry slices DiaSource rows per object; give it only
+    # the columns it uses, numpy-backed, as taking rows of all ~85
+    # pyarrow-backed columns dominated the per-object cost.
+    dia_eph = pd.DataFrame({c: dia[c].to_numpy() for c in ("ssObjectId", "midpointMjdTai", "ra", "dec")})
 
+    util.group_by(
+        [sss, assoc], "ssObjectId", partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem)
+    )
 
     totalNumObjects = np.unique(sss["ssObjectId"]).size
     print(f"{totalNumObjects:,} unique objects with {len(sss):,} total observations.")
 
     util.struct_to_parquet(sss, f"{output_dir}/sssource.parquet")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build the SSSource table from DiaSource and MPC Parquet files",
+        epilog=(
+            "Reads dia_sources, obs_sbn, numbered_identifications, "
+            "current_identifications and mpc_orbits .parquet files from the input "
+            "directory and writes sssource.parquet to the output directory. The ASSIST "
+            "ephemeris files are taken from the SSP_ASSIST_PLANETS and "
+            "SSP_ASSIST_ASTEROIDS environment variables."
+        ),
+    )
+    parser.add_argument("--input-dir", default="./analysis/inputs", help="Input directory (default: %(default)s)")
+    parser.add_argument("--output-dir", default="./analysis/outputs", help="Output directory (default: %(default)s)")
+    parser.add_argument(
+        "--max-objects", type=int, default=None,
+        help="Process only this many randomly chosen objects (default: all)",
+    )
+    parser.add_argument(
+        "--dia-sample-frac", type=float, default=1.0,
+        help="Randomly keep this fraction of DIA sources, shuffled (default: %(default)s)",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for subsampling (default: %(default)s)")
+    parser.add_argument(
+        "--reraise", action="store_true",
+        help="Re-raise exceptions instead of exiting gracefully (for debugging)",
+    )
+    args = parser.parse_args()
+
+    try:
+        build_sssource(
+            args.input_dir, args.output_dir,
+            max_objects=args.max_objects, dia_sample_frac=args.dia_sample_frac, seed=args.seed,
+        )
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        if args.reraise:
+            raise
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

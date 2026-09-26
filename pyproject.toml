@@ -18,6 +18,8 @@ dependencies = [
   "pandas>=1.5",
   "numpy>=1.21",
   "astropy>=5.0",
+  "astroquery>=0.4",
+  "jplephem>=2.15",
   "scipy>=1.7",
   "pyyaml>=6.0",
   "tqdm>=4.0",
@@ -27,8 +29,13 @@ dependencies = [
 dev = [
   "pytest>=8",
 ]
+assist = [
+  "assist",
+  "rebound",
+]
 all = [
-  "jorbit",
+  "assist",
+  "rebound",
 ]
 
 [project.scripts]
