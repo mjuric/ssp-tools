@@ -361,6 +361,10 @@ def run_geometry_check(rows, schedule, ephem):
       - deldot is the plain dot product dhat.(V_em - V_obs), without the
         (1 + dhat.V/c) light-time-rate factor (that variant is off by
         ~0.5 m/s).
+      - On-sky rates are the rates of change of the astrometric position,
+        which include the light-time rate factor (1 - dtau/dt); checked
+        against a central difference of Horizons astrometric RA/Dec at
+        t +- 60 s. Without that factor NEOs near Earth are off by ~1"/h.
       - Horizons' phi is the phase angle with the Sun direction aberrated by
         the target's heliocentric velocity (sunlight direction in the
         target's rest frame); ssp.ephem_assist.EphResult.phase_angle
@@ -369,7 +373,7 @@ def run_geometry_check(rows, schedule, ephem):
     res = {k: [] for k in (
         "state_pos_km", "state_vel_mm_s", "r_km", "rdot_mm_s", "delta_km",
         "deldot_dot_mm_s", "deldot_lt_mm_s", "lt_ms",
-        "phase_arcsec", "phase_geom_arcsec",
+        "phase_arcsec", "phase_geom_arcsec", "rate_arcsec_h", "rate_rel", "rate_ref_arcsec_h",
     )}
     by_id = rows.set_index("unpacked_primary_provisional_designation", drop=False)
     for pid, eph_times in schedule.items():
@@ -408,6 +412,26 @@ def run_geometry_check(rows, schedule, ephem):
         res["deldot_dot_mm_s"].append(np.abs(deldot_dot - cols["deldot"]) * 1e6)
         res["deldot_lt_mm_s"].append(np.abs(deldot_lt - cols["deldot"]) * 1e6)
         res["lt_ms"].append(np.abs(e.light_time * 86400e3 - cols["1-way_down_LT"] * 60e3))
+        # On-sky rates vs a central difference of Horizons astrometric
+        # positions at t +- 60 s. Two separate queries, since Horizons
+        # returns rows sorted by time and epochs < 120 s apart would
+        # otherwise interleave.
+        half = 60.0 / 86400.0
+        try:
+            ra0, dec0 = horizons_ephem(row, Time(eph_times.tai.mjd - half, format="mjd", scale="tai"))
+            ra1, dec1 = horizons_ephem(row, Time(eph_times.tai.mjd + half, format="mjd", scale="tai"))
+        except Exception as exc:
+            print(f"  Horizons rate fetch failed for {pid}: {exc}")
+        else:
+            dmid = np.deg2rad(0.5 * (dec0 + dec1))
+            dra = ((ra1 - ra0 + 540.0) % 360.0) - 180.0
+            h_lon = dra * np.cos(dmid) / (2 * half)          # deg/day
+            h_lat = (dec1 - dec0) / (2 * half)
+            drate = np.hypot(e.mu_lon - h_lon, e.mu_lat - h_lat) * 150.0  # arcsec/h
+            res["rate_arcsec_h"].append(drate)
+            res["rate_ref_arcsec_h"].append(np.hypot(h_lon, h_lat) * 150.0)
+            res["rate_rel"].append(drate / res["rate_ref_arcsec_h"][-1])
+
         res["phase_arcsec"].append(np.abs(e.phase_angle - cols["phi"]) * 3600.0)
         res["phase_geom_arcsec"].append(np.abs(phase_geom - cols["phi"]) * 3600.0)
     return {k: np.concatenate([np.atleast_1d(x) for x in v]) for k, v in res.items() if v}
@@ -534,6 +558,8 @@ def main():
                 "deldot_lt_mm_s": "deldot (with light-time rate) [mm/s]",
                 "lt_ms": "light time [ms]",
                 "phase_arcsec": "phase_angle vs phi [arcsec]",
+                "rate_arcsec_h": "on-sky rate vs Horizons c.d. [arcsec/h]",
+                "rate_rel": "on-sky rate, relative",
                 "phase_geom_arcsec": "(geometric phase vs phi, info) [arcsec]",
             }
             summary["geometry"] = {}
@@ -555,6 +581,12 @@ def main():
                 ("light time < 1 ms", np.max(g["lt_ms"]) < 1.0),
                 # phi is printed to 1e-4 deg (0.36"), so 0.5" allows for rounding.
                 ("phase_angle vs phi < 0.5 arcsec", np.max(g["phase_arcsec"]) < 0.5),
+                # 1e-3 "/h covers the reference's print noise (3.6 uas
+                # positions differenced over 120 s); 1e-5 x rate stays 10x
+                # below the ~1e-4 light-time-rate term (dropping it fails
+                # this gate at ~half the points).
+                ("on-sky rate < 1e-3\"/h + 1e-5 x rate",
+                 bool(np.all(g["rate_arcsec_h"] <= 1e-3 + 1e-5 * g["rate_ref_arcsec_h"]))),
             ]
             for name, ok in gates:
                 print(f"  Gate: {name:40s} {'PASS' if ok else 'FAIL'}")

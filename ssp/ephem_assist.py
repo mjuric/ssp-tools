@@ -21,7 +21,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from astropy.coordinates import SkyCoord
 from astropy.time import Time
 import astropy.units as u
 
@@ -401,6 +400,37 @@ def _phase_angle_deg(helio_pos, topo_pos, helio_vel_au_day):
     return np.degrees(np.arccos(cosph))
 
 
+def _sky_rates(rho, V_em, V_obs, ltrate: bool = True):
+    """On-sky rates of the astrometric position rho = X(t - tau) - O(t).
+
+    d(rho)/dt = V_em (1 - dtau/dt) - V_obs, with dtau/dt = d|rho|/dt / c
+    (``ltrate=False`` drops that factor, a ~1e-4 relative effect). The
+    rate of the unit vector u is (rho' - (u.rho') u) / |rho|, projected on
+    the local east (RA) and north (Dec) directions. Velocities in AU/day.
+
+    Returns (mu_lon, mu_lat, mu_total) in deg/day, where mu_lon includes
+    the cos(dec) factor.
+    """
+    d = np.sqrt(np.sum(rho * rho, axis=0))
+    u_ = rho / d
+    rel = V_em - V_obs
+    if ltrate:
+        # |rho|' (1 + u.V_em / c) = u.(V_em - V_obs)
+        ddot = np.sum(u_ * rel, axis=0) / (1.0 + np.sum(u_ * V_em, axis=0) / C_AU_PER_DAY)
+        rhodot = V_em * (1.0 - ddot / C_AU_PER_DAY) - V_obs
+    else:
+        rhodot = rel
+    udot = (rhodot - np.sum(u_ * rhodot, axis=0) * u_) / d   # rad/day
+    ra = np.arctan2(u_[1], u_[0])
+    dec = np.arcsin(np.clip(u_[2], -1.0, 1.0))
+    e_ra = np.array([-np.sin(ra), np.cos(ra), np.zeros_like(ra)])
+    e_dec = np.array([-np.sin(dec) * np.cos(ra), -np.sin(dec) * np.sin(ra), np.cos(dec)])
+    mu_lon = np.degrees(np.sum(udot * e_ra, axis=0))
+    mu_lat = np.degrees(np.sum(udot * e_dec, axis=0))
+    mu_total = np.degrees(np.sqrt(np.sum(udot * udot, axis=0)))
+    return mu_lon, mu_lat, mu_total
+
+
 def _vector_to_radec(rho):
     """ICRF unit vector to RA, Dec in degrees. ``rho`` is shape (3,) or (3, N)."""
     r = np.sqrt(np.sum(rho * rho, axis=0))
@@ -419,7 +449,6 @@ def compute_ephemerides_one(
     mpcorb: pd.DataFrame,
     ephem,
     observer_code: str = "X05",
-    rate_dt_seconds: float = 60.0,
     row=None,
     obs_pos: Optional[np.ndarray] = None,
     obs_vel: Optional[np.ndarray] = None,
@@ -502,30 +531,8 @@ def compute_ephemerides_one(
     topo_vel = V_em * au_day_to_km_s - v_obs
     phase_angle = _phase_angle_deg(helio_pos, topo_pos, V_em - sun_app_vel)
 
-    # Rates of motion via central difference at +- dt/2 ------------------
-    dt_day = rate_dt_seconds / 86400.0
-    t2_assist = t_assist + dt_day
-    X2, V2 = _propagate_one(X0_bary, V0_bary, t0_assist, t2_assist, ephem)
-    sun_pos2 = np.empty_like(sun_pos)
-    for k, t in enumerate(t2_assist):
-        s = ephem.get_particle("Sun", float(t))
-        sun_pos2[:, k] = (s.x, s.y, s.z)
-    # Observer position at t + dt
-    ephTimes2 = ephTimes + (rate_dt_seconds * u.s)
-    r_obs2_q, _ = util.observatory_barycentric_posvel(observer_code, ephTimes2)
-    r_obs2 = r_obs2_q.to(u.au).value
-    rho2 = _light_time_correct(X2, V2, sun_pos2, r_obs2)
-    ra2, dec2 = _vector_to_radec(rho2)
-
-    # Wrap RA differences across 0/360.
-    dra = ((ra2 - ra_deg + 540.0) % 360.0) - 180.0
-    cos_dec = np.cos(np.deg2rad(dec_deg))
-    mu_lon = (dra * cos_dec) / dt_day              # deg/day
-    mu_lat = (dec2 - dec_deg) / dt_day             # deg/day
-    # Great-circle separation between (ra1,dec1) and (ra2,dec2)
-    s1 = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
-    s2 = SkyCoord(ra=ra2 * u.deg, dec=dec2 * u.deg, frame="icrs")
-    mu_total = s1.separation(s2).to(u.deg).value / dt_day
+    # Rates of motion of the astrometric position, analytically --------
+    mu_lon, mu_lat, mu_total = _sky_rates(rho, V_em, v_obs / au_day_to_km_s)
 
     # Convert object velocity to km/s for caller compatibility.
     vv_km_s = (V * u.au / u.day).to(u.km / u.s).value
@@ -556,7 +563,6 @@ def compute_ephemerides_batch(
     planets_path: Optional[str] = None,
     asteroids_path: Optional[str] = None,
     observer_code: str = "X05",
-    rate_dt_seconds: float = 60.0,
 ) -> dict:
     """Batched form. ``schedule`` maps provID → astropy.Time array (TAI MJD).
 
@@ -569,6 +575,5 @@ def compute_ephemerides_batch(
         out[provID] = compute_ephemerides_one(
             provID, eph_times, mpcorb, ephem,
             observer_code=observer_code,
-            rate_dt_seconds=rate_dt_seconds,
         )
     return out

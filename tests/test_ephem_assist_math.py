@@ -19,6 +19,7 @@ from ssp.ephem_assist import (
     ecliptic_to_equatorial,
     _emission_state,
     _light_time_correct,
+    _sky_rates,
     _vector_to_radec,
 )
 
@@ -236,6 +237,29 @@ class TestLightTime(unittest.TestCase):
         np.testing.assert_allclose(X_em[:, 0], X_ex, rtol=0, atol=1e-12)
         # 1e-12 AU/day ~ 2 um/s: the dropped (1/2) jerk tau^2 velocity term
         np.testing.assert_allclose(V_em[:, 0], V_ex, rtol=0, atol=1e-12)
+
+
+class TestSkyRates(unittest.TestCase):
+
+    def test_transverse_motion(self):
+        """Object at (d, 0, 0) from a static observer moving at v along +y
+        (+RA) and w along +z (+Dec): rates are v/d and w/d; no radial motion
+        so the light-time-rate factor is 1."""
+        d, v, w = 2.0, 0.01, -0.004
+        rho = np.array([[d], [0.0], [0.0]])
+        mu_lon, mu_lat, mu_tot = _sky_rates(rho, np.array([[0.0], [v], [w]]), np.zeros((3, 1)))
+        self.assertAlmostEqual(mu_lon[0], np.degrees(v / d), places=12)
+        self.assertAlmostEqual(mu_lat[0], np.degrees(w / d), places=12)
+        self.assertAlmostEqual(mu_tot[0], np.degrees(np.hypot(v, w) / d), places=12)
+
+    def test_observer_motion_mirrors_object_motion(self):
+        """Observer moving at -v looks like the object moving at +v, except
+        for the light-time-rate factor, which only scales V_em."""
+        rho = np.array([[1.0], [2.0], [0.5]])
+        V = np.array([[0.003], [-0.01], [0.002]])
+        a = _sky_rates(rho, V, np.zeros((3, 1)), ltrate=False)
+        b = _sky_rates(rho, np.zeros((3, 1)), -V, ltrate=False)
+        np.testing.assert_allclose(np.ravel(a), np.ravel(b), rtol=1e-14)
 
 
 class TestVectorToRaDec(unittest.TestCase):
