@@ -137,7 +137,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     if not by_obsid:
         det["obssubid"] = det["obssubid"].astype(int)
     det = det[
-        (["obsid"] if by_obsid else []) + [
+        (["obsid"] if by_obsid else []) + (["trkid"] if "trkid" in det.columns else []) + [
             "trksub",
             "obssubid",
             "provid",
@@ -154,6 +154,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # from the database to here
     expect_dtypes = dict(
         obsid="string[pyarrow]",
+        trkid="string[pyarrow]",
         trksub="string[pyarrow]",
         obssubid="string[pyarrow]" if by_obsid else "int64",
         provid="string[pyarrow]",
@@ -296,8 +297,12 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
 
     # create the output array for SSSource, plus the DiaSource collection
     # (from extract-submitted-sources; null for Butler DiaSources), which
-    # together with diaSourceId identifies the source.
-    sss = np.zeros(totalNumObs, dtype=np.dtype(schema.SSSourceDtype.descr + [("collection", object)]))
+    # together with diaSourceId identifies the source, and the submitted
+    # tracklet: (submission_id, trksub), and MPC's finer trkid. These group
+    # the detections of undesignated objects.
+    tracklet = ("submission_id", "trksub", "trkid")
+    sss = np.zeros(totalNumObs, dtype=np.dtype(
+        schema.SSSourceDtype.descr + [("collection", object)] + [(c, object) for c in tracklet]))
 
     #
     # construct SSSource -- start with easily vectorizable columns
@@ -311,6 +316,10 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
         sss["collection"] = dia["collection"].iloc[assoc["dia_index"]].to_numpy(dtype=object, na_value=None)
     else:
         sss["collection"] = None
+    for c in tracklet:
+        # (on the obsid path from dia: the obs_sbn row it is linked to)
+        src = dia[c].iloc[assoc["dia_index"]] if by_obsid else assoc.get(f"mpc_{c}")
+        sss[c] = None if src is None else src.to_numpy(dtype=object, na_value=None)
 
     df = dia[["ra", "dec", "midpointMjdTai"]].iloc[assoc["dia_index"]]
     ra, dec, t = (

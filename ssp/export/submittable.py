@@ -95,14 +95,14 @@ REQUIRED_COLUMNS = {
 }
 
 # Columns build_output appends to the view's.
-EXTRA_COLUMNS = ["obsid", "obsid_b", "obssubid", "match", "sep_mas", "dt_ms", "dmag", "band_ok", "n_pass",
-                 "ambiguous"]
+EXTRA_COLUMNS = ["obsid", "obsid_b", "obssubid", "submission_id", "trksub", "trkid", "match", "sep_mas",
+                 "dt_ms", "dmag", "band_ok", "n_pass", "ambiguous"]
 
 # obs_sbn columns we read; the ones after "band" are only passed through
 # to the unresolved report.
 OBS_COLUMNS = [
     "obsid", "obssubid", "stn", "obstime", "ra", "dec", "mag", "band",
-    "trksub", "provid", "permid", "submission_id",
+    "trksub", "trkid", "provid", "permid", "submission_id",
 ]
 
 # LSST-<label>-<id>[-A|-B], or a bare <id>. The label is any string.
@@ -254,7 +254,8 @@ def load_obs(tbl):
     tbl = tbl.filter(pc.equal(tbl["stn"], "X05"))
     label, ids, part = parse_obssubid(tbl["obssubid"])
     obs = dict(row=np.arange(len(tbl)), obsid=tbl["obsid"].to_numpy(),
-               submission_id=tbl["submission_id"].to_numpy(),
+               submission_id=tbl["submission_id"].to_numpy(), trksub=tbl["trksub"].to_numpy(),
+               trkid=tbl["trkid"].to_numpy(),
                obssubid=pc.utf8_trim_whitespace(_arr(tbl["obssubid"])).to_numpy(zero_copy_only=False),
                label=label, id=ids, tai=utc_to_tai_mjd(tbl["obstime"]), band_stripped=strip_band(tbl["band"]))
     obs["ra"], obs["dec"], obs["mag"] = (_f64(tbl, c) for c in ("ra", "dec", "mag"))
@@ -518,6 +519,8 @@ def build_output(obs, cand, rows, ci, match, info):
         obsid=pa.array(obs["obsid"][rows], pa.string()),
         obsid_b=pa.array(obs["obsid_b"][rows], pa.string()),
         obssubid=pa.array(obs["obssubid"][rows], pa.string()),
+        # the submitted tracklet: (submission_id, trksub), and MPC's trkid
+        **{c: pa.array(obs[c][rows], pa.string()) for c in ("submission_id", "trksub", "trkid")},
         match=pa.array(match, pa.string()),
         sep_mas=info["sep_mas"], dt_ms=info["dt_ms"],
         dmag=pa.array(info["dmag"], pa.float64(), from_pandas=True),

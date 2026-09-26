@@ -244,7 +244,9 @@ Outputs:
   one row): all of the view's columns (`id` renamed to `diaSourceId`,
   `mjd_tai` to `midpointMjdTai`; DiaSource columns the view lacks, such as
   `extendedness`, are null), plus `obsid` (and `obsid_b` for A/B pairs),
-  `obssubid`, `match` (`id` or `position`) and the match diagnostics `sep_mas`,
+  `obssubid`, the submitted tracklet (`submission_id`, `trksub`, and MPC's
+  `trkid`) of that obs_sbn row, `match` (`id` or `position`) and the match
+  diagnostics `sep_mas`,
   `dt_ms`, `dmag`, `band_ok`, `n_pass`, `ambiguous`. `(collection, diaSourceId)`
   is unique: when one detection was submitted more than once, the row from
   the earliest submission (by `submission_id`) is kept.
@@ -255,7 +257,8 @@ Outputs:
   offset.
 
 `python -m ssp.sssource` links these DiaSources to obs_sbn by `obsid` (instead
-of `diaSourceId == obssubid`) and carries `collection` into SSSource. Detections
+of `diaSourceId == obssubid`) and carries `collection` and the tracklet columns
+(`submission_id`, `trksub`, `trkid`) into SSSource. Detections
 of undesignated objects (unidentified tracklets) are kept with `ssObjectId` 0,
 an empty designation and NaN orbit-derived columns, as are designated objects
 with no `mpc_orbits` orbit (but with their `ssObjectId`); neither gets an

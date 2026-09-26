@@ -211,9 +211,11 @@ def _scenario():
         # submitted band y, view says z: resolves, band_ok false
         dict(obsid="o3", obssubid="300", ra=12.0, dec=1.0, obstime=t, band="Ly", mag=20.0),
         # A/B trail pair; the view's trail centroid is the midpoint
-        dict(obsid="o4a", obssubid="LSST-AP-DS-400-A", ra=13.0, dec=1.0, obstime=t, band="Li", mag=19.0),
+        dict(obsid="o4a", obssubid="LSST-AP-DS-400-A", ra=13.0, dec=1.0, obstime=t, band="Li", mag=19.0,
+             submission_id="s4a", trksub="t4a", trkid="k4a"),
         dict(obsid="o4b", obssubid="LSST-AP-DS-400-B", ra=13.0, dec=1.0002,
-             obstime=t + datetime.timedelta(seconds=30), band="Li", mag=19.0),
+             obstime=t + datetime.timedelta(seconds=30), band="Li", mag=19.0,
+             submission_id="s4b", trksub="t4b", trkid="k4b"),
         # hand submission: no id, found by position
         dict(obsid="o5", obssubid="hand", ra=14.0, dec=1.0, obstime=t, band="Lr", mag=20.0),
         # unknown label -> no candidate -> found by position (in DP2-DS)
@@ -254,6 +256,7 @@ def test_extract_end_to_end(tmp_path):
     assert by["o3"]["band_ok"] is False and by["o3"]["dt_ms"] == pytest.approx(1.4, abs=1e-3)
     assert by["o4a"]["obsid_b"] == "o4b" and by["o4a"]["diaSourceId"] == 400
     assert by["o4a"]["sep_mas"] < 0.01 and abs(by["o4a"]["dt_ms"]) < 1e-3
+    assert (by["o4a"]["submission_id"], by["o4a"]["trksub"], by["o4a"]["trkid"]) == ("s4a", "t4a", "k4a")
     assert (by["o5"]["diaSourceId"], by["o5"]["match"]) == (500, "position")
     assert (by["o6"]["diaSourceId"], by["o6"]["match"]) == (601, "position")
 
@@ -279,8 +282,10 @@ def test_extract_double_submission(tmp_path):
     ms4 = datetime.timedelta(milliseconds=4)
     rows = [
         dict(obsid="Ltt1late", obssubid="100", submission_id="2026-04-25T01:36:42.617_0000BuRx",
+             trksub="late",
              ra=10.0, dec=1.0, obstime=T0 + ms4, band="Li", mag=20.0),
         dict(obsid="Lsa1early", obssubid="100", submission_id="2026-02-06T01:14:28.408_0000Bl6Z",
+             trksub="early",
              ra=10.0, dec=1.0, obstime=T0, band="Li", mag=20.0),
         dict(obsid="other", obssubid="101", submission_id="2026-04-25T01:36:42.617_0000BuRx",
              ra=11.0, dec=1.0, obstime=T0, band="Li", mag=20.0),
@@ -293,6 +298,7 @@ def test_extract_double_submission(tmp_path):
     assert S.extract(tmp_path / "obs.parquet", tmp_path / "dia.parquet", fake_fetch(view)) == 0
     out = pq.read_table(tmp_path / "dia.parquet")
     assert sorted(out["obsid"].to_pylist()) == ["Lsa1early", "other"]
+    assert out.filter(pc.equal(out["obsid"], "Lsa1early"))["trksub"].to_pylist() == ["early"]
     dups = pq.read_table(tmp_path / "dia.duplicates.parquet").to_pylist()
     assert len(dups) == 1
     d = dups[0]
@@ -317,7 +323,8 @@ def test_build_output_name_clash():
     info = dict(sep_mas=[0.0], dt_ms=[0.0], dmag=[0.0], band_ok=[True], n_pass=[1], ambiguous=[False])
     ok = S.build_output(o, view, np.array([0]), np.array([0]), ["id"], info)
     assert len(set(ok.column_names)) == len(ok.column_names)
-    for bad in (view.append_column("sep_mas", view["ra"]), view.append_column("diaSourceId", view["id"])):
+    for bad in (view.append_column("sep_mas", view["ra"]), view.append_column("diaSourceId", view["id"]),
+                view.append_column("trkid", view["band"])):
         with pytest.raises(ValueError, match="clash"):
             S.build_output(o, bad, np.array([0]), np.array([0]), ["id"], info)
 
