@@ -199,6 +199,13 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     else:
         util.assoc_validate(dia, assoc)
 
+    if by_obsid:
+        # obs_sbn also holds unidentified tracklets (status 'I', no provid
+        # nor permid); SSSource only covers identified objects.
+        unidentified = assoc["mpc_provid"].isna() & assoc["mpc_permid"].isna()
+        print(f"dropping {unidentified.sum():,} observations of unidentified objects (no provid, no permid)")
+        assoc = assoc[~unidentified].reset_index(drop=True)
+
     totalNumObs = len(assoc)
 
     numid = pd.read_parquet(
@@ -234,6 +241,12 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
 
     df = assoc[["mpc_provid"]].merge(
         curid, left_on="mpc_provid", right_on="unpacked_secondary_provisional_designation", how="inner"
+    )
+    # (the assignments below align on the index: a missing designation
+    # would silently shift every later row)
+    assert len(df) == len(assoc), (
+        f"{assoc['mpc_provid'].nunique() - df['mpc_provid'].nunique():,} designations "
+        f"({len(assoc) - len(df):,} observations) missing from current_identifications"
     )
     assoc["mpc_provid"] = df["unpacked_primary_provisional_designation"]
     assoc["mpc_packed"] = df["packed_primary_provisional_designation"]

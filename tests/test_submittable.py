@@ -272,22 +272,54 @@ def test_extract_end_to_end(tmp_path):
     assert sorted(unres) == ["o7", "o8"]
 
 
-def test_extract_duplicate_hard_stop(tmp_path, capsys):
-    # Two different obs rows resolving to the same (collection, id).
-    rows = [dict(obsid=f"o{k}", obssubid="LSST-DP2-DS-100", ra=10.0, dec=1.0, obstime=T0, band="r", mag=20.0)
-            for k in range(2)]
-    view = view_table([dict(collection="DP2-DS", id=100, band="r", mjd_tai=tai(T0), ra=10.0, dec=1.0)])
+def test_extract_double_submission(tmp_path):
+    # Like the real case: one detection submitted twice (two obsids, same
+    # bare obssubid, obstime 4 ms apart), in two submissions. The earliest
+    # submission's row is kept, the other goes to duplicates.parquet.
+    ms4 = datetime.timedelta(milliseconds=4)
+    rows = [
+        dict(obsid="Ltt1late", obssubid="100", submission_id="2026-04-25T01:36:42.617_0000BuRx",
+             ra=10.0, dec=1.0, obstime=T0 + ms4, band="Li", mag=20.0),
+        dict(obsid="Lsa1early", obssubid="100", submission_id="2026-02-06T01:14:28.408_0000Bl6Z",
+             ra=10.0, dec=1.0, obstime=T0, band="Li", mag=20.0),
+        dict(obsid="other", obssubid="101", submission_id="2026-04-25T01:36:42.617_0000BuRx",
+             ra=11.0, dec=1.0, obstime=T0, band="Li", mag=20.0),
+    ]
+    view = view_table([
+        dict(collection="NV-S", id=100, band="i", mjd_tai=tai(T0) + 2e-3 / 86400, ra=10.0, dec=1.0),
+        dict(collection="NV-S", id=101, band="i", mjd_tai=tai(T0), ra=11.0, dec=1.0),
+    ])
     pq.write_table(obs_table(rows), tmp_path / "obs.parquet")
-    rc = S.extract(tmp_path / "obs.parquet", tmp_path / "dia.parquet", fake_fetch(view))
-    assert rc != 0
-    assert not (tmp_path / "dia.parquet").exists()
-    assert not (tmp_path / "dia.unresolved.parquet").exists()
-    assert "o0" in capsys.readouterr().err
+    assert S.extract(tmp_path / "obs.parquet", tmp_path / "dia.parquet", fake_fetch(view)) == 0
+    out = pq.read_table(tmp_path / "dia.parquet")
+    assert sorted(out["obsid"].to_pylist()) == ["Lsa1early", "other"]
+    dups = pq.read_table(tmp_path / "dia.duplicates.parquet").to_pylist()
+    assert len(dups) == 1
+    d = dups[0]
+    assert (d["obsid"], d["kept_obsid"]) == ("Ltt1late", "Lsa1early")
+    assert (d["collection"], d["diaSourceId"]) == ("NV-S", 100)
+    assert d["dt_ms"] == pytest.approx(-2.0, abs=1e-3)
+    assert pq.read_table(tmp_path / "dia.unresolved.parquet").num_rows == 0
 
 
-def test_duplicate_keys():
-    t = pa.table(dict(collection=["A", "B", "A", "A"], diaSourceId=pa.array([1, 1, 2, 1], pa.int64())))
-    assert list(S.duplicate_keys(t)) == [0, 3]
+def test_dedupe_tiebreak():
+    t = pa.table(dict(collection=["A", "B", "A", "A"], diaSourceId=pa.array([1, 1, 2, 1], pa.int64()),
+                      obsid=["z", "y", "x", "w"]))
+    keep, drop, kept = S.dedupe(t, np.array(["2026-01", "2026-01", "2026-01", "2026-01"], dtype=object))
+    assert list(keep) == [1, 2, 3] and list(drop) == [0] and list(kept) == [3]
+    keep, drop, kept = S.dedupe(t, np.array(["2025-12", None, "2026-01", "2026-01"], dtype=object))
+    assert list(keep) == [0, 1, 2] and list(drop) == [3] and list(kept) == [0]
+
+
+def test_build_output_name_clash():
+    obs, view = _scenario()
+    o, _, _ = S.load_obs(obs)
+    info = dict(sep_mas=[0.0], dt_ms=[0.0], dmag=[0.0], band_ok=[True], n_pass=[1], ambiguous=[False])
+    ok = S.build_output(o, view, np.array([0]), np.array([0]), ["id"], info)
+    assert len(set(ok.column_names)) == len(ok.column_names)
+    for bad in (view.append_column("sep_mas", view["ra"]), view.append_column("diaSourceId", view["id"])):
+        with pytest.raises(ValueError, match="clash"):
+            S.build_output(o, bad, np.array([0]), np.array([0]), ["id"], info)
 
 
 def test_read_chpass(tmp_path):

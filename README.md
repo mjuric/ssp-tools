@@ -246,7 +246,10 @@ Outputs:
   `extendedness`, are null), plus `obsid` (and `obsid_b` for A/B pairs),
   `obssubid`, `match` (`id` or `position`) and the match diagnostics `sep_mas`,
   `dt_ms`, `dmag`, `band_ok`, `n_pass`, `ambiguous`. `(collection, diaSourceId)`
-  is unique; if it is not, nothing is written and the tool exits non-zero.
+  is unique: when one detection was submitted more than once, the row from
+  the earliest submission (by `submission_id`) is kept.
+- `dia_sources.duplicates.parquet` – the obs_sbn rows dropped that way, with
+  the `kept_obsid` and the source they claimed. They get no SSSource row.
 - `dia_sources.unresolved.parquet` – the obs_sbn rows that did not resolve,
   with a `reason` and the closest failing candidate's separation and time
   offset.

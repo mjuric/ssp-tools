@@ -94,6 +94,10 @@ REQUIRED_COLUMNS = {
     "extendedness": pa.float64(),
 }
 
+# Columns build_output appends to the view's.
+EXTRA_COLUMNS = ["obsid", "obsid_b", "obssubid", "match", "sep_mas", "dt_ms", "dmag", "band_ok", "n_pass",
+                 "ambiguous"]
+
 # obs_sbn columns we read; the ones after "band" are only passed through
 # to the unresolved report.
 OBS_COLUMNS = [
@@ -250,6 +254,7 @@ def load_obs(tbl):
     tbl = tbl.filter(pc.equal(tbl["stn"], "X05"))
     label, ids, part = parse_obssubid(tbl["obssubid"])
     obs = dict(row=np.arange(len(tbl)), obsid=tbl["obsid"].to_numpy(),
+               submission_id=tbl["submission_id"].to_numpy(),
                obssubid=pc.utf8_trim_whitespace(_arr(tbl["obssubid"])).to_numpy(zero_copy_only=False),
                label=label, id=ids, tai=utc_to_tai_mjd(tbl["obstime"]), band_stripped=strip_band(tbl["band"]))
     obs["ra"], obs["dec"], obs["mag"] = (_f64(tbl, c) for c in ("ra", "dec", "mag"))
@@ -498,8 +503,12 @@ def run_queries(tasks, host, port, database, user, workers):
 def build_output(obs, cand, rows, ci, match, info):
     """The dia_sources table: the winning view rows (all columns, renamed),
     required columns null-filled, plus linkage and match diagnostics."""
-    out = cand.take(pa.array(ci, pa.int64()))
-    out = out.rename_columns([RENAMES.get(c, c) for c in out.column_names])
+    names = [RENAMES.get(c, c) for c in cand.column_names]
+    clash = sorted({c for c in names if names.count(c) > 1} | (set(names) & set(EXTRA_COLUMNS)))
+    if clash:
+        raise ValueError(f"view columns {clash} clash (after renaming {RENAMES}) with each other "
+                         f"or with the columns this tool adds; refusing to write duplicate names")
+    out = cand.take(pa.array(ci, pa.int64())).rename_columns(names)
     for name, typ in REQUIRED_COLUMNS.items():
         if name not in out.column_names:
             out = out.append_column(name, pa.nulls(len(out), typ))
@@ -514,18 +523,34 @@ def build_output(obs, cand, rows, ci, match, info):
         dmag=pa.array(info["dmag"], pa.float64(), from_pandas=True),
         band_ok=info["band_ok"], n_pass=pa.array(info["n_pass"], pa.int32()), ambiguous=info["ambiguous"],
     )
+    assert list(extra) == EXTRA_COLUMNS
     for name, col in extra.items():
         out = out.append_column(name, pa.array(col))
     return out
 
 
-def duplicate_keys(out):
-    """Indices of output rows whose (collection, diaSourceId) is not unique."""
+def _codes(values):
+    """Sortable integer codes for a string array (None sorts last)."""
+    v = np.array(["\uffff" if x is None else x for x in values], dtype=object)
+    return np.unique(v.astype(str), return_inverse=True)[1]
+
+
+def dedupe(out, submission_id):
+    """One output row per (collection, diaSourceId).
+
+    The same detection can be submitted to the MPC more than once (e.g.
+    two submissions of one tracklet, both published). Keep the row whose
+    obs_sbn row came from the earliest submission (submission_id starts
+    with its ISO timestamp), tie-broken on obsid. Returns
+    ``(kept row indices, dropped row indices, index of the kept row for
+    each dropped one)``.
+    """
     code = pc.dictionary_encode(out["collection"]).combine_chunks().indices.to_numpy()
     ids = out["diaSourceId"].to_numpy()
-    order = np.lexsort((ids, code))
-    same = (code[order][1:] == code[order][:-1]) & (ids[order][1:] == ids[order][:-1])
-    return np.sort(order[np.r_[same, False] | np.r_[False, same]])
+    order = np.lexsort((_codes(out["obsid"].to_pylist()), _codes(submission_id), ids, code))
+    first = np.r_[True, (code[order][1:] != code[order][:-1]) | (ids[order][1:] != ids[order][:-1])]
+    group_first = order[np.flatnonzero(first)[np.cumsum(first) - 1]]
+    return np.sort(order[first]), order[~first], group_first[~first]
 
 
 def unresolved_table(obs, tbl, rows, best):
@@ -550,8 +575,9 @@ def _counts(values):
 
 def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250_000):
     """Resolve the X05 rows of ``obs_path`` against the view and write
-    ``out_path`` and ``<stem>.unresolved.parquet``. ``fetch`` runs a list
-    of query tasks (see ``run_queries``). Returns the exit code."""
+    ``out_path``, ``<stem>.unresolved.parquet`` and
+    ``<stem>.duplicates.parquet``. ``fetch`` runs a list of query tasks
+    (see ``run_queries``). Returns the exit code."""
     timings = {}
     t0 = time.time()
 
@@ -623,15 +649,17 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     out = build_output(obs, cand, rows_all[order], np.concatenate([c_id, c_pos])[order], match[order],
                        {k: v[order] for k, v in info.items()})
 
-    dup = duplicate_keys(out)
-    if len(dup):
-        print(f"FATAL: {len(dup):,} output rows share a (collection, diaSourceId); nothing written.",
-              file=sys.stderr)
-        cols = ["obsid", "obssubid", "collection", "diaSourceId", "sep_mas", "dt_ms"]
-        d = out.take(pa.array(dup)).select(cols)
-        for r in d.sort_by([("collection", "ascending"), ("diaSourceId", "ascending")]).to_pylist():
-            print("  ", r, file=sys.stderr)
-        return 1
+    # Sources claimed by more than one obs_sbn row: keep the earliest
+    # submission's, report the rest (they get no SSSource row).
+    rows_all = rows_all[order]
+    keep, drop, kept = dedupe(out, obs["submission_id"][rows_all])
+    dups = tbl.take(pa.array(obs["row"][rows_all[drop]], pa.int64())).drop_columns(["stn"])
+    dups = dups.append_column("kept_obsid", out["obsid"].take(pa.array(kept, pa.int64())))
+    for c in ("collection", "diaSourceId", "sep_mas", "dt_ms"):
+        dups = dups.append_column(c, out[c].take(pa.array(drop, pa.int64())))
+    n_dup_sources = len(np.unique(kept))
+    out = out.take(pa.array(keep, pa.int64()))
+    assert len(dedupe(out, obs["submission_id"][rows_all[keep]])[1]) == 0
 
     resolved = np.zeros(n, dtype=bool)
     resolved[rows_all] = True
@@ -639,6 +667,7 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     stem = str(out_path)[:-8] if str(out_path).endswith(".parquet") else str(out_path)
     pq.write_table(out, out_path, compression="zstd")
     pq.write_table(unres, f"{stem}.unresolved.parquet", compression="zstd")
+    pq.write_table(dups, f"{stem}.duplicates.parquet", compression="zstd")
     timings["assemble + write"] = time.time() - t0
 
     print(f"\nobs_sbn X05 rows read:            {n_x05:,}")
@@ -647,6 +676,8 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     print(f"resolved by id:                   {len(r_id):,}")
     print(f"resolved by position:             {len(r_pos):,}  (id-pass reason: {_counts(reason[r_pos])})")
     print(f"unresolved:                       {len(unres):,}  ({_counts(unres['reason'].to_numpy(False))})")
+    print(f"sources claimed by more than one obs_sbn row: {n_dup_sources:,} sources, "
+          f"{len(drop):,} rows dropped (see {stem}.duplicates.parquet)")
     print(f"ambiguous:                        {pc.sum(out['ambiguous']).as_py() or 0:,}")
     print(f"band_ok = false:                  {pc.sum(pc.invert(out['band_ok'])).as_py() or 0:,}")
     print(f"per collection:                   {_counts(out['collection'].to_numpy(False))}")
