@@ -101,14 +101,19 @@ def solar_elongation_ndarray(ra_deg, dec_deg, t):
         Solar elongation in degrees.
     """
 
-    # Get Sun coordinates
-    # FIXME: This is sloooooww af. Should probably extract it in a few points,
-    # then fit a spline or piecewise poly.
-    sun = get_sun(t).icrs  # cheap transformation to ICRS once per row
+    # Get Sun coordinates. get_sun is slow (~90 us per time), but sources
+    # from the same visit share one time, so evaluate it only once per
+    # unique time and broadcast (e.g. 730k sources -> 1,380 visit times).
+    t = Time(t)
+    _, first, inv = np.unique(
+        np.stack([np.atleast_1d(t.jd1), np.atleast_1d(t.jd2)], axis=-1),
+        axis=0, return_index=True, return_inverse=True,
+    )
+    sun = get_sun(np.atleast_1d(t)[first]).icrs
 
     # Extract Sun RA/Dec arrays (radian floats)
-    sun_ra = sun.ra.radian
-    sun_dec = sun.dec.radian
+    sun_ra = sun.ra.radian[inv.ravel()].reshape(t.shape)
+    sun_dec = sun.dec.radian[inv.ravel()].reshape(t.shape)
 
     # Convert input to radians
     ra = np.radians(ra_deg)
