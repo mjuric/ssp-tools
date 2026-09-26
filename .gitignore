@@ -160,3 +160,6 @@ DEADJOE
 
 # Temporary CSV exports (if not cleaned up)
 *.csv.tmp
+
+# Project-specific: local copies of large data files (ASSIST ephemerides, etc.)
+/data/

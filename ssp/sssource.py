@@ -1,3 +1,6 @@
+import argparse
+import sys
+
 from astropy.coordinates import (
     SkyCoord,
     HeliocentricEclipticIAU76,
@@ -103,24 +106,30 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
     print(f"{provID}: max/median separation: {max_sep:.4f}, {med_sep:.4f} arcsec")
 
 
-if __name__ == "__main__":
-    input_dir = "./analysis/inputs"
-    output_dir = "./analysis/outputs"
+def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0, seed=42):
+    """Build ``{output_dir}/sssource.parquet`` from the DiaSource, MPC
+    observation (obs_sbn), identification and orbit tables in ``input_dir``.
 
+    ``max_objects`` and ``dia_sample_frac`` subsample the inputs, for
+    testing.
+    """
     dia = pd.read_parquet(
         f"{input_dir}/dia_sources.parquet", engine="pyarrow", dtype_backend="pyarrow"
     ).reset_index(drop=True)
-    # DEBUG: while debugging, remove some indices and resort the array
-    dia = dia.sample(frac=0.9, random_state=42).reset_index(drop=True)
+    if dia_sample_frac < 1.0:
+        # Testing aid: drop some DIA sources and shuffle the rest, to
+        # exercise the association logic with missing / unsorted indices.
+        dia = dia.sample(frac=dia_sample_frac, random_state=seed).reset_index(drop=True)
 
     det = pd.read_parquet(
         f"{input_dir}/obs_sbn.parquet", engine="pyarrow", dtype_backend="pyarrow"
     ).reset_index()
 
-    # DEBUG: cut this down to a much smaller table
-    sampled_provids = det["provid"].drop_duplicates().sample(10, random_state=42)
-    det = det[det["provid"].isin(sampled_provids)].reset_index()
-    print(len(det))
+    if max_objects is not None:
+        # Testing aid: keep only a random subset of objects.
+        sampled_provids = det["provid"].drop_duplicates().sample(max_objects, random_state=seed)
+        det = det[det["provid"].isin(sampled_provids)].reset_index()
+    print(f"{len(det):,} MPC observations")
 
     # FIXME: this will have to check if the ID's are IAU-style
     # (with string prefixes)
@@ -291,3 +300,47 @@ if __name__ == "__main__":
     print(f"{totalNumObjects:,} unique objects with {len(sss):,} total observations.")
 
     util.struct_to_parquet(sss, f"{output_dir}/sssource.parquet")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build the SSSource table from DiaSource and MPC Parquet files",
+        epilog=(
+            "Reads dia_sources, obs_sbn, numbered_identifications, "
+            "current_identifications and mpc_orbits .parquet files from the input "
+            "directory and writes sssource.parquet to the output directory. The ASSIST "
+            "ephemeris files are taken from the SSP_ASSIST_PLANETS and "
+            "SSP_ASSIST_ASTEROIDS environment variables."
+        ),
+    )
+    parser.add_argument("--input-dir", default="./analysis/inputs", help="Input directory (default: %(default)s)")
+    parser.add_argument("--output-dir", default="./analysis/outputs", help="Output directory (default: %(default)s)")
+    parser.add_argument(
+        "--max-objects", type=int, default=None,
+        help="Process only this many randomly chosen objects (default: all)",
+    )
+    parser.add_argument(
+        "--dia-sample-frac", type=float, default=1.0,
+        help="Randomly keep this fraction of DIA sources, shuffled (default: %(default)s)",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for subsampling (default: %(default)s)")
+    parser.add_argument(
+        "--reraise", action="store_true",
+        help="Re-raise exceptions instead of exiting gracefully (for debugging)",
+    )
+    args = parser.parse_args()
+
+    try:
+        build_sssource(
+            args.input_dir, args.output_dir,
+            max_objects=args.max_objects, dia_sample_frac=args.dia_sample_frac, seed=args.seed,
+        )
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        if args.reraise:
+            raise
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
