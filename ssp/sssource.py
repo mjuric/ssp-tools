@@ -292,8 +292,13 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables.
     ephem = open_ephem()
 
+    # compute_sssource_entry slices DiaSource rows per object; give it only
+    # the columns it uses, numpy-backed, as taking rows of all ~85
+    # pyarrow-backed columns dominated the per-object cost.
+    dia_eph = pd.DataFrame({c: dia[c].to_numpy() for c in ("ssObjectId", "midpointMjdTai", "ra", "dec")})
+
     util.group_by(
-        [sss, assoc], "ssObjectId", partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia, ephem=ephem)
+        [sss, assoc], "ssObjectId", partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem)
     )
 
     totalNumObjects = np.unique(sss["ssObjectId"]).size
