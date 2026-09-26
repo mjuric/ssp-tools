@@ -240,31 +240,31 @@ matching band, then the smallest separation. Rows that cannot be resolved by
 id are searched for by position and time, with the same acceptance rule.
 
 Outputs:
-- `dia_sources.parquet` – one row per resolved observation (an A/B pair is
-  one row): all of the view's columns (`id` renamed to `diaSourceId`,
-  `mjd_tai` to `midpointMjdTai`; DiaSource columns the view lacks, such as
-  `extendedness`, are null), plus `obsid` (and `obsid_b` for A/B pairs),
-  `obssubid`, the submitted tracklet (`submission_id`, `trksub`, and MPC's
-  `trkid`) of that obs_sbn row, `match` (`id` or `position`) and the match
-  diagnostics `sep_mas`,
-  `dt_ms`, `dmag`, `band_ok`, `n_pass`, `ambiguous`. `(collection, diaSourceId)`
-  is unique: when one detection was submitted more than once, the row from
-  the earliest submission (by `submission_id`) is kept.
-- `dia_sources.duplicates.parquet` – the obs_sbn rows dropped that way, with
-  the `kept_obsid` and the source they claimed. They get no SSSource row.
+- `dia_sources.parquet` – one row per resolved obs_sbn row (`obsid` is the
+  key): all of the view's columns (`id` renamed to `diaSourceId`, `mjd_tai` to
+  `midpointMjdTai`; DiaSource columns the view lacks, such as `extendedness`,
+  are null), plus the obs_sbn row's `obsid`, `obssubid` and submitted
+  tracklet (`submission_id`, `trksub`, and MPC's `trkid`), `primary`, `match`
+  (`id` or `position`) and the match diagnostics `sep_mas`, `dt_ms`, `dmag`,
+  `band_ok`, `n_pass`, `ambiguous`. A source can be claimed by several rows:
+  both endpoints of an A/B pair (matched once, at their midpoint), or
+  repeated submissions of one detection. `primary` is true on exactly one row
+  per `(collection, diaSourceId)`: the -A endpoint, else the row from the
+  earliest submission.
 - `dia_sources.unresolved.parquet` – the obs_sbn rows that did not resolve,
   with a `reason` and the closest failing candidate's separation and time
   offset.
 
 `python -m ssp.sssource` links these DiaSources to obs_sbn by `obsid` (instead
-of `diaSourceId == obssubid`) and carries `collection` and the tracklet columns
-(`submission_id`, `trksub`, `trkid`) into SSSource. Detections
-of undesignated objects (unidentified tracklets) are kept with `ssObjectId` 0,
-an empty designation and NaN orbit-derived columns, as are designated objects
-with no `mpc_orbits` orbit (but with their `ssObjectId`); neither gets an
-SSObject row;
-`ssp-build-ssobject` then joins SSSource to DiaSource on
-`(collection, diaSourceId)`.
+of `diaSourceId == obssubid`), one SSSource row per DiaSource row, and carries
+`collection`, the tracklet columns (`submission_id`, `trksub`, `trkid`),
+`obsid` and `primary` into SSSource. Detections of undesignated objects
+(unidentified tracklets) are kept with `ssObjectId` 0, an empty designation
+and NaN orbit-derived columns, as are designated objects with no
+`mpc_orbits` orbit (but with their `ssObjectId`). `ssp-build-ssobject` then
+joins SSSource to DiaSource on `obsid` and computes every per-object
+quantity from the `primary` rows of objects with an orbit only, so no
+detection is counted twice.
 
 ### SSSource Table Construction
 

@@ -169,9 +169,10 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     for col in det.columns:
         assert det[col].dtype == expect_dtypes[col]
 
-    # create the association side table. For a trailed source submitted
-    # as two endpoints, dia's obsid is that of the -A row, so the -B row
-    # joins nothing and creates no extra SSSource row.
+    # create the association side table. From extract-submitted-sources,
+    # dia has one row per obs_sbn row (obsid is unique), so each obs_sbn row
+    # gets one SSSource row; a source claimed by several (both endpoints of
+    # a trail, or repeated submissions) has one of them marked primary.
     if by_obsid:
         assoc = (
             dia[["diaSourceId", "obsid"]]
@@ -299,10 +300,13 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # (from extract-submitted-sources; null for Butler DiaSources), which
     # together with diaSourceId identifies the source, and the submitted
     # tracklet: (submission_id, trksub), and MPC's finer trkid. These group
-    # the detections of undesignated objects.
+    # the detections of undesignated objects. On the obsid path also the
+    # obsid (the key SSObject joins DiaSource on) and whether this row is
+    # the primary one of its source (the one SSObject counts).
     tracklet = ("submission_id", "trksub", "trkid")
     sss = np.zeros(totalNumObs, dtype=np.dtype(
-        schema.SSSourceDtype.descr + [("collection", object)] + [(c, object) for c in tracklet]))
+        schema.SSSourceDtype.descr + [("collection", object)] + [(c, object) for c in tracklet]
+        + [("obsid", object), ("primary", bool)]))
 
     #
     # construct SSSource -- start with easily vectorizable columns
@@ -316,6 +320,12 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
         sss["collection"] = dia["collection"].iloc[assoc["dia_index"]].to_numpy(dtype=object, na_value=None)
     else:
         sss["collection"] = None
+    if by_obsid:
+        sss["obsid"] = dia["obsid"].iloc[assoc["dia_index"]].to_numpy(dtype=object)
+        sss["primary"] = dia["primary"].iloc[assoc["dia_index"]].to_numpy(dtype=bool)
+    else:
+        sss["obsid"] = None
+        sss["primary"] = True
     for c in tracklet:
         # (on the obsid path from dia: the obs_sbn row it is linked to)
         src = dia[c].iloc[assoc["dia_index"]] if by_obsid else assoc.get(f"mpc_{c}")

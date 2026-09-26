@@ -200,6 +200,11 @@ def compute_ssobject(
               f"({(sss['ssObjectId'] == 0).sum():,} undesignated)")
         sss = sss[~no_orbit]
 
+    # A source claimed by several obs_sbn rows (both endpoints of a trail,
+    # repeated submissions) has several SSSource rows; count it once.
+    if "primary" in sss.columns:
+        sss = sss[sss["primary"].to_numpy(dtype=bool)]
+
     # assert that sss is pre-grouped by ssObjectId
     assert util.values_grouped(sss["ssObjectId"]), (
         "SSSource table must be pre-grouped by ssObjectId. "
@@ -209,15 +214,12 @@ def compute_ssobject(
     )
 
     # Join the DiaSource parts we're interested in to our SSSource table.
-    # DiaSources from extract-submitted-sources come from several
-    # collections, where only (collection, diaSourceId) is unique; join on
-    # both when both sides carry a collection.
+    # DiaSources from extract-submitted-sources have one row per obs_sbn
+    # row and come from several collections, so neither diaSourceId nor
+    # (collection, diaSourceId) is unique; join on their key, obsid.
     num = len(sss)
-    by_collection = (
-        "collection" in dia.columns and "collection" in sss.columns
-        and sss["collection"].notna().all() and dia["collection"].notna().all()
-    )
-    dia_cols = DIA_COLUMNS + (["collection"] if by_collection else [])
+    by_obsid = "obsid" in dia.columns and "obsid" in sss.columns and sss["obsid"].notna().all()
+    dia_cols = DIA_COLUMNS + (["obsid"] if by_obsid else [])
     dia_tmp = dia[dia_cols].add_prefix("dia_")  # FIXME: does this cause unnececessary copy?
     # FIXME: The diaSourceId should really be uint64. But Felis doesn't speak
     # uint64, but only knows about int64. Yet the pipeline produces uint64
@@ -225,10 +227,9 @@ def compute_ssobject(
     # to make the join work (otherwise pyarrow tries to cast to float64, and
     # the whole thing gloriously explodes).
     dia_tmp["dia_diaSourceId"] = dia_tmp["dia_diaSourceId"].astype("int64[pyarrow]")
-    if by_collection:
-        sss = sss.merge(dia_tmp, left_on=["collection", "diaSourceId"],
-                        right_on=["dia_collection", "dia_diaSourceId"], how="inner")
-        del sss["dia_collection"]
+    if by_obsid:
+        sss = sss.merge(dia_tmp, left_on="obsid", right_on="dia_obsid", how="inner")
+        del sss["dia_obsid"]
     else:
         sss = sss.merge(dia_tmp, left_on="diaSourceId", right_on="dia_diaSourceId", how="inner")
     assert num == len(sss), f"{num - len(sss)} DiaSources found missing (or duplicated)."
@@ -359,14 +360,14 @@ Examples:
         num = len(sss)
         print(f"Loaded {num:,} SSSource rows")
 
-        # Load DiaSource with required columns (and the collection, for
+        # Load DiaSource with required columns (and the obsid, for
         # DiaSources from extract-submitted-sources)
         dia_columns = [
             "diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness",
             "band", "psfFlux", "psfFluxErr"
         ]
-        if "collection" in pq.read_schema(args.diasource_parquet).names:
-            dia_columns.append("collection")
+        if "obsid" in pq.read_schema(args.diasource_parquet).names:
+            dia_columns.append("obsid")
         print(f"Loading DiaSource from {args.diasource_parquet}...")
         dia = pd.read_parquet(args.diasource_parquet, engine="pyarrow",
                               dtype_backend="pyarrow", columns=dia_columns

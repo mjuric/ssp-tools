@@ -95,7 +95,7 @@ REQUIRED_COLUMNS = {
 }
 
 # Columns build_output appends to the view's.
-EXTRA_COLUMNS = ["obsid", "obsid_b", "obssubid", "submission_id", "trksub", "trkid", "match", "sep_mas",
+EXTRA_COLUMNS = ["obsid", "obssubid", "submission_id", "trksub", "trkid", "primary", "match", "sep_mas",
                  "dt_ms", "dmag", "band_ok", "n_pass", "ambiguous"]
 
 # obs_sbn columns we read; the ones after "band" are only passed through
@@ -247,19 +247,18 @@ def load_obs(tbl):
     Returns ``(obs, tbl, n_pairs)``: ``obs`` is a dict of equal-length
     numpy arrays, one entry per logical row, ``tbl`` the X05 rows of the
     input (``obs["row"]`` indexes it). Each -A/-B trail endpoint pair is
-    merged into its -A row (midpoint position and time, band/mag from -A,
-    the -B obsid in ``obsid_b``). ``reason`` is "" for rows that go to the
-    id pass, else why they go straight to the fallback.
+    matched as one logical row, its -A row (midpoint position and time,
+    band/mag from -A; ``row_b`` is the -B row of ``tbl``, else -1).
+    ``reason`` is "" for rows that go to the id pass, else why they go
+    straight to the fallback.
     """
     tbl = tbl.filter(pc.equal(tbl["stn"], "X05"))
     label, ids, part = parse_obssubid(tbl["obssubid"])
     obs = dict(row=np.arange(len(tbl)), obsid=tbl["obsid"].to_numpy(),
-               submission_id=tbl["submission_id"].to_numpy(), trksub=tbl["trksub"].to_numpy(),
-               trkid=tbl["trkid"].to_numpy(),
                obssubid=pc.utf8_trim_whitespace(_arr(tbl["obssubid"])).to_numpy(zero_copy_only=False),
                label=label, id=ids, tai=utc_to_tai_mjd(tbl["obstime"]), band_stripped=strip_band(tbl["band"]))
     obs["ra"], obs["dec"], obs["mag"] = (_f64(tbl, c) for c in ("ra", "dec", "mag"))
-    obs["obsid_b"] = np.full(len(ids), None, dtype=object)
+    obs["row_b"] = np.full(len(ids), -1)
     obs["reason"] = np.where(ids < 0, "no_id", "").astype(object)
 
     # Pair trail endpoints: a key with exactly one -A and exactly one -B.
@@ -281,7 +280,7 @@ def load_obs(tbl):
     obs["ra"][ia], obs["dec"][ia], obs["tai"][ia] = midpoint(
         obs["ra"][ia], obs["dec"][ia], obs["tai"][ia], obs["ra"][ib], obs["dec"][ib], obs["tai"][ib]
     )
-    obs["obsid_b"][ia] = obs["obsid"][ib]
+    obs["row_b"][ia] = obs["row"][ib]
     keep = np.ones(len(ids), dtype=bool)
     keep[ib] = False
     obs = {k: v[keep] for k, v in obs.items()}
@@ -501,71 +500,83 @@ def run_queries(tasks, host, port, database, user, workers):
 #
 
 
-def build_output(obs, cand, rows, ci, match, info):
-    """The dia_sources table: the winning view rows (all columns, renamed),
-    required columns null-filled, plus linkage and match diagnostics."""
+def build_output(obs, tbl, cand, rows, ci, match, info):
+    """The dia_sources table, one row per resolved obs_sbn row (of
+    ``tbl``): the winning view rows (all columns, renamed), required
+    columns null-filled, plus linkage and match diagnostics. The -B row of
+    a trail pair repeats its -A row's match. Returns ``(table, is_b)``."""
     names = [RENAMES.get(c, c) for c in cand.column_names]
     clash = sorted({c for c in names if names.count(c) > 1} | (set(names) & set(EXTRA_COLUMNS)))
     if clash:
         raise ValueError(f"view columns {clash} clash (after renaming {RENAMES}) with each other "
                          f"or with the columns this tool adds; refusing to write duplicate names")
-    out = cand.take(pa.array(ci, pa.int64())).rename_columns(names)
+
+    rb = obs["row_b"][rows]
+    k = np.concatenate([np.arange(len(rows)), np.flatnonzero(rb >= 0)])
+    trow = np.concatenate([obs["row"][rows], rb[rb >= 0]])
+    is_b = np.arange(len(k)) >= len(rows)
+    order = np.argsort(trow, kind="stable")
+    k, trow, is_b = k[order], trow[order], is_b[order]
+
+    out = cand.take(pa.array(ci[k], pa.int64())).rename_columns(names)
     for name, typ in REQUIRED_COLUMNS.items():
         if name not in out.column_names:
             out = out.append_column(name, pa.nulls(len(out), typ))
         elif out.schema.field(name).type != typ:
             out = out.set_column(out.column_names.index(name), name, out[name].cast(typ))
+    ident = tbl.take(pa.array(trow, pa.int64()))
     extra = dict(
-        obsid=pa.array(obs["obsid"][rows], pa.string()),
-        obsid_b=pa.array(obs["obsid_b"][rows], pa.string()),
-        obssubid=pa.array(obs["obssubid"][rows], pa.string()),
+        obsid=ident["obsid"],
+        obssubid=pc.utf8_trim_whitespace(ident["obssubid"]),
         # the submitted tracklet: (submission_id, trksub), and MPC's trkid
-        **{c: pa.array(obs[c][rows], pa.string()) for c in ("submission_id", "trksub", "trkid")},
-        match=pa.array(match, pa.string()),
-        sep_mas=info["sep_mas"], dt_ms=info["dt_ms"],
-        dmag=pa.array(info["dmag"], pa.float64(), from_pandas=True),
-        band_ok=info["band_ok"], n_pass=pa.array(info["n_pass"], pa.int32()), ambiguous=info["ambiguous"],
+        **{c: ident[c] for c in ("submission_id", "trksub", "trkid")},
+        primary=primary_flags(out["collection"], out["diaSourceId"], is_b, ident["submission_id"],
+                              ident["obsid"]),
+        match=pa.array(np.asarray(match, dtype=object)[k], pa.string()),
+        sep_mas=info["sep_mas"][k], dt_ms=info["dt_ms"][k],
+        dmag=pa.array(info["dmag"][k], pa.float64(), from_pandas=True),
+        band_ok=info["band_ok"][k], n_pass=pa.array(np.asarray(info["n_pass"])[k], pa.int32()),
+        ambiguous=info["ambiguous"][k],
     )
     assert list(extra) == EXTRA_COLUMNS
     for name, col in extra.items():
-        out = out.append_column(name, pa.array(col))
-    return out
+        out = out.append_column(name, col if isinstance(col, (pa.Array, pa.ChunkedArray)) else pa.array(col))
+    return out, is_b
 
 
 def _codes(values):
-    """Sortable integer codes for a string array (None sorts last)."""
-    v = np.array(["\uffff" if x is None else x for x in values], dtype=object)
-    return np.unique(v.astype(str), return_inverse=True)[1]
+    """Sortable integer codes for a string array (nulls last)."""
+    return pc.rank(pc.fill_null(_arr(values, pa.string()), "\uffff"), tiebreaker="dense").to_numpy()
 
 
-def dedupe(out, submission_id):
-    """One output row per (collection, diaSourceId).
+def primary_flags(collection, ids, is_b, submission_id, obsid):
+    """True on exactly one row per (collection, diaSourceId).
 
-    The same detection can be submitted to the MPC more than once (e.g.
-    two submissions of one tracklet, both published). Keep the row whose
-    obs_sbn row came from the earliest submission (submission_id starts
-    with its ISO timestamp), tie-broken on obsid. Returns
-    ``(kept row indices, dropped row indices, index of the kept row for
-    each dropped one)``.
+    The same source is claimed by both rows of a trail pair, and can be
+    claimed by several submissions of the same detection. The primary row
+    is the -A row of a pair, else the row from the earliest submission
+    (submission_id starts with its ISO timestamp), tie-broken on obsid.
     """
-    code = pc.dictionary_encode(out["collection"]).combine_chunks().indices.to_numpy()
-    ids = out["diaSourceId"].to_numpy()
-    order = np.lexsort((_codes(out["obsid"].to_pylist()), _codes(submission_id), ids, code))
+    code, ids = _codes(collection), np.asarray(ids)
+    order = np.lexsort((_codes(obsid), _codes(submission_id), is_b, ids, code))
     first = np.r_[True, (code[order][1:] != code[order][:-1]) | (ids[order][1:] != ids[order][:-1])]
-    group_first = order[np.flatnonzero(first)[np.cumsum(first) - 1]]
-    return np.sort(order[first]), order[~first], group_first[~first]
+    primary = np.zeros(len(ids), dtype=bool)
+    primary[order[first]] = True
+    return primary
 
 
 def unresolved_table(obs, tbl, rows, best):
-    """The obs_sbn rows (of ``tbl``; for a trail pair its -A row) that did
+    """The obs_sbn rows (of ``tbl``; both rows of a trail pair) that did
     not resolve, with the reason and the closest failing candidate's
     sep/dt, if there was one."""
     bsep = np.full(len(obs["id"]), np.nan)
     bdt = np.full(len(obs["id"]), np.nan)
     br, bs, bd = best
     bsep[br], bdt[br] = bs, bd
-    out = tbl.take(pa.array(obs["row"][rows], pa.int64())).drop_columns(["stn"])
-    out = out.append_column("obsid_b", pa.array(obs["obsid_b"][rows], pa.string()))
+    rb = obs["row_b"][rows]
+    rows = np.concatenate([rows, rows[rb >= 0]])
+    trow = np.concatenate([obs["row"][rows[:len(rb)]], rb[rb >= 0]])
+    out = tbl.take(pa.array(trow, pa.int64())).drop_columns(["stn"])
     out = out.append_column("reason", pa.array(obs["reason"][rows], pa.string()))
     out = out.append_column("best_sep_mas", pa.array(bsep[rows], from_pandas=True))
     return out.append_column("best_dt_ms", pa.array(bdt[rows], from_pandas=True))
@@ -578,9 +589,8 @@ def _counts(values):
 
 def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250_000):
     """Resolve the X05 rows of ``obs_path`` against the view and write
-    ``out_path``, ``<stem>.unresolved.parquet`` and
-    ``<stem>.duplicates.parquet``. ``fetch`` runs a list of query tasks
-    (see ``run_queries``). Returns the exit code."""
+    ``out_path`` and ``<stem>.unresolved.parquet``. ``fetch`` runs a list
+    of query tasks (see ``run_queries``). Returns the exit code."""
     timings = {}
     t0 = time.time()
 
@@ -648,21 +658,18 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     rows_all = np.concatenate([r_id, r_pos])
     info = i_id if i_pos is None else {k: np.concatenate([i_id[k], i_pos[k]]) for k in i_id}
     match = np.array(["id"] * len(r_id) + ["position"] * len(r_pos), dtype=object)
-    order = np.argsort(rows_all, kind="stable")
-    out = build_output(obs, cand, rows_all[order], np.concatenate([c_id, c_pos])[order], match[order],
-                       {k: v[order] for k, v in info.items()})
+    out, is_b = build_output(obs, tbl, cand, rows_all, np.concatenate([c_id, c_pos]), match, info)
 
-    # Sources claimed by more than one obs_sbn row: keep the earliest
-    # submission's, report the rest (they get no SSSource row).
-    rows_all = rows_all[order]
-    keep, drop, kept = dedupe(out, obs["submission_id"][rows_all])
-    dups = tbl.take(pa.array(obs["row"][rows_all[drop]], pa.int64())).drop_columns(["stn"])
-    dups = dups.append_column("kept_obsid", out["obsid"].take(pa.array(kept, pa.int64())))
-    for c in ("collection", "diaSourceId", "sep_mas", "dt_ms"):
-        dups = dups.append_column(c, out[c].take(pa.array(drop, pa.int64())))
-    n_dup_sources = len(np.unique(kept))
-    out = out.take(pa.array(keep, pa.int64()))
-    assert len(dedupe(out, obs["submission_id"][rows_all[keep]])[1]) == 0
+    # obsid is the key; each source has exactly one primary row
+    key = ["collection", "diaSourceId"]
+    assert pc.count_distinct(out["obsid"]).as_py() == len(out)
+    g = out.select(key + ["primary"]).group_by(key).aggregate([("primary", "sum")])
+    assert pc.all(pc.equal(g["primary_sum"], 1)).as_py()
+    n_sources = len(g)
+    # sources claimed by more than one submission (not counting -B rows)
+    nb = out.select(key + ["primary", "obsid", "submission_id", "trksub"]).filter(pa.array(~is_b))
+    g = nb.group_by(key).aggregate([("obsid", "count")])
+    claimed = nb.join(g.filter(pc.greater(g["obsid_count"], 1)).select(key), key)
 
     resolved = np.zeros(n, dtype=bool)
     resolved[rows_all] = True
@@ -670,7 +677,6 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     stem = str(out_path)[:-8] if str(out_path).endswith(".parquet") else str(out_path)
     pq.write_table(out, out_path, compression="zstd")
     pq.write_table(unres, f"{stem}.unresolved.parquet", compression="zstd")
-    pq.write_table(dups, f"{stem}.duplicates.parquet", compression="zstd")
     timings["assemble + write"] = time.time() - t0
 
     print(f"\nobs_sbn X05 rows read:            {n_x05:,}")
@@ -679,12 +685,18 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     print(f"resolved by id:                   {len(r_id):,}")
     print(f"resolved by position:             {len(r_pos):,}  (id-pass reason: {_counts(reason[r_pos])})")
     print(f"unresolved:                       {len(unres):,}  ({_counts(unres['reason'].to_numpy(False))})")
-    print(f"sources claimed by more than one obs_sbn row: {n_dup_sources:,} sources, "
-          f"{len(drop):,} rows dropped (see {stem}.duplicates.parquet)")
+    print(f"rows written:                     {len(out):,}, for {n_sources:,} distinct sources")
+    n_b = int(is_b.sum())
+    print(f"non-primary rows:                 {len(out) - n_sources:,}  (trail -B endpoints: {n_b:,}, "
+          f"further submissions of a detection: {len(out) - n_sources - n_b:,})")
+    claimed = claimed.sort_by([("collection", "ascending"), ("diaSourceId", "ascending"),
+                               ("primary", "descending")])
+    for r in claimed.to_pylist():
+        print("   claimed by several submissions:", r)
     print(f"ambiguous:                        {pc.sum(out['ambiguous']).as_py() or 0:,}")
     print(f"band_ok = false:                  {pc.sum(pc.invert(out['band_ok'])).as_py() or 0:,}")
     print(f"per collection:                   {_counts(out['collection'].to_numpy(False))}")
-    print(f"wrote {len(out):,} rows to {out_path}, {len(unres):,} to {stem}.unresolved.parquet")
+    print(f"wrote {out_path} and {stem}.unresolved.parquet")
     for k, v in timings.items():
         print(f"  {k:20s} {v:8.1f} s")
     return 0

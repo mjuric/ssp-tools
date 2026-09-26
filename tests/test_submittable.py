@@ -114,7 +114,7 @@ def test_load_obs_pairs_and_reasons():
     obs, tbl, n_pairs = S.load_obs(obs_table(rows))
     assert n_pairs == 1 and len(tbl) == 5
     assert list(obs["obsid"]) == ["a", "c", "d", "e"]
-    assert list(obs["obsid_b"]) == ["b", None, None, None]
+    assert list(obs["row_b"]) == [1, -1, -1, -1]
     assert list(obs["reason"]) == ["", "unpaired_trail", "no_id", ""]
     assert list(obs["id"]) == [5, -1, -1, 42]
     assert obs["ra"][0] == pytest.approx(0.0) and obs["dec"][0] == pytest.approx(1.0001)
@@ -249,14 +249,20 @@ def test_extract_end_to_end(tmp_path):
     assert rc == 0
     out = pq.read_table(tmp_path / "dia.parquet").to_pylist()
     by = {r["obsid"]: r for r in out}
-    assert sorted(by) == ["o1", "o2", "o3", "o4a", "o5", "o6"]
+    assert sorted(by) == ["o1", "o2", "o3", "o4a", "o4b", "o5", "o6"]
 
     assert (by["o1"]["collection"], by["o1"]["diaSourceId"], by["o1"]["match"]) == ("DP2-DS", 100, "id")
     assert (by["o2"]["collection"], by["o2"]["ambiguous"], by["o2"]["n_pass"]) == ("DP2-DS", True, 2)
     assert by["o3"]["band_ok"] is False and by["o3"]["dt_ms"] == pytest.approx(1.4, abs=1e-3)
-    assert by["o4a"]["obsid_b"] == "o4b" and by["o4a"]["diaSourceId"] == 400
-    assert by["o4a"]["sep_mas"] < 0.01 and abs(by["o4a"]["dt_ms"]) < 1e-3
-    assert (by["o4a"]["submission_id"], by["o4a"]["trksub"], by["o4a"]["trkid"]) == ("s4a", "t4a", "k4a")
+    # an A/B pair: two rows, one source, matched once at the midpoint;
+    # the -A row is primary
+    a, b = by["o4a"], by["o4b"]
+    assert a["diaSourceId"] == b["diaSourceId"] == 400 and (a["primary"], b["primary"]) == (True, False)
+    assert a["sep_mas"] == b["sep_mas"] < 0.01 and abs(a["dt_ms"]) < 1e-3 and a["match"] == b["match"] == "id"
+    assert (a["submission_id"], a["trksub"], a["trkid"]) == ("s4a", "t4a", "k4a")
+    assert b["obssubid"] == "LSST-AP-DS-400-B"
+    assert (b["submission_id"], b["trksub"], b["trkid"]) == ("s4b", "t4b", "k4b")
+    assert all(r["primary"] for k, r in by.items() if k != "o4b")
     assert (by["o5"]["diaSourceId"], by["o5"]["match"]) == (500, "position")
     assert (by["o6"]["diaSourceId"], by["o6"]["match"]) == (601, "position")
 
@@ -277,16 +283,14 @@ def test_extract_end_to_end(tmp_path):
 
 def test_extract_double_submission(tmp_path):
     # Like the real case: one detection submitted twice (two obsids, same
-    # bare obssubid, obstime 4 ms apart), in two submissions. The earliest
-    # submission's row is kept, the other goes to duplicates.parquet.
+    # bare obssubid, obstime 4 ms apart), in two submissions. Both rows are
+    # written; the earliest submission's is primary.
     ms4 = datetime.timedelta(milliseconds=4)
     rows = [
         dict(obsid="Ltt1late", obssubid="100", submission_id="2026-04-25T01:36:42.617_0000BuRx",
-             trksub="late",
-             ra=10.0, dec=1.0, obstime=T0 + ms4, band="Li", mag=20.0),
+             trksub="late", ra=10.0, dec=1.0, obstime=T0 + ms4, band="Li", mag=20.0),
         dict(obsid="Lsa1early", obssubid="100", submission_id="2026-02-06T01:14:28.408_0000Bl6Z",
-             trksub="early",
-             ra=10.0, dec=1.0, obstime=T0, band="Li", mag=20.0),
+             trksub="early", ra=10.0, dec=1.0, obstime=T0, band="Li", mag=20.0),
         dict(obsid="other", obssubid="101", submission_id="2026-04-25T01:36:42.617_0000BuRx",
              ra=11.0, dec=1.0, obstime=T0, band="Li", mag=20.0),
     ]
@@ -296,37 +300,41 @@ def test_extract_double_submission(tmp_path):
     ])
     pq.write_table(obs_table(rows), tmp_path / "obs.parquet")
     assert S.extract(tmp_path / "obs.parquet", tmp_path / "dia.parquet", fake_fetch(view)) == 0
-    out = pq.read_table(tmp_path / "dia.parquet")
-    assert sorted(out["obsid"].to_pylist()) == ["Lsa1early", "other"]
-    assert out.filter(pc.equal(out["obsid"], "Lsa1early"))["trksub"].to_pylist() == ["early"]
-    dups = pq.read_table(tmp_path / "dia.duplicates.parquet").to_pylist()
-    assert len(dups) == 1
-    d = dups[0]
-    assert (d["obsid"], d["kept_obsid"]) == ("Ltt1late", "Lsa1early")
-    assert (d["collection"], d["diaSourceId"]) == ("NV-S", 100)
-    assert d["dt_ms"] == pytest.approx(-2.0, abs=1e-3)
+    by = {r["obsid"]: r for r in pq.read_table(tmp_path / "dia.parquet").to_pylist()}
+    assert sorted(by) == ["Lsa1early", "Ltt1late", "other"]
+    assert by["Lsa1early"]["diaSourceId"] == by["Ltt1late"]["diaSourceId"] == 100
+    assert [by[k]["primary"] for k in ("Lsa1early", "Ltt1late", "other")] == [True, False, True]
+    assert (by["Lsa1early"]["trksub"], by["Ltt1late"]["trksub"]) == ("early", "late")
+    assert by["Ltt1late"]["dt_ms"] == pytest.approx(-2.0, abs=1e-3)
     assert pq.read_table(tmp_path / "dia.unresolved.parquet").num_rows == 0
 
 
-def test_dedupe_tiebreak():
-    t = pa.table(dict(collection=["A", "B", "A", "A"], diaSourceId=pa.array([1, 1, 2, 1], pa.int64()),
-                      obsid=["z", "y", "x", "w"]))
-    keep, drop, kept = S.dedupe(t, np.array(["2026-01", "2026-01", "2026-01", "2026-01"], dtype=object))
-    assert list(keep) == [1, 2, 3] and list(drop) == [0] and list(kept) == [3]
-    keep, drop, kept = S.dedupe(t, np.array(["2025-12", None, "2026-01", "2026-01"], dtype=object))
-    assert list(keep) == [0, 1, 2] and list(drop) == [3] and list(kept) == [0]
+def test_primary_flags():
+    coll = pa.array(["A", "B", "A", "A", "A"])
+    ids = np.array([1, 1, 2, 1, 1])
+    obsid = pa.array(["z", "y", "x", "w", "v"])
+    sub = pa.array(["2026-01", "2026-01", "2026-01", "2026-01", "2025-12"])
+    # earliest submission wins, then obsid
+    assert list(S.primary_flags(coll, ids, np.zeros(5, bool), sub, obsid)) == [False, True, True, False, True]
+    sub = pa.array(["2026-01", None, "2026-01", "2026-01", "2026-02"])
+    assert list(S.primary_flags(coll, ids, np.zeros(5, bool), sub, obsid)) == [False, True, True, True, False]
+    # a trail -B row is never primary over its -A row
+    is_b = np.array([False, False, False, True, False])
+    sub = pa.array(["2026-01", "2026-01", "2026-01", "2025-01", "2026-02"])
+    assert list(S.primary_flags(coll, ids, is_b, sub, obsid)) == [True, True, True, False, False]
 
 
 def test_build_output_name_clash():
     obs, view = _scenario()
-    o, _, _ = S.load_obs(obs)
+    o, tbl, _ = S.load_obs(obs)
     info = dict(sep_mas=[0.0], dt_ms=[0.0], dmag=[0.0], band_ok=[True], n_pass=[1], ambiguous=[False])
-    ok = S.build_output(o, view, np.array([0]), np.array([0]), ["id"], info)
+    info = {k: np.array(v) for k, v in info.items()}
+    ok, _ = S.build_output(o, tbl, view, np.array([0]), np.array([0]), ["id"], info)
     assert len(set(ok.column_names)) == len(ok.column_names)
     for bad in (view.append_column("sep_mas", view["ra"]), view.append_column("diaSourceId", view["id"]),
                 view.append_column("trkid", view["band"])):
         with pytest.raises(ValueError, match="clash"):
-            S.build_output(o, bad, np.array([0]), np.array([0]), ["id"], info)
+            S.build_output(o, tbl, bad, np.array([0]), np.array([0]), ["id"], info)
 
 
 def test_read_chpass(tmp_path):
