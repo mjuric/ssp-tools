@@ -199,12 +199,15 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     else:
         util.assoc_validate(dia, assoc)
 
+    # obs_sbn also holds observations of unidentified tracklets (status
+    # 'I', no provid nor permid). They are in SSSource too -- they were
+    # sent to and accepted by the MPC -- with ssObjectId 0, no designation
+    # and no orbit-derived columns. Set them aside while resolving the
+    # designations of the rest.
     if by_obsid:
-        # obs_sbn also holds unidentified tracklets (status 'I', no provid
-        # nor permid); SSSource only covers identified objects.
-        unidentified = assoc["mpc_provid"].isna() & assoc["mpc_permid"].isna()
-        print(f"dropping {unidentified.sum():,} observations of unidentified objects (no provid, no permid)")
-        assoc = assoc[~unidentified].reset_index(drop=True)
+        undesignated = assoc["mpc_provid"].isna() & assoc["mpc_permid"].isna()
+        und = assoc[undesignated].reset_index(drop=True)
+        assoc = assoc[~undesignated].reset_index(drop=True)
 
     totalNumObs = len(assoc)
 
@@ -253,8 +256,43 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
 
     assert len(assoc) == totalNumObs
 
-    # sort the association table by object
-    assoc.sort_values(["mpc_provid"], inplace=True)
+    mpcorb = pd.read_parquet(
+        f"{input_dir}/mpc_orbits.parquet",
+        engine="pyarrow",
+        dtype_backend="pyarrow",
+        columns=[
+            "unpacked_primary_provisional_designation",
+            "packed_primary_provisional_designation",
+            "a",
+            "q",
+            "e",
+            "i",
+            "node",
+            "argperi",
+            "peri_time",
+            "mean_anomaly",
+            "epoch_mjd",
+            "h",
+            "g",
+        ],
+    ).set_index("unpacked_primary_provisional_designation", drop=False, verify_integrity=True)
+
+    # Rows without an orbit to compute ephemerides from: the undesignated
+    # ones and, on the obsid path, designated objects missing from
+    # mpc_orbits (which the Butler path treats as an error).
+    assoc["no_orbit"] = False
+    if by_obsid:
+        assoc["no_orbit"] = ~assoc["mpc_provid"].isin(mpcorb.index)
+        missing = assoc.loc[assoc["no_orbit"], "mpc_provid"]
+        print(f"{len(und):,} observations of undesignated objects; {len(missing):,} observations of "
+              f"{missing.nunique():,} designated objects without an orbit: {sorted(missing.unique())[:10]}")
+        und["no_orbit"] = True
+        assoc = pd.concat([assoc, und], ignore_index=True)
+        totalNumObs = len(assoc)
+
+    # sort the association table by object, those without an orbit last
+    assoc.sort_values(["no_orbit", "mpc_provid"], inplace=True)
+    n_orbit = int(np.sum(~assoc["no_orbit"].to_numpy(dtype=bool)))
 
     # create the output array for SSSource, plus the DiaSource collection
     # (from extract-submitted-sources; null for Butler DiaSources), which
@@ -265,8 +303,10 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # construct SSSource -- start with easily vectorizable columns
     #
     sss["diaSourceId"] = assoc["diaSourceId"].values
-    sss["ssObjectId"] = util.packed_ascii_to_uint64_le(assoc["mpc_packed"])
-    sss["designation"] = assoc["mpc_provid"]
+    # (ssObjectId 0 and an empty designation for undesignated objects)
+    has_id = assoc["mpc_packed"].notna().to_numpy(dtype=bool)
+    sss["ssObjectId"][has_id] = util.packed_ascii_to_uint64_le(assoc["mpc_packed"][has_id])
+    sss["designation"] = assoc["mpc_provid"].fillna("")
     if "collection" in dia.columns:
         sss["collection"] = dia["collection"].iloc[assoc["dia_index"]].to_numpy(dtype=object, na_value=None)
     else:
@@ -305,27 +345,6 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     sss["galLon"] = gal.l
     sss["galLat"] = gal.b
 
-    mpcorb = pd.read_parquet(
-        f"{input_dir}/mpc_orbits.parquet",
-        engine="pyarrow",
-        dtype_backend="pyarrow",
-        columns=[
-            "unpacked_primary_provisional_designation",
-            "packed_primary_provisional_designation",
-            "a",
-            "q",
-            "e",
-            "i",
-            "node",
-            "argperi",
-            "peri_time",
-            "mean_anomaly",
-            "epoch_mjd",
-            "h",
-            "g",
-        ],
-    ).set_index("unpacked_primary_provisional_designation", drop=False, verify_integrity=True)
-
     # JPL planet and ASSIST asteroid ephemeris files, from the
     # SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables.
     ephem = open_ephem()
@@ -335,12 +354,21 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # pyarrow-backed columns dominated the per-object cost.
     dia_eph = pd.DataFrame({c: dia[c].to_numpy() for c in ("midpointMjdTai", "ra", "dec")})
 
+    # ephemerides for the objects with orbits (the first n_orbit rows);
+    # every orbit-derived column of the rest is NaN.
     util.group_by(
-        [sss, assoc], "ssObjectId", partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem)
+        [sss[:n_orbit], assoc.iloc[:n_orbit]], "ssObjectId",
+        partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem),
     )
+    measured = ("elongation", "eclLambda", "eclBeta", "galLon", "galLat")
+    for name in sss.dtype.names:
+        if sss.dtype[name].kind == "f" and name not in measured:
+            sss[name][n_orbit:] = np.nan
 
-    totalNumObjects = np.unique(sss["ssObjectId"]).size
-    print(f"{totalNumObjects:,} unique objects with {len(sss):,} total observations.")
+    totalNumObjects = np.unique(sss["ssObjectId"][sss["ssObjectId"] != 0]).size
+    print(f"{totalNumObjects:,} unique objects with {len(sss):,} total observations "
+          f"({np.sum(sss['ssObjectId'] == 0):,} of them undesignated, "
+          f"{len(sss) - n_orbit:,} without an orbit).")
 
     util.struct_to_parquet(sss, f"{output_dir}/sssource.parquet")
 

@@ -191,6 +191,15 @@ def compute_ssobject(
     - MOID computation uses a MOIDSolver for each matched object.
     """
 
+    # Sources without an orbit -- undesignated (ssObjectId 0) or with no
+    # mpc_orbits row, so with NaN ephemerides -- get no SSObject.
+    # (NaN, not null: np.isnan, as pyarrow-backed isna() misses NaN)
+    no_orbit = (sss["ssObjectId"] == 0) | np.isnan(sss["ephRa"].to_numpy(dtype=float, na_value=np.nan))
+    if no_orbit.any():
+        print(f"Skipping {no_orbit.sum():,} SSSource rows without an orbit "
+              f"({(sss['ssObjectId'] == 0).sum():,} undesignated)")
+        sss = sss[~no_orbit]
+
     # assert that sss is pre-grouped by ssObjectId
     assert util.values_grouped(sss["ssObjectId"]), (
         "SSSource table must be pre-grouped by ssObjectId. "
