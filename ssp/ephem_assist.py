@@ -421,6 +421,8 @@ def compute_ephemerides_one(
     observer_code: str = "X05",
     rate_dt_seconds: float = 60.0,
     row=None,
+    obs_pos: Optional[np.ndarray] = None,
+    obs_vel: Optional[np.ndarray] = None,
 ) -> EphResult:
     """Per-epoch ephemeris quantities for *one* object from its local mpcorb
     elements (no Horizons fetch), propagated with ASSIST.
@@ -434,6 +436,11 @@ def compute_ephemerides_one(
     objects: otherwise it is looked up in ``mpcorb`` by ``provID`` with a
     full-table scan (~30 ms on the full 1.5M-row table), and ``mpcorb`` may
     be None when ``row`` is given.
+
+    Likewise, ``obs_pos`` [AU] and ``obs_vel`` [km/s], each (3, N), can
+    supply the observer's barycentric ICRF state at ``ephTimes``, e.g.
+    sliced from one vectorized util.observatory_barycentric_posvel call over
+    all observations; that call has a large fixed cost per invocation.
     """
     if row is None:
         row = (
@@ -473,9 +480,12 @@ def compute_ephemerides_one(
         sun_pos[:, k] = (s.x, s.y, s.z)
 
     # Observer barycentric ICRF state at each obs time -------------------
-    r_obs_q, v_obs_q = util.observatory_barycentric_posvel(observer_code, ephTimes)
-    r_obs = r_obs_q.to(u.au).value          # (3, N)
-    v_obs = v_obs_q.to(u.km / u.s).value    # (3, N)
+    if obs_pos is None or obs_vel is None:
+        r_obs_q, v_obs_q = util.observatory_barycentric_posvel(observer_code, ephTimes)
+        obs_pos = r_obs_q.to(u.au).value          # (3, N)
+        obs_vel = v_obs_q.to(u.km / u.s).value    # (3, N)
+    r_obs = np.asarray(obs_pos, dtype=np.float64)
+    v_obs = np.asarray(obs_vel, dtype=np.float64)
 
     # Light-emission-time state and apparent astrometric ICRF positions ---
     X_em, V_em, tau = _emission_state(X, V, sun_pos, r_obs)

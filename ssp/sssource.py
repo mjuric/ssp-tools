@@ -16,7 +16,9 @@ from .ephem_assist import compute_ephemerides_one, open_ephem
 def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
     """Fill the ephemeris-derived SSSource columns for one object.
 
-    ``mpcorb`` must be indexed by unpacked_primary_provisional_designation.
+    ``mpcorb`` must be indexed by unpacked_primary_provisional_designation;
+    ``assoc`` must carry the observer's barycentric state per observation
+    (obs_x/y/z [AU], obs_vx/vy/vz [km/s]).
     """
 
     # extract only the subset of observations related to this object
@@ -29,7 +31,15 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
 
     provID = sss["designation"][0]
     ephTimes = Time(dia["midpointMjdTai"].values, format="mjd", scale="tai")
-    e = compute_ephemerides_one(provID, ephTimes, None, ephem, row=mpcorb.loc[provID])
+    e = compute_ephemerides_one(
+        provID,
+        ephTimes,
+        None,
+        ephem,
+        row=mpcorb.loc[provID],
+        obs_pos=assoc[["obs_x", "obs_y", "obs_z"]].to_numpy().T,
+        obs_vel=assoc[["obs_vx", "obs_vy", "obs_vz"]].to_numpy().T,
+    )
 
     sss["ephRateRa"] = e.mu_lon
     sss["ephRateDec"] = e.mu_lat
@@ -223,6 +233,16 @@ if __name__ == "__main__":
     )
 
     sss["elongation"] = util.solar_elongation_ndarray(ra, dec, t)
+
+    # Observer barycentric state for every observation, in one vectorized
+    # call (it has a large fixed cost per call), carried per row of assoc so
+    # compute_sssource_entry gets its object's slice.
+    robs, vobs = util.observatory_barycentric_posvel("X05", t)
+    robs = robs.to_value(u.au)
+    vobs = vobs.to_value(u.km / u.s)
+    for k, c in enumerate("xyz"):
+        assoc[f"obs_{c}"] = robs[k]
+        assoc[f"obs_v{c}"] = vobs[k]
 
     # FIXME: verify these coordinate transforms replicate IAU76 at JPL
     p = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, distance=1 * u.au, frame="hcrs")
