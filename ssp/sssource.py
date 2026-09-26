@@ -234,12 +234,15 @@ if __name__ == "__main__":
 
     sss["elongation"] = util.solar_elongation_ndarray(ra, dec, t)
 
-    # Observer barycentric state for every observation, in one vectorized
-    # call (it has a large fixed cost per call), carried per row of assoc so
-    # compute_sssource_entry gets its object's slice.
-    robs, vobs = util.observatory_barycentric_posvel("X05", t)
-    robs = robs.to_value(u.au)
-    vobs = vobs.to_value(u.km / u.s)
+    # Observer barycentric state for every observation, carried per row of
+    # assoc so compute_sssource_entry gets its object's slice. It is
+    # computed once per unique time (all sources from a visit share one
+    # midpointMjdTai) in one vectorized call: the computation costs ~65 us
+    # per time plus a large fixed overhead per call.
+    tu, inv = np.unique(t.tai.mjd, return_inverse=True)
+    robs, vobs = util.observatory_barycentric_posvel("X05", Time(tu, format="mjd", scale="tai"))
+    robs = robs.to_value(u.au)[:, inv]
+    vobs = vobs.to_value(u.km / u.s)[:, inv]
     for k, c in enumerate("xyz"):
         assoc[f"obs_{c}"] = robs[k]
         assoc[f"obs_v{c}"] = vobs[k]

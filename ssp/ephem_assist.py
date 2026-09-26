@@ -44,6 +44,10 @@ _SIN_EPS = np.sin(OBLIQUITY_J2000)
 # J2000.0 epoch as MJD; ASSIST counts days from this instant in TDB.
 MJD_J2000 = 51544.5
 
+# ASSIST body id of the Sun. Passing the integer to Ephem.get_particle
+# skips its per-call name lookup, which dominated its cost.
+ASSIST_SUN = 0
+
 
 EphResult = namedtuple(
     "EphResult",
@@ -372,10 +376,10 @@ def _apparent_sun(X_em, t_em_assist, ephem, n_iter: int = 3):
     for k, t in enumerate(t_em):
         t_refl = t
         for _ in range(n_iter):
-            s = ephem.get_particle("Sun", float(t_refl))
+            s = ephem.get_particle(ASSIST_SUN, float(t_refl))
             d = np.array([X_em[0, k] - s.x, X_em[1, k] - s.y, X_em[2, k] - s.z])
             t_refl = t - np.sqrt(d @ d) / C_AU_PER_DAY
-        s = ephem.get_particle("Sun", float(t_refl))
+        s = ephem.get_particle(ASSIST_SUN, float(t_refl))
         pos[:, k] = (s.x, s.y, s.z)
         vel[:, k] = (s.vx, s.vy, s.vz)
     return pos, vel
@@ -492,7 +496,7 @@ def compute_ephemerides_one(
 
     # Initial state ------------------------------------------------------
     # ASSIST gives us the Sun's barycentric state at epoch directly.
-    sun = ephem.get_particle("Sun", t0_assist)
+    sun = ephem.get_particle(ASSIST_SUN, t0_assist)
     sun_pos_epoch = np.array([sun.x, sun.y, sun.z])
     sun_vel_epoch = np.array([sun.vx, sun.vy, sun.vz])
 
@@ -505,7 +509,7 @@ def compute_ephemerides_one(
     # acceleration term and for caller's helio* columns).
     sun_pos = np.empty((3, len(t_assist)))
     for k, t in enumerate(t_assist):
-        s = ephem.get_particle("Sun", float(t))
+        s = ephem.get_particle(ASSIST_SUN, float(t))
         sun_pos[:, k] = (s.x, s.y, s.z)
 
     # Observer barycentric ICRF state at each obs time -------------------
