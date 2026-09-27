@@ -214,8 +214,9 @@ The resulting Parquet file is optimized for downstream columnar analytics (Arrow
 `extract-submitted-sources` is an alternative to `extract-catalog`: it builds
 `dia_sources.parquet` for the X05 rows of an MPC `obs_sbn` dump from the
 ClickHouse view `ssp.SubmittableSources`, which serves the source catalogs of
-every processing Rubin has submitted from (each under a collection label such
-as `DP2-DS` or `AP-DS`).
+every processing Rubin has submitted from (each under a `processing` label such
+as `DP2-DS` or `AP-DS`; the view's `processingTable` names the `ssp` table a
+row comes from).
 
 ```bash
 extract-submitted-sources obs_sbn.parquet dia_sources.parquet
@@ -229,27 +230,26 @@ Credentials are taken from `SSP_CH_USER`/`SSP_CH_PASSWORD` if set, else from
 `~/.chpass`, a pgpass-format file (`host:port:database:user:password`, mode
 0600). There is no password flag.
 
-Matching: each `obsSubID` (`LSST-<collection>-<id>`, or a bare `<id>` from
-before labels existed) is looked up by id, in its collection or, for bare
+Matching: each `obsSubID` (`LSST-<processing>-<id>`, or a bare `<id>` from
+before labels existed) is looked up by id, in its processing or, for bare
 ids, in all of them. A candidate is accepted if its PSF or trail centroid is
 within 3 mas of the submitted position and its time within 10 ms (band and
 magnitude are recorded but never reject); trailed sources submitted as two
 endpoints (`...-A`/`...-B`) are matched on the endpoints' midpoint. Among
-accepted candidates the winner prefers a non-superseded collection, then a
+accepted candidates the winner prefers a non-superseded processing, then a
 matching band, then the smallest separation. Rows that cannot be resolved by
 id are searched for by position and time, with the same acceptance rule.
 
 Outputs:
 - `dia_sources.parquet` – one row per resolved obs_sbn row (`obsid` is the
-  key): all of the view's columns (`id` renamed to `diaSourceId`, `mjd_tai` to
-  `midpointMjdTai`; DiaSource columns the view lacks, such as `extendedness`,
-  are null), plus the obs_sbn row's `obsid`, `obssubid` and submitted
+  key): all of the view's columns (`id` renamed to `diaSourceId`; DiaSource
+  columns SSSource/SSObject need but the view lacks are null), plus the obs_sbn row's `obsid`, `obssubid` and submitted
   tracklet (`submission_id`, `trksub`, and MPC's `trkid`), `primary`, `match`
   (`id` or `position`) and the match diagnostics `sep_mas`, `dt_ms`, `dmag`,
   `band_ok`, `n_pass`, `ambiguous`. A source can be claimed by several rows:
   both endpoints of an A/B pair (matched once, at their midpoint), or
   repeated submissions of one detection. `primary` is true on exactly one row
-  per `(collection, diaSourceId)`: the -A endpoint, else the row from the
+  per `(processing, diaSourceId)`: the -A endpoint, else the row from the
   earliest submission.
 - `dia_sources.unresolved.parquet` – the obs_sbn rows that did not resolve,
   with a `reason` and the closest failing candidate's separation and time
@@ -257,7 +257,7 @@ Outputs:
 
 `python -m ssp.sssource` links these DiaSources to obs_sbn by `obsid` (instead
 of `diaSourceId == obssubid`), one SSSource row per DiaSource row, and carries
-`collection`, the tracklet columns (`submission_id`, `trksub`, `trkid`),
+`processing`, the tracklet columns (`submission_id`, `trksub`, `trkid`),
 `obsid` and `primary` into SSSource. Detections of undesignated objects
 (unidentified tracklets) are kept with `ssObjectId` 0, an empty designation
 and NaN orbit-derived columns, as are designated objects with no

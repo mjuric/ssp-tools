@@ -215,8 +215,8 @@ def compute_ssobject(
 
     # Join the DiaSource parts we're interested in to our SSSource table.
     # DiaSources from extract-submitted-sources have one row per obs_sbn
-    # row and come from several collections, so neither diaSourceId nor
-    # (collection, diaSourceId) is unique; join on their key, obsid.
+    # row and come from several processings, so neither diaSourceId nor
+    # (processing, diaSourceId) is unique; join on their key, obsid.
     num = len(sss)
     by_obsid = "obsid" in dia.columns and "obsid" in sss.columns and sss["obsid"].notna().all()
     dia_cols = DIA_COLUMNS + (["obsid"] if by_obsid else [])

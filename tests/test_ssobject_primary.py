@@ -12,7 +12,7 @@ def _tables(n=8):
     phase = np.linspace(2, 25, n)
     sss = pd.DataFrame(dict(
         ssObjectId=np.full(n, 7), diaSourceId=np.arange(n) + 100, designation="2025 AA1",
-        collection="DP2-DS", obsid=[f"o{i}" for i in range(n)], primary=True,
+        processing="DP2-DS", obsid=[f"o{i}" for i in range(n)], primary=True,
         phaseAngle=phase, topoRange=1.5, helioRange=2.3, ephRa=10.0,
     ))
     mag = 18 + 0.03 * phase + rng.normal(0, 0.02, n)
