@@ -8,10 +8,10 @@ observation, carrying all of the view's columns plus the linkage
 
 Matching:
 
-1. **By id.** ``obsSubID`` is ``LSST-<collection>-<id>`` (or, for trailed
+1. **By id.** ``obsSubID`` is ``LSST-<processing>-<id>`` (or, for trailed
    sources submitted as two endpoints, ``...-<id>-A`` / ``-B``), or a bare
    ``<id>`` from before labels existed. Labelled ids are looked up in their
-   collection, bare ids in all collections.
+   processing, bare ids in all processings.
 2. **Verified.** A candidate passes if its PSF or trail centroid is within
    ``SEP_MAS`` of the submitted position and its time within ``DT_MS``.
    Band and magnitude are recorded but never reject.
@@ -57,11 +57,11 @@ DT_MS = 10.0
 # Two passing candidates closer than this in separation are a tie.
 AMBIGUOUS_MAS = 0.01
 
-#: Labels whose rows are SUPERSEDED BY CONSTRUCTION -- another collection
+#: Labels whose rows are SUPERSEDED BY CONSTRUCTION -- another processing
 #: serves a better row for the same id. These must never outrank a live label
 #: on a tie.
 #:
-#: Without this, `collection` was doing two jobs in one sort key: the
+#: Without this, `processing` was doing two jobs in one sort key: the
 #: deterministic tie-break (below) AND, when no --order was given and every
 #: _pri was 0, the preference. `'002-DS' < 'AP-DS'` lexicographically, so the
 #: superseded copy was presented as rank 1 -- "the one to substitute" per this
@@ -79,7 +79,7 @@ CELL_ORDER = 16
 CELL_SHIFT = 2 * (29 - CELL_ORDER)
 
 # View columns renamed to their DiaSource names on output.
-RENAMES = {"id": "diaSourceId", "mjd_tai": "midpointMjdTai"}
+RENAMES = {"id": "diaSourceId"}
 
 # DiaSource columns that SSSource/SSObject read. Any missing from the view
 # is added as an all-null column of this type (today: extendedness).
@@ -328,7 +328,7 @@ def score(obs, oi, cand, ci):
         s_psf = sep_mas(ra, dec, _f64(cand, "ra")[ci], _f64(cand, "dec")[ci])
         s_trail = sep_mas(ra, dec, _f64(cand, "trailRa")[ci], _f64(cand, "trailDec")[ci])
     sep = np.fmin(s_psf, s_trail)
-    dt = (_f64(cand, "mjd_tai")[ci] - obs["tai"][oi]) * 86400e3
+    dt = (_f64(cand, "midpointMjdTai")[ci] - obs["tai"][oi]) * 86400e3
 
     band = cand["band"].to_numpy(zero_copy_only=False)[ci]
     band_ok = np.asarray(band == obs["band_stripped"][oi], dtype=bool) & (band != None)  # noqa: E711
@@ -342,11 +342,11 @@ def score(obs, oi, cand, ci):
     return dict(sep_mas=sep, dt_ms=dt, band_ok=band_ok, dmag=dmag, passed=passed)
 
 
-def rank(oi, collection, ids, sep, band_ok):
+def rank(oi, processing, ids, sep, band_ok):
     """Pick one winner per obs row among (already passing) pairs.
 
     Sort key, ascending: (deprioritized label, not band_ok, sep_mas,
-    collection, id) -- the last two only make the choice deterministic.
+    processing, id) -- the last two only make the choice deterministic.
     Returns ``(pair index of each winner, n_pass, ambiguous)``, one entry
     per distinct obs row, in ascending ``oi`` order. ``ambiguous`` means
     the runner-up ties the winner on (deprioritized, band_ok) and is
@@ -355,8 +355,8 @@ def rank(oi, collection, ids, sep, band_ok):
     oi = np.asarray(oi)
     if len(oi) == 0:
         return np.zeros(0, int), np.zeros(0, int), np.zeros(0, bool)
-    deprio = np.isin(collection, DEPRIORITIZED_LABELS)
-    _, ccode = np.unique(collection.astype(str), return_inverse=True)
+    deprio = np.isin(processing, DEPRIORITIZED_LABELS)
+    _, ccode = np.unique(processing.astype(str), return_inverse=True)
     order = np.lexsort((ids, ccode, sep, ~band_ok, deprio, oi))
     so = oi[order]
     start = np.flatnonzero(np.r_[True, so[1:] != so[:-1]])
@@ -377,9 +377,9 @@ def resolve(obs, oi, cand, ci):
     that had candidates but none passing."""
     sc = score(obs, oi, cand, ci)
     p = sc["passed"]
-    collection = cand["collection"].to_numpy(zero_copy_only=False)[ci]
+    processing = cand["processing"].to_numpy(zero_copy_only=False)[ci]
     ids = cand["id"].to_numpy()[ci]
-    win, n_pass, ambiguous = rank(oi[p], collection[p], ids[p], sc["sep_mas"][p], sc["band_ok"][p])
+    win, n_pass, ambiguous = rank(oi[p], processing[p], ids[p], sc["sep_mas"][p], sc["band_ok"][p])
     win = np.flatnonzero(p)[win]
     info = dict(sep_mas=sc["sep_mas"][win], dt_ms=sc["dt_ms"][win], dmag=sc["dmag"][win],
                 band_ok=sc["band_ok"][win], n_pass=n_pass, ambiguous=ambiguous)
@@ -411,15 +411,15 @@ def ext_data(**sets):
 
 def id_queries(obs, database, chunk_size):
     """Id-pass queries: ``[(label, sql, params, ext sets)]``. Labelled ids
-    are filtered on their collection (15x faster than not); bare ids
-    (label None) search all collections."""
+    are filtered on their processing (15x faster than not); bare ids
+    (label None) search all processings."""
     tasks = []
     labels = obs["label"]
     usable = obs["id"] >= 0
     for label in sorted(set(labels[usable & (labels != None)])) + [None]:  # noqa: E711
         sel = usable & ((labels == label) if label is not None else (labels == None))  # noqa: E711
         ids = np.unique(obs["id"][sel])
-        where = "collection = {label:String} AND " if label is not None else ""
+        where = "processing = {label:String} AND " if label is not None else ""
         sql = f"SELECT * FROM {database}.{VIEW} WHERE {where}id IN (SELECT q FROM q)"
         for k in range(0, len(ids), chunk_size):
             tasks.append((label, sql, {"label": label} if label is not None else None,
@@ -461,8 +461,8 @@ def position_queries(obs, rows, database):
         cells = cell_block(obs["ra"][r], obs["dec"][r])
         sql = (
             f"SELECT * FROM {database}.{VIEW}\n"
-            f"WHERE mjd_tai BETWEEN {float(tai.min() - tol_d)!r} AND {float(tai.max() + tol_d)!r}\n"
-            f"  AND toInt64(floor(mjd_tai * 1440)) IN (SELECT b FROM b)\n"
+            f"WHERE midpointMjdTai BETWEEN {float(tai.min() - tol_d)!r} AND {float(tai.max() + tol_d)!r}\n"
+            f"  AND toInt64(floor(midpointMjdTai * 1440)) IN (SELECT b FROM b)\n"
             f"  AND hpix29 IS NOT NULL\n"
             f"  AND bitShiftRight(hpix29, {CELL_SHIFT}) IN (SELECT c FROM c)"
         )
@@ -530,7 +530,7 @@ def build_output(obs, tbl, cand, rows, ci, match, info):
         obssubid=pc.utf8_trim_whitespace(ident["obssubid"]),
         # the submitted tracklet: (submission_id, trksub), and MPC's trkid
         **{c: ident[c] for c in ("submission_id", "trksub", "trkid")},
-        primary=primary_flags(out["collection"], out["diaSourceId"], is_b, ident["submission_id"],
+        primary=primary_flags(out["processing"], out["diaSourceId"], is_b, ident["submission_id"],
                               ident["obsid"]),
         match=pa.array(np.asarray(match, dtype=object)[k], pa.string()),
         sep_mas=info["sep_mas"][k], dt_ms=info["dt_ms"][k],
@@ -549,15 +549,15 @@ def _codes(values):
     return pc.rank(pc.fill_null(_arr(values, pa.string()), "\uffff"), tiebreaker="dense").to_numpy()
 
 
-def primary_flags(collection, ids, is_b, submission_id, obsid):
-    """True on exactly one row per (collection, diaSourceId).
+def primary_flags(processing, ids, is_b, submission_id, obsid):
+    """True on exactly one row per (processing, diaSourceId).
 
     The same source is claimed by both rows of a trail pair, and can be
     claimed by several submissions of the same detection. The primary row
     is the -A row of a pair, else the row from the earliest submission
     (submission_id starts with its ISO timestamp), tie-broken on obsid.
     """
-    code, ids = _codes(collection), np.asarray(ids)
+    code, ids = _codes(processing), np.asarray(ids)
     order = np.lexsort((_codes(obsid), _codes(submission_id), is_b, ids, code))
     first = np.r_[True, (code[order][1:] != code[order][:-1]) | (ids[order][1:] != ids[order][:-1])]
     primary = np.zeros(len(ids), dtype=bool)
@@ -661,7 +661,7 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     out, is_b = build_output(obs, tbl, cand, rows_all, np.concatenate([c_id, c_pos]), match, info)
 
     # obsid is the key; each source has exactly one primary row
-    key = ["collection", "diaSourceId"]
+    key = ["processing", "diaSourceId"]
     assert pc.count_distinct(out["obsid"]).as_py() == len(out)
     g = out.select(key + ["primary"]).group_by(key).aggregate([("primary", "sum")])
     assert pc.all(pc.equal(g["primary_sum"], 1)).as_py()
@@ -689,13 +689,13 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     n_b = int(is_b.sum())
     print(f"non-primary rows:                 {len(out) - n_sources:,}  (trail -B endpoints: {n_b:,}, "
           f"further submissions of a detection: {len(out) - n_sources - n_b:,})")
-    claimed = claimed.sort_by([("collection", "ascending"), ("diaSourceId", "ascending"),
+    claimed = claimed.sort_by([("processing", "ascending"), ("diaSourceId", "ascending"),
                                ("primary", "descending")])
     for r in claimed.to_pylist():
         print("   claimed by several submissions:", r)
     print(f"ambiguous:                        {pc.sum(out['ambiguous']).as_py() or 0:,}")
     print(f"band_ok = false:                  {pc.sum(pc.invert(out['band_ok'])).as_py() or 0:,}")
-    print(f"per collection:                   {_counts(out['collection'].to_numpy(False))}")
+    print(f"per processing:                   {_counts(out['processing'].to_numpy(False))}")
     print(f"wrote {out_path} and {stem}.unresolved.parquet")
     for k, v in timings.items():
         print(f"  {k:20s} {v:8.1f} s")

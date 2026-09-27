@@ -296,7 +296,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     assoc.sort_values(["no_orbit", "mpc_provid"], inplace=True)
     n_orbit = int(np.sum(~assoc["no_orbit"].to_numpy(dtype=bool)))
 
-    # create the output array for SSSource, plus the DiaSource collection
+    # create the output array for SSSource, plus the DiaSource processing
     # (from extract-submitted-sources; null for Butler DiaSources), which
     # together with diaSourceId identifies the source, and the submitted
     # tracklet: (submission_id, trksub), and MPC's finer trkid. These group
@@ -305,7 +305,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # the primary one of its source (the one SSObject counts).
     tracklet = ("submission_id", "trksub", "trkid")
     sss = np.zeros(totalNumObs, dtype=np.dtype(
-        schema.SSSourceDtype.descr + [("collection", object)] + [(c, object) for c in tracklet]
+        schema.SSSourceDtype.descr + [("processing", object)] + [(c, object) for c in tracklet]
         + [("obsid", object), ("primary", bool)]))
 
     #
@@ -316,10 +316,10 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     has_id = assoc["mpc_packed"].notna().to_numpy(dtype=bool)
     sss["ssObjectId"][has_id] = util.packed_ascii_to_uint64_le(assoc["mpc_packed"][has_id])
     sss["designation"] = assoc["mpc_provid"].fillna("")
-    if "collection" in dia.columns:
-        sss["collection"] = dia["collection"].iloc[assoc["dia_index"]].to_numpy(dtype=object, na_value=None)
+    if "processing" in dia.columns:
+        sss["processing"] = dia["processing"].iloc[assoc["dia_index"]].to_numpy(dtype=object, na_value=None)
     else:
-        sss["collection"] = None
+        sss["processing"] = None
     if by_obsid:
         sss["obsid"] = dia["obsid"].iloc[assoc["dia_index"]].to_numpy(dtype=object)
         sss["primary"] = dia["primary"].iloc[assoc["dia_index"]].to_numpy(dtype=bool)

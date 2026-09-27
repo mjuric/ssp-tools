@@ -29,9 +29,9 @@ def tai(dt):
 
 def view_table(rows):
     """SubmittableSources-shaped table, plus a made-up extra column."""
-    names = ["collection", "id", "band", "mjd_tai", "ra", "dec", "psfFlux", "psfFluxErr",
+    names = ["processing", "id", "band", "midpointMjdTai", "ra", "dec", "psfFlux", "psfFluxErr",
              "trailRa", "trailDec", "hpix29", "madeUpColumn"]
-    types = dict(collection=pa.string(), id=pa.int64(), band=pa.string(), hpix29=pa.int64(),
+    types = dict(processing=pa.string(), id=pa.int64(), band=pa.string(), hpix29=pa.int64(),
                  madeUpColumn=pa.string())
     cols = {c: [r.get(c) for r in rows] for c in names}
     # hpix29 as the ingest computes it: the depth-29 cell of (ra, dec)
@@ -49,7 +49,7 @@ def view_table(rows):
 
 def fake_fetch(view):
     """Answer run_queries-style tasks from ``view``: id tasks by filtering on
-    (collection, id); position tasks by returning everything (the client-side
+    (processing, id); position tasks by returning everything (the client-side
     cell pairing and verification must do the rest)."""
     def fetch(tasks):
         out = []
@@ -58,7 +58,7 @@ def fake_fetch(view):
             if "q" in sets:
                 mask = pc.is_in(t["id"], pa.array(sets["q"], pa.int64()))
                 if params:
-                    mask = pc.and_(mask, pc.equal(t["collection"], params["label"]))
+                    mask = pc.and_(mask, pc.equal(t["processing"], params["label"]))
                 t = t.filter(mask)
             out.append((key, t))
         return out
@@ -132,7 +132,7 @@ def _obs(ra=10.0, dec=1.0, band="r", mag=20.0, n=1):
 
 
 def _cand(**kw):
-    base = dict(collection="DP2-DS", id=1, band="r", mjd_tai=tai(T0), ra=10.0, dec=1.0)
+    base = dict(processing="DP2-DS", id=1, band="r", midpointMjdTai=tai(T0), ra=10.0, dec=1.0)
     return view_table([{**base, **k} for k in kw.get("rows", [{}])])
 
 
@@ -142,8 +142,8 @@ def test_score_psf_trail_and_edges():
         dict(dec=1.0 + 2.9 * MAS),                                              # psf, just inside
         dict(dec=1.0 + 3.1 * MAS),                                              # psf, just outside
         dict(dec=1.0 + 500 * MAS, trailRa=10.0, trailDec=1.0 + 1 * MAS),        # trail match
-        dict(mjd_tai=t + 9.9e-3 / 86400),                                       # time, inside
-        dict(mjd_tai=t - 10.1e-3 / 86400),                                      # time, outside
+        dict(midpointMjdTai=t + 9.9e-3 / 86400),                                       # time, inside
+        dict(midpointMjdTai=t - 10.1e-3 / 86400),                                      # time, outside
         dict(band="z", psfFlux=-5.0),                                           # band mismatch passes
     ])
     obs = _obs(n=1)
@@ -171,7 +171,7 @@ def test_rank_preferences():
     # 002-DS never wins over a live label, even when closer
     win, _, amb = _rank([("002-DS", 1, 0.0, True), ("AP-DS", 1, 1.0, True)])
     assert list(win) == [1] and not amb[0]
-    # a never-seen label ranks normally; ties break on (collection, id)
+    # a never-seen label ranks normally; ties break on (processing, id)
     win, _, amb = _rank([("pDP2-DS", 7, 0.5, True), ("DP2-DS", 7, 0.5, True), ("ZZ-NEW", 7, 0.1, True)])
     assert list(win) == [2] and not amb[0]
     win, _, amb = _rank([("pDP2-DS", 7, 0.5, True), ("DP2-DS", 7, 0.5, True)])
@@ -227,17 +227,17 @@ def _scenario():
     ]
     tt = tai(t)
     view = [
-        dict(collection="DP2-DS", id=100, band="r", mjd_tai=tt, ra=10.0, dec=1.0 + 0.5 * MAS),
-        dict(collection="pDP2-DS", id=100, band="r", mjd_tai=tt, ra=10.0, dec=1.0),
-        dict(collection="DP2-DS", id=200, band="g", mjd_tai=tt, ra=11.0, dec=1.0),
-        dict(collection="pDP2-DS", id=200, band="g", mjd_tai=tt, ra=11.0, dec=1.0),
-        dict(collection="NV-S", id=200, band="g", mjd_tai=tt, ra=50.0, dec=1.0),
-        dict(collection="DP2-S", id=300, band="z", mjd_tai=tt + 1.4e-3 / 86400, ra=12.0, dec=1.0),
-        dict(collection="AP-DS", id=400, band="i", mjd_tai=tt + 15 / 86400, ra=13.0, dec=1.0 + 0.3 / 3600,
-             trailRa=13.0, trailDec=1.0001),
-        dict(collection="DP2-DS", id=500, band="r", mjd_tai=tt, ra=14.0, dec=1.0 + 1 * MAS),
-        dict(collection="DP2-DS", id=601, band="r", mjd_tai=tt, ra=15.0, dec=1.0),
-        dict(collection="DP2-DS", id=700, band="r", mjd_tai=tt, ra=16.0, dec=1.0 + 1000 * MAS),
+        dict(processing="DP2-DS", id=100, band="r", midpointMjdTai=tt, ra=10.0, dec=1.0 + 0.5 * MAS),
+        dict(processing="pDP2-DS", id=100, band="r", midpointMjdTai=tt, ra=10.0, dec=1.0),
+        dict(processing="DP2-DS", id=200, band="g", midpointMjdTai=tt, ra=11.0, dec=1.0),
+        dict(processing="pDP2-DS", id=200, band="g", midpointMjdTai=tt, ra=11.0, dec=1.0),
+        dict(processing="NV-S", id=200, band="g", midpointMjdTai=tt, ra=50.0, dec=1.0),
+        dict(processing="DP2-S", id=300, band="z", midpointMjdTai=tt + 1.4e-3 / 86400, ra=12.0, dec=1.0),
+        dict(processing="AP-DS", id=400, band="i", midpointMjdTai=tt + 15 / 86400, ra=13.0,
+             dec=1.0 + 0.3 / 3600, trailRa=13.0, trailDec=1.0001),
+        dict(processing="DP2-DS", id=500, band="r", midpointMjdTai=tt, ra=14.0, dec=1.0 + 1 * MAS),
+        dict(processing="DP2-DS", id=601, band="r", midpointMjdTai=tt, ra=15.0, dec=1.0),
+        dict(processing="DP2-DS", id=700, band="r", midpointMjdTai=tt, ra=16.0, dec=1.0 + 1000 * MAS),
     ]
     return obs_table(rows), view_table(view)
 
@@ -251,8 +251,8 @@ def test_extract_end_to_end(tmp_path):
     by = {r["obsid"]: r for r in out}
     assert sorted(by) == ["o1", "o2", "o3", "o4a", "o4b", "o5", "o6"]
 
-    assert (by["o1"]["collection"], by["o1"]["diaSourceId"], by["o1"]["match"]) == ("DP2-DS", 100, "id")
-    assert (by["o2"]["collection"], by["o2"]["ambiguous"], by["o2"]["n_pass"]) == ("DP2-DS", True, 2)
+    assert (by["o1"]["processing"], by["o1"]["diaSourceId"], by["o1"]["match"]) == ("DP2-DS", 100, "id")
+    assert (by["o2"]["processing"], by["o2"]["ambiguous"], by["o2"]["n_pass"]) == ("DP2-DS", True, 2)
     assert by["o3"]["band_ok"] is False and by["o3"]["dt_ms"] == pytest.approx(1.4, abs=1e-3)
     # an A/B pair: two rows, one source, matched once at the midpoint;
     # the -A row is primary
@@ -268,7 +268,7 @@ def test_extract_end_to_end(tmp_path):
 
     # all view columns pass through, renamed; missing required ones null-filled
     r = by["o1"]
-    assert r["madeUpColumn"] == "x0" and "id" not in r and "mjd_tai" not in r
+    assert r["madeUpColumn"] == "x0" and "id" not in r
     assert r["midpointMjdTai"] == pytest.approx(tai(T0))
     assert r["extendedness"] is None and r["psfFluxErr"] is None
     schema = pq.read_schema(tmp_path / "dia.parquet")
@@ -295,8 +295,8 @@ def test_extract_double_submission(tmp_path, capsys):
              ra=11.0, dec=1.0, obstime=T0, band="Li", mag=20.0),
     ]
     view = view_table([
-        dict(collection="NV-S", id=100, band="i", mjd_tai=tai(T0) + 2e-3 / 86400, ra=10.0, dec=1.0),
-        dict(collection="NV-S", id=101, band="i", mjd_tai=tai(T0), ra=11.0, dec=1.0),
+        dict(processing="NV-S", id=100, band="i", midpointMjdTai=tai(T0) + 2e-3 / 86400, ra=10.0, dec=1.0),
+        dict(processing="NV-S", id=101, band="i", midpointMjdTai=tai(T0), ra=11.0, dec=1.0),
     ])
     pq.write_table(obs_table(rows), tmp_path / "obs.parquet")
     assert S.extract(tmp_path / "obs.parquet", tmp_path / "dia.parquet", fake_fetch(view)) == 0
