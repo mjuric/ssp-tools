@@ -247,7 +247,7 @@ HORIZONS_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
 
 
 def horizons_observer(row, eph_times: Time, quantities: str = "1",
-                      observer_code: str = "X05"):
+                      observer_code: str = "X05", extra: Optional[dict] = None):
     """Query a Horizons observer table for the row's *own* osculating
     elements (so the only thing being compared between Horizons and ASSIST
     is the propagator and the geometry).
@@ -260,6 +260,9 @@ def horizons_observer(row, eph_times: Time, quantities: str = "1",
     "R.A.___(ICRF)", "r", "deldot", "S-T-O") to a float ndarray aligned with
     eph_times; ``state`` is the (6,) heliocentric ICRF cartesian state
     [AU, AU/day] that Horizons derived from the input elements.
+
+    ``extra`` adds or overrides request parameters (e.g. ``{"H": ...,
+    "G": ...}`` for magnitudes).
     """
     def tdb_jd(tt_mjd):
         return Time(float(tt_mjd), format="mjd", scale="tt").tdb.jd
@@ -289,6 +292,16 @@ def horizons_observer(row, eph_times: Time, quantities: str = "1",
         "REF_PLANE": "FRAME",
         "REF_SYSTEM": "ICRF",
     }
+    params.update(extra or {})
+    return horizons_request(params, len(eph_times))
+
+
+def horizons_request(params: dict, n_expected: int):
+    """Send one Horizons API request and parse its CSV observer table.
+
+    Returns (columns, state) as `horizons_observer` describes. Callers are
+    responsible for the Horizons etiquette (serial, paced requests).
+    """
     url = HORIZONS_URL + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": "ssp-tools-bench/0.1"})
     with urllib.request.urlopen(req, timeout=60) as resp:
@@ -306,8 +319,8 @@ def horizons_observer(row, eph_times: Time, quantities: str = "1",
     pre = [ln for ln in body[:soe].splitlines() if ln.strip() and not ln.startswith("*")]
     header = [h.strip() for h in pre[-1].split(",")]
     rows_text = [r for r in body[soe + 5:eoe].splitlines() if r.strip()]
-    if len(rows_text) != len(eph_times):
-        raise RuntimeError(f"expected {len(eph_times)} rows, got {len(rows_text)}")
+    if len(rows_text) != n_expected:
+        raise RuntimeError(f"expected {n_expected} rows, got {len(rows_text)}")
 
     columns = {}
     for j, name in enumerate(header):
