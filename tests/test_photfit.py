@@ -1,6 +1,8 @@
 import unittest
 import numpy as np
-from ssp.photfit import HG12_model, fitHG12, _HG1G2_basis, _HG12_residuals_and_jac
+from ssp.photfit import (
+    HG12_model, fitHG12, _fitHG12_reference, _HG1G2_basis, _HG12_residuals_and_jac,
+)
 
 # Independently calculated test vectors for H=17.30, G12=0.42
 # 15 observations spanning phase angles 0.8-60 degrees
@@ -310,6 +312,167 @@ class TestHG12FastModel(unittest.TestCase):
             J = jac([17.3])
             self.assertEqual(J.shape, (len(self.PHASE), 1))
             np.testing.assert_allclose(J, J_num, rtol=1e-6, atol=1e-6)
+
+
+def _synthetic(G12, H=H_TRUE):
+    """Noiseless apparent magnitudes at the test geometry."""
+    reduced = HG12_model(np.deg2rad(PHASE_ANGLE), [H, G12])
+    return reduced + 5.0 * np.log10(TDIST * RDIST)
+
+
+class TestHG12Bounded(unittest.TestCase):
+    """The profiled, bounded fit (and its least_squares reference)."""
+
+    # interior values, including both sides of the branch at 0.2
+    INTERIOR = [0.05, 0.19, 0.2, 0.21, 0.42, 0.8, 0.97]
+    ROBUST = dict(magSigmaFloor=0.05, nSigmaClip=10.0)
+
+    def testNoiselessRecovery(self):
+        """Noiseless data at G12 inside [0, 1] recover H and G12 to 1e-6,
+        with finite errors equal to the reference's inv(J^T J) ones.
+        """
+        for G12 in self.INTERIOR:
+            for kw in ({}, self.ROBUST):
+                with self.subTest(G12=G12, **kw):
+                    mag = _synthetic(G12)
+                    res = fitHG12(mag, MAG_SIGMA, PHASE_ANGLE, TDIST, RDIST, **kw)
+                    self.assertLess(abs(res.H - H_TRUE), 1e-6)
+                    self.assertLess(abs(res.G12 - G12), 1e-6)
+                    self.assertEqual(res.nobs, 15)
+                    self.assertLess(res.chi2dof, 1e-10)
+                    ref = _fitHG12_reference(mag, MAG_SIGMA, PHASE_ANGLE, TDIST, RDIST, **kw)
+                    for f in ("H_err", "G12_err", "HG_cov"):
+                        self.assertTrue(np.isfinite(getattr(res, f)))
+                        np.testing.assert_allclose(getattr(res, f), getattr(ref, f), rtol=1e-4)
+
+    def testNoiselessAtBounds(self):
+        """Noiseless data at G12 = 0 and 1 recover the bound exactly,
+        and H to 1e-6.
+        """
+        for G12 in (0.0, 1.0):
+            for kw in ({}, self.ROBUST):
+                with self.subTest(G12=G12, **kw):
+                    res = fitHG12(_synthetic(G12), MAG_SIGMA, PHASE_ANGLE, TDIST, RDIST, **kw)
+                    self.assertEqual(res.G12, G12)
+                    self.assertLess(abs(res.H - H_TRUE), 1e-6)
+                    self.assertEqual(res.nobs, 15)
+
+    def testOutsideBoundsGivesBound(self):
+        """Data generated with G12 outside [0, 1] give the bound, with
+        NaN G12_err and HG_cov, and the fixed-G12 H_err.
+        """
+        sigma = MAG_SIGMA.copy()
+        sigma[::2] = 0.05
+        for G12, bound in ((-0.3, 0.0), (1.4, 1.0)):
+            for kw in ({}, self.ROBUST):
+                with self.subTest(G12=G12, **kw):
+                    mag = _synthetic(G12)
+                    res = fitHG12(mag, sigma, PHASE_ANGLE, TDIST, RDIST, **kw)
+                    self.assertEqual(res.G12, bound)
+                    self.assertTrue(np.isnan(res.G12_err))
+                    self.assertTrue(np.isnan(res.HG_cov))
+                    s = np.sqrt(sigma**2 + kw.get("magSigmaFloor", 0.0)**2)
+                    self.assertAlmostEqual(res.H_err, 1 / np.sqrt(np.sum(s**-2)), places=12)
+                    self.assertEqual(res.nobs, 15)
+                    # H is the fixed-G12 fit at the bound
+                    fixed = fitHG12(mag, sigma, PHASE_ANGLE, TDIST, RDIST, fixedG12=bound, **kw)
+                    self.assertAlmostEqual(res.H, fixed.H, places=9)
+                    self.assertAlmostEqual(res.chi2dof * 13, fixed.chi2dof * 14, places=6)
+                    # the reference agrees
+                    ref = _fitHG12_reference(mag, sigma, PHASE_ANGLE, TDIST, RDIST, **kw)
+                    self.assertAlmostEqual(ref.G12, bound, places=6)
+                    self.assertAlmostEqual(ref.H, res.H, places=5)
+                    self.assertTrue(np.isnan(ref.G12_err))
+
+    def testOutlierRejection(self):
+        """Injected outliers are exactly the points rejected, and H and
+        G12 are recovered from the rest.
+        """
+        rng = np.random.RandomState(3)
+        G12 = 0.42
+        mag = _synthetic(G12) + rng.normal(0, 0.01, len(PHASE_ANGLE))
+        bad = np.zeros(len(mag), dtype=bool)
+        bad[[2, 7, 11]] = True
+        mag[bad] += np.array([1.0, -0.8, 1.5])   # 14-26 sigma with the floor
+        for fn in (fitHG12, _fitHG12_reference):
+            with self.subTest(fn=fn.__name__):
+                det = {}
+                res = fn(mag, MAG_SIGMA, PHASE_ANGLE, TDIST, RDIST, _details=det, **self.ROBUST)
+                np.testing.assert_array_equal(det["keep"], ~bad)
+                self.assertEqual(res.nobs, 12)
+                self.assertLess(abs(res.H - H_TRUE), 0.05)
+                self.assertLess(abs(res.G12 - G12), 0.2)
+                clean = fn(mag[~bad], MAG_SIGMA[~bad], PHASE_ANGLE[~bad], TDIST[~bad], RDIST[~bad],
+                           magSigmaFloor=0.05)
+                self.assertAlmostEqual(res.H, clean.H, places=5)
+                self.assertAlmostEqual(res.G12, clean.G12, places=4)
+
+    def testFixedG12ClosedForm(self):
+        """With fixedG12 set, H is the weighted mean of the reduced
+        magnitudes minus the model, with H_err = 1/sqrt(sum(w)).
+        """
+        rng = np.random.RandomState(5)
+        mag = MAG_EXPECTED + rng.normal(0, 0.03, len(MAG_EXPECTED))
+        sigma = rng.uniform(0.01, 0.1, len(mag))
+        for kw in ({}, {"magSigmaFloor": 0.05}):
+            for G12 in (0.1, 0.5, 1.2):
+                with self.subTest(G12=G12, **kw):
+                    s = np.sqrt(sigma**2 + kw.get("magSigmaFloor", 0.0)**2)
+                    w = s**-2
+                    y = mag - 5 * np.log10(TDIST * RDIST) - HG12_model(np.deg2rad(PHASE_ANGLE), [0.0, G12])
+                    H = np.sum(w * y) / np.sum(w)
+                    res = fitHG12(mag, sigma, PHASE_ANGLE, TDIST, RDIST, fixedG12=G12, **kw)
+                    self.assertAlmostEqual(res.H, H, places=10)
+                    self.assertEqual(res.G12, G12)
+                    self.assertAlmostEqual(res.H_err, 1 / np.sqrt(np.sum(w)), places=12)
+                    self.assertAlmostEqual(res.chi2dof, np.sum(w * (y - H)**2) / 14, places=9)
+                    self.assertTrue(np.isnan(res.G12_err) and np.isnan(res.HG_cov))
+
+    def testFailures(self):
+        """Degenerate inputs fail as before: nobs = 0 and NaNs."""
+        nan_fields = ("H", "G12", "H_err", "G12_err", "HG_cov", "chi2dof")
+        cases = {
+            # a single observation, free G12: fewer observations than
+            # parameters
+            "one obs": (MAG_EXPECTED[:1], MAG_SIGMA[:1], PHASE_ANGLE[:1], TDIST[:1], RDIST[:1], {}),
+            # all phase angles equal, free G12: J^T J is singular
+            "same phase": (MAG_EXPECTED[:4], MAG_SIGMA[:4], np.full(4, 10.0), TDIST[:4], RDIST[:4], {}),
+            # zero or negative errors are dropped
+            "bad errors": (MAG_EXPECTED[:3], np.array([0.0, -1.0, np.nan]), PHASE_ANGLE[:3],
+                           TDIST[:3], RDIST[:3], {}),
+            # clipping leaves too few points
+            "all clipped": (_synthetic(0.42) + np.arange(15) * 0.1, MAG_SIGMA, PHASE_ANGLE, TDIST,
+                            RDIST, {"nSigmaClip": 1e-6}),
+        }
+        for name, (m, s, p, t, r, kw) in cases.items():
+            for fn in (fitHG12, _fitHG12_reference):
+                if name == "same phase" and fn is _fitHG12_reference:
+                    # inv() of the reference's numerically (not exactly)
+                    # singular J^T J need not raise
+                    continue
+                with self.subTest(name, fn=fn.__name__):
+                    res = fn(m, s, p, t, r, **kw)
+                    self.assertEqual(res.nobs, 0)
+                    for f in nan_fields:
+                        self.assertTrue(np.isnan(getattr(res, f)), f)
+
+    def testMatchesReferenceOnNoisyData(self):
+        """Fast path and reference agree on noisy synthetic fits."""
+        rng = np.random.RandomState(11)
+        for trial in range(20):
+            G12 = rng.uniform(-0.2, 1.2)
+            sigma = rng.uniform(0.02, 0.15, len(PHASE_ANGLE))
+            mag = _synthetic(G12) + rng.normal(0, 1, len(sigma)) * sigma
+            for kw in ({}, self.ROBUST):
+                with self.subTest(trial=trial, **kw):
+                    res = fitHG12(mag, sigma, PHASE_ANGLE, TDIST, RDIST, **kw)
+                    ref = _fitHG12_reference(mag, sigma, PHASE_ANGLE, TDIST, RDIST, **kw)
+                    self.assertEqual(res.nobs, ref.nobs)
+                    self.assertLess(abs(res.H - ref.H), 1e-4)
+                    self.assertLess(abs(res.G12 - ref.G12), 1e-3)
+                    np.testing.assert_allclose(res.H_err, ref.H_err, rtol=1e-2)
+                    np.testing.assert_allclose(res.chi2dof, ref.chi2dof, rtol=1e-2)
+                    self.assertEqual(np.isnan(res.G12_err), np.isnan(ref.G12_err))
 
 
 if __name__ == "__main__":
