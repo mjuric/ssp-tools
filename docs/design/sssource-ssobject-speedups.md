@@ -1,16 +1,90 @@
 # Design: faster SSSource/SSObject builds
 
-Status: **proposed**, for review. Nothing here is implemented yet.
-Tracks items 3 and 4 of [#9](https://github.com/mjuric/ssp-tools/issues/9).
+Status: **implemented** (2026-09-27). See *Results* for what landed and
+where it departed from this design. Tracks items 3 and 4 of
+[#9](https://github.com/mjuric/ssp-tools/issues/9).
 
 Four changes:
-- **A:** run the SSObject per-object work in parallel;
+- **A:** run the SSObject per-object work in parallel (#14);
 - **B:** `sssource.py` reads only the DiaSource (and obs_sbn) columns it uses
-  (done: #13);
+  (#13);
 - **C:** cheaper H/G12 fits, with G12 bounded to [0, 1], and DP2's robust
-  defaults (0.05 mag floor, 10σ clipping);
-- **E:** a faster SSSource build: E1 runs the per-object loop in parallel,
-  E2 replaces per-object astropy bookkeeping with numpy.
+  defaults (0.05 mag floor, 10σ clipping) (#17);
+- **E:** a faster SSSource build: E1 runs the per-object loop in parallel
+  (#16), E2 replaces per-object astropy bookkeeping with numpy (#15).
+
+## Results
+
+All measured on the 128-core USDF node (shared, load average ~13–25), on
+the full dataset: 297,749 objects and 8,069,956 SSSource rows from the
+2026-09-25 obs_sbn dump.
+
+| build | before | after | how |
+|---|---|---|---|
+| SSSource | 2,045 s (34 min), serial | **92 s** at 64 workers | B, E2, E1 |
+| SSObject | ~2.5 h serial (estimated from 27–31 ms/object) | **68 s** at 64 workers | A, C |
+
+SSSource peak memory at full size: ~20 GB → 16.4 GB serial with B. At 64
+workers it's 22.7 GiB summed PSS, about 100 MB per worker.
+
+### What landed, and where it departs from the design
+
+- **B (#13).** It also trims the obs_sbn read (all 91 columns before), which
+  was the larger share of the remaining memory.
+  - SSSource peak memory for 3,000 objects: 19.7 → 5.1 GB.
+  - Output identical to before.
+- **A (#14).** As designed.
+  - Output byte-identical at 1, 8, 16, 32 and 64 workers, and to the
+    pre-change build.
+  - 3,000 objects: 98.5 s → 9.4 s.
+  - No BLAS oversubscription; copy-on-write sharing holds (~8 MB per
+    worker).
+- **E2 (#15).** `ephOffset` uses astropy's own Vincenty formula (same
+  operations and unit factors), not a haversine. That's because
+  `ephOffset` is stored as float32: a haversine correct to ~2e-10″ still
+  rounded to the neighbouring float32 in ~1% of rows.
+  - The output is bitwise identical to before.
+  - −25% per object (3,000 objects: 31.6 → 23.7 s serial).
+- **E1 (#16).** A's pool helpers moved to `ssp/util.py` and are shared.
+  - The ephemeris is opened lazily per worker process. The ASSIST files are
+    memory-mapped and shared, so each worker costs only ~100 MB.
+  - Full build bitwise identical to the serial one, NaNs included.
+- **C (#17):**
+  - **Robust stage:** the H solve is IRLS with Newton steps (plain IRLS
+    converged too slowly).
+  - **Search:** up to 3 local minima of the G12 grid are refined, and
+    G12 = 0.2 is evaluated exactly. The model's published piecewise
+    G12 → (G1, G2) mapping jumps slightly there, and ~9% of fits land
+    exactly on it.
+  - **Acceptance:** the design's test against a *single-start* bounded
+    `least_squares` reference gave 88.4%. Nearly every disagreement was
+    the reference stuck in a worse minimum or unconverged. Accepted
+    instead on:
+    - agreement with a 9-start reference (99.88%, the fast fit never
+      worse);
+    - an independent check that the fit's χ² is at or below the minimum of
+      a 20,001-point brute-force grid in all 7,317 fits with degrees of
+      freedom.
+  - **Speed:** 3.3× per fit against the bounded reference and 6.5× against
+    the old fit, below the 5–10× estimate.
+  - **Added in integration:** `{band}_Chi2` now scales `chi2dof` by the
+    points the fit used (`nObsUsed`), not all of the band's. That was wrong
+    whenever points were dropped, which default clipping made common.
+  - **Effect of the new defaults** on the 3,000-object subset:
+    - failed fits: 2,510 → 37;
+    - ~2/3 of free fits end at a G12 bound (2,909 at 0, 3,234 at 1,
+      2,969 inside);
+    - 663 fits lose points to clipping.
+
+### Not done
+
+- **D** (numpy slices in SSObject): the per-object loop is now dominated by
+  the fits, so it isn't worth it.
+- **Fixed costs:** ~55 s of the SSSource build and ~25 s of the SSObject
+  build are serial: reading, joins, coordinate transforms, MOID set-up,
+  writing. They're now the floor.
+- **Python 3.14** warns that `fork()` in a multi-threaded parent is
+  deprecated (pyarrow and OpenBLAS threads). No problems have been seen.
 
 See *Plan* for the order and who does what.
 
