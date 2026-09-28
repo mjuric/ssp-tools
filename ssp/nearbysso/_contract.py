@@ -111,6 +111,16 @@ VISIT_DTYPE = np.dtype([
 #       margin_arcsec of the track position extrapolated linearly to the
 #       visit time. It must never miss a visit the object is actually in,
 #       which the WP5 brute-force check verifies.
+#
+#       The linear extrapolation within a night is not accurate for nearby
+#       objects: the topocentric track curves with the diurnal parallax
+#       (amplitude ~R_earth/delta; hundreds to thousands of arcsec for NEOs
+#       within ~0.01 AU), and the rate itself changes. So the tolerance per
+#       visit is at least
+#           radius + |rate|*|dt| + 2*R_earth/delta + 0.5*|drate/dt|*dt^2
+#           + margin_arcsec
+#       where drate/dt is estimated from the rate change between adjacent
+#       nightly samples (conservatively, the larger of the two sides).
 
 # --------------------------------------------------------------------------
 # WP2: propagation and uncertainty
@@ -135,6 +145,8 @@ class CoarseTrack(NamedTuple):
     ra_dec_cov: np.ndarray   # (K,) [deg^2]
     sigma_major: np.ndarray  # (K,) [arcsec] 1-sigma semi-major axis of the ellipse
     ok: np.ndarray           # (K,) bool: False where the integration failed
+    delta: np.ndarray        # (K,) [AU] topocentric distance (sizes the diurnal-
+                             # parallax term of the candidate margin)
 
 
 # propagate.coarse(orbit, t, obs_pos, ephem) -> CoarseTrack
