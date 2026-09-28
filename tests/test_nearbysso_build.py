@@ -210,6 +210,8 @@ def synth(tmp_path_factory, orbits, ephem):
                     sid += 1
                     rows.append((sid, visit, t, ra % 360.0, dec))
                     truth.append((sid, str(o["designation"]), kind))
+    rows.append((sid + 1, rows[0][1], rows[0][2], np.nan, 0.0))    # dropped by read_dia
+    truth.append((sid + 1, "", "bad"))
     dia = pd.DataFrame(rows, columns=["diaSourceId", "visit", "midpointMjdTai", "ra", "dec"])
     path = d / "dia.parquet"
     pq.write_table(pa.Table.from_pandas(dia.sample(frac=1.0, random_state=1), preserve_index=False), path,
@@ -234,6 +236,8 @@ def test_end_to_end(tmp_path, synth, orbits, ephem):
     assert list(res.columns) == list(NEARBYSSO_DTYPE.names)[1:]
     assert res.index.is_monotonic_increasing and res.index.is_unique
     assert rep["output_rows"] == len(res) and rep["exceptions"] == {}
+    assert rep["dia_dropped"] == 1 and rep["dia_sources"] == len(dia) - 1
+    assert rep["counts"]["step_cap_stops"] == 0 and rep["counts"]["nights_skipped"] == 0
     assert json.load(open(tmp_path / "e2e.report.json"))["output_rows"] == len(res)
 
     # no background source is near a prediction
@@ -256,7 +260,9 @@ def test_end_to_end(tmp_path, synth, orbits, ephem):
     want = res["designation"].map({"2007 VY347": 1234.0, "2003 LN6": 5678.0}).to_numpy(dtype=float)
     np.testing.assert_array_equal(sso_id, want)
 
-    # the eph* values are SSSource's, for the same orbit and DiaSource
+    # the eph* values are SSSource's, for the same orbit and DiaSource: to
+    # integrator noise (it depends on the set of times integrated through,
+    # here all the candidate visits, there only the matched ones), 3.6 uas
     from ssp import schema
     from ssp.sssource import compute_sssource_entry
     from ssp.util import observatory_barycentric_posvel
@@ -277,16 +283,21 @@ def test_end_to_end(tmp_path, synth, orbits, ephem):
         assoc["obs_pos"] = rp.to_value(u.au).T
         assoc["obs_vel"] = vp.to_value(u.km / u.s).T
         compute_sssource_entry(sss, assoc, mpcorb, de, ephem)
-        np.testing.assert_array_equal(grp["ephRa"], sss["ephRa"])
-        np.testing.assert_array_equal(grp["ephDec"], sss["ephDec"])
+        np.testing.assert_allclose(grp["ephRa"], sss["ephRa"], rtol=0, atol=1e-9)
+        np.testing.assert_allclose(grp["ephDec"], sss["ephDec"], rtol=0, atol=1e-9)
         for c in ("ephOffset", "ephVmag", "ephRateRa", "ephRateDec"):
-            np.testing.assert_array_equal(grp[c], sss[c].astype(np.float32), err_msg=f"{desig} {c}")
+            np.testing.assert_allclose(grp[c], sss[c].astype(np.float32), rtol=1e-6, atol=1e-6,
+                                       err_msg=f"{desig} {c}")
 
 
 @needs_assist
-def test_serial_parallel_identical_and_slices_same(tmp_path, synth, orbits):
+def test_serial_parallel_identical_and_slices_same(tmp_path, synth, orbits, monkeypatch):
     a, rep_a = _run(tmp_path, synth, orbits, "serial", workers=1)
     b, _ = _run(tmp_path, synth, orbits, "parallel", workers=3, chunk_factor=2)
+    with monkeypatch.context() as mp:     # one DiaIndex.match call per orbit
+        mp.setattr(B, "_MATCH_BATCH", 1)
+        d, _ = _run(tmp_path, synth, orbits, "unbatched", workers=1)
+    assert a.read_bytes() == d.read_bytes()
     c, rep_c = _run(tmp_path, synth, orbits, "sliced", workers=2, slice_days=1)
     assert pq.read_metadata(a).num_rows > 0
     assert a.read_bytes() == b.read_bytes()

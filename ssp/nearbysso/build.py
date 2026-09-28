@@ -76,21 +76,30 @@ MIN_HALF_SPAN_DAYS = 1.0 / 24.0
 #: Exceptions kept per type, for the run report.
 _N_EXAMPLES = 5
 
-#: A worker's output: one row per (prediction, DiaSource) match.
-_MATCH_DTYPE = np.dtype([
-    ("dia_row", "i8"),       # into the slice's visit-sorted dia arrays
+#: An eligible prediction: an orbit at a candidate visit.
+_PRED_DTYPE = np.dtype([
+    ("visit", "i8"),         # into the slice's visits
     ("orbit", "i8"),         # into the (designation-sorted) orbits
-    ("sep", "f8"),           # ephOffset [arcsec]
     ("ra", "f8"), ("dec", "f8"),
     ("vmag", "f4"), ("rate_ra", "f4"), ("rate_dec", "f4"),
     ("ra_err", "f4"), ("dec_err", "f4"), ("ra_dec_cov", "f4"),
 ])
 
+#: A worker's output: one row per (prediction, DiaSource) match.
+_MATCH_DTYPE = np.dtype([
+    ("dia_row", "i8"),       # into the slice's visit-sorted dia arrays
+    ("sep", "f8"),           # ephOffset [arcsec]
+] + [(f, _PRED_DTYPE[f]) for f in _PRED_DTYPE.names[1:]])
+
+#: Predictions collected (from several orbits) per DiaIndex.match call.
+_MATCH_BATCH = 20000
+
 #: Per-orbit counters a worker returns (summed over chunks and slices, so
 #: "orbits", "with_candidates" and the "coarse_*" ones count orbit-slices;
 #: the run report's "failed_orbits" counts orbits).
 _COUNTS = ("orbits", "coarse_partial_fail", "coarse_all_fail", "with_candidates", "candidate_visits",
-           "precise_evals", "eligible_evals", "sigma_rejected", "matches")
+           "precise_evals", "eligible_evals", "sigma_rejected", "matches", "nights_skipped",
+           "step_cap_stops")
 _STAGES = ("coarse", "candidates", "precise", "ellipse", "match")
 
 
@@ -113,7 +122,7 @@ def night_ranges(path):
         t = batch.column(1).to_numpy(zero_copy_only=False)
         # runs of equal nights (one per night for visit-sorted input)
         s = np.flatnonzero(np.r_[True, night[1:] != night[:-1]])
-        parts.append((night[s], np.minimum.reduceat(t, s), np.maximum.reduceat(t, s),
+        parts.append((night[s], np.fmin.reduceat(t, s), np.fmax.reduceat(t, s),
                       np.diff(np.r_[s, night.size])))
     if not parts:
         return np.zeros(0, np.int64), np.zeros(0), np.zeros(0), np.zeros(0, np.int64)
@@ -122,8 +131,8 @@ def night_ranges(path):
     tmin = np.full(nights.size, np.inf)
     tmax = np.full(nights.size, -np.inf)
     n = np.zeros(nights.size, np.int64)
-    np.minimum.at(tmin, inv, lo)
-    np.maximum.at(tmax, inv, hi)
+    np.fmin.at(tmin, inv, lo)
+    np.fmax.at(tmax, inv, hi)
     np.add.at(n, inv, cnt)
     return nights, tmin, tmax, n
 
@@ -138,12 +147,13 @@ def _night_day_number(nights):
         return np.asarray(nights, dtype=np.int64)
 
 
-def plan_slices(nights, tmin, tmax, slice_days):
+def plan_slices(nights, tmin, tmax, slice_days, n=None):
     """Group sorted nights into slices of ``slice_days`` consecutive
     day_obs dates, counted from the first night. Returns a list of dicts
-    with the slice's first and last night and its read bounds ``[t_lo,
-    t_hi)`` (TAI MJD), which cover all its nights' sources; the slice then
-    keeps only the rows of its own nights (see ``_read_slice``)."""
+    with the slice's first and last night, its read bounds ``[t_lo,
+    t_hi)`` (TAI MJD), which cover all its nights' sources (the slice then
+    keeps only the rows of its own nights; see ``_read_slice``), and the
+    number of its rows (from ``n``, per night; for the dropped-row count)."""
     if slice_days <= 0:
         raise ValueError("slice_days must be positive")
     if not len(nights):
@@ -154,7 +164,8 @@ def plan_slices(nights, tmin, tmax, slice_days):
     for s in np.unique(sid):
         k = np.flatnonzero(sid == s)
         out.append(dict(night_lo=int(nights[k[0]]), night_hi=int(nights[k[-1]]),
-                        t_lo=float(tmin[k].min()), t_hi=float(np.nextafter(tmax[k].max(), np.inf))))
+                        t_lo=float(tmin[k].min()), t_hi=float(np.nextafter(tmax[k].max(), np.inf)),
+                        n=None if n is None else int(np.sum(n[k]))))
     return out
 
 
@@ -196,8 +207,9 @@ _EPHEM = None   # one ASSIST ephemeris per worker process, opened lazily
 
 
 def process_orbit(i, w, ephem, stage_t):
-    """Everything for orbit ``i`` of ``w["orbits"]`` in the current slice.
-    Returns (matches or None, counters dict)."""
+    """Orbit ``i`` of ``w["orbits"]`` in the current slice, up to the
+    match: its eligible predictions (``_PRED_DTYPE``, or None) and its
+    counters."""
     orbit = w["orbits"][i]
     c = dict.fromkeys(_COUNTS, 0)
     c["orbits"] = 1
@@ -207,7 +219,9 @@ def process_orbit(i, w, ephem, stage_t):
     stage_t["coarse"] += t1 - t0
     if not track.ok.all():
         c["coarse_all_fail" if not track.ok.any() else "coarse_partial_fail"] = 1
-    cand = w["vindex"].candidates(track, _visits.DEFAULT_CANDIDATE_MARGIN_ARCSEC)
+    vindex = w["vindex"]
+    cand = vindex.candidates(track, _visits.DEFAULT_CANDIDATE_MARGIN_ARCSEC)
+    c["nights_skipped"] = int(vindex.last_skipped)
     t2 = time.perf_counter()
     stage_t["candidates"] += t2 - t1
     if not cand.size:
@@ -222,25 +236,13 @@ def process_orbit(i, w, ephem, stage_t):
     stage_t["precise"] += t3 - t2
 
     ra_err, dec_err, ra_dec_cov, smaj = propagate.ellipse_at(track, v["t"], topo_pos=e.topo_pos.T)
-    good = np.flatnonzero(np.isfinite(smaj) & (smaj <= SIGMA_MAX_ARCSEC))
-    c["eligible_evals"] = int(good.size)
-    c["sigma_rejected"] = int(cand.size - good.size)
-    t4 = time.perf_counter()
-    stage_t["ellipse"] += t4 - t3
-    if not good.size:
+    k = np.flatnonzero(np.isfinite(smaj) & (smaj <= SIGMA_MAX_ARCSEC))
+    c["eligible_evals"] = int(k.size)
+    c["sigma_rejected"] = int(cand.size - k.size)
+    if not k.size:
+        stage_t["ellipse"] += time.perf_counter() - t3
         return None, c
 
-    # (as SSSource: RA wrapped to [0, 360), and the separation measured
-    # from the prediction)
-    ra = util.wrap_ra_deg(e.ra_deg[good])
-    dec = e.dec_deg[good]
-    pred, dia_row, sep = w["dindex"].match(cand[good], ra, dec, MATCH_RADIUS_ARCSEC)
-    stage_t["match"] += time.perf_counter() - t4
-    if not pred.size:
-        return None, c
-    c["matches"] = int(pred.size)
-
-    k = good[pred]                  # the matched predictions, into cand
     # V exactly as SSSource computes it: from its float32 helio/topo
     # columns (and its float64 phase angle)
     helio = e.helio_pos[:, k].astype(np.float32)
@@ -248,19 +250,38 @@ def process_orbit(i, w, ephem, stage_t):
     helio_r = np.sqrt(helio[0] ** 2 + helio[1] ** 2 + helio[2] ** 2)
     topo_r = np.sqrt(topo[0] ** 2 + topo[1] ** 2 + topo[2] ** 2)
 
+    p = np.empty(k.size, dtype=_PRED_DTYPE)
+    p["visit"] = cand[k]
+    p["orbit"] = i
+    # (as SSSource: RA wrapped to [0, 360), and the separation measured
+    # from the prediction)
+    p["ra"] = util.wrap_ra_deg(e.ra_deg[k])
+    p["dec"] = e.dec_deg[k]
+    p["vmag"] = hg_V_mag(e.H, e.G, helio_r, topo_r, e.phase_angle[k])
+    p["rate_ra"] = e.mu_lon[k]
+    p["rate_dec"] = e.mu_lat[k]
+    p["ra_err"] = ra_err[k]
+    p["dec_err"] = dec_err[k]
+    p["ra_dec_cov"] = ra_dec_cov[k]
+    stage_t["ellipse"] += time.perf_counter() - t3
+    return p, c
+
+
+def _match(preds, w, stage_t):
+    """The DiaSources within the radius of the predictions of several
+    orbits, in one ``DiaIndex.match`` call (it has a fixed cost per call):
+    ``_MATCH_DTYPE`` rows, in the order of ``preds``."""
+    t0 = time.perf_counter()
+    p = np.concatenate(preds)
+    pred, dia_row, sep = w["dindex"].match(p["visit"], p["ra"], p["dec"], MATCH_RADIUS_ARCSEC)
     m = np.empty(pred.size, dtype=_MATCH_DTYPE)
     m["dia_row"] = dia_row
-    m["orbit"] = i
     m["sep"] = sep
-    m["ra"] = ra[pred]
-    m["dec"] = dec[pred]
-    m["vmag"] = hg_V_mag(e.H, e.G, helio_r, topo_r, e.phase_angle[k])
-    m["rate_ra"] = e.mu_lon[k]
-    m["rate_dec"] = e.mu_lat[k]
-    m["ra_err"] = ra_err[k]
-    m["dec_err"] = dec_err[k]
-    m["ra_dec_cov"] = ra_dec_cov[k]
-    return m, c
+    q = p[pred]
+    for f in _PRED_DTYPE.names[1:]:
+        m[f] = q[f]
+    stage_t["match"] += time.perf_counter() - t0
+    return m
 
 
 def _chunk(o0, o1):
@@ -275,14 +296,15 @@ def _chunk(o0, o1):
         if _EPHEM is None:
             _EPHEM = open_ephem()
         ephem = _EPHEM
+    propagate.STEP_CAP_STOPS = 0
     counts = dict.fromkeys(_COUNTS, 0)
     stage_t = dict.fromkeys(_STAGES, 0.0)
     errors, examples = Counter(), {}
     bad = {"coarse_all": [], "coarse_partial": [], "exception": []}
-    out = []
+    out, preds, n_pred = [], [], 0
     for i in range(o0, o1):
         try:
-            m, c = process_orbit(i, w, ephem, stage_t)
+            p, c = process_orbit(i, w, ephem, stage_t)
         except Exception as ex:     # one bad orbit must not stop a run
             name = type(ex).__name__
             errors[name] += 1
@@ -297,9 +319,17 @@ def _chunk(o0, o1):
             bad["coarse_partial"].append(i)
         for k, v in c.items():
             counts[k] += v
-        if m is not None:
-            out.append(m)
+        if p is not None:
+            preds.append(p)
+            n_pred += p.size
+            if n_pred >= _MATCH_BATCH:
+                out.append(_match(preds, w, stage_t))
+                preds, n_pred = [], 0
+    if preds:
+        out.append(_match(preds, w, stage_t))
     matches = np.concatenate(out) if out else np.zeros(0, dtype=_MATCH_DTYPE)
+    counts["matches"] = int(matches.size)
+    counts["step_cap_stops"] = int(propagate.STEP_CAP_STOPS)
     bad = {k: np.array(v, dtype=np.int64) for k, v in bad.items()}
     return matches, counts, dict(errors), examples, stage_t, bad
 
@@ -429,7 +459,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, slice_
     # Slices ---------------------------------------------------------------
     t = time.perf_counter()
     nights, tmin, tmax, nsrc = night_ranges(dia_path)
-    slices = plan_slices(nights, tmin, tmax, slice_days)
+    slices = plan_slices(nights, tmin, tmax, slice_days, nsrc)
     tim["plan_slices"] = time.perf_counter() - t
     log(f"{nsrc.sum():,} DiaSources in {nights.size} nights, {len(slices)} slice(s) of {slice_days} d "
         f"({tim['plan_slices']:.1f} s)")
@@ -447,6 +477,8 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, slice_
         dia = _read_slice(dia_path, sl)
         st["read"] = time.perf_counter() - t
         st["dia"] = int(dia["diaSourceId"].size)
+        # (read_dia drops rows with nulls or non-finite values, and warns)
+        st["dia_dropped"] = sl["n"] - st["dia"]
         n_dia += st["dia"]
 
         t = time.perf_counter()
@@ -554,6 +586,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, slice_
         failed[k] = dict(n=int(idx.size), examples=orbits["designation"][idx[:_N_EXAMPLES]].tolist())
     rep.update(
         dia_sources=int(n_dia), nights=int(nights.size),
+        dia_dropped=int(sum(st["dia_dropped"] for st in rep["slices"])),
         counts=counts, failed_orbits=failed,
         exceptions=dict(errors), exception_examples=examples,
         matches_before_nearest=int(sum(st["matches"] for st in rep["slices"])),
@@ -580,6 +613,9 @@ def _print_report(rep):
           f"exceptions: {rep['exceptions'] or 'none'}")
     for k, v in rep["exception_examples"].items():
         print(f"  {k}: {v}")
+    print(f"DiaSources: {rep['dia_sources']:,} in {rep['nights']:,} nights ({rep['dia_dropped']:,} dropped "
+          f"by read_dia); step-cap stops: {c['step_cap_stops']:,}; nights skipped by candidates: "
+          f"{c['nights_skipped']:,}")
     print(f"{c['with_candidates']:,} orbits with candidates; {c['candidate_visits']:,} candidate visits "
           f"= precise evaluations; {c['eligible_evals']:,} eligible, {c['sigma_rejected']:,} rejected by "
           f"sigma; {rep['matches_before_nearest']:,} matches, {rep['matches_after_nearest']:,} nearest; "
