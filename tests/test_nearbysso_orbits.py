@@ -144,11 +144,17 @@ def test_load_synthetic(tmp_path, capsys):
     pq.write_table(table, path)
     ephem = FakeEphem()
 
-    out = O.load_orbits(path, ephem=ephem)
+    stats = {}
+    out = O.load_orbits(path, ephem=ephem, stats=stats)
     line = capsys.readouterr().out
     # rows without an arc (no JSON, or none in it) drop, as in get-mpcorb.py
     assert "14 rows read" in line and "removed 2 comets, 1 missing elements, 5 arcs <= 2 d" in line
     assert "6 kept" in line and "has_cov false 1 (0 missing, 1 not PSD)" in line
+    rms = stats.pop("normalized_rms")
+    assert stats == dict(rows_read=14, kept=6, removed=dict(comet=2, elements=1, arc=5), has_cov_false=1,
+                         cov_missing=0, cov_not_psd=1, cov_clipped_to_psd=stats["cov_clipped_to_psd"])
+    assert set(rms) == {"p5", "p50", "p95", "p99", "n", "n_zero"} and rms["n"] + rms["n_zero"] <= 6
+    assert f"{rms['p50']:.3f}" in line
 
     assert out.dtype == ORBIT_DTYPE
     assert list(out["designation"]) == ["1993 TT", "1994 UU", "1995 VV", "1998 YY", "1999 ZZ", "2000 AA"]

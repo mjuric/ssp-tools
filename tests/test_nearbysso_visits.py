@@ -571,15 +571,16 @@ def test_candidates_eligibility():
     for field, val in (("sigma_major", np.array([C.SIGMA_MAX_ARCSEC * 1.01, 1, 1])),
                        ("ok", np.array([False, True, True])), ("sigma_major", np.array([np.nan, 1, 1]))):
         c2 = vi.candidates(tr._replace(**{field: val}), 60.0)
+        assert vi.last_sigma_gated == 1
         assert not (vis["night"][c2] == vi.nights[0]).any()
         np.testing.assert_array_equal(c2, all_c[vis["night"][all_c] != vi.nights[0]])
     # exactly at the limit is eligible
     c3 = vi.candidates(tr._replace(sigma_major=np.full(3, C.SIGMA_MAX_ARCSEC)), 60.0)
     np.testing.assert_array_equal(c3, all_c)
-    assert vi.last_skipped == 0
+    assert vi.last_skipped == 0 and vi.last_sigma_gated == 0
     # samples far from every night: nothing, and the nights are counted
     assert vi.candidates(tr._replace(t=tr.t + 5.0), 60.0).size == 0
-    assert vi.last_skipped == 3
+    assert vi.last_skipped == 3 and vi.last_sigma_gated == 0
     vi.candidates(tr._replace(t=tr.t + 1.3), 60.0)   # the first night is 1.3 d from any
     assert vi.last_skipped == 1
     # empty track

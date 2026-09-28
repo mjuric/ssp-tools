@@ -505,7 +505,7 @@ def _col(table, name):
     return np.asarray(col.to_pylist(), dtype=object)
 
 
-def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True):
+def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True, stats=None):
     """Read mpc_orbits Parquet into an ``ORBIT_DTYPE`` array, sorted by
     designation. See ``_contract``.
 
@@ -513,7 +513,7 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True):
     from ``SSP_ASSIST_*`` if None); ``nthreads`` bounds the JSON parsing
     threads. With ``with_filter=False`` every row is kept, and rows whose
     state can't be computed have NaN states. Prints a one-line summary
-    unless ``verbose`` is False.
+    unless ``verbose`` is False; a ``stats`` dict, if given, gets its counts.
     """
     t0 = time.perf_counter()
     table = pq.read_table(path, columns=_COLUMNS)
@@ -567,12 +567,19 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True):
     out["cov0"] = c
     t_conv = time.perf_counter() - t2
 
+    # 0 is the MPC's placeholder in zeroed ("no_orbit") fit statistics
+    rms = out["normalized_rms"]
+    n_zero = int(np.sum(rms == 0))
+    rms = rms[np.isfinite(rms) & (rms > 0)]
+    pct = np.percentile(rms, [5, 50, 95, 99]) if len(rms) else [np.nan] * 4
+    if stats is not None:
+        stats.update(rows_read=int(n_read), kept=int(len(out)),
+                     removed=dict(counts) if with_filter else None,
+                     has_cov_false=int((~pd_ok).sum()), cov_missing=int(missing.sum()),
+                     cov_not_psd=int((~missing & ~pd_ok).sum()), cov_clipped_to_psd=int(clipped.sum()),
+                     normalized_rms=dict(p5=float(pct[0]), p50=float(pct[1]), p95=float(pct[2]),
+                                         p99=float(pct[3]), n=int(len(rms)), n_zero=n_zero))
     if verbose:
-        # 0 is the MPC's placeholder in zeroed ("no_orbit") fit statistics
-        rms = out["normalized_rms"]
-        n_zero = int(np.sum(rms == 0))
-        rms = rms[np.isfinite(rms) & (rms > 0)]
-        pct = np.percentile(rms, [5, 50, 95, 99]) if len(rms) else [np.nan] * 4
         removed = (f"removed {counts['comet']:,} comets, {counts['elements']:,} missing elements, "
                    f"{counts['arc']:,} arcs <= 2 d" if with_filter else "no filter")
         print(f"load_orbits: {n_read:,} rows read, {removed}; {len(out):,} kept; "

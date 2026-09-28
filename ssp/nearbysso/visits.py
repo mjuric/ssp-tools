@@ -642,9 +642,11 @@ class VisitIndex:
         geocentric one plus the diurnal parallax offset d(t):
 
         - geocentric curvature: <= 0.5 max|accel| dt^2, which the 0.5 a_k dt^2
-          term estimates from the nightly samples (d(t) nearly cancels in the
-          difference of rates a day apart). The w_k |dt| term (not needed for
-          linear motion) is the slack for where the nightly estimate
+          term estimates from the adjacent samples. (Samples a day apart
+          nearly cancel d(t) in the difference of rates; samples within the
+          night, as the WP4 build takes them, include the diurnal
+          acceleration too, which is conservative.) The w_k |dt| term (not
+          needed for linear motion) is the slack for where the estimate
           underestimates the acceleration within the night.
         - diurnal parallax: d(t) is the site's geocentric vector, rotating at
           the sidereal rate W, projected onto the sky and scaled by 1/delta:
@@ -680,12 +682,15 @@ class VisitIndex:
 
         ``self.last_skipped`` is set to the number of nights of the index
         that had no track sample within ``MAX_SAMPLE_GAP_DAYS`` (and so were
-        skipped) in this call.
+        skipped) in this call, and ``self.last_sigma_gated`` to the number of
+        the other nights whose sample is unusable or has ``sigma_major >
+        SIGMA_MAX_ARCSEC``.
         """
         nn = self.nights.size
         empty = np.zeros(0, dtype=np.int64)
         tk = np.asarray(track.t, dtype=np.float64)
         self.last_skipped = nn if tk.size == 0 else 0
+        self.last_sigma_gated = 0
         if not nn or not tk.size:
             return empty
         margin = margin_arcsec * _ARCSEC
@@ -709,7 +714,9 @@ class VisitIndex:
         usable = (np.asarray(track.ok, dtype=bool)
                   & np.isfinite(ra) & np.isfinite(dec) & np.isfinite(rra) & np.isfinite(rdec))
         elig = usable & (np.asarray(track.sigma_major, dtype=np.float64) <= SIGMA_MAX_ARCSEC)
-        nights = np.flatnonzero((gap <= MAX_SAMPLE_GAP_DAYS) & elig[k_n])
+        near = gap <= MAX_SAMPLE_GAP_DAYS
+        nights = np.flatnonzero(near & elig[k_n])
+        self.last_sigma_gated = int(near.sum() - nights.size)
         if not nights.size:
             return empty
 
