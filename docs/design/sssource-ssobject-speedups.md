@@ -3,11 +3,14 @@
 Status: **proposed**, for review. Nothing here is implemented yet.
 Tracks items 3 and 4 of [#9](https://github.com/mjuric/ssp-tools/issues/9).
 
-Three changes:
+Four changes:
 - **A:** run the SSObject per-object work in parallel;
-- **B:** `sssource.py` reads only the DiaSource columns it uses;
+- **B:** `sssource.py` reads only the DiaSource (and obs_sbn) columns it uses
+  (done: #13);
 - **C:** cheaper H/G12 fits, with G12 bounded to [0, 1], and DP2's robust
-  defaults (0.05 mag floor, 10σ clipping).
+  defaults (0.05 mag floor, 10σ clipping);
+- **E:** a faster SSSource build: E1 runs the per-object loop in parallel,
+  E2 replaces per-object astropy bookkeeping with numpy.
 
 See *Plan* for the order and who does what.
 
@@ -31,7 +34,11 @@ See *Plan* for the order and who does what.
      full build benchmark with both);
    - open one PR per change (B, A, C), or a combined A+C PR if they're easier
      to review together, and merge only after owner approval.
-4. **Order of effect:**
+4. **E after A is merged,** by one subagent in its own worktree, reusing A's
+   pool and chunking. E2 comes first, so that E1's serial-against-parallel
+   equality check compares identical code. The same review, integration and
+   merge flow as above.
+5. **Order of effect:**
    - A alone is ~30–60× (per-object work across ~64 workers);
    - C alone is ~5–10× per fit, with the robust stage included, since both
      stages become one-parameter searches;
@@ -361,6 +368,100 @@ value and only G12 is searched.
    configuration.
 4. **Speed:** time per fit, old reference against new fast path, with the new
    defaults (robust stage included), and the 3,000-object build's wall time.
+
+## E. Faster SSSource build
+
+### Measurements
+
+- **The full SSSource build takes ~34 min** (2,062 s for 297,749 objects,
+  2026-09-26), about 6.6 ms per object, on one core.
+- **Profile on the 3,000-object subset** (cProfile, which inflates the total
+  to 42.9 s against 31.5 s unprofiled):
+
+| part | time | calls |
+|---|---|---|
+| per-object loop (`util.group_by` → `compute_sssource_entry`) | 31.0 s (72%) | 3,000 |
+| &nbsp;&nbsp;ASSIST ephemerides (`compute_ephemerides_one`) | 13.8 s | 3,000 |
+| &nbsp;&nbsp;astropy `SkyCoord` construction + `separation` | 4.8 s | 9,006 |
+| &nbsp;&nbsp;pandas slicing | 1.9 s | 6,014 |
+| &nbsp;&nbsp;other per-object Python | ~10 s | |
+| vectorized: observatory positions, elongation, ecl/gal transforms | 4.5 s | |
+| input joins | 1.9 s | |
+| reading inputs | 0.8 s | |
+
+### E1. Parallel per-object loop
+
+- **Where:** in `build_sssource`, the `util.group_by([sss[:n_orbit], assoc.iloc[:n_orbit]], "ssObjectId", compute_sssource_entry…)`
+  call. Each object's ephemerides are independent.
+- **Mechanism, as in A:**
+  - a fork-based `ProcessPoolExecutor`;
+  - inputs shared through module-level globals set before the fork: the
+    `sss` structured array, `assoc`, `dia_eph` and `mpcorb`;
+  - contiguous chunks of groups, balanced by observation count, about
+    `8 × workers` chunks.
+  - **Reuse A's code.** If it factors naturally, move A's chunking and pool
+    helper into `ssp/util.py` and use it from both. A's tests must still
+    pass. Don't build a framework.
+- **Results.** Today `compute_sssource_entry` writes into slices of `sss`. In
+  a forked worker those writes land in its private copy-on-write pages, so
+  each worker returns **only the fields it computes**:
+  - the eph*, helio*, topo* and range/rate columns, `phaseAngle` and
+    `ephVmag`, as one structured array per chunk;
+  - kept as an explicit module-level list (`EPH_FIELDS`) next to
+    `compute_sssource_entry`, with a test that it matches what the function
+    writes.
+
+  The parent assigns each chunk back into `sss`.
+- **ASSIST ephemeris:**
+  - each worker opens its own `open_ephem()` in the pool initializer, rather
+    than sharing the parent's C-level object across the fork;
+  - the parent doesn't open one when `workers > 1`;
+  - measure per-worker memory; if the ephemeris files are read into memory
+    per worker, report it and cap the default worker count to fit.
+- **Interface:**
+  - `python -m ssp.sssource --workers N`, default `min(64, os.cpu_count())`;
+  - `--workers 1` runs today's serial code path unchanged;
+  - library default `workers=1`.
+- **Output and errors:**
+  - the per-object `max/median separation` lines are kept (interleaved
+    across workers);
+  - progress is printed per chunk;
+  - any worker exception fails the build with no output written.
+- **Verification:**
+  - `sssource.parquet` from `--workers 1` and `--workers 64` is
+    **identical** (`Table.equals`) on the 3,000-object subset;
+  - a new synthetic test: `workers=1` against `workers=3`;
+  - a benchmark at 1, 8, 32 and 64 workers (wall time, CPU, peak RSS);
+  - one full build at the default worker count, identical to the serial
+    full build at `/lscratch/mjuric/sspwt/full/sssource.parquet` (B's code)
+    apart from E2's tolerance below.
+
+### E2. Numpy instead of per-object astropy and pandas bookkeeping
+
+- **`ephRa`/`ephDec`:** replace `SkyCoord(ra=e.ra_deg, dec=e.dec_deg)` →
+  `.ra.deg`/`.dec.deg` with the equivalent numpy normalization (RA wrapped to
+  [0, 360), Dec unchanged). The result must be **bitwise identical** to
+  today's.
+- **`ephOffset`:** replace the second `SkyCoord` and `eph.separation(obsv)`
+  with a float64 haversine separation, as in
+  `ssp/export/submittable.py:sep_mas`. That's not bitwise, so the tolerance
+  is `|ΔephOffset| ≤ 1e-9″`, with the maximum difference reported. Add a
+  unit test of the haversine against `SkyCoord.separation` on random points,
+  including the poles and the RA wrap.
+- **Per-object slicing:** prepare `dia_eph` and the observer state in `assoc`
+  as numpy arrays once, before the loop, instead of
+  `dia.iloc[...]`/`assoc[[...]].to_numpy()` per object. The values are
+  identical.
+- **Unchanged:** the `Time` construction and the `compute_ephemerides_one`
+  call. ASSIST's API needs them, and that's the inherent work.
+- **Verification:** `sssource.parquet` on the 3,000-object subset against
+  B's serial output (`/lscratch/mjuric/sspwt/bbench/new_ext/sssource.parquet`):
+  every column identical except `ephOffset`, which must be within
+  tolerance.
+- **Expected:** roughly 15–25% off the per-object cost.
+
+**Expected combined:** ~34 min → about 1 min at 64 workers (E1), a little
+less with E2, plus ~10–20 s of fixed cost at full size.
 
 ## Follow-ups (not in this change)
 
