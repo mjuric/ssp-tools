@@ -6,7 +6,8 @@ Tracks items 3 and 4 of [#9](https://github.com/mjuric/ssp-tools/issues/9).
 Three changes:
 - **A:** run the SSObject per-object work in parallel;
 - **B:** `sssource.py` reads only the DiaSource columns it uses;
-- **C:** cheaper H/G12 fits, with G12 bounded to [0, 1].
+- **C:** cheaper H/G12 fits, with G12 bounded to [0, 1], and DP2's robust
+  defaults (0.05 mag floor, 10σ clipping).
 
 See *Plan* for the order and who does what.
 
@@ -32,7 +33,8 @@ See *Plan* for the order and who does what.
      to review together, and merge only after owner approval.
 4. **Order of effect:**
    - A alone is ~30–60× (per-object work across ~64 workers);
-   - C alone is ~5–10× per fit;
+   - C alone is ~5–10× per fit, with the robust stage included, since both
+     stages become one-parameter searches;
    - together, the fits should drop from ~2.5 h to on the order of a minute,
      leaving the fixed loading and join costs, ~20–40 s at full size, as the
      floor.
@@ -234,41 +236,94 @@ per-worker overhead.
     3,000-object subset and for a Butler-path run (`--max-objects 10`);
   - peak memory and wall time reported before and after.
 
-## C. Cheaper H/G12 fits (G12 bounded to [0, 1])
+## C. Cheaper H/G12 fits, and DP2's robust defaults
 
-**Owner decision (2026-09-27):** G12 is bounded to **[0, 1]**. This
-intentionally changes results for fits that today diverge outside that range
-(#9, item 3, 30–40% of objects on narrow phase-angle ranges).
+**Owner decisions (2026-09-27):**
+- **G12 is a free fit bounded to [0, 1].** This intentionally changes results
+  for fits that today diverge outside that range (#9, item 3, 30–40% of
+  objects on narrow phase-angle ranges). DP2 instead fixed G12 at 0.5; that
+  remains available with `--hg12FixedG12 0.5`.
+- **Robust fitting is on by default, as in DP2:** a 0.05 mag error floor in
+  quadrature, a robust `soft_l1` first fit, rejection of residuals beyond
+  10σ, then an ordinary least-squares fit on the retained points.
+
+### DP2 comparison
+
+DP2's SSObject used pipe_tasks `fitHG12`
+([DM-54843, pipe_tasks#1300](https://github.com/lsst/pipe_tasks/pull/1300)),
+configured in `lsst/drp_pipe` `pipelines/_ingredients/LSSTCam/DRP.yaml`
+(commit `299697d7a6`) with `hg12FixedG12: 0.5`, `hg12MagSigmaFloor: 0.05`
+and `hg12NSigmaClip: 10`. Described in RTN-115 §4.5.2.
+
+- **Our `fitHG12` is a backport of that function.** The only differences are
+  performance ones: a precomputed basis and an analytic Jacobian. The flux →
+  magnitude conversion (31.4 − 2.5 log10 f; σ = 1.085736 σ_f/f), the distance
+  reduction, the `soft_l1` stage with `f_scale=1`, the clipping and the final
+  fit are the same.
+- **So the gap to DP2 is only the defaults:**
+
+| option | DP2 | today | after C |
+|---|---|---|---|
+| error floor (`--hg12MagSigmaFloor`) | 0.05 | 0.0 | **0.05** |
+| clip threshold (`--hg12NSigmaClip`) | 10 | off | **10** |
+| G12 (`--hg12FixedG12`) | fixed 0.5 | free, unbounded | **free, bounded [0, 1]** |
+
+- **The floor also matters for the clipping.** `f_scale=1` and the 10σ
+  threshold are both in units of the magnitude errors. Without the floor,
+  bright detections' small formal errors make both far stricter than
+  intended.
+- **Where the defaults go:** the CLI (`ssp-build-ssobject`) and the
+  `compute_ssobject()` keywords. `fitHG12`'s own keyword defaults stay neutral
+  (no floor, no clipping), matching pipe_tasks, so the function stays a
+  faithful building block.
 
 ### Approach
 
-- **The model is linear in H.** In magnitudes, for fixed G12,
-  `m_i = H + f_i(G12)` with `f_i = -2.5 log10(G1 Φ1 + G2 Φ2 + (1 - G1 - G2) Φ3)`.
-  With weights `w_i = 1/σ_i²`, the best H is the weighted mean
-  `H*(G12) = Σ w_i (m_i - f_i) / Σ w_i`.
-- **So the fit is a one-parameter search** minimizing
-  `χ²(G12) = Σ w_i (m_i - f_i - H*)²` over `G12 ∈ [0, 1]`.
-  - It uses the existing `_HG1G2_basis` (Φ1, Φ2, Φ3 evaluated once per fit)
-    and the existing piecewise `G12 → (G1, G2)` mapping, with its kink at
-    0.2.
-  - **Coarse grid first:** evaluate χ² on a fixed grid of G12 values over
-    [0, 1] (e.g. 101 points), vectorized in one numpy expression.
-  - **Then refine** the best grid cell with a bounded scalar minimizer
-    (`scipy.optimize.minimize_scalar(method="bounded")`, or a golden-section
-    search) to a tolerance of 1e-6 in G12. The grid makes it safe against
-    local minima; the refinement gives the precision.
-- **`fixedG12` stays exact:** just `H*(fixedG12)`, no search.
-- **The robust path is unchanged:** with `nSigmaClip` (off by default), the
-  `soft_l1` first stage stays `least_squares`, since its loss isn't
-  quadratic. The final linear-loss fit then uses the new method.
+The weighted residuals are `r_i = (m_i − H − f_i(G12)) / σ_i`, with
+`f_i = −2.5 log10(G1 Φ1 + G2 Φ2 + (1 − G1 − G2) Φ3)`, and `m_i` the
+distance-reduced magnitudes with the floor already applied to `σ_i`. For a
+fixed G12 the model is linear in H, so in both stages H is solved per G12
+value and only G12 is searched.
+
+- **Final stage (linear loss).**
+  - For a given G12, the best H is the weighted mean
+    `H*(G12) = Σ w_i (m_i − f_i) / Σ w_i`, with `w_i = 1/σ_i²`.
+  - That leaves a one-parameter search minimizing
+    `χ²(G12) = Σ w_i (m_i − f_i − H*)²` over [0, 1].
+- **Robust stage (`soft_l1`)**, with `ρ(z) = 2(√(1+z) − 1)` of `z = r²`,
+  and the same scale as today (`f_scale = 1`).
+  - For a given G12, the best H minimizes `Σ ρ(r_i²)`. That's a
+    one-dimensional convex problem, solved by iteratively reweighted least
+    squares: weights `w_i ∝ (1 + r_i²)^(−1/2)`, a few iterations to a
+    tolerance of 1e-9 mag.
+  - The profiled robust cost is then minimized over G12 in [0, 1], the same
+    way as the final stage.
+- **The search over G12** is the same in both stages:
+  - a coarse fixed grid over [0, 1] (e.g. 101 points), evaluated vectorized
+    across the grid, including the per-G12 H solve;
+  - then a bounded scalar refinement of the best cell
+    (`scipy.optimize.minimize_scalar(method="bounded")`, or golden-section)
+    to 1e-6 in G12.
+
+  The grid guards against local minima, and the piecewise G12 → (G1, G2)
+  mapping with its kink at 0.2 is used unchanged. The refinement gives the
+  precision.
+- **Clipping is unchanged:** keep `|r_i| < nSigmaClip`, with the residuals
+  taken at the robust stage's solution. `nObsUsed` is the retained count.
+- **`fixedG12`:** both stages reduce to the H solve alone, with no search. So
+  DP2's configuration is also fast.
+- **Reference implementation.** The existing `least_squares` path stays in
+  `photfit.py` as a private reference (`_fitHG12_reference`), extended with
+  bounds `[0, 1]` on G12 in both stages. It is used only by tests and the
+  verification below, to check the fast path.
 
 ### Outputs (same fields and schema as today)
 
-- **`H`, `G12` and `chi2dof`** come from the minimum.
-- **Uncertainties when G12 is inside (0, 1):** `H_err`, `G12_err` and `HG_cov`
-  come from `inv(JᵀJ)` of the two-parameter model at the solution, using the
-  existing analytic Jacobian. That's the same formula as today, so interior
-  fits are directly comparable.
+- **`H`, `G12` and `chi2dof`** come from the final stage's minimum.
+- **Uncertainties when G12 is inside (0, 1):** `H_err`, `G12_err` and
+  `HG_cov` come from `inv(JᵀJ)` of the two-parameter model at the solution,
+  using the existing analytic Jacobian. That's the same formula as today, so
+  interior fits are directly comparable.
 - **Uncertainties when G12 is at a bound:**
   - `G12` is the bound (0 or 1);
   - `G12_err` and `HG_cov` are **NaN**, since a Gaussian error at a hard
@@ -277,26 +332,36 @@ intentionally changes results for fits that today diverge outside that range
 
   **Flagged for owner review:** the alternative is to report the
   two-parameter formula even at a bound.
-- **Failure:** `nobs = 0` and NaNs, exactly as today (no finite
-  observations, a singular `JᵀJ`).
+- **Failure:** `nobs = 0` and NaNs, as today (no finite observations, too
+  few points left after clipping, a singular `JᵀJ`).
 
 ### Verification
 
 1. **Unit tests** in `tests/test_photfit.py`:
-   - noiseless synthetic data at several G12 values in [0, 1], including near
-     0.2 and at 0 and 1, recover H and G12 to 1e-6;
+   - noiseless synthetic data at several G12 values in [0, 1], including
+     near 0.2 and at 0 and 1, recover H and G12 to 1e-6;
    - data generated with G12 outside [0, 1] gives the bound, with NaN
      `G12_err`/`HG_cov`;
+   - with injected outliers, the right points are rejected;
    - `fixedG12` gives the closed-form H;
    - the error handling is unchanged.
-2. **Agreement with today's fits,** on every (object, band) fit of the
-   3,000-object subset, old `fitHG12` against new:
-   - where today's fit converged with G12 in [0, 1]: `|ΔH| < 1e-4` mag,
-     `|ΔG12| < 1e-3`, and `H_err`/`G12_err`/`chi2dof` within 1%;
-   - for the rest: report how many there are and how H and G12 move. These
-     are the intended changes.
-3. **Speed:** time per fit old against new on the same subset, and the
-   3,000-object build's wall time.
+2. **Fast path against the bounded reference,** on every (object, band) fit
+   of the 3,000-object subset, with the new defaults (floor 0.05, clip 10σ):
+   - the retained sets after clipping are identical in ≥ 99.9% of fits, with
+     each exception listed;
+   - where both converge: `|ΔH| < 1e-4` mag, `|ΔG12| < 1e-3`, and
+     `H_err`/`G12_err`/`chi2dof` within 1%;
+   - robust stage alone: the same `|ΔH|`/`|ΔG12|` tolerances.
+3. **The effect of the new defaults** (reported, not asserted). Against
+   today's build of the same subset (free unbounded fit, no floor, no clip):
+   - how many fits end at a G12 bound;
+   - how many points get clipped;
+   - the distributions of ΔH and ΔG12.
+
+   Also compared against a run with `--hg12FixedG12 0.5`, i.e. DP2's
+   configuration.
+4. **Speed:** time per fit, old reference against new fast path, with the new
+   defaults (robust stage included), and the 3,000-object build's wall time.
 
 ## Follow-ups (not in this change)
 
