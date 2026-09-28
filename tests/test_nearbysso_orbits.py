@@ -90,7 +90,7 @@ def _synthetic_table(rng):
         ("2002 CD", "K02C00D", _orbit_json(good, "0 days"), 2.0),           # short arc
         ("2002 CE", "K02C00E", _orbit_json(good, None), 2.0),               # no arc: dropped
         ("1999 ZZ", "J99Z00Z", _orbit_json(good, "3 days"), 2.0),           # kept
-        ("1998 YY", "J98Y00Y", _orbit_json(notpd, "3 days"), 2.0),          # kept, not PD
+        ("1998 YY", "J98Y00Y", _orbit_json(notpd, "3 days"), 2.0),          # kept, indefinite
         ("1997 XX", "J97X00X", None, 2.0),                                  # kept, no JSON
         ("1996 WW", "J96W00W", "{}", 2.0),                                  # kept, no CAR
         ("1995 VV", "J95V00V", _orbit_json(good, "10 days", layout="other"), 2.0),  # slow path
@@ -148,7 +148,7 @@ def test_load_synthetic(tmp_path, capsys):
     line = capsys.readouterr().out
     # rows without an arc (no JSON, or none in it) drop, as in get-mpcorb.py
     assert "14 rows read" in line and "removed 2 comets, 1 missing elements, 5 arcs <= 2 d" in line
-    assert "6 kept" in line and "has_cov false 1 (0 missing, 1 not PD)" in line
+    assert "6 kept" in line and "has_cov false 1 (0 missing, 1 not PSD)" in line
 
     assert out.dtype == ORBIT_DTYPE
     assert list(out["designation"]) == ["1993 TT", "1994 UU", "1995 VV", "1998 YY", "1999 ZZ", "2000 AA"]
@@ -203,21 +203,46 @@ def test_cholesky_pivots_match_numpy():
             assert not np.all(p > 0)
 
 
-def test_is_positive_definite():
+def test_make_psd():
     rng = np.random.default_rng(6)
     good = np.stack([_random_cov(rng) for _ in range(4)])
-    # numerically singular: rank 5, plus rounding-level noise
+    sc = np.array([1e-6] * 3 + [1e-8] * 3)
+    # singular PSD: rank 5, with rounding-level noise of either sign
     B = rng.normal(size=(6, 5))
-    sing = B @ B.T * 1e-12
-    sing = sing + 1e-16 * np.max(sing) * np.diag(rng.uniform(-1, 1, 6))
-    neg = good[0].copy()
+    sing = (B @ B.T) * sc[:, None] * sc[None, :]
+    sing = sing * (1 + 1e-15 * rng.uniform(-1, 1, (6, 6)))
+    sing = 0.5 * (sing + sing.T)
+    neg = good[0].copy()                        # clearly indefinite
     neg[2, 3] = neg[3, 2] = 2 * np.sqrt(neg[2, 2] * neg[3, 3])
     nan = good[1].copy()
     nan[4, 5] = nan[5, 4] = np.nan
     zero = good[2].copy()
     zero[1, :] = zero[:, 1] = 0
-    pd = O.is_positive_definite(np.stack([*good, sing, neg, nan, zero]))
-    np.testing.assert_array_equal(pd, [1, 1, 1, 1, 0, 0, 0, 0])
+    stack = np.stack([*good, sing, neg, nan, zero])
+    cov, ok, clipped = O.make_psd(stack)
+    np.testing.assert_array_equal(ok, [1, 1, 1, 1, 1, 0, 0, 0])
+    np.testing.assert_array_equal(cov[:4], good)            # untouched
+    assert np.all(np.isnan(cov[5:]))
+    # the singular one: symmetric, PSD, the diagonal kept
+    c = cov[4]
+    np.testing.assert_array_equal(c, c.T)
+    s = np.sqrt(np.diag(c))
+    assert np.linalg.eigvalsh(c / np.outer(s, s))[0] > -1e-15
+    np.testing.assert_allclose(np.diag(c), np.diag(sing), rtol=1e-12)
+    np.testing.assert_allclose(c / np.outer(s, s), sing / np.outer(s, s), atol=1e-12)
+    # force a clip: an eigenvalue of -1e-12 (relative)
+    lam, V = np.linalg.eigh(sing / np.outer(s, s))
+    lam[0] = -1e-12
+    corr = (V * lam) @ V.T
+    m = corr * np.outer(s, s)
+    c2, ok2, cl2 = O.make_psd(m[None])
+    assert ok2[0] and cl2[0]
+    np.testing.assert_allclose(np.diag(c2[0]), np.diag(m), rtol=1e-11)
+    assert np.linalg.eigvalsh(c2[0] / np.outer(s, s))[0] > -1e-15
+    # and -1e-6 is rejected
+    lam[0] = -1e-6
+    _, ok3, _ = O.make_psd(((V * lam) @ V.T * np.outer(s, s))[None])
+    assert not ok3[0]
 
 
 def test_vectorized_kepler_matches_scalar():
@@ -280,7 +305,9 @@ def test_real_covariance_symmetric_pd(sample):
     c = o["cov0"]
     np.testing.assert_array_equal(c, np.swapaxes(c, 1, 2))
     for m in c[:: max(1, len(c) // 2000)]:
-        np.linalg.cholesky(m)                     # raises if not PD
+        sd = np.sqrt(np.diag(m))
+        lam = np.linalg.eigvalsh(m / np.outer(sd, sd))
+        assert lam[0] >= -1e-9 * lam[-1]          # PSD up to rounding
     assert np.all(np.isnan(sample.out["cov0"][~sample.out["has_cov"]]))
 
 
@@ -315,8 +342,13 @@ def test_real_frame_and_units(sample):
     rel = np.linalg.norm(car_eq[:, :3] - helio[:, :3], axis=1) / np.linalg.norm(helio[:, :3], axis=1)
     relv = np.linalg.norm(car_eq[:, 3:] - helio[:, 3:], axis=1) / np.linalg.norm(helio[:, 3:], axis=1)
     assert np.percentile(rel, 99) < 1e-8 and np.percentile(relv, 99) < 1e-8
-    # and the covariance we store is that one, rotated
-    np.testing.assert_allclose(o["cov0"], O.rotate_cov_to_equatorial(cov[idx]), rtol=0, atol=0)
+    # and the covariance we store is that one, rotated (and, for the few
+    # numerically singular ones, clipped to PSD)
+    ref = O.rotate_cov_to_equatorial(cov[idx])
+    sd = np.sqrt(np.diagonal(ref, axis1=1, axis2=2))
+    norm = sd[:, :, None] * sd[:, None, :]
+    np.testing.assert_allclose(np.diagonal(o["cov0"], axis1=1, axis2=2), sd ** 2, rtol=1e-9)
+    np.testing.assert_allclose(o["cov0"] / norm, ref / norm, rtol=0, atol=1e-9)
 
     js = t["mpc_orb_jsonb"]
     rng = np.random.default_rng(17)

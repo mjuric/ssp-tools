@@ -400,37 +400,62 @@ def cholesky_pivots(a):
     return piv
 
 
-#: A covariance counts as positive definite when every Cholesky pivot of its
-#: correlation matrix exceeds this. Blocks below it are numerically singular
-#: (the MPC prints 16 digits); they're ~2.7% of the orbits, nearly all short
-#: arcs with sigma(position) > 1e-3 AU, which the sigma gate excludes anyway.
-PD_TOL = 1e-12
+#: Eigenvalues of the correlation matrix in [-PSD_TOL * largest, 0) are
+#: rounding noise and are clipped to 0; below that, the matrix is unusable.
+#: About 2.7% of the CAR blocks are numerically singular: correlation
+#: eigenvalues ~1e-16 (the MPC prints 16 digits), of either sign. Singular
+#: but positive semi-definite is fine for C(t) = Phi C0 Phi^T. They are
+#: nearly all short arcs with sigma(position) > 1e-3 AU.
+PSD_TOL = 1e-9
+
+#: Rows whose correlation Cholesky pivots all exceed this are positive
+#: definite (all pivots > 0 proves it; the margin covers rounding, ~1e-15)
+#: and skip the eigendecomposition.
+_SAFE_PIVOT = 1e-6
 
 
-def is_positive_definite(cov, tol=PD_TOL):
-    """For a stack (N, 6, 6): finite, positive diagonal, every Cholesky pivot
-    of the correlation matrix > ``tol``, and numpy.linalg.cholesky succeeding
-    on the matrix itself (checked only where the smallest pivot is below
-    1e-9, which is the only place it can fail). The correlation form keeps
-    positions (~1e-11 AU^2) and velocities (~1e-17 AU^2/d^2) on one scale."""
-    ok = np.all(np.isfinite(cov), axis=(1, 2))
+def make_psd(cov, tol=PSD_TOL):
+    """Check and repair a stack (N, 6, 6) of covariances.
+
+    Works on the correlation matrix (it keeps positions, ~1e-11 AU^2, and
+    velocities, ~1e-17 AU^2/d^2, on one scale). Returns (cov, usable,
+    clipped):
+
+    - usable: finite, positive diagonal, and no correlation eigenvalue below
+      ``-tol`` times the largest;
+    - clipped: usable rows that had eigenvalues in [-tol * largest, 0); they
+      are set to 0 and the row rebuilt as D V diag(lambda) V^T D, which moves
+      the diagonal by ~|clipped eigenvalue| relative;
+    - cov: the input, with clipped rows rebuilt and unusable rows NaN.
+    """
+    cov = np.array(cov, dtype=np.float64, copy=True)
+    n = len(cov)
+    usable = np.all(np.isfinite(cov), axis=(1, 2))
     d = np.diagonal(cov, axis1=1, axis2=2)
-    ok &= np.all(d > 0, axis=1)
-    out = np.zeros(len(cov), dtype=bool)
-    idx = np.flatnonzero(ok)
+    usable &= np.all(d > 0, axis=1)
+    clipped = np.zeros(n, dtype=bool)
+    idx = np.flatnonzero(usable)
     if len(idx):
-        s = 1.0 / np.sqrt(d[idx])
-        corr = cov[idx] * s[:, :, None] * s[:, None, :]
+        sd = np.sqrt(d[idx])
+        corr = cov[idx] / sd[:, :, None] / sd[:, None, :]
         piv = cholesky_pivots(corr)
-        good = np.all(piv > tol, axis=1)
         minpiv = np.min(np.where(np.isnan(piv), -np.inf, piv), axis=1)
-        for k in np.flatnonzero(good & (minpiv < 1e-9)):
-            try:
-                np.linalg.cholesky(cov[idx[k]])
-            except np.linalg.LinAlgError:
-                good[k] = False
-        out[idx] = good
-    return out
+        chk = np.flatnonzero(~(minpiv > _SAFE_PIVOT))
+        if len(chk):
+            lam, V = np.linalg.eigh(corr[chk])
+            lo = -tol * lam[:, -1]
+            bad = np.any(lam < lo[:, None], axis=1)
+            clip = ~bad & np.any(lam < 0, axis=1)
+            usable[idx[chk[bad]]] = False
+            if clip.any():
+                lc = np.maximum(lam[clip], 0.0)
+                c2 = (V[clip] * lc[:, None, :]) @ np.swapaxes(V[clip], 1, 2)
+                s = sd[chk[clip]]
+                c2 = c2 * s[:, :, None] * s[:, None, :]
+                cov[idx[chk[clip]]] = 0.5 * (c2 + np.swapaxes(c2, 1, 2))
+                clipped[idx[chk[clip]]] = True
+    cov[~usable] = np.nan
+    return cov, usable, clipped
 
 
 # --------------------------------------------------------------------------
@@ -537,9 +562,8 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True):
     # Covariance
     c = rotate_cov_to_equatorial(cov_ecl[idx])
     missing = ~np.all(np.isfinite(c), axis=(1, 2))
-    pd_ok = is_positive_definite(c)
+    c, pd_ok, clipped = make_psd(c)
     out["has_cov"] = pd_ok
-    c[~pd_ok] = np.nan
     out["cov0"] = c
     t_conv = time.perf_counter() - t2
 
@@ -553,7 +577,8 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True):
                    f"{counts['arc']:,} arcs <= 2 d" if with_filter else "no filter")
         print(f"load_orbits: {n_read:,} rows read, {removed}; {len(out):,} kept; "
               f"has_cov false {int((~pd_ok).sum()):,} ({int(missing.sum()):,} missing, "
-              f"{int((~missing & ~pd_ok).sum()):,} not PD); normalized_rms p5/p50/p95/p99 "
+              f"{int((~missing & ~pd_ok).sum()):,} not PSD), {int(clipped.sum()):,} clipped to PSD; "
+              f"normalized_rms p5/p50/p95/p99 "
               f"{pct[0]:.3f}/{pct[1]:.3f}/{pct[2]:.3f}/{pct[3]:.3f} ({len(rms):,} with it, "
               f"{n_zero:,} zero excluded); "
               f"{time.perf_counter() - t0:.1f} s (read and parse {t_parse:.1f}, "
