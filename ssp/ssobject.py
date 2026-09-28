@@ -7,7 +7,11 @@ from . import util
 from . import schema
 from .moid import MOIDSolver, earth_orbit
 import argparse
+import multiprocessing
+import os
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # The only columns we need from DiaSource.
 # TODO DM-53699: These column names should be taken from and/or checked to
@@ -140,9 +144,107 @@ def compute_ssobject_entry(
     row["extendednessMax"] = ext.max() if len(ext) else np.nan
     row["extendednessMedian"] = np.median(ext) if len(ext) else np.nan
 
+#
+# Parallel build (--workers N > 1)
+#
+# Workers are forked, and read their inputs from this module-level dict,
+# filled in by the parent just before it creates the pool. The (large)
+# joined SSSource frame is thus inherited through fork, never pickled.
+# Tasks are (start, end) index ranges; results are small numpy arrays.
+#
+_PARALLEL = {}
+_MOID_SOLVER = None   # one MOIDSolver per worker process, created lazily
+
+MOID_COLUMNS = [
+    "MOIDEarth", "MOIDEarthDeltaV", "MOIDEarthEclipticLongitude",
+    "MOIDEarthTrueAnomaly", "MOIDEarthTrueAnomalyObject",
+]
+
+def _fork_context():
+    """The fork multiprocessing context, or None where fork is unavailable."""
+    if "fork" not in multiprocessing.get_all_start_methods():
+        return None
+    return multiprocessing.get_context("fork")
+
+def _balanced_chunks(weights, n_chunks):
+    """
+    Split ``len(weights)`` items into at most ``n_chunks`` contiguous,
+    non-empty ranges of about equal total weight. Returns a list of
+    (start, end) index pairs covering all items in order.
+    """
+    n = len(weights)
+    if n == 0:
+        return []
+    n_chunks = max(1, min(n_chunks, n))
+    cum = np.cumsum(weights, dtype=np.float64)
+    targets = cum[-1] * np.arange(1, n_chunks) / n_chunks
+    cuts = np.searchsorted(cum, targets, side="left") + 1
+    edges = np.unique(np.concatenate(([0], cuts, [n])))
+    return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:]) if b > a]
+
+def _ssobject_chunk(g0, g1):
+    """Worker: compute SSObject rows for groups [g0, g1)."""
+    sss = _PARALLEL["sss"]
+    idx_start, idx_end = _PARALLEL["idx_start"], _PARALLEL["idx_end"]
+    callback = _PARALLEL["callback"]
+    out = np.zeros(g1 - g0, dtype=schema.SSObjectDtype)
+    # the same slicing and call as util.group_by
+    for k, g in enumerate(range(g0, g1)):
+        callback(out[k], sss[idx_start[g]:idx_end[g]])
+    return out
+
+def _moid_chunk(j0, j1):
+    """Worker: compute the MOID columns for matched orbits [j0, j1)."""
+    global _MOID_SOLVER
+    if _MOID_SOLVER is None:
+        _MOID_SOLVER = MOIDSolver()
+    solver = _MOID_SOLVER
+    a, e, i, node, argperi, epoch_mjd = _PARALLEL["elements"]
+    res = np.full((len(MOID_COLUMNS), j1 - j0), np.nan, dtype=np.float64)
+    for k, j in enumerate(range(j0, j1)):
+        earth = earth_orbit(epoch_mjd[j])
+        res[:, k] = solver.compute(earth, (a[j], e[j], i[j], node[j], argperi[j]))
+    return res
+
+def _run_chunks(func, chunks, workers, label, weights=None):
+    """
+    Run ``func(start, end)`` for each (start, end) chunk in a forked
+    process pool and return the results in chunk order.
+
+    Prints progress once per finished chunk; the time left is estimated
+    from the chunks' ``weights`` (default: their sizes). The first
+    exception in any worker cancels the remaining chunks and is re-raised
+    in the parent.
+    """
+    if weights is None:
+        weights = [e - s for s, e in chunks]
+    total, total_weight = chunks[-1][1] - chunks[0][0], float(sum(weights))
+    t0 = time.monotonic()
+    results = [None] * len(chunks)
+    done, done_weight = 0, 0.0
+    pool = ProcessPoolExecutor(max_workers=min(workers, len(chunks)), mp_context=_fork_context())
+    try:
+        futures = {pool.submit(func, s, e): n for n, (s, e) in enumerate(chunks)}
+        for fut in as_completed(futures):
+            n = futures[fut]
+            results[n] = fut.result()   # re-raises a worker's exception
+            s, e = chunks[n]
+            done += e - s
+            done_weight += weights[n]
+            elapsed = time.monotonic() - t0
+            left = elapsed * (total_weight - done_weight) / done_weight if done_weight else float("nan")
+            print(f"[{label}] {done:,}/{total:,} objects, "
+                  f"{elapsed:.1f} s elapsed, ~{left:.0f} s left", flush=True)
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
+    return results
+
+
 def compute_ssobject(
     sss, dia, mpcorb, fixedG12=None, magSigmaFloor=0.0,
-    nSigmaClip=None,
+    nSigmaClip=None, workers=1, chunk_factor=8,
 ):
     """
     Compute solar system object properties by joining and processing
@@ -167,6 +269,14 @@ def compute_ssobject(
         MPC orbit data with columns like
         'unpacked_primary_provisional_designation', 'q', 'e', 'i',
         'node', 'argperi'.
+    workers : int
+        Number of worker processes for the per-object and MOID stages.
+        1 (the default) runs everything serially in this process. More
+        than 1 forks a process pool (falling back to serial where the
+        fork start method is unavailable); the result is identical.
+    chunk_factor : int
+        With workers > 1, split each stage into about
+        ``chunk_factor * workers`` chunks, to balance the load.
 
     Returns
     -------
@@ -249,7 +359,30 @@ def compute_ssobject(
         compute_ssobject_entry, fixedG12=fixedG12,
         magSigmaFloor=magSigmaFloor, nSigmaClip=nSigmaClip,
     )
-    util.group_by([sss], "ssObjectId", callback, out=obj)
+    parallel = workers > 1 and _fork_context() is not None
+    if not parallel:
+        util.group_by([sss], "ssObjectId", callback, out=obj)
+    elif totalNumObjects:
+        # Group boundaries as util.group_by computes them, so the rows come
+        # out in the same (ascending ssObjectId) order.
+        keys = sss["ssObjectId"]
+        if not util.values_grouped(keys.to_numpy()):
+            raise ValueError("Key 'ssObjectId' is not properly grouped.")
+        _, idx_start, counts = np.unique(keys, return_index=True, return_counts=True)
+        idx_end = idx_start + counts
+        # contiguous runs of groups, balanced by observation count
+        chunks = _balanced_chunks(counts, chunk_factor * workers)
+        print(f"Computing {totalNumObjects:,} objects in {len(chunks)} chunks "
+              f"on {workers} workers...")
+        _PARALLEL.update(sss=sss, idx_start=idx_start, idx_end=idx_end, callback=callback)
+        try:
+            results = _run_chunks(_ssobject_chunk, chunks, workers, "objects",
+                                  weights=[int(counts[g0:g1].sum()) for g0, g1 in chunks])
+        finally:
+            _PARALLEL.clear()
+        for (g0, g1), res in zip(chunks, results):
+            obj[g0:g1] = res
+        del results
 
     #
     # compute columns that can be efficiently computed in a vector fashon
@@ -257,10 +390,11 @@ def compute_ssobject(
     # Tisserand J
 
     if mpcorb is not None:
-        # inner join by provisional designation. We allow for some objects to be
-        # missing from mpcorb (this should not happen often, but it did in DP1).
-        # FIXME: at some point require that no objects are missing. I _think_ that
-        # shouldn't happen in normal operations.
+        # inner join by provisional designation. We allow for some objects
+        # to be missing from mpcorb (this should not happen often, but it
+        # did in DP1).
+        # FIXME: at some point require that no objects are missing. I _think_
+        # that shouldn't happen in normal operations.
         oidx, midx = util.argjoin(obj["designation"].astype("U"),
                              mpcorb["unpacked_primary_provisional_designation"].to_numpy().astype("U")
                             )
@@ -273,16 +407,32 @@ def compute_ssobject(
         obj["tisserand_J"][oidx] = util.tisserand_jupiter(a, e, i)
 
         # MOID computation
-        solver = MOIDSolver()
-        for i, el_obj in enumerate(zip(a, e, i, node, argperi)):
-            earth = earth_orbit(epoch_mjd[i])
-            (moid, deltaV, eclon, trueEarth, trueObject) = solver.compute(earth, el_obj)
-            row = obj[oidx[i]]
-            row["MOIDEarth"] = moid
-            row["MOIDEarthDeltaV"] = deltaV
-            row["MOIDEarthEclipticLongitude"] = eclon
-            row["MOIDEarthTrueAnomaly"] = trueEarth
-            row["MOIDEarthTrueAnomalyObject"] = trueObject
+        if parallel and len(oidx):
+            n = len(oidx)
+            chunks = _balanced_chunks(np.ones(n), chunk_factor * workers)
+            _PARALLEL.update(elements=(a, e, i, node, argperi, epoch_mjd))
+            try:
+                results = _run_chunks(_moid_chunk, chunks, workers, "MOID")
+            finally:
+                _PARALLEL.clear()
+            moid = np.concatenate(results, axis=1)
+            # The serial loop writes in order, so if an object matched
+            # several orbits its last one wins; do the same.
+            _, last = np.unique(oidx[::-1], return_index=True)
+            last = n - 1 - last
+            for col, vals in zip(MOID_COLUMNS, moid):
+                obj[col][oidx[last]] = vals[last]
+        else:
+            solver = MOIDSolver()
+            for i, el_obj in enumerate(zip(a, e, i, node, argperi)):
+                earth = earth_orbit(epoch_mjd[i])
+                (moid, deltaV, eclon, trueEarth, trueObject) = solver.compute(earth, el_obj)
+                row = obj[oidx[i]]
+                row["MOIDEarth"] = moid
+                row["MOIDEarthDeltaV"] = deltaV
+                row["MOIDEarthEclipticLongitude"] = eclon
+                row["MOIDEarthTrueAnomaly"] = trueEarth
+                row["MOIDEarthTrueAnomalyObject"] = trueObject
 
     return obj
 
@@ -350,7 +500,32 @@ Examples:
         ),
     )
 
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(64, os.cpu_count() or 1),
+        help=(
+            "Number of worker processes for the per-object fits and the "
+            "MOIDs (default: min(64, number of CPUs)). 1 runs serially, "
+            "with no process pool. The output does not depend on it."
+        ),
+    )
+
+    parser.add_argument(
+        "--chunk-factor",
+        type=int,
+        default=8,
+        help=(
+            "With --workers > 1, split the work into about this many "
+            "chunks per worker, to balance the load (default: 8)."
+        ),
+    )
+
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if args.chunk_factor < 1:
+        parser.error("--chunk-factor must be at least 1")
 
     try:
         # Load SSSource
@@ -396,6 +571,8 @@ Examples:
             fixedG12=args.hg12FixedG12,
             magSigmaFloor=args.hg12MagSigmaFloor,
             nSigmaClip=args.hg12NSigmaClip,
+            workers=args.workers,
+            chunk_factor=args.chunk_factor,
         )
 
         # Save result

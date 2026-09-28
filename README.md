@@ -331,6 +331,8 @@ Arguments:
 - `dia_sources.parquet` – DiaSource Parquet file with photometric measurements
 - `mpc_orbits.parquet` – MPC orbit Parquet file with orbital elements
 - `--output ssobject.parquet` – Output SSObject Parquet file
+- `--workers N` – Number of worker processes for the per-object fits and the MOIDs (default: `min(64, CPUs)`).
+  `--workers 1` runs serially, with no process pool. The output is identical for any `N`.
 
 The tool performs:
 - Photometric fitting (H/G12 parameters) for each band (ugrizy)
