@@ -158,6 +158,9 @@ class CoarseTrack(NamedTuple):
     ok: np.ndarray           # (K,) bool: False where the integration failed
     delta: np.ndarray        # (K,) [AU] topocentric distance (sizes the diurnal-
                              # parallax term of the candidate margin)
+    cpos: np.ndarray | None = None  # (K, 3, 3) [AU^2] barycentric position block
+                             # of C(t) (NaN where not ok or not has_cov), for
+                             # ellipse_at's precise projection
 
 
 # propagate.coarse(orbit, t, obs_pos, ephem) -> CoarseTrack
@@ -175,11 +178,19 @@ class CoarseTrack(NamedTuple):
 #   infinite sigma_major (so they're never eligible) and NaN ellipses, but
 #   positions and rates as usual.
 #
-# propagate.ellipse_at(track, t) -> (ra_err, dec_err, ra_dec_cov, sigma_major)
+# propagate.ellipse_at(track, t, topo_pos=None)
+#       -> (ra_err, dec_err, ra_dec_cov, sigma_major)
 #   The error ellipse at arbitrary ASSIST times t (inside the sampled span).
-#   It linearly interpolates the covariance components between samples
-#   (their convex combination stays positive semidefinite), then derives
-#   the errors and sigma_major from them.
+#   With topo_pos ((N, 3) [AU], object - observer at each t, e.g. the
+#   precise pass's EphResult.topo_pos.T), it linearly interpolates
+#   track.cpos between samples (a convex combination, so it stays positive
+#   semidefinite) and projects it on the tangent plane of topo_pos; this is
+#   what the published ephRaErr/ephDecErr/ephRa_ephDec_Cov use. (Interpolating
+#   the sky components instead is ~20% off for NEOs within ~0.01 AU, whose
+#   line of sight turns within a night, and loses size near the poles.)
+#   Without topo_pos, it interpolates the sky components of the samples.
+#   Non-finite t, or a non-PSD result, gives NaN errors and an infinite
+#   sigma_major (never eligible).
 
 # --------------------------------------------------------------------------
 # WP4: the output
