@@ -237,7 +237,10 @@ within 3 mas of the submitted position and its time within 10 ms (band and
 magnitude are recorded but never reject); trailed sources submitted as two
 endpoints (`...-A`/`...-B`) are matched on the endpoints' midpoint. Among
 accepted candidates the winner prefers a non-superseded processing, then a
-matching band, then the smallest separation. Rows that cannot be resolved by
+matching band, then the smallest separation. A bare `obsSubID` accepted by
+both DP2 processings goes by submission date: `pDP2-DS` (the DP2 prerelease
+run the April 2026 submissions were made from) if submitted before
+2026-06-04, else `DP2-DS`. Rows that cannot be resolved by
 id are searched for by position and time, with the same acceptance rule.
 
 Outputs:
