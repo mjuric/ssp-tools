@@ -322,19 +322,18 @@ def coarse(orbit, t, obs_pos, ephem, _phi=None):
     # Uncertainty -------------------------------------------------------------
     if bool(orbit["has_cov"]):
         cov0 = np.asarray(orbit["cov0"], dtype=np.float64)
-        P = Phi[:, :3, :]                                  # (K, 3, 6)
-        cpos = P @ cov0 @ np.transpose(P, (0, 2, 1))       # (K, 3, 3)
-        cpos = 0.5 * (cpos + np.transpose(cpos, (0, 2, 1)))
-        s00, s01, s11 = _sky(cpos, rho)
+        cov = Phi @ cov0 @ np.transpose(Phi, (0, 2, 1))    # (K, 6, 6)
+        cov = 0.5 * (cov + np.transpose(cov, (0, 2, 1)))
+        s00, s01, s11 = _sky(cov[:, :3, :3], rho)
     else:
-        cpos = np.full((K, 3, 3), np.nan)
+        cov = np.full((K, 6, 6), np.nan)
         s00 = s01 = s11 = np.full(K, np.nan)
     ra_err, dec_err, ra_dec_cov, sigma_major = _ellipse(s00, s01, s11)
 
     return CoarseTrack(
         t=t.copy(), ra=ra, dec=dec, rate_ra=rate_ra, rate_dec=rate_dec,
         ra_err=ra_err, dec_err=dec_err, ra_dec_cov=ra_dec_cov,
-        sigma_major=sigma_major, ok=ok, delta=d, cpos=cpos,
+        sigma_major=sigma_major, ok=ok, delta=d, cov=cov,
     )
 
 
@@ -343,15 +342,19 @@ def ellipse_at(track, t, topo_pos=None):
     ra_dec_cov, sigma_major), shaped like ``t``.
 
     With ``topo_pos`` (t's shape + (3,), [AU], object - observer at each t,
-    e.g. the precise pass's ``EphResult.topo_pos.T``), it linearly
-    interpolates ``track.cpos`` (the barycentric position covariance)
-    between the two bracketing samples, and projects it on the tangent
-    plane of ``topo_pos``: exact but for the interpolation of C(t), and it
-    follows a line of sight that turns within a night (NEOs close to the
-    Earth). Without ``topo_pos``, it interpolates the samples' sky
-    covariance components (ra_err^2, ra_dec_cov, dec_err^2) instead.
+    e.g. the precise pass's ``EphResult.topo_pos.T``), it propagates
+    ``track.cov`` from each of the two bracketing samples k to t under free
+    motion, giving the position block C_pp + tau (C_pv + C_vp) + tau^2 C_vv
+    with tau = t - t_k, blends the two linearly in time, and projects the
+    result on the tangent plane of ``topo_pos``. That follows C(t), which is
+    quadratic in time over a day (interpolating the position block alone
+    overestimates short-arc sigmas up to ~50x near their observed arc), and
+    a line of sight that turns within a night (NEOs close to the Earth).
+    Without ``topo_pos``, it interpolates the samples' sky covariance
+    components (ra_err^2, ra_dec_cov, dec_err^2) instead.
 
-    Either way it's a convex combination of PSD matrices, so it stays PSD.
+    Either way it's a convex combination of PSD matrices (each free-motion
+    propagation A C A^T is PSD), so it stays PSD.
     Times outside the sampled span are **clamped** to the nearest sample
     (no extrapolation). A non-finite time, a bracketing sample with weight
     and no covariance (failed, or has_cov False), or a non-PSD result give
@@ -365,15 +368,18 @@ def ellipse_at(track, t, topo_pos=None):
     ts = np.asarray(track.t, dtype=np.float64)
     if topo_pos is not None:
         topo_pos = np.asarray(topo_pos, dtype=np.float64).reshape(N, 3)
-        if track.cpos is None:
-            raise ValueError("ellipse_at: topo_pos needs a track with cpos")
+        if track.cov is None:
+            raise ValueError("ellipse_at: topo_pos needs a track with cov")
     if len(ts) == 0:
         nan = np.full(shape, np.nan)
         return nan, nan.copy(), nan.copy(), np.full(shape, np.inf)
     order = np.argsort(ts, kind="stable")
     ts = ts[order]
     if topo_pos is not None:
-        vals = np.asarray(track.cpos, dtype=np.float64)[order].reshape(len(ts), 9)
+        C = np.asarray(track.cov, dtype=np.float64)[order]
+        # per sample: C_pp, C_pv + C_vp, C_vv, flattened (K, 27)
+        vals = np.concatenate([C[:, :3, :3], C[:, :3, 3:] + C[:, 3:, :3], C[:, 3:, 3:]],
+                              axis=1).reshape(len(ts), 27)
     else:
         vals = np.stack([np.asarray(track.ra_err)[order] ** 2,
                          np.asarray(track.ra_dec_cov)[order],
@@ -388,8 +394,17 @@ def ellipse_at(track, t, topo_pos=None):
         w = np.where(span > 0, (tc - ts[lo]) / span, 1.0)[:, None]
     # Only include a neighbour that has weight, so that a NaN neighbour
     # doesn't poison an exact hit on a good sample.
-    v = (np.where(w < 1.0, (1.0 - w) * vals[lo], 0.0)
-         + np.where(w > 0.0, w * vals[hi], 0.0))
+    if topo_pos is not None:
+        # free-motion position covariance from sample k at tau = t - t_k
+        def free(k):
+            tau = (tc - ts[k])[:, None]
+            c = vals[k]
+            return c[:, :9] + tau * c[:, 9:18] + tau * tau * c[:, 18:]
+        v = (np.where(w < 1.0, (1.0 - w) * free(lo), 0.0)
+             + np.where(w > 0.0, w * free(hi), 0.0))
+    else:
+        v = (np.where(w < 1.0, (1.0 - w) * vals[lo], 0.0)
+             + np.where(w > 0.0, w * vals[hi], 0.0))
     v[~finite] = np.nan
     if topo_pos is not None:
         s00, s01, s11 = _sky(v.reshape(N, 3, 3), topo_pos)

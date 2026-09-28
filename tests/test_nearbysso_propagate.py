@@ -435,13 +435,18 @@ def test_ellipse_non_psd_fails_safe():
     assert np.isfinite(propagate._ellipse(S[0, 0], S[0, 1], S[1, 1])[3])
 
 
-def _cpos_track(t, cpos):
+def _cov_track(t, cov):
     K = len(t)
     z = np.zeros(K)
-    sig = np.zeros(K)
     return CoarseTrack(t=np.asarray(t, float), ra=z, dec=z, rate_ra=z, rate_dec=z, ra_err=z, dec_err=z,
-                       ra_dec_cov=z, sigma_major=sig, ok=np.ones(K, bool), delta=np.ones(K),
-                       cpos=np.asarray(cpos, float))
+                       ra_dec_cov=z, sigma_major=z.copy(), ok=np.ones(K, bool), delta=np.ones(K),
+                       cov=np.asarray(cov, float))
+
+
+def _pos_only(Cpp):
+    C = np.zeros((6, 6))
+    C[:3, :3] = Cpp
+    return C
 
 
 def test_ellipse_at_nonfinite_t():
@@ -449,8 +454,8 @@ def test_ellipse_at_nonfinite_t():
     ra_err, dec_err, cov, sig = propagate.ellipse_at(tr, np.array([np.nan, np.inf, -np.inf, 0.5]))
     assert np.all(sig[:3] == np.inf) and np.isnan(ra_err[:3]).all() and np.isnan(cov[:3]).all()
     assert np.isfinite(sig[3])
-    C = np.diag([1e-12, 4e-12, 9e-12])
-    tr = _cpos_track([0.0, 1.0], [C, C])
+    C = _pos_only(np.diag([1e-12, 4e-12, 9e-12]))
+    tr = _cov_track([0.0, 1.0], [C, C])
     topo = np.tile([2.0, 0.0, 0.0], (2, 1))
     ra_err, dec_err, cov, sig = propagate.ellipse_at(tr, np.array([np.nan, 0.5]), topo_pos=topo)
     assert sig[0] == np.inf and np.isnan(ra_err[0])
@@ -458,21 +463,38 @@ def test_ellipse_at_nonfinite_t():
     k = np.degrees(1) / 2
     assert np.isclose(ra_err[1], np.sqrt(4e-12) * k) and np.isclose(dec_err[1], np.sqrt(9e-12) * k)
     assert np.isclose(sig[1], np.sqrt(9e-12) * k * 3600) and abs(cov[1]) < 1e-30
+    # a non-PSD cov fails safe
+    tr = _cov_track([0.0, 1.0], [-C, -C])
+    assert np.all(propagate.ellipse_at(tr, np.array([0.2, 0.7]), topo_pos=topo)[3] == np.inf)
 
 
-def test_ellipse_at_topo_pos_interpolates_cpos():
-    """cpos is interpolated linearly, then projected on each topo_pos."""
-    C0 = np.diag([1e-12, 4e-12, 9e-12])
-    C1 = np.array([[3e-12, 1e-12, 0], [1e-12, 2e-12, 0], [0, 0, 1e-12]])
-    tr = _cpos_track([0.0, 2.0], [C0, C1])
-    tq = np.array([0.0, 0.5, 2.0, 5.0])
-    topo = np.array([[1.0, 0.2, 0.1], [0.3, 1.0, -0.5], [-1, 0, 0.9], [0.1, 0.1, 1.0]])
+def test_ellipse_at_topo_pos_free_motion():
+    """The position block is propagated under free motion from both
+    bracketing samples and blended linearly, then projected on topo_pos:
+    exact for a free-motion C(t)."""
+    rng = np.random.default_rng(5)
+    A = rng.normal(size=(6, 6)) * np.array([1e-6] * 3 + [1e-7] * 3)
+    C0 = A @ A.T                                   # at t = 0
+    ts = np.array([0.0, 1.0, 3.0])
+
+    def Phi(tau):
+        M = np.eye(6)
+        M[:3, 3:] = tau * np.eye(3)
+        return M
+    Cs = np.array([Phi(tk) @ C0 @ Phi(tk).T for tk in ts])
+    tr = _cov_track(ts, Cs)
+    tq = np.array([0.0, 0.3, 1.0, 2.2, 3.0, 5.0])
+    topo = rng.normal(size=(len(tq), 3))
     got = propagate.ellipse_at(tr, tq, topo_pos=topo)
-    w = np.clip(tq / 2, 0, 1)
-    Ci = (1 - w)[:, None, None] * C0 + w[:, None, None] * C1
-    exp = propagate._ellipse(*propagate._sky(Ci, topo))
+    tcl = np.clip(tq, 0, 3)                          # clamped outside the span
+    exp_pos = np.array([(Phi(x) @ C0 @ Phi(x).T)[:3, :3] for x in tcl])
+    exp = propagate._ellipse(*propagate._sky(exp_pos, topo))
     for g, e in zip(got, exp):
-        np.testing.assert_allclose(g, e, rtol=1e-12, atol=1e-30)
+        np.testing.assert_allclose(g, e, rtol=1e-9, atol=1e-30)
+    # and not what linear interpolation of the position block gives
+    lin = 0.35 * Cs[1, :3, :3] + 0.65 * Cs[0, :3, :3]
+    s_lin = propagate._ellipse(*propagate._sky(lin[None], topo[1:2]))[3][0]
+    assert not np.isclose(s_lin, got[3][1], rtol=1e-3)
     with pytest.raises(ValueError):
         propagate.ellipse_at(_track([0.0, 1.0], [1e-8] * 2, [0] * 2, [1e-8] * 2), tq[:1],
                              topo_pos=topo[:1])
@@ -528,7 +550,7 @@ def test_non_psd_cov0_fails_safe(ephem, orbits):
 
 
 @needs_assist
-def test_nonfinite_observer_and_cpos(ephem, orbits):
+def test_nonfinite_observer_and_cov(ephem, orbits):
     orbit = orbits[MB_LONG]
     t = nights(60790, 60800)
     obs_pos, _ = x05_state(t, ephem)
@@ -536,15 +558,15 @@ def test_nonfinite_observer_and_cpos(ephem, orbits):
     tr = propagate.coarse(orbit, t, obs_pos, ephem)
     assert tr.ok.tolist() == [k != 3 for k in range(len(t))]
     assert tr.sigma_major[3] == np.inf and np.isnan(tr.ra[3]) and np.isnan(tr.delta[3])
-    assert np.isnan(tr.cpos[3]).all() and np.isfinite(tr.cpos[tr.ok]).all()
-    # cpos is the symmetric position block of Phi C0 Phi^T
+    assert np.isnan(tr.cov[3]).all() and np.isfinite(tr.cov[tr.ok]).all()
+    # cov is Phi C0 Phi^T (symmetrized)
     out = {}
     propagate.coarse(orbit, t, obs_pos, ephem, _phi=out)
-    P = out["phi"][0, :3]
-    np.testing.assert_allclose(tr.cpos[0], P @ orbit["cov0"] @ P.T, rtol=1e-10)
+    P = out["phi"][0]
+    np.testing.assert_allclose(tr.cov[0], P @ orbit["cov0"] @ P.T, rtol=1e-8, atol=1e-30)
     no = orbit.copy()
     no["has_cov"] = False
-    assert np.isnan(propagate.coarse(no, t, obs_pos, ephem).cpos).all()
+    assert np.isnan(propagate.coarse(no, t, obs_pos, ephem).cov).all()
     # a NaN time fails alone
     tt = t.copy()
     tt[2] = np.nan
@@ -587,22 +609,15 @@ def test_earth_state_cache(ephem):
 
 
 @needs_assist
-@pytest.mark.parametrize("name,ca,exact", [(NEO_CA, 60936.5, True), (NEO_SHORT, 60904.5, False)])
-def test_ellipse_at_topo_pos_close_approach(ephem, orbits, name, ca, exact):
-    """Within 0.007 AU of the Earth the line of sight turns within a night.
-    Interpolating the sky components was 0.78-1.95x off; interpolating cpos
-    and projecting it on the actual topo_pos matches coarse() evaluated
-    directly at hourly times to 2% for 2025 FA22 (18-yr arc).
-
-    It can't for 2025 PM, observed (31-day arc) during this approach: its
-    position covariance has a large, mostly radial, component that shrinks
-    and grows again within a day about the observed arc, and C(t) is
-    quadratic in time over a day (free motion: C_pp + tau (C_pv + C_vp) +
-    tau^2 C_vv), so the linear chord overestimates it, here by up to 55x
-    (0.06" -> 3"). A chord of a PSD-convex quadratic is never below it, so
-    this errs only towards larger sigma (never falsely eligible). Fixing it
-    needs the full 6x6 C(t) per sample (see the WP2 report): free-motion
-    propagation from both bracketing samples, blended, is within 1%."""
+@pytest.mark.parametrize("name,ca", [(NEO_CA, 60936.5), (NEO_SHORT, 60904.5), (MB_SHORT, 61090.0)])
+def test_ellipse_at_topo_pos_close_approach(ephem, orbits, name, ca):
+    """ellipse_at with topo_pos against coarse() evaluated directly at
+    hourly times, within 2%, where simpler interpolations fail: 2025 FA22
+    and 2025 PM within 0.007 AU of the Earth (the line of sight turns within
+    a night; interpolating sky components was 0.78-1.95x off), and 2025 PM
+    and 2026 DF62 at their observed short arcs (C(t) is quadratic in time
+    over a day; interpolating the position block alone was up to 55x
+    off)."""
     orbit = orbits[name]
     t = nights(ca - 5, ca + 5)
     obs_pos, _ = x05_state(t, ephem)
@@ -610,15 +625,15 @@ def test_ellipse_at_topo_pos_close_approach(ephem, orbits, name, ca, exact):
     tq = np.arange(t[0], t[-1], 1 / 24)
     oq, _ = x05_state(tq, ephem)
     direct = propagate.coarse(orbit, tq, oq, ephem)
-    assert direct.ok.all() and direct.delta.min() < 0.008
+    assert direct.ok.all()
     topo = np.stack([np.cos(np.radians(direct.dec)) * np.cos(np.radians(direct.ra)),
                      np.cos(np.radians(direct.dec)) * np.sin(np.radians(direct.ra)),
                      np.sin(np.radians(direct.dec))], axis=1) * direct.delta[:, None]
     ra_err, dec_err, cov, sig = propagate.ellipse_at(tr, tq, topo_pos=topo)
-    if exact:
-        np.testing.assert_allclose(sig, direct.sigma_major, rtol=0.02)
-        np.testing.assert_allclose(ra_err, direct.ra_err, rtol=0.02)
-        np.testing.assert_allclose(dec_err, direct.dec_err, rtol=0.02)
-    else:
-        assert np.all(sig >= 0.999 * direct.sigma_major)
-        assert (sig / direct.sigma_major).max() > 10
+    np.testing.assert_allclose(sig, direct.sigma_major, rtol=0.02)
+    # the components within 2%, or 2% of the ellipse's size (for a thin,
+    # tilted ellipse the smaller of ra_err, dec_err is a small difference)
+    smaj = direct.sigma_major / 3600
+    for got, want in ((ra_err, direct.ra_err), (dec_err, direct.dec_err)):
+        assert np.all(np.abs(got - want) < np.maximum(0.02 * want, 0.02 * smaj)), name
+    assert np.all(np.abs(cov - direct.ra_dec_cov) < 0.04 * smaj ** 2), name
