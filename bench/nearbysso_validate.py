@@ -613,7 +613,8 @@ def coarse_at(orbit, mjd_tai, ephem):
         tr = propagate.coarse(orbit, tai_to_assist(uniq), obs_pos, ephem)
     except NotImplementedError:
         return None
-    return {k: np.asarray(getattr(tr, k))[inv] for k in C.CoarseTrack._fields}
+    return {k: np.asarray(getattr(tr, k))[inv] for k in C.CoarseTrack._fields
+            if getattr(tr, k) is not None}
 
 
 class SigmaOracle:
