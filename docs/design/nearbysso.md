@@ -204,8 +204,62 @@ The coarse pass is ~88% of the CPU. On 3 nights it costs ~3 ms per orbit, mostly
 | wall, NEO-first schedule (64 chunks per worker) | **11.9 min, efficiency 0.99**; output byte-identical |
 
 - **The stragglers are NEOs at very close approaches, in the precise pass.** 37,793 NEOs (q < 1.3 AU) take 1.45 h (23% of the CPU; 138 ms each against 11.5 ms for the rest). The slowest ~150, all 2025–2026 designations with approaches as close as 0.0003 AU, take 70–127 s each (1.24 h, 20% of all the CPU). Their nights within 0.02 AU take every visit (~537 a night), so they have 2,000–12,000 candidates.
-- **The cost is in `ephem_assist._propagate_one`'s integration, not per epoch.** It runs IAS15 with ASSIST's default step control: 2.9M steps for 2025 WR7's year (128 s), against 84 steps (0.01 s) with `adaptive_mode = 2`, which the coarse pass uses. Without these ~150 orbits the precise pass is ~51 CPU-min for 93.9M evaluations, ~33 µs each including ~4 ms per call; the 79 µs average is theirs. Switching `_propagate_one` (and so SSSource) to `adaptive_mode = 2` would remove ~20% of the CPU, but changes both outputs at the level of integrator noise: an owner decision, not made here.
+- **The cost is in `ephem_assist._propagate_one`'s integration, not per epoch.** It runs IAS15 with ASSIST's default step control: 2.9M steps for 2025 WR7's year (128 s), against 84 steps (0.01 s) with `adaptive_mode = 2`, which the coarse pass uses. Without these ~150 orbits the precise pass is ~51 CPU-min for 93.9M evaluations, ~33 µs each including ~4 ms per call; the 79 µs average is theirs. This was then changed (see "Precise-pass step control" below): the precise pass is now 54 CPU-min a year, not 126.
 - **Estimate for a year at 64 cores:** pass 2 6.3 h / 64 ≈ **6 min** (at the efficiency measured); passes 1 and 3, 3.6B DiaSources read twice (~2 GB/s assumed) on 8 read workers, **~3 min**; loading, night ranges, sort, reduce and write **~1.5 min**; **~10 min in all**, within the 30-min budget.
+
+### Precise-pass step control (measured 2026-09-28)
+
+`ephem_assist._propagate_one` (the precise pass, and SSSource) now runs IAS15 with `adaptive_mode = 2` at `epsilon = 1e-11`, set after attaching ASSIST (`PRECISE_ADAPTIVE_MODE`, `PRECISE_EPSILON`). Before, it used ASSIST's default step control. The coarse pass stays at mode 2 with the default ε (1e-9).
+
+**Accuracy.** 250 orbits (none of ASSIST's own perturbers), each over its year of candidate times plus the coarse samples. The table gives the maximum topocentric (X05) difference in mas, with p99 in brackets, against a converged reference: mode 2 at ε = 1e-15, whose convergence sequence agrees to ≤ 0.34 mas. Default control at ε/100 is *not* a usable reference: it takes 8–20M steps and is up to 61 mas off.
+
+| class | default (before) | mode 2, ε 1e-9 | mode 2, ε 1e-11 (now) | CPU: default → now |
+|---|---|---|---|---|
+| 20 slowest NEOs (δ 0.0001–0.003 AU) | 7.3 (7.1) | 2.5 (2.3) | 0.93 (0.80) | 1,899 s → 0.68 s |
+| 30 other NEOs with δ < 0.05 AU | 1.1 (0.89) | **120 (109)** | 0.34 (0.30) | 168 s → 0.45 s |
+| 120 main belt | < 0.0001 | 0.029 | 0.26 (< 0.0001) | 6.7 → 6.1 ms per orbit |
+| 40 Jupiter Trojans | < 0.0001 | 0.006 | 0.0001 | 6.7 → 5.4 ms |
+| 40 TNOs | < 0.0001 | 0.005 | 0.004 | 5.4 → 4.9 ms |
+
+- **Plain mode 2 under-resolves moderate encounters,** e.g. 2025 QD at 0.014 AU, 120 mas off.
+- **The default is the one that is off in deep encounters** (2025 OS at 0.0001 AU: 7.3 mas, 3.05M steps, 134 s). Mode 2 at 1e-11 takes 50–550 steps there.
+- **A rare main-belt cost:** mode 2 at 1e-11 moves 3 of the 12,269 DP2-fixture objects by more than 0.01 mas, where the default was already exact:
+
+  | object | default | mode 2, 1e-9 | 1e-11 (now) | 1e-13 |
+  |---|---|---|---|---|
+  | 1999 CU79 | 0.045 | 0.69 | 0.69 | 0.23 |
+  | 2015 BZ220 | < 0.001 | 23 | 0.36 | 0.12 |
+
+  All in mas from the reference.
+
+**Horizons** (10 serial queries, with our own MPC elements): it confirms plain mode 2 is 34–120 mas off on the moderate encounters, where every other setting is 0.5–3 mas from Horizons. In deep encounters (δ < 0.003 AU), all our settings, the converged reference included, differ from Horizons by 30–730 mas while agreeing with each other to 2–8 mas. So Horizons can't separate them there. That discrepancy is a separate problem, tracked in [issue #36](https://github.com/mjuric/ssp-tools/issues/36).
+
+**Owner decision (2026-09-28):** mode 2 at ε = 1e-11 in `_propagate_one`, all paths (including the self-perturber integrations).
+
+**Runtime before → after** (32 workers, the same node at load 120–150, runs interleaved):
+
+| | before | after |
+|---|---|---|
+| DP2-DS fixture: total wall | 210 s | 216 s |
+| DP2-DS pass 2 wall | 173 s | 170 s |
+| DP2-DS pass 2 CPU: coarse / candidates / precise / ellipse | 4,779 / 387 / 212 / 8 s | 4,777 / 387 / 104 / 8 s |
+| AP-DS fixture: total wall | 196 s | 199 s |
+| AP-DS pass 2 wall | 164 s | 163 s |
+| AP-DS pass 2 CPU: coarse / candidates / precise / ellipse | 4,391 / 379 / 98 / 2 s | 4,417 / 380 / 31 / 2 s |
+| year, pass 2 wall (efficiency) | 12.8 min (0.99) | **10.3 min** (0.98) |
+| year, pass 2 CPU: coarse / candidates / precise / ellipse | 6.75 h = 246 / 19 / **135** / 4.5 min | 5.38 h = 245 / 19 / **54** / 4.5 min |
+| year, per orbit | 15.7 ms | 12.5 ms |
+| year, the 20 slowest NEOs' precise pass | 70–127 s each | 0.07–0.29 s each |
+| year at 64 cores: pass 2, and the whole build | 6.3 min, ~10 min | 5.0 min, ~9 min |
+
+The fixtures' wall time is dominated by the coarse pass and doesn't change measurably. The remaining precise-pass CPU (~54 min a year, ~35 µs per evaluation) is per-epoch geometry and per-call overhead, not integration.
+
+**Output changes:**
+- **DP2-DS NearbySSO:** md5 `f2e8f9086a501b4a190486fc229f79db` → `c77fdf556c20ab93abe0de1e7418b671`. The same rows, designations and nearest matches; max position change 0.69 mas (1999 CU79), p99.9 < 0.0001 mas.
+- **AP-DS:** `556df1a1a45d06713cdce976bebb2575` → `1b5c4c447d1cdbee920ce48393d01cdd`, max change < 0.001 mas.
+- **WP5 same-orbits** against the SSSource fixture, which was built with the old integrator: max 0.69 mas. 97 rows exceed its 0.1 mas tolerance: 2015 BZ220 (89 rows, 0.36 mas) and 1999 CU79 (8 rows, 0.69 mas). The gate passes again once that fixture is rebuilt with the same code.
+
+The measurement scripts and logs are in `/lscratch/mjuric/sspwt/nearbysso/adaptive/`, not in the repo.
 
 Memory: the parent peaks at about twice the predictions during the sort (~25–30 GB for 200–300M); each read worker holds one 7-day slice (~5 GB at PPDB rates).
 
