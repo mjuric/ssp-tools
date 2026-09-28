@@ -7,11 +7,8 @@ from . import util
 from . import schema
 from .moid import MOIDSolver, earth_orbit
 import argparse
-import multiprocessing
 import os
 import sys
-import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # The only columns we need from DiaSource.
 # TODO DM-53699: These column names should be taken from and/or checked to
@@ -160,28 +157,6 @@ MOID_COLUMNS = [
     "MOIDEarthTrueAnomaly", "MOIDEarthTrueAnomalyObject",
 ]
 
-def _fork_context():
-    """The fork multiprocessing context, or None where fork is unavailable."""
-    if "fork" not in multiprocessing.get_all_start_methods():
-        return None
-    return multiprocessing.get_context("fork")
-
-def _balanced_chunks(weights, n_chunks):
-    """
-    Split ``len(weights)`` items into at most ``n_chunks`` contiguous,
-    non-empty ranges of about equal total weight. Returns a list of
-    (start, end) index pairs covering all items in order.
-    """
-    n = len(weights)
-    if n == 0:
-        return []
-    n_chunks = max(1, min(n_chunks, n))
-    cum = np.cumsum(weights, dtype=np.float64)
-    targets = cum[-1] * np.arange(1, n_chunks) / n_chunks
-    cuts = np.searchsorted(cum, targets, side="left") + 1
-    edges = np.unique(np.concatenate(([0], cuts, [n])))
-    return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:]) if b > a]
-
 def _ssobject_chunk(g0, g1):
     """Worker: compute SSObject rows for groups [g0, g1)."""
     sss = _PARALLEL["sss"]
@@ -205,42 +180,6 @@ def _moid_chunk(j0, j1):
         earth = earth_orbit(epoch_mjd[j])
         res[:, k] = solver.compute(earth, (a[j], e[j], i[j], node[j], argperi[j]))
     return res
-
-def _run_chunks(func, chunks, workers, label, weights=None):
-    """
-    Run ``func(start, end)`` for each (start, end) chunk in a forked
-    process pool and return the results in chunk order.
-
-    Prints progress once per finished chunk; the time left is estimated
-    from the chunks' ``weights`` (default: their sizes). The first
-    exception in any worker cancels the remaining chunks and is re-raised
-    in the parent.
-    """
-    if weights is None:
-        weights = [e - s for s, e in chunks]
-    total, total_weight = chunks[-1][1] - chunks[0][0], float(sum(weights))
-    t0 = time.monotonic()
-    results = [None] * len(chunks)
-    done, done_weight = 0, 0.0
-    pool = ProcessPoolExecutor(max_workers=min(workers, len(chunks)), mp_context=_fork_context())
-    try:
-        futures = {pool.submit(func, s, e): n for n, (s, e) in enumerate(chunks)}
-        for fut in as_completed(futures):
-            n = futures[fut]
-            results[n] = fut.result()   # re-raises a worker's exception
-            s, e = chunks[n]
-            done += e - s
-            done_weight += weights[n]
-            elapsed = time.monotonic() - t0
-            left = elapsed * (total_weight - done_weight) / done_weight if done_weight else float("nan")
-            print(f"[{label}] {done:,}/{total:,} objects, "
-                  f"{elapsed:.1f} s elapsed, ~{left:.0f} s left", flush=True)
-    except BaseException:
-        pool.shutdown(wait=False, cancel_futures=True)
-        raise
-    pool.shutdown(wait=True)
-    return results
-
 
 def compute_ssobject(
     sss, dia, mpcorb, fixedG12=None, magSigmaFloor=0.0,
@@ -359,7 +298,7 @@ def compute_ssobject(
         compute_ssobject_entry, fixedG12=fixedG12,
         magSigmaFloor=magSigmaFloor, nSigmaClip=nSigmaClip,
     )
-    parallel = workers > 1 and _fork_context() is not None
+    parallel = workers > 1 and util.fork_context() is not None
     if not parallel:
         util.group_by([sss], "ssObjectId", callback, out=obj)
     elif totalNumObjects:
@@ -371,12 +310,12 @@ def compute_ssobject(
         _, idx_start, counts = np.unique(keys, return_index=True, return_counts=True)
         idx_end = idx_start + counts
         # contiguous runs of groups, balanced by observation count
-        chunks = _balanced_chunks(counts, chunk_factor * workers)
+        chunks = util.balanced_chunks(counts, chunk_factor * workers)
         print(f"Computing {totalNumObjects:,} objects in {len(chunks)} chunks "
               f"on {workers} workers...")
         _PARALLEL.update(sss=sss, idx_start=idx_start, idx_end=idx_end, callback=callback)
         try:
-            results = _run_chunks(_ssobject_chunk, chunks, workers, "objects",
+            results = util.run_chunks(_ssobject_chunk, chunks, workers, "objects",
                                   weights=[int(counts[g0:g1].sum()) for g0, g1 in chunks])
         finally:
             _PARALLEL.clear()
@@ -409,10 +348,10 @@ def compute_ssobject(
         # MOID computation
         if parallel and len(oidx):
             n = len(oidx)
-            chunks = _balanced_chunks(np.ones(n), chunk_factor * workers)
+            chunks = util.balanced_chunks(np.ones(n), chunk_factor * workers)
             _PARALLEL.update(elements=(a, e, i, node, argperi, epoch_mjd))
             try:
-                results = _run_chunks(_moid_chunk, chunks, workers, "MOID")
+                results = util.run_chunks(_moid_chunk, chunks, workers, "MOID")
             finally:
                 _PARALLEL.clear()
             moid = np.concatenate(results, axis=1)

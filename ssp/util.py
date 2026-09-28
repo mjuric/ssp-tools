@@ -17,6 +17,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from datetime import datetime
 import pyarrow.compute as pc
+import multiprocessing
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 def assoc_validate(dia, assoc):
@@ -573,3 +576,67 @@ def argjoin(a, v):
 
     assert np.all(a[aidx] == v[vidx])
     return aidx, vidx
+
+
+#
+# Forked process pools over contiguous chunks (ssobject and sssource
+# --workers N > 1)
+#
+def fork_context():
+    """The fork multiprocessing context, or None where fork is unavailable."""
+    if "fork" not in multiprocessing.get_all_start_methods():
+        return None
+    return multiprocessing.get_context("fork")
+
+
+def balanced_chunks(weights, n_chunks):
+    """
+    Split ``len(weights)`` items into at most ``n_chunks`` contiguous,
+    non-empty ranges of about equal total weight. Returns a list of
+    (start, end) index pairs covering all items in order.
+    """
+    n = len(weights)
+    if n == 0:
+        return []
+    n_chunks = max(1, min(n_chunks, n))
+    cum = np.cumsum(weights, dtype=np.float64)
+    targets = cum[-1] * np.arange(1, n_chunks) / n_chunks
+    cuts = np.searchsorted(cum, targets, side="left") + 1
+    edges = np.unique(np.concatenate(([0], cuts, [n])))
+    return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:]) if b > a]
+
+
+def run_chunks(func, chunks, workers, label, weights=None):
+    """
+    Run ``func(start, end)`` for each (start, end) chunk in a forked
+    process pool and return the results in chunk order.
+
+    Prints progress once per finished chunk; the time left is estimated
+    from the chunks' ``weights`` (default: their sizes). The first
+    exception in any worker cancels the remaining chunks and is re-raised
+    in the parent.
+    """
+    if weights is None:
+        weights = [e - s for s, e in chunks]
+    total, total_weight = chunks[-1][1] - chunks[0][0], float(sum(weights))
+    t0 = time.monotonic()
+    results = [None] * len(chunks)
+    done, done_weight = 0, 0.0
+    pool = ProcessPoolExecutor(max_workers=min(workers, len(chunks)), mp_context=fork_context())
+    try:
+        futures = {pool.submit(func, s, e): n for n, (s, e) in enumerate(chunks)}
+        for fut in as_completed(futures):
+            n = futures[fut]
+            results[n] = fut.result()   # re-raises a worker's exception
+            s, e = chunks[n]
+            done += e - s
+            done_weight += weights[n]
+            elapsed = time.monotonic() - t0
+            left = elapsed * (total_weight - done_weight) / done_weight if done_weight else float("nan")
+            print(f"[{label}] {done:,}/{total:,} objects, "
+                  f"{elapsed:.1f} s elapsed, ~{left:.0f} s left", flush=True)
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
+    return results
