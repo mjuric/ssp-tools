@@ -417,3 +417,208 @@ def test_ellipse_matches_monte_carlo(ephem, orbits, name, linear):
         # and it does break down at the observed arc, as described above
         k = np.argmin(np.abs(t + 51544.5 - 61090))
         assert np.sqrt(np.linalg.eigvalsh(np.cov(off[:, k].T)))[1] * 3600 > 5 * tr.sigma_major[k]
+
+
+# ---------------------------------------------------------------------------
+# Review round 2: fail-safe behaviour, and ellipse_at with topo_pos
+# ---------------------------------------------------------------------------
+
+def test_ellipse_non_psd_fails_safe():
+    a = 1e-8
+    for s00, s01, s11 in [(-a, 0, a), (a, 0, -a), (a, 2 * a, a), (-a, 0, -a), (np.inf, 0, a)]:
+        ra_err, dec_err, cov, sig = propagate._ellipse(s00, s01, s11)
+        assert sig == np.inf and np.isnan(ra_err) and np.isnan(dec_err) and np.isnan(cov), (s00, s01, s11)
+    # a very elongated but PSD ellipse (1e6:1 in variance) is kept
+    th = 0.3
+    S = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]]) @ np.diag([a, a * 1e-6])
+    S = S @ np.array([[np.cos(th), np.sin(th)], [-np.sin(th), np.cos(th)]])
+    assert np.isfinite(propagate._ellipse(S[0, 0], S[0, 1], S[1, 1])[3])
+
+
+def _cpos_track(t, cpos):
+    K = len(t)
+    z = np.zeros(K)
+    sig = np.zeros(K)
+    return CoarseTrack(t=np.asarray(t, float), ra=z, dec=z, rate_ra=z, rate_dec=z, ra_err=z, dec_err=z,
+                       ra_dec_cov=z, sigma_major=sig, ok=np.ones(K, bool), delta=np.ones(K),
+                       cpos=np.asarray(cpos, float))
+
+
+def test_ellipse_at_nonfinite_t():
+    tr = _track([0.0, 1.0], [1e-8, 1e-8], [0, 0], [1e-8, 1e-8])
+    ra_err, dec_err, cov, sig = propagate.ellipse_at(tr, np.array([np.nan, np.inf, -np.inf, 0.5]))
+    assert np.all(sig[:3] == np.inf) and np.isnan(ra_err[:3]).all() and np.isnan(cov[:3]).all()
+    assert np.isfinite(sig[3])
+    C = np.diag([1e-12, 4e-12, 9e-12])
+    tr = _cpos_track([0.0, 1.0], [C, C])
+    topo = np.tile([2.0, 0.0, 0.0], (2, 1))
+    ra_err, dec_err, cov, sig = propagate.ellipse_at(tr, np.array([np.nan, 0.5]), topo_pos=topo)
+    assert sig[0] == np.inf and np.isnan(ra_err[0])
+    # along +x at 2 AU: east is +y, north is +z
+    k = np.degrees(1) / 2
+    assert np.isclose(ra_err[1], np.sqrt(4e-12) * k) and np.isclose(dec_err[1], np.sqrt(9e-12) * k)
+    assert np.isclose(sig[1], np.sqrt(9e-12) * k * 3600) and abs(cov[1]) < 1e-30
+
+
+def test_ellipse_at_topo_pos_interpolates_cpos():
+    """cpos is interpolated linearly, then projected on each topo_pos."""
+    C0 = np.diag([1e-12, 4e-12, 9e-12])
+    C1 = np.array([[3e-12, 1e-12, 0], [1e-12, 2e-12, 0], [0, 0, 1e-12]])
+    tr = _cpos_track([0.0, 2.0], [C0, C1])
+    tq = np.array([0.0, 0.5, 2.0, 5.0])
+    topo = np.array([[1.0, 0.2, 0.1], [0.3, 1.0, -0.5], [-1, 0, 0.9], [0.1, 0.1, 1.0]])
+    got = propagate.ellipse_at(tr, tq, topo_pos=topo)
+    w = np.clip(tq / 2, 0, 1)
+    Ci = (1 - w)[:, None, None] * C0 + w[:, None, None] * C1
+    exp = propagate._ellipse(*propagate._sky(Ci, topo))
+    for g, e in zip(got, exp):
+        np.testing.assert_allclose(g, e, rtol=1e-12, atol=1e-30)
+    with pytest.raises(ValueError):
+        propagate.ellipse_at(_track([0.0, 1.0], [1e-8] * 2, [0] * 2, [1e-8] * 2), tq[:1],
+                             topo_pos=topo[:1])
+
+
+def test_ra_wraps_below_360():
+    ra = propagate._ra_deg(np.array([[1.0, -1e-17, 0.0], [1.0, 0.0, 0.0], [-1.0, -1e-300, 0.0]]))
+    assert np.all((ra >= 0) & (ra < 360)) and ra[0] == 0.0 and ra[1] == 0.0
+
+
+@needs_assist
+def test_sun_plunge_is_bounded(ephem, orbits, monkeypatch):
+    """States that fall into the Sun used to hang coarse() for minutes. They
+    are rejected up front (osculating q < 0.02 AU); and, with that check
+    disabled, the step cap still stops them in about a second."""
+    import time
+
+    orbit = orbits[MB_LONG]
+    t = nights(60790, 61150)
+    obs_pos, _ = x05_state(t, ephem)
+    sun = ephem.get_particle(0, float(orbit["epoch"]))
+    plunges = [np.zeros(6)]
+    for r in (0.05, 0.01, 0.004):
+        plunges.append(np.array([sun.x + r, sun.y, sun.z, sun.vx, sun.vy + 0.001, sun.vz]))
+    for s0 in plunges:
+        o = orbit.copy()
+        o["state0"] = s0
+        t0 = time.perf_counter()
+        tr = propagate.coarse(o, t, obs_pos, ephem)
+        assert time.perf_counter() - t0 < 1.0
+        assert not tr.ok.any() and np.all(tr.sigma_major == np.inf)
+    monkeypatch.setattr(propagate, "_Q_MIN_AU", -1.0)
+    for s0 in plunges[1:]:
+        o = orbit.copy()
+        o["state0"] = s0
+        t0 = time.perf_counter()
+        tr = propagate.coarse(o, t, obs_pos, ephem)
+        assert time.perf_counter() - t0 < 10.0      # measured 0.6 s; minutes before
+        assert not tr.ok[-1]
+    assert propagate._perihelion(orbit["state0"], orbit["epoch"], ephem) > 1.5
+
+
+@needs_assist
+def test_non_psd_cov0_fails_safe(ephem, orbits):
+    orbit = orbits[MB_LONG].copy()
+    orbit["cov0"] = -orbit["cov0"]
+    t = nights(60790, 60800)
+    obs_pos, _ = x05_state(t, ephem)
+    tr = propagate.coarse(orbit, t, obs_pos, ephem)
+    assert tr.ok.all() and np.all(tr.sigma_major == np.inf) and np.isnan(tr.ra_err).all()
+    assert np.all(propagate.ellipse_at(tr, t + 0.3)[3] == np.inf)
+    assert np.all(propagate.ellipse_at(tr, t, topo_pos=np.ones((len(t), 3)))[3] == np.inf)
+
+
+@needs_assist
+def test_nonfinite_observer_and_cpos(ephem, orbits):
+    orbit = orbits[MB_LONG]
+    t = nights(60790, 60800)
+    obs_pos, _ = x05_state(t, ephem)
+    obs_pos[3] = np.nan
+    tr = propagate.coarse(orbit, t, obs_pos, ephem)
+    assert tr.ok.tolist() == [k != 3 for k in range(len(t))]
+    assert tr.sigma_major[3] == np.inf and np.isnan(tr.ra[3]) and np.isnan(tr.delta[3])
+    assert np.isnan(tr.cpos[3]).all() and np.isfinite(tr.cpos[tr.ok]).all()
+    # cpos is the symmetric position block of Phi C0 Phi^T
+    out = {}
+    propagate.coarse(orbit, t, obs_pos, ephem, _phi=out)
+    P = out["phi"][0, :3]
+    np.testing.assert_allclose(tr.cpos[0], P @ orbit["cov0"] @ P.T, rtol=1e-10)
+    no = orbit.copy()
+    no["has_cov"] = False
+    assert np.isnan(propagate.coarse(no, t, obs_pos, ephem).cpos).all()
+    # a NaN time fails alone
+    tt = t.copy()
+    tt[2] = np.nan
+    tr = propagate.coarse(orbit, tt, x05_state(t, ephem)[0], ephem)
+    assert tr.ok.tolist() == [k != 2 for k in range(len(t))]
+
+
+@needs_assist
+def test_nonfinite_state_without_error_truncates(ephem, orbits, monkeypatch):
+    """A non-finite state that ASSIST doesn't flag fails that sample and
+    every later one in that direction of time."""
+    import assist
+
+    orbit = orbits[MB_LONG]
+    t = nights(61010, 61030)                    # all after the epoch (61000)
+    obs_pos, _ = x05_state(t, ephem)
+    real = assist.Extras.integrate_or_interpolate
+    t_bad = t[5]
+
+    def poisoned(self, tk):
+        real(self, tk)
+        if tk >= t_bad and tk < t_bad + 0.5:
+            self._sim.contents.particles[0].x = float("nan")
+    monkeypatch.setattr(assist.Extras, "integrate_or_interpolate", poisoned)
+    tr = propagate.coarse(orbit, t, obs_pos, ephem)
+    assert tr.ok.tolist() == [k < 5 for k in range(len(t))]
+    assert np.all(tr.sigma_major[5:] == np.inf)
+
+
+@needs_assist
+def test_earth_state_cache(ephem):
+    t = nights(60790, 60800)
+    propagate._EARTH_CACHE.update(key=None, E=None)
+    E1 = propagate._earth_states(t, ephem)
+    assert propagate._earth_states(t.copy(), ephem) is E1
+    E2 = propagate._earth_states(t + 1.0, ephem)
+    assert E2 is not E1
+    e = ephem.get_particle(3, float(t[4] + 1.0))
+    np.testing.assert_array_equal(E2[4], [e.x, e.y, e.z, e.vx, e.vy, e.vz])
+
+
+@needs_assist
+@pytest.mark.parametrize("name,ca,exact", [(NEO_CA, 60936.5, True), (NEO_SHORT, 60904.5, False)])
+def test_ellipse_at_topo_pos_close_approach(ephem, orbits, name, ca, exact):
+    """Within 0.007 AU of the Earth the line of sight turns within a night.
+    Interpolating the sky components was 0.78-1.95x off; interpolating cpos
+    and projecting it on the actual topo_pos matches coarse() evaluated
+    directly at hourly times to 2% for 2025 FA22 (18-yr arc).
+
+    It can't for 2025 PM, observed (31-day arc) during this approach: its
+    position covariance has a large, mostly radial, component that shrinks
+    and grows again within a day about the observed arc, and C(t) is
+    quadratic in time over a day (free motion: C_pp + tau (C_pv + C_vp) +
+    tau^2 C_vv), so the linear chord overestimates it, here by up to 55x
+    (0.06" -> 3"). A chord of a PSD-convex quadratic is never below it, so
+    this errs only towards larger sigma (never falsely eligible). Fixing it
+    needs the full 6x6 C(t) per sample (see the WP2 report): free-motion
+    propagation from both bracketing samples, blended, is within 1%."""
+    orbit = orbits[name]
+    t = nights(ca - 5, ca + 5)
+    obs_pos, _ = x05_state(t, ephem)
+    tr = propagate.coarse(orbit, t, obs_pos, ephem)
+    tq = np.arange(t[0], t[-1], 1 / 24)
+    oq, _ = x05_state(tq, ephem)
+    direct = propagate.coarse(orbit, tq, oq, ephem)
+    assert direct.ok.all() and direct.delta.min() < 0.008
+    topo = np.stack([np.cos(np.radians(direct.dec)) * np.cos(np.radians(direct.ra)),
+                     np.cos(np.radians(direct.dec)) * np.sin(np.radians(direct.ra)),
+                     np.sin(np.radians(direct.dec))], axis=1) * direct.delta[:, None]
+    ra_err, dec_err, cov, sig = propagate.ellipse_at(tr, tq, topo_pos=topo)
+    if exact:
+        np.testing.assert_allclose(sig, direct.sigma_major, rtol=0.02)
+        np.testing.assert_allclose(ra_err, direct.ra_err, rtol=0.02)
+        np.testing.assert_allclose(dec_err, direct.dec_err, rtol=0.02)
+    else:
+        assert np.all(sig >= 0.999 * direct.sigma_major)
+        assert (sig / direct.sigma_major).max() > 10

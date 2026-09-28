@@ -41,6 +41,12 @@ propagation"):
   ``ok = False`` with NaN positions, rates and ellipses and an infinite
   sigma_major; coarse() never raises for one bad orbit. Once an integration
   fails, every later sample in that direction of time is marked failed.
+  So do samples with a non-finite time or observer position. Orbits with
+  an osculating perihelion below 0.02 AU at epoch aren't integrated at all
+  (a plunge into the Sun would hang IAS15), and a step cap stops any other
+  runaway integration (see _MAX_STEPS_BASE).
+- **Non-PSD sky covariances** (e.g. from a non-PSD cov0) are treated like
+  missing ones: NaN errors, infinite sigma_major.
 - **Orbits with has_cov False** get NaN ellipses and sigma_major = inf, but
   positions and rates as usual.
 """
@@ -64,6 +70,24 @@ _OMEGA_EARTH = 2.0 * np.pi / 0.99726958
 _EARTH_SITE_MAX_AU = 1e-4
 
 _RAD2DEG = 180.0 / np.pi
+
+# Orbits whose osculating heliocentric perihelion distance at epoch is
+# below this [AU] are not integrated (all samples ok=False): a plunge into
+# the Sun drives IAS15's step to zero and would hang the integration.
+_Q_MIN_AU = 0.02
+
+# Backstop: a simulation that takes more steps than
+# _MAX_STEPS_BASE + _MAX_STEPS_PER_YEAR * (years integrated) is stopped,
+# and its remaining samples fail. Real orbits take ~20-65 steps per year
+# (measured: at most 91 over 1.4 years, on 205 orbits including NEOs
+# through 0.006 AU approaches); a step costs 0.1-0.7 ms (the most near the
+# Sun), so this bounds a runaway orbit to ~1 s per year integrated. A step
+# count (not wall time) keeps the output deterministic.
+_MAX_STEPS_BASE = 1000
+_MAX_STEPS_PER_YEAR = 300
+
+# Relative tolerance of the PSD test of a sky covariance (see _ellipse).
+_PSD_EPS = 1e-10
 
 
 def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
@@ -89,10 +113,17 @@ def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
     ax = assist.Extras(sim, ephem)
     sim.ri_ias15.adaptive_mode = 2   # after attaching: ASSIST resets it
 
+    years = abs(float(t_seq[-1]) - float(epoch)) / 365.25 if len(t_seq) else 0.0
+    max_steps = int(_MAX_STEPS_BASE + _MAX_STEPS_PER_YEAR * years)
+
+    def heartbeat(simp):             # the backstop; see _MAX_STEPS_BASE
+        if simp.contents.steps_done > max_steps:
+            simp.contents.stop()
+    sim.heartbeat = heartbeat
+
     n = sim.N            # 7: the particle, then its six variations
     stride = ctypes.sizeof(rebound.Particle) // 8
     buf_t = ctypes.c_double * (n * stride)
-    views = {}           # particle-array address -> numpy view of it
     S = np.empty((len(idx), n, 6))
     m = 0                # samples done
     for t in t_seq:
@@ -100,7 +131,7 @@ def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
             ax.integrate_or_interpolate(float(t))
         except Exception:   # one bad orbit must not stop a run
             break
-        if sim._status > 0:  # REB_STATUS_GENERIC_ERROR, escape, ...
+        if sim._status > 0:  # REB_STATUS_GENERIC_ERROR, stopped, ...
             break
         # Read the particle array afresh each time: integrate_or_interpolate
         # swaps in an interpolated copy (see ephem_assist._propagate_one).
@@ -109,10 +140,7 @@ def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
         # (serialize_particle_data would be simpler, but only copies the
         # real particles.)
         addr = ctypes.addressof(sim._particles.contents)
-        v = views.get(addr)
-        if v is None:
-            v = views[addr] = np.frombuffer(buf_t.from_address(addr)).reshape(n, stride)[:, :6]
-        S[m] = v
+        S[m] = np.frombuffer(buf_t.from_address(addr)).reshape(n, stride)[:, :6]
         m += 1
     # Everything from the first non-finite sample on has failed.
     bad = ~np.all(np.isfinite(S[:m]), axis=(1, 2))
@@ -124,16 +152,50 @@ def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
     ok[done] = True
 
 
+# The Earth's states for the last times asked for: every orbit of a run is
+# sampled at the same times. (Per process, so safe under fork.)
+_EARTH_CACHE = {"key": None, "E": None}
+
+
+def _earth_states(t, ephem):
+    """(K, 6) barycentric Earth states at ASSIST times t, cached for the
+    last (t, ephem). NaN where the ephemeris can't give one."""
+    key = (id(ephem), t.tobytes())
+    if _EARTH_CACHE["key"] != key:
+        get = ephem.get_particle
+        fin = np.isfinite(t)   # (get_particle segfaults on a NaN time)
+        E = np.full((len(t), 6), np.nan)
+        try:
+            E[fin] = np.array([(e.x, e.y, e.z, e.vx, e.vy, e.vz)
+                               for e in (get(_ASSIST_EARTH, tk) for tk in t[fin].tolist())]
+                              ).reshape(-1, 6)
+        except Exception:            # a time outside the ephemeris
+            for k in np.flatnonzero(fin):
+                try:
+                    e = get(_ASSIST_EARTH, float(t[k]))
+                except Exception:
+                    continue
+                E[k] = (e.x, e.y, e.z, e.vx, e.vy, e.vz)
+        E.setflags(write=False)
+        _EARTH_CACHE.update(key=key, E=E)
+    return _EARTH_CACHE["E"]
+
+
 def _observer_velocity(t, obs_pos, ephem):
     """Barycentric velocity [AU/day] of an Earth-bound observer at obs_pos
     (K, 3), at ASSIST times t (K,). See the module docstring."""
-    get = ephem.get_particle
-    E = np.array([(e.x, e.y, e.z, e.vx, e.vy, e.vz)
-                  for e in (get(_ASSIST_EARTH, tk) for tk in t.tolist())]).reshape(-1, 6)
+    E = _earth_states(t, ephem)
     g = obs_pos - E[:, :3]
     site = np.sqrt(np.sum(g * g, axis=1)) < _EARTH_SITE_MAX_AU
     rot = _OMEGA_EARTH * np.stack([-g[:, 1], g[:, 0], np.zeros(len(t))], axis=1)
     return E[:, 3:] + np.where(site[:, None], rot, 0.0)
+
+
+def _ra_deg(u):
+    """RA [deg] in [0, 360) of unit vectors u (K, 3)."""
+    ra = np.degrees(np.arctan2(u[:, 1], u[:, 0])) % 360.0
+    ra[ra >= 360.0] = 0.0   # (-tiny) % 360 rounds to 360.0
+    return ra
 
 
 def _tangent_basis(u):
@@ -146,21 +208,54 @@ def _tangent_basis(u):
     return e_ra, e_dec
 
 
+def _sky(cpos, rho):
+    """Project position covariances cpos (K, 3, 3) [AU^2] onto the tangent
+    planes of the topocentric vectors rho (K, 3) [AU]: the sky covariance
+    components (s00, s01, s11) [deg^2] of (RA cos Dec, Dec)."""
+    d = np.sqrt(np.sum(rho * rho, axis=1))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        e_ra, e_dec = _tangent_basis(rho / d[:, None])
+        J = np.stack([e_ra, e_dec], axis=1) * (_RAD2DEG / d)[:, None, None]
+    S = J @ cpos @ np.transpose(J, (0, 2, 1))              # (K, 2, 2)
+    return S[:, 0, 0], 0.5 * (S[:, 0, 1] + S[:, 1, 0]), S[:, 1, 1]
+
+
 def _ellipse(s00, s01, s11):
     """(ra_err, dec_err, ra_dec_cov, sigma_major) from the sky covariance
-    [deg^2]. NaN input gives NaN errors and an infinite sigma_major."""
+    [deg^2]. Non-finite or non-PSD input (s00 < 0, s11 < 0, or
+    s00 s11 - s01^2 < -eps s00 s11) gives NaN errors and an infinite
+    sigma_major, so that it is never eligible."""
     s00 = np.asarray(s00, dtype=np.float64)
     s01 = np.asarray(s01, dtype=np.float64)
     s11 = np.asarray(s11, dtype=np.float64)
-    with np.errstate(invalid="ignore"):
+    with np.errstate(invalid="ignore", over="ignore"):
+        good = (np.isfinite(s00) & np.isfinite(s01) & np.isfinite(s11)
+                & (s00 >= 0) & (s11 >= 0)
+                & (s00 * s11 - s01 * s01 >= -_PSD_EPS * s00 * s11))
         lam = 0.5 * (s00 + s11) + np.hypot(0.5 * (s00 - s11), s01)
-        sigma = np.sqrt(np.maximum(lam, 0.0)) * 3600.0
-        ra_err = np.sqrt(np.maximum(s00, 0.0))
-        dec_err = np.sqrt(np.maximum(s11, 0.0))
-    ra_err = np.where(np.isnan(s00), np.nan, ra_err)
-    dec_err = np.where(np.isnan(s11), np.nan, dec_err)
-    sigma = np.where(np.isnan(lam), np.inf, sigma)
-    return ra_err, dec_err, s01.copy(), sigma
+        sigma = np.where(good, np.sqrt(np.maximum(lam, 0.0)) * 3600.0, np.inf)
+        ra_err = np.where(good, np.sqrt(np.maximum(s00, 0.0)), np.nan)
+        dec_err = np.where(good, np.sqrt(np.maximum(s11, 0.0)), np.nan)
+        cov = np.where(good, s01, np.nan)
+    return ra_err, dec_err, cov, sigma
+
+
+def _perihelion(state0, epoch, ephem):
+    """Osculating heliocentric perihelion distance [AU] of state0 at epoch
+    (NaN if the Sun isn't available there)."""
+    from ..ephem_assist import ASSIST_SUN, GM_SUN
+    try:
+        s = ephem.get_particle(ASSIST_SUN, float(epoch))
+    except Exception:
+        return np.nan
+    r = state0[:3] - np.array([s.x, s.y, s.z])
+    v = state0[3:] - np.array([s.vx, s.vy, s.vz])
+    rn = np.sqrt(r @ r)
+    if not rn > 0:
+        return 0.0
+    h = np.cross(r, v)
+    e = np.cross(v, h) / GM_SUN - r / rn
+    return float((h @ h) / GM_SUN / (1.0 + np.sqrt(e @ e)))
 
 
 def coarse(orbit, t, obs_pos, ephem, _phi=None):
@@ -187,14 +282,21 @@ def coarse(orbit, t, obs_pos, ephem, _phi=None):
 
     state0 = np.asarray(orbit["state0"], dtype=np.float64)
     epoch = float(orbit["epoch"])
-    if K and np.all(np.isfinite(state0)) and np.isfinite(epoch):
+    if (K and np.all(np.isfinite(state0)) and np.isfinite(epoch)
+            and _perihelion(state0, epoch, ephem) >= _Q_MIN_AU):
         order = np.argsort(t, kind="stable")
         ts = t[order]
-        fwd = order[ts >= epoch]
-        bwd = order[ts < epoch][::-1]
+        good_t = np.isfinite(ts)
+        fwd = order[good_t & (ts >= epoch)]
+        bwd = order[good_t & (ts < epoch)][::-1]
         for idx in (fwd, bwd):
             if len(idx):
                 _integrate(state0, epoch, t[idx], ephem, X, Phi, ok, idx)
+    # A sample without a finite observer position has no track.
+    bad = ~np.all(np.isfinite(obs_pos), axis=1)
+    ok &= ~bad
+    X[bad] = np.nan
+    Phi[bad] = np.nan
     if _phi is not None:
         _phi.update(state=X, phi=Phi)
 
@@ -203,13 +305,14 @@ def coarse(orbit, t, obs_pos, ephem, _phi=None):
     d = np.sqrt(np.sum(rho * rho, axis=1))
     with np.errstate(invalid="ignore", divide="ignore"):
         u = rho / d[:, None]
-    ra = np.degrees(np.arctan2(u[:, 1], u[:, 0])) % 360.0
+    ra = _ra_deg(u)
     dec = np.degrees(np.arcsin(np.clip(u[:, 2], -1.0, 1.0)))
     e_ra, e_dec = _tangent_basis(u)
 
     v_obs = np.full((K, 3), np.nan)
     if ok.any():
-        v_obs[ok] = _observer_velocity(t[ok], obs_pos[ok], ephem)
+        # all of t, so that the Earth states are shared with other orbits
+        v_obs[ok] = _observer_velocity(t, obs_pos, ephem)[ok]
     rhodot = X[:, 3:] - v_obs
     with np.errstate(invalid="ignore", divide="ignore"):
         udot = (rhodot - np.sum(u * rhodot, axis=1)[:, None] * u) / d[:, None]
@@ -220,57 +323,77 @@ def coarse(orbit, t, obs_pos, ephem, _phi=None):
     if bool(orbit["has_cov"]):
         cov0 = np.asarray(orbit["cov0"], dtype=np.float64)
         P = Phi[:, :3, :]                                  # (K, 3, 6)
-        Cpos = P @ cov0 @ np.transpose(P, (0, 2, 1))       # (K, 3, 3)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            J = np.stack([e_ra, e_dec], axis=1) * (_RAD2DEG / d)[:, None, None]
-        S = J @ Cpos @ np.transpose(J, (0, 2, 1))          # (K, 2, 2) [deg^2]
-        s00, s01, s11 = S[:, 0, 0], 0.5 * (S[:, 0, 1] + S[:, 1, 0]), S[:, 1, 1]
+        cpos = P @ cov0 @ np.transpose(P, (0, 2, 1))       # (K, 3, 3)
+        cpos = 0.5 * (cpos + np.transpose(cpos, (0, 2, 1)))
+        s00, s01, s11 = _sky(cpos, rho)
     else:
+        cpos = np.full((K, 3, 3), np.nan)
         s00 = s01 = s11 = np.full(K, np.nan)
     ra_err, dec_err, ra_dec_cov, sigma_major = _ellipse(s00, s01, s11)
 
     return CoarseTrack(
         t=t.copy(), ra=ra, dec=dec, rate_ra=rate_ra, rate_dec=rate_dec,
         ra_err=ra_err, dec_err=dec_err, ra_dec_cov=ra_dec_cov,
-        sigma_major=sigma_major, ok=ok, delta=d,
+        sigma_major=sigma_major, ok=ok, delta=d, cpos=cpos,
     )
 
 
-def ellipse_at(track, t):
+def ellipse_at(track, t, topo_pos=None):
     """The error ellipse at ASSIST times ``t``: (ra_err, dec_err,
     ra_dec_cov, sigma_major), shaped like ``t``.
 
-    Linearly interpolates the sky covariance components (ra_err^2,
-    ra_dec_cov, dec_err^2) between the two bracketing samples of ``track``
-    (a convex combination of PSD matrices stays PSD), then derives the
-    errors and sigma_major. Times outside the sampled span are **clamped**
-    to the nearest sample (no extrapolation). If either bracketing sample
-    has no ellipse (failed, or has_cov False), the result is NaN with an
-    infinite sigma_major; a time exactly on a good sample returns it.
+    With ``topo_pos`` (t's shape + (3,), [AU], object - observer at each t,
+    e.g. the precise pass's ``EphResult.topo_pos.T``), it linearly
+    interpolates ``track.cpos`` (the barycentric position covariance)
+    between the two bracketing samples, and projects it on the tangent
+    plane of ``topo_pos``: exact but for the interpolation of C(t), and it
+    follows a line of sight that turns within a night (NEOs close to the
+    Earth). Without ``topo_pos``, it interpolates the samples' sky
+    covariance components (ra_err^2, ra_dec_cov, dec_err^2) instead.
+
+    Either way it's a convex combination of PSD matrices, so it stays PSD.
+    Times outside the sampled span are **clamped** to the nearest sample
+    (no extrapolation). A non-finite time, a bracketing sample with weight
+    and no covariance (failed, or has_cov False), or a non-PSD result give
+    NaN errors and an infinite sigma_major; a time exactly on a good sample
+    returns that sample.
     """
     t = np.asarray(t, dtype=np.float64)
     shape = t.shape
     t = t.reshape(-1)
+    N = len(t)
     ts = np.asarray(track.t, dtype=np.float64)
+    if topo_pos is not None:
+        topo_pos = np.asarray(topo_pos, dtype=np.float64).reshape(N, 3)
+        if track.cpos is None:
+            raise ValueError("ellipse_at: topo_pos needs a track with cpos")
     if len(ts) == 0:
         nan = np.full(shape, np.nan)
         return nan, nan.copy(), nan.copy(), np.full(shape, np.inf)
     order = np.argsort(ts, kind="stable")
     ts = ts[order]
-    comps = np.stack([np.asarray(track.ra_err)[order] ** 2,
-                      np.asarray(track.ra_dec_cov)[order],
-                      np.asarray(track.dec_err)[order] ** 2])   # (3, K)
+    if topo_pos is not None:
+        vals = np.asarray(track.cpos, dtype=np.float64)[order].reshape(len(ts), 9)
+    else:
+        vals = np.stack([np.asarray(track.ra_err)[order] ** 2,
+                         np.asarray(track.ra_dec_cov)[order],
+                         np.asarray(track.dec_err)[order] ** 2], axis=1)
 
-    tc = np.clip(t, ts[0], ts[-1])
+    finite = np.isfinite(t)
+    tc = np.clip(np.where(finite, t, ts[0]), ts[0], ts[-1])
     hi = np.clip(np.searchsorted(ts, tc, side="left"), 0, len(ts) - 1)
     lo = np.maximum(hi - 1, 0)
     span = ts[hi] - ts[lo]
     with np.errstate(invalid="ignore", divide="ignore"):
-        w = np.where(span > 0, (tc - ts[lo]) / span, 1.0)
+        w = np.where(span > 0, (tc - ts[lo]) / span, 1.0)[:, None]
     # Only include a neighbour that has weight, so that a NaN neighbour
     # doesn't poison an exact hit on a good sample.
-    a = np.where(w < 1.0, (1.0 - w) * comps[:, lo], 0.0)
-    b = np.where(w > 0.0, w * comps[:, hi], 0.0)
-    s = a + b
-    out = _ellipse(s[0], s[1], s[2])
+    v = (np.where(w < 1.0, (1.0 - w) * vals[lo], 0.0)
+         + np.where(w > 0.0, w * vals[hi], 0.0))
+    v[~finite] = np.nan
+    if topo_pos is not None:
+        s00, s01, s11 = _sky(v.reshape(N, 3, 3), topo_pos)
+    else:
+        s00, s01, s11 = v[:, 0], v[:, 1], v[:, 2]
+    out = _ellipse(s00, s01, s11)
     return tuple(x.reshape(shape) for x in out)
