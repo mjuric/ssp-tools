@@ -22,13 +22,12 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
-from astropy.coordinates import Latitude, Longitude
 from astropy.time import Time
 from cdshealpix import nested
 
 from .. import util
 from ..ephem_assist import MJD_J2000
-from ._contract import DIA_COLUMNS, OBSCODE, SIGMA_MAX_ARCSEC, VISIT_DTYPE
+from ._contract import DIA_COLUMNS, NEAR_DELTA_AU, OBSCODE, SIGMA_MAX_ARCSEC, VISIT_DTYPE
 
 _ARCSEC = np.pi / (180.0 * 3600.0)   # radians per arcsec
 
@@ -61,7 +60,10 @@ MAX_SAMPLE_GAP_DAYS = 1.0
 #: The ``margin_arcsec`` for ``VisitIndex.candidates``: what its explicit
 #: terms don't cover of the difference between the coarse track and the
 #: precise prediction, i.e. the 5" match radius + <= 55" of light time + 30"
-#: of safety (see ``candidates``).
+#: of safety (see ``candidates``). The light time: the coarse track is
+#: geometric and the prediction light-time corrected, which moves it by
+#: (velocity x light time) / distance = v_perp / c whatever the distance,
+#: <= 55" for v_perp <= 80 km/s.
 DEFAULT_CANDIDATE_MARGIN_ARCSEC = 90.0
 
 #: Earth's equatorial radius [AU] (6378.1 km), the largest distance of any
@@ -76,7 +78,8 @@ _CHUNK = 1 << 20
 
 #: Threads used by build_visits and DiaIndex (NumPy releases the GIL in the
 #: heavy parts). Everything else is single-threaded, for fork-pool workers.
-DEFAULT_THREADS = min(16, os.cpu_count() or 1)
+DEFAULT_THREADS = min(16, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+                      else (os.cpu_count() or 1))
 
 
 def _unit_vectors(ra_deg, dec_deg):
@@ -91,6 +94,90 @@ def _angle(u1, u2):
     return np.arctan2(np.linalg.norm(np.cross(u1, u2), axis=-1), np.einsum("...i,...i->...", u1, u2))
 
 
+# HEALPix NESTED in NumPy. cdshealpix costs ~50-65 us per call whatever the
+# size (its Rust side builds a thread pool per call; the astropy Angle
+# wrappers of its Python API add ~100 us more), which dominated a match() of a
+# few predictions. The hash below is healpy's ang2pix_nest (with 1 - |z| taken
+# accurately at the poles); it reproduces cdshealpix's cells on 4M test points
+# (random, near the poles and the base-cell corners) at orders 0-20, except
+# points exactly on a cell boundary (which may go to either side). It is used
+# both to build DiaIndex and to query it, so the two agree anyway.
+# Neighbours inside a base cell are the (ix +- 1, iy +- 1) grid; the rare cells
+# on a base-cell edge (4 / 2**order of them) use cdshealpix.
+
+def _spread16(v):
+    v = v.astype(np.uint64)
+    v = (v | (v << np.uint64(8))) & np.uint64(0x00FF00FF)
+    v = (v | (v << np.uint64(4))) & np.uint64(0x0F0F0F0F)
+    v = (v | (v << np.uint64(2))) & np.uint64(0x33333333)
+    return (v | (v << np.uint64(1))) & np.uint64(0x55555555)
+
+
+_SPREAD16 = _spread16(np.arange(1 << 16))
+
+
+def _spread_bits(v):
+    """Interleave: bit i of v goes to bit 2i (0 <= v < 2**32)."""
+    v = v.astype(np.int64)
+    return _SPREAD16[v & 0xFFFF] | (_SPREAD16[v >> 16] << np.uint64(32))
+
+
+def _fxy_to_nest(face, ix, iy, depth):
+    return ((face.astype(np.uint64) << np.uint64(2 * depth))
+            | _spread_bits(ix) | (_spread_bits(iy) << np.uint64(1))).astype(np.int64)
+
+
+def _hash_fxy(ra_deg, dec_deg, depth):
+    """HEALPix NESTED (base cell, ix, iy) at ``depth`` of finite RA, Dec
+    [deg], |Dec| <= 90."""
+    nside = 1 << depth
+    phi = np.radians(np.asarray(ra_deg, dtype=np.float64) % 360.0)
+    dec = np.radians(np.asarray(dec_deg, dtype=np.float64))
+    z = np.sin(dec)
+    tt = phi / (np.pi / 2)                                   # [0, 4)
+    tt = np.where(tt >= 4.0, 0.0, tt)
+    face = np.empty(z.shape, np.int64)
+    ix = np.empty(z.shape, np.int64)
+    iy = np.empty(z.shape, np.int64)
+    eq = np.abs(z) <= 2.0 / 3.0
+    if eq.any():
+        t1 = nside * (0.5 + tt[eq])
+        t2 = nside * z[eq] * 0.75
+        jp = (t1 - t2).astype(np.int64)
+        jm = (t1 + t2).astype(np.int64)
+        ifp, ifm = jp >> depth, jm >> depth
+        face[eq] = np.where(ifp == ifm, ifp | 4, np.where(ifp < ifm, ifp, ifm + 8))
+        ix[eq] = jm & (nside - 1)
+        iy[eq] = nside - (jp & (nside - 1)) - 1
+    po = ~eq
+    if po.any():
+        ttp = tt[po]
+        ntt = np.minimum(3, ttp.astype(np.int64))
+        tp = ttp - ntt
+        # nside sqrt(3 (1 - |z|)), with 1 - |z| = 2 sin^2(colatitude / 2)
+        tmp = nside * np.sqrt(6.0) * np.abs(np.sin((np.pi / 2 - np.abs(dec[po])) / 2.0))
+        jp = np.minimum((tp * tmp).astype(np.int64), nside - 1)
+        jm = np.minimum(((1.0 - tp) * tmp).astype(np.int64), nside - 1)
+        north = z[po] >= 0
+        face[po] = np.where(north, ntt, ntt + 8)
+        ix[po] = np.where(north, nside - jm - 1, jp)
+        iy[po] = np.where(north, nside - jp - 1, jm)
+    return face, ix, iy
+
+
+def _neighbourhood(face, ix, iy, depth):
+    """(M, 9) NESTED ids of each cell and its neighbours (-1 where a
+    base-cell corner has only 7), as ``cdshealpix.nested.neighbours``."""
+    nside = 1 << depth
+    da, db = np.divmod(np.arange(9), 3)
+    out = _fxy_to_nest(np.repeat(face[:, None], 9, axis=1), np.clip(ix[:, None] + da - 1, 0, nside - 1),
+                       np.clip(iy[:, None] + db - 1, 0, nside - 1), depth)
+    edge = np.flatnonzero((ix == 0) | (iy == 0) | (ix == nside - 1) | (iy == nside - 1))
+    if edge.size:
+        out[edge] = nested.neighbours(out[edge, 4].astype(np.uint64), depth, num_threads=1)
+    return out
+
+
 def _healpix(ra_deg, dec_deg, depth):
     """NESTED cells at ``depth``; non-finite coordinates get ``_NO_CELL``."""
     ra_deg = np.asarray(ra_deg, dtype=np.float64)
@@ -102,8 +189,7 @@ def _healpix(ra_deg, dec_deg, depth):
     else:
         ra_g, dec_g = ra_deg[good], dec_deg[good]
     if ra_g.size:
-        cells = nested.lonlat_to_healpix(Longitude(ra_g, unit=u.deg, copy=False),
-                                         Latitude(dec_g, unit=u.deg, copy=False), depth, num_threads=1)
+        cells = _fxy_to_nest(*_hash_fxy(ra_g, dec_g, depth), depth)
         if good.all():
             out[...] = cells
         else:
@@ -115,6 +201,16 @@ def _healpix(ra_deg, dec_deg, depth):
 # read_dia
 # --------------------------------------------------------------------------
 
+def _sorted_by(a, b):
+    """Whether rows are strictly increasing in (a, b); in chunks, as whole-
+    array diffs would cost 16 bytes per row."""
+    for i in range(0, a.size - 1, _CHUNK):
+        da = np.diff(a[i:i + _CHUNK + 1])
+        if not ((da > 0) | ((da == 0) & (np.diff(b[i:i + _CHUNK + 1]) > 0))).all():
+            return False
+    return True
+
+
 def read_dia(path, t_lo_mjd=None, t_hi_mjd=None):
     """The ``DIA_COLUMNS`` of the DiaSources with
     ``t_lo_mjd <= midpointMjdTai < t_hi_mjd`` (either bound optional), as
@@ -123,13 +219,15 @@ def read_dia(path, t_lo_mjd=None, t_hi_mjd=None):
     Reads only those columns, with the time filter pushed down to Parquet
     (row groups outside the range are skipped by their statistics). ``path``
     is anything ``pyarrow.dataset.dataset`` accepts (a file, a list of
-    files, or a dataset directory). Rows with a null in any of the columns
-    are dropped, with a warning.
+    files, or a dataset directory). Rows with a null in any of the columns,
+    or a non-finite ``ra``, ``dec`` or ``midpointMjdTai``, or ``|dec| > 90``,
+    are dropped, with a warning counting them.
 
     Memory: the rows are streamed, a batch at a time, into preallocated
-    arrays (their count comes from a first, filter-only pass), so the peak
-    is about the result (36 bytes per row) plus one batch, not the several
-    times that a whole Arrow table and its conversion would take.
+    arrays (their count comes from a first, filter-only pass), with Arrow's
+    read-ahead limited to a couple of batches; so the peak is about the
+    result (40 bytes per row) plus a few batches, plus the sort's index and
+    one column copy (16 bytes per row) if the input isn't already sorted.
     """
     dset = ds.dataset(path, format="parquet")
     expr = None
@@ -144,8 +242,12 @@ def read_dia(path, t_lo_mjd=None, t_hi_mjd=None):
     dtypes = {c: np.float64 for c in DIA_COLUMNS} | {"diaSourceId": np.int64, "visit": np.int64}
     dia = {c: np.empty(n, dtype=dtypes[c]) for c in DIA_COLUMNS}
     m = 0
+    n_null = n_bad = 0
     pool = pa.default_memory_pool()
-    for i, batch in enumerate(dset.to_batches(columns=DIA_COLUMNS, filter=expr, batch_size=1 << 20)):
+    batches = dset.to_batches(
+        columns=DIA_COLUMNS, filter=expr, batch_size=1 << 20, batch_readahead=2, fragment_readahead=2,
+        fragment_scan_options=ds.ParquetFragmentScanOptions(pre_buffer=False))
+    for i, batch in enumerate(batches):
         if i % 8 == 7:
             pool.release_unused()   # else the allocator holds on to the batches read
         if not batch.num_rows:
@@ -154,26 +256,35 @@ def read_dia(path, t_lo_mjd=None, t_hi_mjd=None):
             valid = pc.is_valid(batch.column(DIA_COLUMNS[0]))
             for c in DIA_COLUMNS[1:]:
                 valid = pc.and_(valid, pc.is_valid(batch.column(c)))
+            k0 = batch.num_rows
             batch = batch.filter(valid)
-        k = batch.num_rows
+            n_null += k0 - batch.num_rows
+        cols = {c: batch.column(c).to_numpy(zero_copy_only=False) for c in DIA_COLUMNS}
+        good = (np.isfinite(cols["ra"]) & np.isfinite(cols["dec"]) & np.isfinite(cols["midpointMjdTai"])
+                & (np.abs(cols["dec"]) <= 90.0))
+        if not good.all():
+            n_bad += int((~good).sum())
+            cols = {c: v[good] for c, v in cols.items()}
+        k = cols["ra"].size
         if m + k > n:
             raise RuntimeError("read_dia: the dataset changed while being read")
         for c in DIA_COLUMNS:
-            dia[c][m:m + k] = batch.column(c).to_numpy(zero_copy_only=False)
+            dia[c][m:m + k] = cols[c]
         m += k
+        cols = None
+    if n_null or n_bad:
+        warnings.warn(f"read_dia: dropped {n_null} DiaSources with nulls in {DIA_COLUMNS} and {n_bad} "
+                      "with a non-finite ra, dec or midpointMjdTai, or |dec| > 90", stacklevel=2)
     if m < n:
-        warnings.warn(f"read_dia: dropped {n - m} DiaSources with nulls in {DIA_COLUMNS}", stacklevel=2)
         dia = {c: dia[c][:m].copy() for c in DIA_COLUMNS}
     batch = None
     pool.release_unused()
 
     visit, sid = dia["visit"], dia["diaSourceId"]
     if visit.size > 1:
-        dv = np.diff(visit)
-        in_order = ((dv > 0) | ((dv == 0) & (np.diff(sid) > 0))).all()
-        del dv
-        if not in_order:
+        if not _sorted_by(visit, sid):
             order = np.lexsort((sid, visit))
+            del visit, sid          # (or the old columns outlive the gather)
             for c in DIA_COLUMNS:
                 dia[c] = dia[c][order]
     return dia
@@ -348,7 +459,7 @@ class DiaIndex:
         Completeness: at order d = ``query_depth(radius)`` every cell is wider
         than the radius, so every point within it of a prediction lies in the
         prediction's order-d cell or one of that cell's neighbours
-        (``cdshealpix.nested.neighbours``: 8, or 7 at the corners of the base
+        (``_neighbourhood``: 8, or 7 at the corners of the base
         cells; this holds at the poles too, and cells have no RA seam). The
         DiaSources of those (up to 9) cells are the order-15 key ranges
         ``[(v << 34) | (c << 2(15-d)), ... + 4**(15-d))``, which are then
@@ -374,8 +485,7 @@ class DiaIndex:
                 k, vi, r, d = k[good], vi[good], r[good], d[good]
             if not k.size:
                 continue
-            cell = _healpix(r, d, dq)
-            nb = nested.neighbours(cell, dq, num_threads=1)   # (M, 9), -1 if absent
+            nb = _neighbourhood(*_hash_fxy(r, d, dq), dq)       # (M, 9), -1 if absent
             j = np.nonzero(nb >= 0)
             pk = j[0]                                         # local prediction of each cell
             lo = (vi[pk] << _CELL_BITS) | (nb[j].astype(np.int64) << shift)
@@ -559,10 +669,23 @@ class VisitIndex:
         The last two, plus 30" of safety for what isn't modelled (e.g. the
         coarse pass vs the precise one) are the margin:
         ``DEFAULT_CANDIDATE_MARGIN_ARCSEC`` = 90".
+
+        Close approaches. For delta below ~0.007 AU the rate (~1/delta^2)
+        can grow within the night faster than the nightly differences show
+        (and a lone sample has no estimate at all). So, per the contract, a
+        night whose sample has ``delta < NEAR_DELTA_AU`` (0.02 AU), or a
+        non-finite delta, takes every visit of that night. (Within |dt| <=
+        0.338 d at <= 40 km/s delta changes by < 0.008 AU, so the formula is
+        relied on only beyond ~0.012 AU.)
+
+        ``self.last_skipped`` is set to the number of nights of the index
+        that had no track sample within ``MAX_SAMPLE_GAP_DAYS`` (and so were
+        skipped) in this call.
         """
         nn = self.nights.size
         empty = np.zeros(0, dtype=np.int64)
         tk = np.asarray(track.t, dtype=np.float64)
+        self.last_skipped = nn if tk.size == 0 else 0
         if not nn or not tk.size:
             return empty
         margin = margin_arcsec * _ARCSEC
@@ -576,6 +699,7 @@ class VisitIndex:
         use_r = np.abs(ts[jr] - self.night_t) < np.abs(ts[jl] - self.night_t)
         k_n = srt[np.where(use_r, jr, jl)]
         gap = np.abs(tk[k_n] - self.night_t)
+        self.last_skipped = int((~(gap <= MAX_SAMPLE_GAP_DAYS)).sum())
 
         ra = np.asarray(track.ra, dtype=np.float64)
         dec = np.asarray(track.dec, dtype=np.float64)
@@ -592,33 +716,18 @@ class VisitIndex:
         # per sample: position, rate vector (3D, rad/day), and the rate change
         # and distance change per day to the adjacent usable samples
         p_all, vel_all = _pos_vel(ra, dec, rra, rdec)
-        acc_all = np.zeros(tk.size)
-        ddel_all = np.zeros(tk.size)
-        u = srt[usable[srt]]                     # usable samples, time-sorted
-        if u.size > 1:
-            dtu = np.diff(tk[u])
-            with np.errstate(invalid="ignore", divide="ignore"):
-                acc = np.linalg.norm(np.diff(vel_all[u], axis=0), axis=1) / dtu
-                ddel = np.abs(np.diff(delta[u])) / dtu
-            acc = np.where(dtu > 0, acc, np.inf)
-            ddel = np.where(dtu > 0, ddel, np.inf)
-            acc_all[u[:-1]] = acc                  # the side after
-            acc_all[u[1:]] = np.maximum(acc_all[u[1:]], acc)
-            ddel_all[u[:-1]] = ddel
-            ddel_all[u[1:]] = np.maximum(ddel_all[u[1:]], ddel)
-        # (NaN changes, e.g. from a NaN delta, count as infinite)
-        acc_all = np.where(np.isnan(acc_all), np.inf, acc_all)
-        ddel_all = np.where(np.isnan(ddel_all), np.inf, ddel_all)
+        acc_all, ddel_all = _sample_derivatives(tk, vel_all, delta, usable, srt)
 
         k = k_n[nights]
         w = np.linalg.norm(vel_all[k], axis=1)                        # rad/day
         dt_max = np.maximum(np.abs(self.night_tmax[nights] - tk[k]), np.abs(self.night_tmin[nights] - tk[k]))
+        # nights too near for the formula take all their visits
+        near = ~(delta[k] >= NEAR_DELTA_AU)
         # the centre of a candidate is within radius + 2 w dt + (the other
         # terms) of the sample itself; the cell lookup finds those within
         # radius + pad. (Every term grows with |dt|.)
-        extra_max = (2.0 * w * dt_max + _diurnal(delta[k], ddel_all[k], dt_max)
-                     + _curvature(acc_all[k], dt_max) + margin)
-        fall = ~(extra_max <= self.pad_rad)
+        extra_max = w * dt_max + _tolerance(0.0, w, delta[k], ddel_all[k], acc_all[k], dt_max, margin)
+        fall = ~(extra_max <= self.pad_rad) | near
 
         pair_n, pair_v = [], []
         # lookup
@@ -658,10 +767,40 @@ class VisitIndex:
             dirn = np.where(wk[:, None] > 0, vel_all[kk] / wk[:, None], 0.0)
         p_ext = p_all[kk] * np.cos(ang)[:, None] + dirn * np.sin(ang)[:, None]
         sep = _angle(self.center[pv], p_ext)
-        tol = (self.radius[pv] + wk * adt + _diurnal(delta[kk], ddel_all[kk], adt)
-               + _curvature(acc_all[kk], adt) + margin)
-        keep = sep <= tol
+        tol = _tolerance(self.radius[pv], wk, delta[kk], ddel_all[kk], acc_all[kk], adt, margin)
+        keep = (sep <= tol) | near[pn]
         return np.unique(pv[keep])
+
+
+def _sample_derivatives(t, vel, delta, usable, srt=None):
+    """Per sample, the rate change |dv/dt| [rad/day^2] and |d delta/dt|
+    [AU/day] to the adjacent usable samples (in time), the larger of the two
+    sides; 0 for a lone sample, infinite where not finite (e.g. from a NaN
+    delta). Unusable samples get 0 (they're never eligible)."""
+    t = np.asarray(t, dtype=np.float64)
+    srt = np.argsort(t, kind="stable") if srt is None else srt
+    acc_all = np.zeros(t.size)
+    ddel_all = np.zeros(t.size)
+    u = srt[usable[srt]]                     # usable samples, time-sorted
+    if u.size > 1:
+        dtu = np.diff(t[u])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            acc = np.linalg.norm(np.diff(vel[u], axis=0), axis=1) / dtu
+            ddel = np.abs(np.diff(delta[u])) / dtu
+        acc = np.where((dtu > 0) & ~np.isnan(acc), acc, np.inf)
+        ddel = np.where((dtu > 0) & ~np.isnan(ddel), ddel, np.inf)
+        acc_all[u[:-1]] = acc                  # the side after
+        acc_all[u[1:]] = np.maximum(acc_all[u[1:]], acc)
+        ddel_all[u[:-1]] = ddel
+        ddel_all[u[1:]] = np.maximum(ddel_all[u[1:]], ddel)
+    return acc_all, ddel_all
+
+
+def _tolerance(radius, w, delta, ddelta, acc, adt, margin):
+    """The candidate tolerance [rad] of ``VisitIndex.candidates`` at |dt|
+    ``adt`` [day]: radius + w |dt| + D + 0.5 acc dt^2 + margin (w [rad/day],
+    delta [AU], ddelta [AU/day], acc [rad/day^2], radius and margin [rad])."""
+    return radius + w * adt + _diurnal(delta, ddelta, adt) + _curvature(acc, adt) + margin
 
 
 def _pos_vel(ra, dec, rate_ra, rate_dec):

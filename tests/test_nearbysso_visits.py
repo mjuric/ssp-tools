@@ -75,7 +75,8 @@ def test_read_dia_projection_filter_sort(tmp_path):
         "band": pa.array(rng.choice(["g", "r"], n)),
         "diaSourceId": pa.array(rng.permutation(n).astype(np.int64) + 100),
         "visit": pa.array(rng.integers(0, 20, n).astype(np.int64) + 2025050100000),
-        "midpointMjdTai": pa.array(rng.uniform(60000, 60010, n)),
+        # with rows exactly on both bounds: the slice is [t_lo, t_hi)
+        "midpointMjdTai": pa.array(np.r_[rng.uniform(60000, 60010, n - 20), [60002.0] * 10, [60005.0] * 10]),
         "ra": pa.array(rng.uniform(0, 360, n)),
         "dec": pa.array(rng.uniform(-90, 90, n)),
         "extra": pa.array(np.zeros(n)),
@@ -88,6 +89,7 @@ def test_read_dia_projection_filter_sort(tmp_path):
     t = tbl.column("midpointMjdTai").to_numpy()
     sel = (t >= 60002.0) & (t < 60005.0)
     assert dia["visit"].size == sel.sum()
+    assert (dia["midpointMjdTai"] == 60002.0).sum() == 10 and not (dia["midpointMjdTai"] == 60005.0).any()
     assert (dia["midpointMjdTai"] >= 60002.0).all() and (dia["midpointMjdTai"] < 60005.0).all()
     order = np.lexsort((dia["diaSourceId"], dia["visit"]))
     assert (order == np.arange(order.size)).all()
@@ -102,6 +104,8 @@ def test_read_dia_projection_filter_sort(tmp_path):
     assert V.read_dia(path)["ra"].size == n
     assert V.read_dia(path, t_lo_mjd=60005.0)["ra"].size == (t >= 60005.0).sum()
     assert V.read_dia(path, t_hi_mjd=60005.0)["ra"].size == (t < 60005.0).sum()
+    assert V.read_dia(path, 60005.0, 60005.0 + 1e-9)["ra"].size == 10
+    assert V.read_dia(path, 60002.0 - 1e-9, 60002.0)["ra"].size == 0
     empty = V.read_dia(path, 70000.0, 70001.0)
     assert set(empty) == set(C.DIA_COLUMNS) and empty["ra"].size == 0
     assert V.build_visits(empty).size == 0
@@ -115,6 +119,24 @@ def test_read_dia_nulls(tmp_path):
     with pytest.warns(UserWarning, match="dropped 1"):
         dia = V.read_dia(tmp_path / "n.parquet")
     assert list(dia["diaSourceId"]) == [1, 3]
+
+
+def test_read_dia_nonfinite(tmp_path):
+    """Rows with a non-finite ra, dec or time, or |dec| > 90, are dropped
+    (a NaN ra would otherwise make the visit's centre NaN), counted apart
+    from the nulls."""
+    tbl = pa.table({"diaSourceId": pa.array(np.arange(8), pa.int64()),
+                    "visit": pa.array([1, 1, 1, 1, 2, 2, 2, 2], pa.int64()),
+                    "midpointMjdTai": [0.0, 0.0, np.nan, 0.0, 1.0, 1.0, 1.0, None],
+                    "ra": [1.0, np.nan, 3.0, 4.0, 5.0, np.inf, 7.0, 8.0],
+                    "dec": [0.0, 0.0, 0.0, 95.0, 0.0, 0.0, -np.inf, 0.0]})
+    pq.write_table(tbl, tmp_path / "f.parquet", row_group_size=3)
+    with pytest.warns(UserWarning, match="dropped 1 DiaSources with nulls .* and 5 with a non-finite"):
+        dia = V.read_dia(tmp_path / "f.parquet")
+    assert list(dia["diaSourceId"]) == [0, 4]
+    vis = V.build_visits(dia)
+    assert np.isfinite(vis["center"]).all() and np.isfinite(vis["radius"]).all()
+    V.VisitIndex(vis)
 
 
 # --------------------------------------------------------------------------
@@ -455,6 +477,84 @@ def test_diurnal_coefficient():
             assert np.hypot(e1, e2).max() <= V.diurnal_coefficient(dt) * (1 + 1e-12)
 
 
+def test_default_margin():
+    """The default margin covers the match radius, the light-time shift of
+    the geometric coarse track (v_perp / c: <= 55" for v_perp <= 80 km/s)
+    and 30" of safety; the explicit terms cover the rest."""
+    c_kms = 299792.458
+    assert np.degrees(80.0 / c_kms) * 3600 < 55.1
+    assert V.DEFAULT_CANDIDATE_MARGIN_ARCSEC >= C.MATCH_RADIUS_ARCSEC + 55 + 30
+
+
+def test_tolerance_formula():
+    """_tolerance against the contract's formula, written out, at a few
+    (delta, d delta/dt, dt): radius + w|dt| + D + 0.5 a dt^2 + margin,
+    D = A max(2, |exp(iWdt) - 1 - iWdt|) (1 + A), A = arcsin(R_E / (delta -
+    |d delta/dt| |dt|))."""
+    radius, w, acc, margin = np.radians(1.75), np.radians(0.3), np.radians(2.0), np.radians(90 / 3600)
+    for delta, ddel, dt in ((2.0, 0.0, 0.2), (0.05, 0.01, 0.3), (0.03, 0.02, 0.1), (0.021, 0.005, 0.45),
+                            (1.0, 0.5, 0.0), (0.02, 0.05, 0.25)):
+        x = V.OMEGA_EARTH * dt
+        A = np.arcsin(V.R_EARTH_AU / (delta - ddel * dt))
+        D = A * max(2.0, abs(np.exp(1j * x) - 1 - 1j * x)) * (1 + A)
+        exp = radius + w * dt + D + 0.5 * acc * dt**2 + margin
+        got = V._tolerance(radius, w, delta, ddel, acc, dt, margin)
+        assert abs(got - exp) <= 1e-15 * exp, (delta, ddel, dt)
+    # delta_eff at or below R_earth: A = 90 deg
+    assert V._tolerance(0.0, 0.0, 0.001, 1.0, 0.0, 0.3, 0.0) >= np.pi / 2 * 2
+
+
+def test_sample_derivatives():
+    """The rate and distance changes per day to the adjacent usable samples,
+    the larger side; a lone usable sample gets 0; unordered input."""
+    t = np.array([2.0, 0.0, 1.0, 3.0, 5.0])
+    vel = np.zeros((5, 3))
+    vel[:, 0] = [0.3, 0.0, 0.1, 0.35, 9.0]      # rad/day
+    delta = np.array([1.2, 1.0, 1.05, 1.25, 9.0])
+    usable = np.array([True, True, True, True, False])
+    acc, ddel = V._sample_derivatives(t, vel, delta, usable)
+    # in time order: samples 1, 2, 0, 3; changes 0.1, 0.2, 0.05 per day
+    np.testing.assert_allclose(acc[[1, 2, 0, 3]], [0.1, 0.2, 0.2, 0.05])
+    np.testing.assert_allclose(ddel[[1, 2, 0, 3]], [0.05, 0.15, 0.15, 0.05])
+    assert acc[4] == 0 and ddel[4] == 0
+    a1, d1 = V._sample_derivatives(t[:1], vel[:1], delta[:1], usable[:1])
+    assert a1[0] == 0 and d1[0] == 0
+    # a NaN delta next to a sample makes its change infinite
+    _, dn = V._sample_derivatives(t, vel, np.where(np.arange(5) == 2, np.nan, delta), usable)
+    assert np.isinf(dn[[1, 2, 0]]).all() and np.isclose(dn[3], 0.05)
+
+
+def test_candidates_grid_pad_borderline():
+    """Fast movers with w dt_max ~ 1-1.9 deg, and visits whose centres are
+    anywhere within the tolerance of the extrapolated position: all are
+    candidates. This needs the lookup to allow for radius + 2 w dt_max
+    around the sample (the extrapolation, then the w |dt| slack), or it
+    must fall back to the whole night."""
+    rng = np.random.default_rng(11)
+    for trial in range(60):
+        w_deg = rng.uniform(5.0, 9.5)                    # deg/day; dt_max ~ 0.2 d
+        pos_at = great_circle_path(rng.uniform(0, 360), rng.uniform(-50, 50), rng.uniform(0, 360), w_deg,
+                                   26357.2)
+        tv = 26356.0 + np.arange(3)[:, None] + np.linspace(0.0, 0.4, 40)[None, :]
+        tv = tv.ravel()
+        ra, dec = pos_at(tv)
+        wr = np.radians(w_deg)
+        slack = wr * np.abs(tv - np.round(tv - 0.2 - 26356.0) - 26356.2) + np.radians(R / 3600)
+        off = (np.radians(1.75) + rng.uniform(0, 0.98, tv.size) * slack) * 206264.806
+        cra, cdec = offset(ra, dec, off, rng.uniform(0, 2 * np.pi, tv.size))
+        vis = np.zeros(tv.size, dtype=C.VISIT_DTYPE)
+        vis["night"] = 20250501 + np.repeat(np.arange(3), 40)
+        vis["visit"] = vis["night"] * 100000 + np.tile(np.arange(40), 3)
+        vis["t"] = tv
+        vis["center"] = unit(cra, cdec)
+        vis["radius"] = np.radians(1.75)
+        vi = V.VisitIndex(vis)
+        np.testing.assert_allclose(vi.night_t, 26356.2 + np.arange(3))
+        track = make_track(pos_at, vi.night_t, delta=1e9)
+        got = vi.candidates(track, R)
+        np.testing.assert_array_equal(got, np.arange(tv.size))
+
+
 def test_candidates_eligibility():
     rng = np.random.default_rng(8)
     vis = synthetic_visits(rng)
@@ -476,8 +576,12 @@ def test_candidates_eligibility():
     # exactly at the limit is eligible
     c3 = vi.candidates(tr._replace(sigma_major=np.full(3, C.SIGMA_MAX_ARCSEC)), 60.0)
     np.testing.assert_array_equal(c3, all_c)
-    # samples far from every night: nothing
+    assert vi.last_skipped == 0
+    # samples far from every night: nothing, and the nights are counted
     assert vi.candidates(tr._replace(t=tr.t + 5.0), 60.0).size == 0
+    assert vi.last_skipped == 3
+    vi.candidates(tr._replace(t=tr.t + 1.3), 60.0)   # the first night is 1.3 d from any
+    assert vi.last_skipped == 1
     # empty track
     e = C.CoarseTrack(*[np.zeros(0)] * 11)
     assert vi.candidates(e, 60.0).size == 0
@@ -516,18 +620,15 @@ def test_candidates_field_edge_and_fast():
 SITE_LAT = np.radians(-30.24)
 
 
-def flyby(rng, delta0, t0):
-    """A geocentric object at delta0 [AU] at t0, moving mostly radially
-    (so its geocentric rate on the sky is small, 0.02-1 deg/day, or passes
-    through zero), with a random acceleration, seen from a site rotating
-    with the Earth: returns topo(t) -> (ra, dec, delta)."""
+def flyby(rng, delta0, t0, v_rad_kms, v_perp_kms):
+    """A geocentric object at delta0 [AU] at t0, moving with the given
+    radial and transverse speeds and a random acceleration, seen from a
+    site rotating with the Earth: returns topo(t) -> (ra, dec, delta)."""
     xhat = unit(rng.uniform(0, 360), np.degrees(np.arcsin(rng.uniform(-0.9, 0.9))))
     perp = np.cross(xhat, rng.normal(size=3))
     perp /= np.linalg.norm(perp)
-    v_rad = rng.uniform(-3, 3) / 1731.46             # km/s -> AU/day
-    v_perp = np.radians(rng.uniform(0.02, 1.0)) * delta0 * rng.choice([-1, 1])
     G = rng.normal(size=3) * 1e-6                      # AU/day^2
-    X0, V0 = xhat * delta0, v_rad * xhat + v_perp * perp
+    X0, V0 = xhat * delta0, (v_rad_kms * xhat + v_perp_kms * perp) / 1731.45683681
     th0 = rng.uniform(0, 2 * np.pi)
 
     def topo(t):
@@ -544,7 +645,7 @@ def flyby(rng, delta0, t0):
     return topo
 
 
-def flyby_track(topo, t, h=1e-5):
+def flyby_track(topo, t, h=1e-6):
     ra, dec, d = topo(t)
     p0, p1 = unit(*topo(t - h)[:2]), unit(*topo(t + h)[:2])
     v = (p1 - p0) / (2 * h)                            # rad/day, tangent to the sky
@@ -559,16 +660,17 @@ def flyby_track(topo, t, h=1e-5):
                          ok=np.ones(K, bool), delta=d)
 
 
-def flyby_visits(rng, topo, nights=4, per_night=120):
-    """Visits (radius 1.75 deg) with times over 9 h of each night, centred
-    near where the object is at some other time of that night, many of them
-    near the edge of the field."""
+def flyby_visits(rng, topo, nights, per_night=60):
+    """Visits (radius 1.75 deg) with times over 9 h of each night: half
+    centred near where the object is at some other time of that night, half
+    on the edge of the field (0.9-1.0 radius) around it at the visit time."""
     rows = []
     for n in range(nights):
         tn = 26356.1 + n + np.sort(rng.uniform(0.0, 0.375, per_night))
-        tc = 26356.1 + n + rng.uniform(0.0, 0.375, per_night)
+        tc = np.where(rng.uniform(size=per_night) < 0.5, 26356.1 + n + rng.uniform(0.0, 0.375, per_night), tn)
         ra, dec, _ = topo(tc)
-        off = np.degrees(rng.uniform(0, 1, per_night) ** 0.3 * np.radians(2.5)) * 3600
+        off = np.where(tc == tn, np.radians(1.75) * rng.uniform(0.9, 1.0, per_night),
+                       rng.uniform(0, 1, per_night) ** 0.3 * np.radians(2.5)) * 206264.806
         cra, cdec = offset(ra, dec, off, rng.uniform(0, 2 * np.pi, per_night))
         for i in range(per_night):
             rows.append((20250501 + n, i, tn[i], cra[i], cdec[i]))
@@ -582,36 +684,47 @@ def flyby_visits(rng, topo, nights=4, per_night=120):
     return vis
 
 
-@pytest.mark.parametrize("delta0", [0.002, 0.005, 0.01, 0.02, 0.05])
-def test_candidates_close_approach(delta0):
-    """Nearby objects with small on-sky rates, whose diurnal parallax (up to
-    1.2 deg at 0.002 AU) dominates their motion within a night: no visit the
-    object is in is missed, against brute force, with just the match radius
-    as the margin (the geometric truth has no light time). Without the
-    diurnal term (delta -> infinity) there are misses."""
-    rng = np.random.default_rng(int(delta0 * 1e4))
-    n_true = n_miss_nodiurnal = n_cand = 0
-    for trial in range(40):
-        topo = flyby(rng, delta0, 26357.3)
-        vis = flyby_visits(rng, topo)
+@pytest.mark.parametrize("drange", [(2e-4, 0.003), (0.003, 0.03), (0.03, 0.1)])
+def test_candidates_close_approach(drange):
+    """Close approaches against brute force: distances log-uniform in
+    ``drange`` at a time anywhere from 1.5 nights before the first sampled
+    night to 1.5 after the last, radial speeds up to 40 km/s, transverse ones
+    up to 40 km/s or nearly none (so the on-sky rate is small and the diurnal
+    parallax, up to ~1.2 deg at 0.002 AU, dominates), 1-, 2- and 4-night
+    tracks (a 1-night track has no rate-change estimate). Closest approaches
+    stay beyond 2e-4 AU. No visit the object is in is missed, with just the
+    match radius as the margin (the geometric truth has no light time), nor
+    with the default. Without the delta-dependent parts (delta -> infinity)
+    there are misses."""
+    rng = np.random.default_rng(int(drange[0] * 1e5))
+    n_true = n_miss_far = n_cand = n_trial = 0
+    while n_trial < 150:
+        nights = int(rng.choice([1, 2, 4]))
+        d0 = np.exp(rng.uniform(np.log(drange[0]), np.log(drange[1])))
+        v_rad = rng.uniform(-40, 40)
+        v_perp = rng.choice([rng.uniform(0, 0.5), rng.uniform(0, 40)])
+        t0 = 26356.1 + rng.uniform(-1.5, nights + 1.5)
+        topo = flyby(rng, d0, t0, v_rad, v_perp)
+        if topo(np.linspace(26354.0, 26358.0 + nights, 40000))[2].min() < 2e-4:
+            continue
+        n_trial += 1
+        vis = flyby_visits(rng, topo, nights)
         vi = V.VisitIndex(vis)
         track = flyby_track(topo, vi.night_t)
         ra, dec, _ = topo(vis["t"])
         truth = set(np.flatnonzero(V._angle(vis["center"], unit(ra, dec))
                                    <= vis["radius"] + np.radians(R / 3600)).tolist())
         got = set(vi.candidates(track, R * 1.001).tolist())
-        assert truth <= got, (trial, sorted(truth - got))
-        # and with the default margin, as in production
+        assert truth <= got, (n_trial, d0, v_rad, v_perp, t0, sorted(truth - got))
         assert truth <= set(vi.candidates(track, V.DEFAULT_CANDIDATE_MARGIN_ARCSEC).tolist())
         far = set(vi.candidates(track._replace(delta=np.full(track.t.size, 1e9)), R * 1.001).tolist())
         n_true += len(truth)
         n_cand += len(got)
-        n_miss_nodiurnal += len(truth - far)
+        n_miss_far += len(truth - far)
     assert n_true > 1000
-    if delta0 <= 0.01:
-        assert n_miss_nodiurnal > 0
-    print(f"delta {delta0}: {n_true} true, {n_cand} candidates, {n_miss_nodiurnal} missed without the "
-          "diurnal term")
+    if drange[0] < 0.01:
+        assert n_miss_far > 0
+    print(f"delta {drange}: {n_true} true, {n_cand} candidates, {n_miss_far} missed with delta -> infinity")
 
 
 def test_sky_grid_disk_complete():
@@ -634,3 +747,36 @@ def test_sky_grid_disk_complete():
                           rng.uniform(0, 2 * np.pi, m))
         got = set(g.cell(np.r_[pr, pr2], np.r_[pd, pd2]).tolist())
         assert got <= cells, (ra, dec, r)
+
+
+def test_healpix_matches_cdshealpix():
+    """The NumPy HEALPix hash and neighbourhood reproduce cdshealpix: random
+    points, near the poles, near the base-cell corners and edges, RA 0/360."""
+    import astropy.units as u
+    from astropy.coordinates import Latitude, Longitude
+    from cdshealpix import nested
+    rng = np.random.default_rng(12)
+    n = 400_000
+    ra = rng.uniform(0, 360, n)
+    dec = np.degrees(np.arcsin(rng.uniform(-1, 1, n)))
+    q = n // 4
+    dec[:q] = rng.choice([-1, 1], q) * (90 - np.abs(rng.normal(0, 0.01, q)))
+    dec[q:2 * q] = rng.choice([-1, 1], q) * np.degrees(np.arcsin(2 / 3)) + rng.normal(0, 1e-4, q)
+    ra[2 * q:3 * q] = rng.integers(0, 8, q) * 45 + rng.normal(0, 1e-4, q)
+    ra[:5], dec[:5] = [0.0, 360.0 - 1e-12, 90.0, 180.0, 45.0], [90.0, -90.0, 0.0, 41.8103149, -41.8103149]
+    ra %= 360.0
+    for depth in (0, 5, 13, 14, 15):
+        cells = V._healpix(ra, dec, depth)
+        def hp(a, d):
+            return nested.lonlat_to_healpix(Longitude(a * u.deg), Latitude(d * u.deg), depth).astype(np.int64)
+        ref = hp(ra, dec)
+        # points exactly on a cell boundary (the vertices given) may go to
+        # either cell; everywhere else the cells are identical
+        bad = np.flatnonzero(cells != ref)
+        assert set(bad.tolist()) <= set(range(5))
+        for i in bad:
+            eps = 1e-9 * np.array([[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]])
+            assert cells[i] in hp((ra[i] + eps[:, 0]) % 360, np.clip(dec[i] + eps[:, 1], -90, 90))
+        nb = V._neighbourhood(*V._hash_fxy(ra[:20000], dec[:20000], depth), depth)
+        nref = nested.neighbours(cells[:20000].astype(np.uint64), depth)
+        np.testing.assert_array_equal(np.sort(nb, axis=1), np.sort(nref, axis=1))
