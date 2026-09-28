@@ -156,10 +156,79 @@ The cost grows about linearly with survey length. When full regeneration outgrow
 3. **Coarse-pass safety.** On a sample of visits, compare the candidate list against brute force (all eligible orbits, exact ephemerides) to show the margins lose nothing.
 4. **Uncertainty checks:**
    - Φ from the variational particles against finite differences, for a sample including NEOs;
-   - the propagated σ against a Monte Carlo sample of orbits drawn from C₀ (each integrated), for a few short-arc and long-arc objects. This can't be checked against Horizons with user-supplied elements, since Horizons reports uncertainties only for JPL's own orbits.
-   - **Optional, qualitative:** Horizons' RA/Dec 3σ (quantity 36) for JPL's orbit of the same objects, as a sanity check on the order of magnitude. The orbit solutions differ, so it's not gated.
+   - the propagated σ against a Monte Carlo sample of orbits drawn from C₀ (each integrated), for a few short-arc and long-arc objects;
+   - **Against Horizons, using JPL's orbits.** Horizons reports uncertainties only for JPL's own orbits, so use those as the input:
+     - fetch JPL's elements **and covariance** from the JPL Small-Body Database API (`sbdb.api`, `cov=mat`);
+     - propagate them with our code;
+     - compare our on-sky ellipse with Horizons' plane-of-sky 3σ ellipse for the same object, epoch and observer (quantity 37: semi-major and semi-minor axes and orientation; quantity 36: RA/Dec 3σ).
+
+     Stratified like the spot checks, including short-arc objects and epochs far from their observations. Gate: σ within ~10% where it's below ~1′ (the linear regime); reported beyond that. The same Horizons etiquette applies.
 5. **Serial against parallel:** byte-identical output.
 6. **Tests:** synthetic orbits with a fake ephemeris, as E1's tests use, for the matching, reduction and σ gate. ASSIST-dependent tests are skipped when `SSP_ASSIST_*` isn't set; Horizons checks are never in the test suite.
+
+## Implementation plan
+
+Built by parallel subagents, each in its own git worktree, with the integrating session defining interfaces, reviewing, integrating and merging. The more complex work packages also get **independent reviews**: a fresh reviewer agent that sees only the design, the interface contract and the code, and tries to break it.
+
+### Phase 0: interfaces and fixtures (integrating session, before any agent starts)
+
+So that the work packages can be built in parallel against a fixed contract:
+
+1. **Module layout:** `ssp/nearbysso/`, containing:
+   - `orbits.py` (WP1), `propagate.py` (WP2), `visits.py` (WP3), `build.py` and the CLI (WP4);
+   - `_contract.py`: the shared dtypes and function signatures, with docstrings, and `NotImplementedError` stubs where no implementation exists yet.
+2. **The contract:**
+   - **`OrbitSet`**, a structured array:
+     - `designation`, `packed`, `epoch` (ASSIST time);
+     - `state0` (6, barycentric ICRF, AU and AU/d) and `cov0` (6×6, the same frame);
+     - `H`, `G` and a `has_cov` flag.
+   - **`Visits`**: `visit`, `t` (ASSIST time, TDB), `night`, `center` (unit vector), `radius` (rad), `obs_pos`/`obs_vel` (X05, barycentric ICRF).
+   - **`coarse(orbit, t_nights, obs_pos_nights) → CoarseTrack`**: topocentric unit vectors, on-sky rates, the 1σ ellipse (`raErr`, `decErr`, `ra_dec_Cov`) and σ_major, per night.
+   - **`ellipse_at(track, t) → ellipse`:** interpolated to exact visit times.
+   - **`candidates(visits, track, sigma_max, margin) → visit indices`** and **`match(dia_index, visit, radec, radius) → (dia row, sep)`**.
+   - **The `NearbySSO` output dtype.**
+3. **Fixtures under `/lscratch/mjuric/sspwt/nearbysso/fixtures/`**, read-only for the agents:
+   - a 3-night DP2-DS DiaSource slice and a 3-night PPDB AP-DS slice, both from ClickHouse;
+   - the 2026-09-26 `mpc_orbits` snapshot;
+   - SSSource built by `ssp.sssource` from that same snapshot on the DP2-DS slice, for WP5's same-orbits comparison.
+4. **Confirm the `CAR` covariance frame** (the design's first implementation step). This fixes WP1's conversion, so it has to be settled before WP1 starts.
+
+### Phase 1: four work packages in parallel
+
+| WP | builds | depends on | independent review |
+|---|---|---|---|
+| **WP1 Orbits** | Read `mpc_orbits`; apply the filter (no comets, elements present, arc > 2 d); parse the `CAR` covariance from `mpc_orb_jsonb` quickly for ~1.5M rows (vectorized or a fast JSON parser, not a per-row Python loop); convert to the barycentric ICRF state and covariance at epoch; report orbits without a covariance and the `normalized_rms` distribution. Tests: the state matches our `COM`-derived one, covariance symmetry and positivity, the filter. | contract | no; small, but its output checks are part of WP2's review |
+| **WP2 Propagation and uncertainty** | `coarse()` (one orbit per ASSIST simulation, six variational particles with `testparticle=0`, IAS15 `adaptive_mode = 2` after attaching ASSIST, nightly outputs); the projection of C(t) onto the topocentric sky; `ellipse_at()`. Tests: Φ against finite differences (including an NEO); σ against a Monte Carlo sample. | contract | **yes:** numerics, frames, the Jacobian, the interpolation, the regimes where linearization fails |
+| **WP3 Visits, candidates and matching** | Read any DiaSource Parquet (5 columns, in time slices); derive visits (centre, radius, night) and observer states; per-visit HEALPix order-15 DiaSource indices; `candidates()` (field plus a motion margin plus a safety margin, with the σ gate); `match()` (the cell and its neighbours, 5″); nearest-per-DiaSource with deterministic ties. Tests: fake tracks; coverage at cell and field edges, the RA wrap and the poles. | contract | **yes:** completeness at every edge, the margin reasoning, memory at PPDB scale |
+| **WP5 Validation harness** | Black-box tools run on outputs only:<br>(a) comparison against SSSource built from the same orbits;<br>(b) comparison against DP2 SSSource on the objects both keep, reported not gated;<br>(c) Horizons adjudication of every discrepancy;<br>(d) the stratified Horizons position spot check;<br>(e) the Horizons uncertainty check with SBDB elements and covariance;<br>(f) brute-force coarse-pass safety.<br>Horizons strictly serial and polite; reuses `bench/ephem_bench.py`. | contract and fixtures only | no; it *is* an independent check of WP1–4, written without seeing their code |
+
+The agents may not change `_contract.py`. A needed contract change comes back to the integrating session, which applies it for everyone.
+
+### Phase 2: integration (WP4)
+
+Starts once WP1–3 have landed.
+- **`build.py` and the CLI `ssp-build-nearbysso`:** the parallel per-orbit pass with `util.run_chunks`: coarse, then candidates, then the precise `compute_ephemerides_one`, then matching. Also time slicing, the reduction, attaching `ssObjectId`, the Parquet writer and the run report.
+- **Tests:** serial against parallel byte-identical; an end-to-end run on the fixtures.
+- **Independent review: yes,** of the whole pipeline: fork sharing, determinism, error handling, the time-slice boundaries (a night split across slices), and memory.
+
+### Phase 3: validation and performance (integrating session, with WP5's tools)
+
+1. **On the fixtures:** every WP5 check. Discrepancies are adjudicated with Horizons and fixed in the relevant work package.
+2. **A full year of PPDB AP-DS** (or the largest available span): the run time against the 30-minute budget on 64 cores, peak memory, the row count against the RFC's ~120M/yr estimate, and the run report.
+3. **Results go into this doc,** as for the SSSource/SSObject speed-ups.
+
+### Reviews and merging
+
+- **Each work package gets:**
+  - my review against this design and the contract;
+  - an independent review for WP2, WP3 and WP4;
+  - fixes sent back to the author until both reviews are clean.
+- **Each work package merges through its own PR,** as a merge commit.
+- **The owner approves before each merge,** unless blanket approval is given for this project.
+
+### Schema follow-up
+
+Draft the `sdm_schemas` change adding `ephRaErr`, `ephDecErr` and `ephRa_ephDec_Cov` to `NearbySSO` on `u/mjuric/ppdb-sso-ng`, for the owner to take forward.
 
 ## Out of scope
 
