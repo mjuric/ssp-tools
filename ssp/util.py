@@ -142,6 +142,42 @@ def solar_elongation_ndarray(ra_deg, dec_deg, t):
     return np.degrees(sep)
 
 
+def wrap_ra_deg(ra):
+    """RA [deg] wrapped to [0, 360), bitwise as astropy's ``Longitude`` (and
+    so ``SkyCoord(...).ra.deg``) does it: the same operations, applied only
+    when some value is out of range (so e.g. -0.0 stays -0.0 otherwise)."""
+    ra = np.array(ra, dtype=np.float64)
+    if not ((ra < 0.0) | (ra >= 360.0)).any():
+        return ra
+    ra -= (ra - 0.0) // 360.0 * 360.0
+    ra[ra >= 360.0] -= 360.0
+    ra[ra < 0.0] += 360.0
+    return ra
+
+
+_DEG2RAD = u.deg.to(u.rad)
+_RAD2DEG = u.rad.to(u.deg)
+_DEG2ARCSEC = u.deg.to(u.arcsec)
+
+
+def sky_separation_arcsec(ra1, dec1, ra2, dec2):
+    """Great-circle separation [arcsec] of ICRS points given in degrees,
+    bitwise as ``SkyCoord(ra1, dec1).separation(SkyCoord(ra2, dec2)).arcsec``
+    but without its per-call overhead: the same Vincenty formula
+    (``astropy.coordinates.angular_separation``) with the same operations
+    and unit-conversion factors as astropy's Quantity arithmetic applies
+    (the RA difference taken in degrees, then converted)."""
+    ra1, ra2 = wrap_ra_deg(ra1), wrap_ra_deg(ra2)
+    dlon = (ra2 - ra1) * _DEG2RAD
+    lat1, lat2 = np.asarray(dec1) * _DEG2RAD, np.asarray(dec2) * _DEG2RAD
+    sdlon, cdlon = np.sin(dlon), np.cos(dlon)
+    slat1, slat2, clat1, clat2 = np.sin(lat1), np.sin(lat2), np.cos(lat1), np.cos(lat2)
+    num1 = clat2 * sdlon
+    num2 = clat1 * slat2 - slat1 * clat2 * cdlon
+    denominator = slat1 * slat2 + clat1 * clat2 * cdlon
+    return np.arctan2(np.hypot(num1, num2), denominator) * _RAD2DEG * _DEG2ARCSEC
+
+
 def group_by(arrs, key, func, out=None, check_grouped=True):
     """
     Group multiple NumPy arrays by arrs[0][key], assuming the key column
