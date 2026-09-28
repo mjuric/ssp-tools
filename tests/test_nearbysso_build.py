@@ -291,32 +291,37 @@ def test_end_to_end(tmp_path, synth, orbits, ephem):
 
 
 @needs_assist
-def test_serial_parallel_identical_and_slices_same(tmp_path, synth, orbits, monkeypatch):
-    a, rep_a = _run(tmp_path, synth, orbits, "serial", workers=1)
-    b, _ = _run(tmp_path, synth, orbits, "parallel", workers=3, chunk_factor=2)
-    with monkeypatch.context() as mp:     # one DiaIndex.match call per orbit
-        mp.setattr(B, "_MATCH_BATCH", 1)
-        d, _ = _run(tmp_path, synth, orbits, "unbatched", workers=1)
-    assert a.read_bytes() == d.read_bytes()
-    c, rep_c = _run(tmp_path, synth, orbits, "sliced", workers=2, slice_days=1)
+def test_serial_parallel_and_slice_sizes_identical(tmp_path, synth, orbits, monkeypatch):
+    a, rep_a = _run(tmp_path, synth, orbits, "serial", workers=1, read_workers=1)
     assert pq.read_metadata(a).num_rows > 0
-    assert a.read_bytes() == b.read_bytes()
-
-    # one slice per night: the same rows, candidates and ellipses; the
-    # precise positions agree to integrator noise (see build's docstring)
+    ref = a.read_bytes()
+    b, _ = _run(tmp_path, synth, orbits, "parallel", workers=3, read_workers=2, chunk_factor=2)
+    assert b.read_bytes() == ref
+    # one slice per night
+    c, rep_c = _run(tmp_path, synth, orbits, "sliced", workers=2, read_workers=3, slice_days=1)
     assert len(rep_a["slices"]) == 1 and len(rep_c["slices"]) == len(DAY_OBS)
-    for k in ("candidate_visits", "eligible_evals", "sigma_rejected", "matches"):   # (not per orbit)
-        assert rep_a["counts"][k] == rep_c["counts"][k], k
-    ta, tc = pq.read_table(a), pq.read_table(c)
-    assert ta.schema == tc.schema
-    for name in ta.column_names:
-        x, y = ta[name].to_numpy(), tc[name].to_numpy()
-        if name in ("ephRa", "ephDec"):
-            np.testing.assert_allclose(x, y, rtol=0, atol=1e-9, err_msg=name)
-        elif name in ("diaSourceId", "ssObjectId", "designation") or name.endswith(("Err", "Cov")):
-            np.testing.assert_array_equal(x, y, err_msg=name)
-        else:
-            np.testing.assert_allclose(x, y, rtol=1e-6, err_msg=name)
+    assert c.read_bytes() == ref
+    assert rep_a["counts"] == rep_c["counts"]
+    # one DiaIndex.match call per prediction
+    with monkeypatch.context() as mp:
+        mp.setattr(B, "_MATCH_BATCH", 1)
+        d, _ = _run(tmp_path, synth, orbits, "unbatched", workers=1, slice_days=2)
+    assert d.read_bytes() == ref
+
+
+def test_sort_by_visit_is_stable():
+    rng = np.random.default_rng(3)
+    chunks, full = [], []
+    for j in range(4):
+        p = np.zeros(rng.integers(0, 50), dtype=B.PRED_DTYPE)
+        p["visit"] = rng.integers(0, 7, p.size)
+        p["orbit"] = np.sort(rng.integers(100 * j, 100 * j + 100, p.size))
+        chunks.append(p)
+        full.append(p.copy())
+    full = np.concatenate(full)
+    out = B.sort_by_visit(chunks, 7)
+    assert np.array_equal(out, full[np.argsort(full["visit"], kind="stable")])
+    assert all(c is None for c in chunks)
 
 
 @needs_assist

@@ -1,52 +1,49 @@
 """WP4: build ``nearbysso.parquet`` (docs/design/nearbysso.md).
 
-The pipeline, per time slice of the DiaSources:
+Three passes; each orbit is integrated once, and only the DiaSources are
+sliced:
 
-- **Parent:** read the slice (``visits.read_dia``), derive its visits
-  (``build_visits``), index the DiaSources (``DiaIndex``) and the visits
-  (``VisitIndex``), and compute the observer at the coarse sample times.
-- **Workers** (``util.run_chunks``, forked; inputs shared as module
-  globals), per orbit: ``propagate.coarse``, ``VisitIndex.candidates``, the
-  precise ``compute_ephemerides_one`` at the candidate visits, the error
-  ellipse there (``propagate.ellipse_at``), the sigma gate and
-  ``DiaIndex.match``. Every match comes back as a row of ``_MATCH_DTYPE``.
-- **Reduce:** the nearest match per diaSourceId (ties by designation),
-  ``ssObjectId`` from an SSObject table, and the Parquet file plus a JSON
-  run report next to it.
+1. **Visits** (``read_workers`` forked processes, one slice each): read a
+   slice (``visits.read_dia``) and derive its visits (``build_visits``).
+   The parent concatenates them into one ``visits`` array over all nights,
+   builds one ``VisitIndex`` and computes the observer at the coarse
+   sample times.
+2. **Orbits** (``workers`` forked processes, chunks of orbits), per orbit
+   over all nights: ``propagate.coarse``, ``VisitIndex.candidates``, the
+   precise ``compute_ephemerides_one`` at the candidate visits (as
+   SSSource), the error ellipse there (``propagate.ellipse_at``) and the
+   sigma gate. The eligible predictions (``PRED_DTYPE``, 48 bytes each)
+   come back to the parent, which sorts them by visit.
+3. **Matching** (``read_workers`` processes, one slice each; the
+   predictions shared through fork): read the slice again, index it
+   (``DiaIndex``), match the slice's predictions (a contiguous range of the
+   visit-sorted ones) and keep the nearest per DiaSource (ties by
+   designation). A slice owns its DiaSources, so that is exact.
+
+The parent then attaches ``ssObjectId`` from an SSObject table, writes the
+Parquet file (sorted by diaSourceId) and a JSON run report next to it.
 
 Slices never split a night (``night = visit // 100000``, i.e. day_obs):
 they are blocks of ``slice_days`` consecutive day_obs dates, read with time
 bounds that cover their nights and then cut on the night itself. So every
-DiaSource belongs to exactly one slice, and the per-slice reduction is
-exact.
+DiaSource belongs to exactly one slice.
 
 The coarse samples are three per night: its ``VisitIndex.night_t`` (the
 midpoint of its visits, where ``candidates`` looks) and ``night_t -+ h``
 with h = max(half the night's span of visit times, ``MIN_HALF_SPAN_DAYS``),
 so that every visit time is bracketed (``ellipse_at`` clamps outside the
-sampled span) by samples of its own night. Everything a visit's result
-depends on -- the sample ``candidates`` uses for its night, the rate and
-distance changes it estimates from that sample's neighbours, and the two
-samples ``ellipse_at`` interpolates between -- is then a function of that
-night's visits alone, so the candidates, the sigma gate and the ellipses
-don't depend on how the nights are sliced. (Sampling only at the nights'
-``night_t``, plus a trailing and a leading one, would make the first and
-last nights of each slice differ from the same nights inside a longer one.)
+sampled span) by samples of its own night, and the rate and distance
+changes ``candidates`` estimates for a night come from that night alone.
 
-The output is byte-identical for any ``workers`` and chunking. Across
-``slice_days`` the rows are the same, but ``ephRa``/``ephDec`` can differ
-at the ~1e-11 deg level: the precise pass integrates each orbit through the
-candidate times of its slice, and the integrator's path depends on the set
-of times asked for (``ephem_assist._propagate_one`` visits them in
-ascending order, even when integrating backwards from the epoch). SSSource,
-which asks for an object's times all at once, is subject to the same noise.
+The output is byte-identical for any ``workers``, ``read_workers``,
+``chunk_factor`` and ``slice_days``: the orbit pass sees all nights at
+once whatever the slicing, and matching and the reduction are per visit
+and per DiaSource.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import json
 import os
 import resource
@@ -67,7 +64,8 @@ from ..ephem_assist import MJD_J2000, compute_ephemerides_one, open_ephem
 from ..photfit import hg_V_mag
 from . import orbits as _orbits
 from . import propagate, visits as _visits
-from ._contract import MATCH_RADIUS_ARCSEC, NEARBYSSO_DTYPE, OBSCODE, ORBIT_DTYPE, SIGMA_MAX_ARCSEC
+from ._contract import (MATCH_RADIUS_ARCSEC, NEARBYSSO_DTYPE, OBSCODE, ORBIT_DTYPE, SIGMA_MAX_ARCSEC,
+                        VISIT_DTYPE)
 
 #: The smallest spacing [day] of a night's three coarse samples (for a night
 #: with a single visit, or visits close in time; see the module docstring).
@@ -76,31 +74,22 @@ MIN_HALF_SPAN_DAYS = 1.0 / 24.0
 #: Exceptions kept per type, for the run report.
 _N_EXAMPLES = 5
 
-#: An eligible prediction: an orbit at a candidate visit.
-_PRED_DTYPE = np.dtype([
-    ("visit", "i8"),         # into the slice's visits
-    ("orbit", "i8"),         # into the (designation-sorted) orbits
+#: An eligible prediction: an orbit at a candidate visit (48 bytes).
+PRED_DTYPE = np.dtype([
+    ("visit", "i4"),         # into the visits (of all nights)
+    ("orbit", "i4"),         # into the (designation-sorted) orbits
     ("ra", "f8"), ("dec", "f8"),
     ("vmag", "f4"), ("rate_ra", "f4"), ("rate_dec", "f4"),
     ("ra_err", "f4"), ("dec_err", "f4"), ("ra_dec_cov", "f4"),
 ])
 
-#: A worker's output: one row per (prediction, DiaSource) match.
-_MATCH_DTYPE = np.dtype([
-    ("dia_row", "i8"),       # into the slice's visit-sorted dia arrays
-    ("sep", "f8"),           # ephOffset [arcsec]
-] + [(f, _PRED_DTYPE[f]) for f in _PRED_DTYPE.names[1:]])
+#: Predictions per DiaIndex.match call (it has a fixed cost per call).
+_MATCH_BATCH = 1 << 18
 
-#: Predictions collected (from several orbits) per DiaIndex.match call.
-_MATCH_BATCH = 20000
-
-#: Per-orbit counters a worker returns (summed over chunks and slices, so
-#: "orbits", "with_candidates" and the "coarse_*" ones count orbit-slices;
-#: the run report's "failed_orbits" counts orbits).
+#: Per-orbit counters of the orbit pass.
 _COUNTS = ("orbits", "coarse_partial_fail", "coarse_all_fail", "with_candidates", "candidate_visits",
-           "precise_evals", "eligible_evals", "sigma_rejected", "matches", "nights_skipped",
-           "step_cap_stops")
-_STAGES = ("coarse", "candidates", "precise", "ellipse", "match")
+           "eligible", "sigma_rejected", "nights_skipped", "step_cap_stops")
+_STAGES = ("coarse", "candidates", "precise", "ellipse")
 
 
 # --------------------------------------------------------------------------
@@ -181,9 +170,9 @@ def _read_slice(path, sl):
 
 
 def sample_times(vindex):
-    """The coarse sample times of a slice (ASSIST, TDB): per night,
-    ``night_t - h``, ``night_t``, ``night_t + h`` (see the module
-    docstring)."""
+    """The coarse sample times (ASSIST, TDB) of the nights of ``vindex``:
+    per night, ``night_t - h``, ``night_t``, ``night_t + h`` (see the
+    module docstring)."""
     nt = np.asarray(vindex.night_t, dtype=np.float64)
     h = np.maximum(0.5 * (vindex.night_tmax - vindex.night_tmin), MIN_HALF_SPAN_DAYS)
     return np.stack([nt - h, nt, nt + h], axis=1).ravel()
@@ -197,22 +186,57 @@ def observer_at(t_assist):
 
 
 # --------------------------------------------------------------------------
-# The per-orbit pass
+# Fork pools
 # --------------------------------------------------------------------------
 
-# Filled by the parent before the workers fork (and for the serial run), so
+# Filled by the parent before a pool forks (and for the serial runs), so
 # that the large arrays are inherited, never pickled.
 _W = {}
 _EPHEM = None   # one ASSIST ephemeris per worker process, opened lazily
 
 
+def _map(func, chunks, workers, label, weights=None):
+    """``func(a, b)`` over ``chunks``, in a fork pool of ``workers``
+    (serially with 1, or where fork is unavailable); results in order."""
+    if workers > 1 and len(chunks) > 1 and util.fork_context() is not None:
+        return util.run_chunks(func, chunks, workers, label, weights=weights)
+    return [func(a, b) for a, b in chunks]
+
+
+def _peak_rss_gb():
+    """This process's peak RSS [GB] (for a forked worker, it counts the
+    pages it shares with the parent, too)."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
+
+
+# --------------------------------------------------------------------------
+# Pass 1: visits, per slice
+# --------------------------------------------------------------------------
+
+def _visits_slice(s0, s1):
+    """Slices [s0, s1): per slice (its visits, rows read, seconds reading,
+    seconds in build_visits), and the peak RSS."""
+    w = _W
+    out = []
+    for s in range(s0, s1):
+        t0 = time.perf_counter()
+        dia = _read_slice(w["dia_path"], w["slices"][s])
+        t1 = time.perf_counter()
+        vis = _visits.build_visits(dia, threads=w["threads"])
+        out.append((vis, int(dia["diaSourceId"].size), t1 - t0, time.perf_counter() - t1))
+        del dia
+    return out, _peak_rss_gb()
+
+
+# --------------------------------------------------------------------------
+# Pass 2: the orbits, once
+# --------------------------------------------------------------------------
+
 def process_orbit(i, w, ephem, stage_t):
-    """Orbit ``i`` of ``w["orbits"]`` in the current slice, up to the
-    match: its eligible predictions (``_PRED_DTYPE``, or None) and its
-    counters."""
+    """Orbit ``i`` of ``w["orbits"]`` over every night: its eligible
+    predictions (``PRED_DTYPE``, or None) and its counters."""
     orbit = w["orbits"][i]
     c = dict.fromkeys(_COUNTS, 0)
-    c["orbits"] = 1
     t0 = time.perf_counter()
     track = propagate.coarse(orbit, w["ts"], w["obs_ts"], ephem)
     t1 = time.perf_counter()
@@ -227,7 +251,7 @@ def process_orbit(i, w, ephem, stage_t):
     if not cand.size:
         return None, c
     c["with_candidates"] = 1
-    c["candidate_visits"] = c["precise_evals"] = int(cand.size)
+    c["candidate_visits"] = int(cand.size)
 
     v = w["visits"][cand]
     e = compute_ephemerides_one(str(orbit["designation"]), w["times"][cand], None, ephem, row=orbit,
@@ -237,7 +261,7 @@ def process_orbit(i, w, ephem, stage_t):
 
     ra_err, dec_err, ra_dec_cov, smaj = propagate.ellipse_at(track, v["t"], topo_pos=e.topo_pos.T)
     k = np.flatnonzero(np.isfinite(smaj) & (smaj <= SIGMA_MAX_ARCSEC))
-    c["eligible_evals"] = int(k.size)
+    c["eligible"] = int(k.size)
     c["sigma_rejected"] = int(cand.size - k.size)
     if not k.size:
         stage_t["ellipse"] += time.perf_counter() - t3
@@ -250,11 +274,11 @@ def process_orbit(i, w, ephem, stage_t):
     helio_r = np.sqrt(helio[0] ** 2 + helio[1] ** 2 + helio[2] ** 2)
     topo_r = np.sqrt(topo[0] ** 2 + topo[1] ** 2 + topo[2] ** 2)
 
-    p = np.empty(k.size, dtype=_PRED_DTYPE)
+    p = np.empty(k.size, dtype=PRED_DTYPE)
     p["visit"] = cand[k]
     p["orbit"] = i
-    # (as SSSource: RA wrapped to [0, 360), and the separation measured
-    # from the prediction)
+    # (as SSSource: RA wrapped to [0, 360); the separation is measured from
+    # the prediction, in pass 3)
     p["ra"] = util.wrap_ra_deg(e.ra_deg[k])
     p["dec"] = e.dec_deg[k]
     p["vmag"] = hg_V_mag(e.H, e.G, helio_r, topo_r, e.phase_angle[k])
@@ -267,28 +291,11 @@ def process_orbit(i, w, ephem, stage_t):
     return p, c
 
 
-def _match(preds, w, stage_t):
-    """The DiaSources within the radius of the predictions of several
-    orbits, in one ``DiaIndex.match`` call (it has a fixed cost per call):
-    ``_MATCH_DTYPE`` rows, in the order of ``preds``."""
-    t0 = time.perf_counter()
-    p = np.concatenate(preds)
-    pred, dia_row, sep = w["dindex"].match(p["visit"], p["ra"], p["dec"], MATCH_RADIUS_ARCSEC)
-    m = np.empty(pred.size, dtype=_MATCH_DTYPE)
-    m["dia_row"] = dia_row
-    m["sep"] = sep
-    q = p[pred]
-    for f in _PRED_DTYPE.names[1:]:
-        m[f] = q[f]
-    stage_t["match"] += time.perf_counter() - t0
-    return m
-
-
-def _chunk(o0, o1):
-    """Orbits [o0, o1) of the current slice: (matches, counters, exceptions
-    by type, examples, stage times, {"coarse_all", "coarse_partial",
-    "exception"}: the orbits whose coarse pass failed entirely or in part,
-    or that raised). One bad orbit doesn't stop the rest."""
+def _orbit_chunk(o0, o1):
+    """Orbits [o0, o1): (predictions, counters, exceptions by type,
+    examples, stage times, {"coarse_all", "coarse_partial", "exception"}:
+    the orbits whose coarse pass failed entirely or in part, or that
+    raised, peak RSS). One bad orbit doesn't stop the rest."""
     global _EPHEM
     w = _W
     ephem = w.get("ephem")
@@ -301,7 +308,7 @@ def _chunk(o0, o1):
     stage_t = dict.fromkeys(_STAGES, 0.0)
     errors, examples = Counter(), {}
     bad = {"coarse_all": [], "coarse_partial": [], "exception": []}
-    out, preds, n_pred = [], [], 0
+    out = []
     for i in range(o0, o1):
         try:
             p, c = process_orbit(i, w, ephem, stage_t)
@@ -320,28 +327,88 @@ def _chunk(o0, o1):
         for k, v in c.items():
             counts[k] += v
         if p is not None:
-            preds.append(p)
-            n_pred += p.size
-            if n_pred >= _MATCH_BATCH:
-                out.append(_match(preds, w, stage_t))
-                preds, n_pred = [], 0
-    if preds:
-        out.append(_match(preds, w, stage_t))
-    matches = np.concatenate(out) if out else np.zeros(0, dtype=_MATCH_DTYPE)
-    counts["matches"] = int(matches.size)
+            out.append(p)
+    preds = np.concatenate(out) if out else np.zeros(0, dtype=PRED_DTYPE)
     counts["step_cap_stops"] = int(propagate.STEP_CAP_STOPS)
     bad = {k: np.array(v, dtype=np.int64) for k, v in bad.items()}
-    return matches, counts, dict(errors), examples, stage_t, bad
+    return preds, counts, dict(errors), examples, stage_t, bad, _peak_rss_gb()
 
 
-def chunk_weights(orbits, t_mid):
+def chunk_weights(orbits, t_lo, t_hi):
     """A cheap cost proxy per orbit: the integration span in years (the
-    coarse pass integrates from the epoch), with NEOs (q < 1.3 AU), whose
-    close approaches force small steps, counted 3x, plus a fixed cost."""
-    years = np.abs(orbits["epoch"] - t_mid) / 365.25
+    coarse pass integrates from the epoch through [t_lo, t_hi]), with NEOs
+    (q < 1.3 AU), whose close approaches force small steps, counted 3x,
+    plus a fixed cost."""
+    years = (np.maximum(orbits["epoch"], t_hi) - np.minimum(orbits["epoch"], t_lo)) / 365.25
     neo = np.where(orbits["q"] < 1.3, 3.0, 1.0)
     w = 0.5 + years * neo
     return np.where(np.isfinite(w), w, 1.0)
+
+
+def sort_by_visit(chunks, nvisits):
+    """Concatenate the chunks' predictions sorted by visit, stably (so
+    within a visit in orbit order), freeing each chunk as it's placed: a
+    counting sort, so the peak is the input plus the output."""
+    counts = np.zeros(nvisits, np.int64)
+    for p in chunks:
+        counts += np.bincount(p["visit"], minlength=nvisits)
+    cursor = np.r_[0, np.cumsum(counts)[:-1]]
+    out = np.empty(int(counts.sum()), dtype=PRED_DTYPE)
+    for j in range(len(chunks)):
+        p = chunks[j]
+        chunks[j] = None
+        if not p.size:
+            continue
+        o = np.argsort(p["visit"], kind="stable")
+        v = p["visit"][o]
+        first = np.r_[0, np.flatnonzero(v[1:] != v[:-1]) + 1]
+        rank = np.arange(v.size) - np.repeat(first, np.diff(np.r_[first, v.size]))
+        out[cursor[v] + rank] = p[o]
+        cursor += np.bincount(v, minlength=nvisits)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Pass 3: matching, per slice
+# --------------------------------------------------------------------------
+
+def _match_slice(s0, s1):
+    """Slices [s0, s1): per slice, the nearest match of each of its
+    DiaSources, as (diaSourceId, prediction index, separation), plus the
+    number of matches before that reduction; then (seconds reading,
+    indexing, matching) and the peak RSS."""
+    w = _W
+    preds, vstart = w["preds"], w["vstart"]
+    out, tim = [], np.zeros(3)
+    for s in range(s0, s1):
+        t0 = time.perf_counter()
+        dia = _read_slice(w["dia_path"], w["slices"][s])
+        v0, v1 = vstart[s], vstart[s + 1]
+        vis = w["visits"][v0:v1]
+        t1 = time.perf_counter()
+        dindex = _visits.DiaIndex(dia, vis, threads=w["threads"])
+        ids = dia["diaSourceId"]
+        del dia
+        t2 = time.perf_counter()
+        p0, p1 = np.searchsorted(preds["visit"], [v0, v1])
+        k_all, row_all, sep_all = [], [], []
+        for b0 in range(p0, p1, _MATCH_BATCH):
+            b1 = min(b0 + _MATCH_BATCH, p1)
+            p = preds[b0:b1]
+            k, row, sep = dindex.match(p["visit"].astype(np.int64) - v0, p["ra"], p["dec"],
+                                       MATCH_RADIUS_ARCSEC)
+            k_all.append(k + b0)
+            row_all.append(row)
+            sep_all.append(sep)
+        k = np.concatenate(k_all) if k_all else np.zeros(0, np.int64)
+        row = np.concatenate(row_all) if row_all else np.zeros(0, np.int64)
+        sep = np.concatenate(sep_all) if sep_all else np.zeros(0)
+        n_match = int(k.size)
+        # (prediction order is (visit, orbit), so k breaks ties by designation)
+        sel = nearest(row, sep, k)
+        out.append((ids[row[sel]], k[sel], sep[sel], n_match))
+        tim += (t1 - t0, t2 - t1, time.perf_counter() - t2)
+    return out, tim, _peak_rss_gb()
 
 
 # --------------------------------------------------------------------------
@@ -401,36 +468,30 @@ def write_parquet(rows, has_ssobject, path):
     pq.write_table(table, path, row_group_size=1 << 20)
 
 
-def _rss_gb():
-    """Peak RSS [GB] of this process and of its (reaped) children."""
-    s = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    c = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    return s / 2**20, c / 2**20
-
-
 # --------------------------------------------------------------------------
 # build
 # --------------------------------------------------------------------------
 
-def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, slice_days=30,
-          chunk_factor=8, report_path=None, verbose=True):
+def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_workers=8,
+          slice_days=7, chunk_factor=8, report_path=None, verbose=True):
     """Build ``out_path`` (``nearbysso.parquet``) from the DiaSources at
     ``dia_path`` and the ``mpc_orbits`` Parquet at ``orbits_path`` (or an
     ``ORBIT_DTYPE`` array, e.g. for tests). ``ssObjectId`` comes from the
     SSObject table at ``ssobject_path`` (null for objects without a row,
     and everywhere without one).
 
-    ``workers`` > 1 runs the per-orbit pass in that many forked processes;
-    the output does not depend on it, nor (but for integrator noise; see the
-    module docstring) on ``slice_days``. Writes the run
-    report as JSON to ``report_path`` (default: next to the output,
-    ``<stem>.report.json``) and returns it.
+    ``workers`` forked processes run the orbit pass, and ``read_workers``
+    the per-slice passes (each holds one slice of DiaSources; they bound
+    the memory). The output depends on neither, nor on ``slice_days``.
+    Writes the run report as JSON to ``report_path`` (default: next to the
+    output, ``<stem>.report.json``) and returns it.
     """
     T0 = time.perf_counter()
     rep = dict(inputs=dict(dia=str(dia_path), ssobject=None if ssobject_path is None else str(ssobject_path),
                            orbits="<array>" if isinstance(orbits_path, np.ndarray) else str(orbits_path)),
-               workers=workers, slice_days=slice_days, timings={}, slices=[])
+               workers=workers, read_workers=read_workers, slice_days=slice_days, timings={})
     tim = rep["timings"]
+    peak = rep["peak_rss_gb"] = {}
 
     def log(*a):
         if verbose:
@@ -439,133 +500,138 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, slice_
     # Orbits and the ephemeris, once ---------------------------------------
     t = time.perf_counter()
     ephem = open_ephem()
+    stats = {}
     if isinstance(orbits_path, np.ndarray):
         orbits = orbits_path
         if orbits.dtype != ORBIT_DTYPE:
             raise TypeError("orbits: expected an ORBIT_DTYPE array")
         if orbits.size > 1 and not (orbits["designation"][1:] > orbits["designation"][:-1]).all():
             raise ValueError("orbits: must be sorted by designation, without duplicates")
-        summary = f"{orbits.size:,} orbits given"
+        stats.update(kept=int(orbits.size), has_cov_false=int((~orbits["has_cov"]).sum()))
     else:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            orbits = _orbits.load_orbits(orbits_path, ephem=ephem)
-        summary = buf.getvalue().strip()
-        log(summary)
-    rep["orbits"] = dict(kept=int(orbits.size), has_cov_false=int((~orbits["has_cov"]).sum()),
-                         load_orbits=summary)
+        orbits = _orbits.load_orbits(orbits_path, ephem=ephem, verbose=verbose, stats=stats)
+    rep["orbits"] = stats
     tim["load_orbits"] = time.perf_counter() - t
 
     # Slices ---------------------------------------------------------------
     t = time.perf_counter()
     nights, tmin, tmax, nsrc = night_ranges(dia_path)
     slices = plan_slices(nights, tmin, tmax, slice_days, nsrc)
+    ns = len(slices)
     tim["plan_slices"] = time.perf_counter() - t
-    log(f"{nsrc.sum():,} DiaSources in {nights.size} nights, {len(slices)} slice(s) of {slice_days} d "
+    log(f"{nsrc.sum():,} DiaSources in {nights.size} nights, {ns} slice(s) of {slice_days} d "
         f"({tim['plan_slices']:.1f} s)")
+    rw = max(1, min(read_workers, ns))
+    threads = max(1, _visits.DEFAULT_THREADS // rw)
+    _W.update(dia_path=dia_path, slices=slices, threads=threads)
+    one = [(s, s + 1) for s in range(ns)]
 
+    # Pass 1: visits -------------------------------------------------------
+    t = time.perf_counter()
+    try:
+        res = _map(_visits_slice, one, rw, "pass 1: visits",
+                   weights=[sl["n"] for sl in slices])
+    finally:
+        _W.clear()
+    per_slice = [r for chunk, _ in res for r in chunk]
+    peak["pass1_worker"] = max((r[1] for r in res), default=0.0)
+    vis_parts = [r[0] for r in per_slice]
+    visits = np.concatenate(vis_parts) if vis_parts else np.zeros(0, VISIT_DTYPE)
+    vstart = np.r_[0, np.cumsum([v.size for v in vis_parts])].astype(np.int64)
+    n_dia = sum(r[1] for r in per_slice)
+    rep["slices"] = [dict(nights=[sl["night_lo"], sl["night_hi"]], dia=r[1], dia_dropped=sl["n"] - r[1],
+                          visits=int(r[0].size), read=r[2], build_visits=r[3])
+                     for sl, r in zip(slices, per_slice)]
+    del res, per_slice, vis_parts
+    vindex = _visits.VisitIndex(visits)
+    ts = sample_times(vindex)
+    obs_ts = observer_at(ts)
+    times = Time(visits["t_tai_mjd"], format="mjd", scale="tai").tdb
+    tim["pass1_visits"] = time.perf_counter() - t
+    log(f"pass 1: {visits.size:,} visits in {nights.size} nights, {ts.size} coarse samples "
+        f"({tim['pass1_visits']:.1f} s)")
+
+    # Pass 2: the orbits ---------------------------------------------------
+    t = time.perf_counter()
+    weights = chunk_weights(orbits, ts.min(), ts.max()) if ts.size else np.ones(orbits.size)
+    use_pool = workers > 1 and util.fork_context() is not None
+    chunks = util.balanced_chunks(weights, chunk_factor * workers if use_pool else 1) if ts.size else []
+    _W.update(orbits=orbits, ts=ts, obs_ts=obs_ts, visits=visits, times=times, vindex=vindex,
+              ephem=None if use_pool else ephem)
+    log(f"pass 2: {orbits.size:,} orbits in {len(chunks)} chunks on {workers if use_pool else 1} worker(s)")
+    try:
+        res = _map(_orbit_chunk, chunks, workers, "pass 2: orbits",
+                   weights=[float(weights[a:b].sum()) for a, b in chunks])
+    finally:
+        _W.clear()
     counts = dict.fromkeys(_COUNTS, 0)
+    counts["orbits"] = int(orbits.size)
     stage_cpu = dict.fromkeys(_STAGES, 0.0)
     errors, examples = Counter(), {}
-    bad = {"coarse_all": [], "coarse_partial": [], "exception": []}
-    kept = []                     # per slice: nearest matches, with diaSourceId
-    n_dia = 0
-    use_pool = workers > 1 and util.fork_context() is not None
-    for si, sl in enumerate(slices):
-        st = dict(nights=[sl["night_lo"], sl["night_hi"]])
-        t = time.perf_counter()
-        dia = _read_slice(dia_path, sl)
-        st["read"] = time.perf_counter() - t
-        st["dia"] = int(dia["diaSourceId"].size)
-        # (read_dia drops rows with nulls or non-finite values, and warns)
-        st["dia_dropped"] = sl["n"] - st["dia"]
-        n_dia += st["dia"]
-
-        t = time.perf_counter()
-        vis = _visits.build_visits(dia)
-        st["build_visits"] = time.perf_counter() - t
-        t = time.perf_counter()
-        dindex = _visits.DiaIndex(dia, vis)
-        st["dia_index"] = time.perf_counter() - t
-        t = time.perf_counter()
-        vindex = _visits.VisitIndex(vis)
-        ts = sample_times(vindex)
-        obs_ts = observer_at(ts)
-        times = Time(vis["t_tai_mjd"], format="mjd", scale="tai").tdb
-        st["visit_index"] = time.perf_counter() - t
-        st["visits"] = int(vis.size)
-        # (only what the workers need: dia's ra/dec live in dindex)
-        dia_id = dia["diaSourceId"]
-        del dia
-
-        t = time.perf_counter()
-        weights = chunk_weights(orbits, 0.5 * (ts[0] + ts[-1]))
-        n_chunks = chunk_factor * workers if use_pool else 1
-        chunks = util.balanced_chunks(weights, n_chunks)
-        _W.update(orbits=orbits, ts=ts, obs_ts=obs_ts, visits=vis, times=times,
-                  vindex=vindex, dindex=dindex, ephem=None if use_pool else ephem)
-        try:
-            if use_pool:
-                log(f"slice {si + 1}/{len(slices)}: {st['dia']:,} DiaSources, {vis.size:,} visits; "
-                    f"{orbits.size:,} orbits in {len(chunks)} chunks on {workers} workers")
-                res = util.run_chunks(_chunk, chunks, workers, f"slice {si + 1}/{len(slices)}",
-                                      weights=[float(weights[a:b].sum()) for a, b in chunks])
-            else:
-                res = [_chunk(a, b) for a, b in chunks]
-        finally:
-            _W.clear()
-        st["orbit_pass"] = time.perf_counter() - t
-
-        t = time.perf_counter()
-        m = np.concatenate([r[0] for r in res]) if res else np.zeros(0, _MATCH_DTYPE)
-        sc = dict.fromkeys(_COUNTS, 0)
-        for _, c, err, exs, stt, bd in res:
-            for k, v in bd.items():
-                bad[k].append(v)
-            for k, v in c.items():
-                sc[k] += v
-            for k, v in stt.items():
-                stage_cpu[k] += v
-            errors.update(err)
-            for k, v in exs.items():
-                lst = examples.setdefault(k, [])
-                lst.extend(v[:_N_EXAMPLES - len(lst)])
-        for k, v in sc.items():
+    failed = {}
+    for k in ("coarse_all", "coarse_partial", "exception"):
+        idx = np.concatenate([r[5][k] for r in res]) if res else np.zeros(0, np.int64)
+        failed[k] = dict(n=int(idx.size), examples=orbits["designation"][idx[:_N_EXAMPLES]].tolist())
+    for _, c, err, exs, stt, _, _ in res:
+        for k, v in c.items():
             counts[k] += v
-        ids = dia_id[m["dia_row"]]
-        near = nearest(ids, m["sep"], m["orbit"])
-        kept.append((ids[near], m[near]))
-        st["reduce"] = time.perf_counter() - t
-        st["matches"] = int(m.size)
-        st["nearest"] = int(near.size)
-        st["errors"] = int(sum(sum(r[2].values()) for r in res))
-        rep["slices"].append(st)
-        log(f"slice {si + 1}/{len(slices)} nights {sl['night_lo']}..{sl['night_hi']}: "
-            f"{st['dia']:,} DiaSources, {st['visits']:,} visits, {sc['candidate_visits']:,} candidate "
-            f"visits, {sc['eligible_evals']:,} eligible, {st['matches']:,} matches -> {st['nearest']:,}; "
-            f"read {st['read']:.1f} s, visits {st['build_visits']:.1f} s, index {st['dia_index']:.1f} s, "
-            f"orbit pass {st['orbit_pass']:.1f} s")
-        del m, dindex, vindex, vis, dia_id, times
-
-    # Reduce over slices (a diaSourceId is in one slice, unless the input
-    # repeats it) --------------------------------------------------------
+        for k, v in stt.items():
+            stage_cpu[k] += v
+        errors.update(err)
+        for k, v in exs.items():
+            lst = examples.setdefault(k, [])
+            lst.extend(v[:_N_EXAMPLES - len(lst)])
+    peak["pass2_worker"] = max((r[6] for r in res), default=0.0)
+    pchunks = [r[0] for r in res]
+    del res
+    tim["pass2_orbits"] = time.perf_counter() - t
     t = time.perf_counter()
-    ids = np.concatenate([k[0] for k in kept]) if kept else np.zeros(0, np.int64)
-    m = np.concatenate([k[1] for k in kept]) if kept else np.zeros(0, _MATCH_DTYPE)
-    sel = nearest(ids, m["sep"], m["orbit"])
-    ids, m = ids[sel], m[sel]
-    rows = np.zeros(m.size, dtype=NEARBYSSO_DTYPE)
+    preds = sort_by_visit(pchunks, visits.size)
+    del pchunks
+    tim["sort_predictions"] = time.perf_counter() - t
+    log(f"pass 2: {counts['with_candidates']:,} orbits with candidates, {counts['candidate_visits']:,} "
+        f"candidate visits, {preds.size:,} eligible predictions ({preds.nbytes / 2**30:.2f} GB); "
+        f"{tim['pass2_orbits']:.1f} s + sort {tim['sort_predictions']:.1f} s")
+
+    # Pass 3: matching -----------------------------------------------------
+    t = time.perf_counter()
+    _W.update(dia_path=dia_path, slices=slices, threads=threads, visits=visits, vstart=vstart, preds=preds)
+    try:
+        res = _map(_match_slice, one, rw, "pass 3: matching",
+                   weights=[sl["n"] for sl in slices])
+    finally:
+        _W.clear()
+    per_slice = [r for chunk, _, _ in res for r in chunk]
+    t3 = sum((r[1] for r in res), np.zeros(3))
+    peak["pass3_worker"] = max((r[2] for r in res), default=0.0)
+    del res
+    for st, r in zip(rep["slices"], per_slice):
+        st.update(matches=r[3], nearest=int(r[0].size))
+    ids = np.concatenate([r[0] for r in per_slice]) if per_slice else np.zeros(0, np.int64)
+    k = np.concatenate([r[1] for r in per_slice]) if per_slice else np.zeros(0, np.int64)
+    sep = np.concatenate([r[2] for r in per_slice]) if per_slice else np.zeros(0)
+    n_matches = int(sum(r[3] for r in per_slice))
+    del per_slice
+    tim["pass3_matching"] = time.perf_counter() - t
+    tim["pass3_cpu"] = dict(read=float(t3[0]), dia_index=float(t3[1]), match=float(t3[2]))
+
+    # Reduce (a diaSourceId is in one slice, unless the input repeats it) --
+    t = time.perf_counter()
+    sel = nearest(ids, sep, k)
+    ids, k, sep = ids[sel], k[sel], sep[sel]
+    p = preds[k]
+    rows = np.zeros(k.size, dtype=NEARBYSSO_DTYPE)
     rows["diaSourceId"] = ids
-    rows["designation"] = orbits["designation"][m["orbit"]]
-    rows["ephRa"] = m["ra"]
-    rows["ephDec"] = m["dec"]
-    rows["ephOffset"] = m["sep"]
-    rows["ephVmag"] = m["vmag"]
-    rows["ephRateRa"] = m["rate_ra"]
-    rows["ephRateDec"] = m["rate_dec"]
-    rows["ephRaErr"] = m["ra_err"]
-    rows["ephDecErr"] = m["dec_err"]
-    rows["ephRa_ephDec_Cov"] = m["ra_dec_cov"]
+    rows["designation"] = orbits["designation"][p["orbit"]]
+    rows["ephRa"] = p["ra"]
+    rows["ephDec"] = p["dec"]
+    rows["ephOffset"] = sep
+    rows["ephVmag"] = p["vmag"]
+    rows["ephRateRa"] = p["rate_ra"]
+    rows["ephRateDec"] = p["rate_dec"]
+    rows["ephRaErr"] = p["ra_err"]
+    rows["ephDecErr"] = p["dec_err"]
+    rows["ephRa_ephDec_Cov"] = p["ra_dec_cov"]
     sso_id, has_sso = ssobject_ids(ssobject_path, rows["designation"])
     rows["ssObjectId"] = sso_id
     tim["reduce"] = time.perf_counter() - t
@@ -574,26 +640,17 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, slice_
     write_parquet(rows, has_sso, out_path)
     tim["write"] = time.perf_counter() - t
 
-    for s in ("read", "build_visits", "dia_index", "visit_index", "orbit_pass", "reduce"):
-        tim[f"slices_{s}"] = float(sum(st[s] for st in rep["slices"]))
     tim["worker_cpu"] = stage_cpu
     tim["total"] = time.perf_counter() - T0
-    rss_self, rss_child = _rss_gb()
-    # (orbits, not orbit-slices: one failing in several slices counts once)
-    failed = {}
-    for k, v in bad.items():
-        idx = np.unique(np.concatenate(v)) if v else np.zeros(0, np.int64)
-        failed[k] = dict(n=int(idx.size), examples=orbits["designation"][idx[:_N_EXAMPLES]].tolist())
+    peak["parent"] = _peak_rss_gb()
     rep.update(
-        dia_sources=int(n_dia), nights=int(nights.size),
+        dia_sources=int(n_dia), nights=int(nights.size), visits=int(visits.size),
         dia_dropped=int(sum(st["dia_dropped"] for st in rep["slices"])),
         counts=counts, failed_orbits=failed,
         exceptions=dict(errors), exception_examples=examples,
-        matches_before_nearest=int(sum(st["matches"] for st in rep["slices"])),
-        matches_after_nearest=int(m.size),
-        output_rows=int(rows.size),
-        with_ssobject=int(has_sso.sum()),
-        peak_rss_gb=dict(parent=rss_self, largest_worker=rss_child),
+        predictions=int(preds.size), predictions_gb=preds.nbytes / 2**30,
+        matches_before_nearest=n_matches, matches_after_nearest=int(rows.size),
+        output_rows=int(rows.size), with_ssobject=int(has_sso.sum()),
     )
     if report_path is None:
         stem = str(out_path)[:-len(".parquet")] if str(out_path).endswith(".parquet") else str(out_path)
@@ -606,24 +663,25 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, slice_
 
 
 def _print_report(rep):
-    c, tim, f = rep["counts"], rep["timings"], rep["failed_orbits"]
-    print(f"orbits: {rep['orbits']['kept']:,} (has_cov false {rep['orbits']['has_cov_false']:,}); "
+    c, tim, f, pk = rep["counts"], rep["timings"], rep["failed_orbits"], rep["peak_rss_gb"]
+    o = rep["orbits"]
+    print(f"orbits: {o['kept']:,} (has_cov false {o['has_cov_false']:,}); "
           f"coarse failed: {f['coarse_all']['n']:,} entirely, {f['coarse_partial']['n']:,} partly "
           f"(e.g. {f['coarse_all']['examples'] + f['coarse_partial']['examples']}); "
           f"exceptions: {rep['exceptions'] or 'none'}")
     for k, v in rep["exception_examples"].items():
         print(f"  {k}: {v}")
-    print(f"DiaSources: {rep['dia_sources']:,} in {rep['nights']:,} nights ({rep['dia_dropped']:,} dropped "
-          f"by read_dia); step-cap stops: {c['step_cap_stops']:,}; nights skipped by candidates: "
-          f"{c['nights_skipped']:,}")
+    print(f"DiaSources: {rep['dia_sources']:,} in {rep['nights']:,} nights, {rep['visits']:,} visits "
+          f"({rep['dia_dropped']:,} dropped by read_dia); step-cap stops: {c['step_cap_stops']:,}; "
+          f"nights skipped by candidates: {c['nights_skipped']:,}")
     print(f"{c['with_candidates']:,} orbits with candidates; {c['candidate_visits']:,} candidate visits "
-          f"= precise evaluations; {c['eligible_evals']:,} eligible, {c['sigma_rejected']:,} rejected by "
+          f"= precise evaluations; {c['eligible']:,} eligible, {c['sigma_rejected']:,} rejected by "
           f"sigma; {rep['matches_before_nearest']:,} matches, {rep['matches_after_nearest']:,} nearest; "
           f"{rep['output_rows']:,} rows ({rep['with_ssobject']:,} with an ssObjectId)")
     print("timings [s]: " + ", ".join(f"{k} {v:.1f}" for k, v in tim.items() if not isinstance(v, dict))
-          + "; worker CPU: " + ", ".join(f"{k} {v:.1f}" for k, v in tim["worker_cpu"].items()))
-    print(f"peak RSS: parent {rep['peak_rss_gb']['parent']:.1f} GB, largest worker "
-          f"{rep['peak_rss_gb']['largest_worker']:.1f} GB", flush=True)
+          + "; pass 2 worker CPU: " + ", ".join(f"{k} {v:.1f}" for k, v in tim["worker_cpu"].items())
+          + "; pass 3 worker CPU: " + ", ".join(f"{k} {v:.1f}" for k, v in tim["pass3_cpu"].items()))
+    print("peak RSS [GB]: " + ", ".join(f"{k} {v:.1f}" for k, v in pk.items()), flush=True)
 
 
 def main():
@@ -644,13 +702,18 @@ def main():
     parser.add_argument("--ssobject", default=None,
                         help="SSObject Parquet, to fill ssObjectId (designation -> ssObjectId); "
                              "without it ssObjectId is null")
-    parser.add_argument("--slice-days", type=int, default=30,
-                        help="Process the DiaSources in slices of this many nights' dates, to bound "
-                             "memory (default: %(default)s). The output does not depend on it.")
+    parser.add_argument("--slice-days", type=int, default=7,
+                        help="Read the DiaSources in slices of this many nights' dates (default: "
+                             "%(default)s). The output does not depend on it.")
     parser.add_argument(
         "--workers", type=int, default=min(64, os.cpu_count() or 1),
         help="Number of worker processes for the per-orbit pass (default: min(64, number of CPUs)). "
              "1 runs serially, with no process pool. The output does not depend on it.",
+    )
+    parser.add_argument(
+        "--read-workers", type=int, default=8,
+        help="Number of worker processes reading and indexing slices of DiaSources, each holding one "
+             "slice; bounds the memory (default: %(default)s). The output does not depend on it.",
     )
     parser.add_argument(
         "--chunk-factor", type=int, default=8,
@@ -660,16 +723,13 @@ def main():
     parser.add_argument("--reraise", action="store_true",
                         help="Re-raise exceptions instead of exiting gracefully (for debugging)")
     args = parser.parse_args()
-    if args.workers < 1:
-        parser.error("--workers must be at least 1")
-    if args.chunk_factor < 1:
-        parser.error("--chunk-factor must be at least 1")
-    if args.slice_days < 1:
-        parser.error("--slice-days must be at least 1")
+    for name in ("workers", "read_workers", "chunk_factor", "slice_days"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be at least 1")
 
     try:
         build(args.dia, args.orbits, args.output, ssobject_path=args.ssobject, workers=args.workers,
-              slice_days=args.slice_days, chunk_factor=args.chunk_factor)
+              read_workers=args.read_workers, slice_days=args.slice_days, chunk_factor=args.chunk_factor)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         if args.reraise:

@@ -505,7 +505,7 @@ def _col(table, name):
     return np.asarray(col.to_pylist(), dtype=object)
 
 
-def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True):
+def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True, stats=None):
     """Read mpc_orbits Parquet into an ``ORBIT_DTYPE`` array, sorted by
     designation. See ``_contract``.
 
@@ -513,7 +513,7 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True):
     from ``SSP_ASSIST_*`` if None); ``nthreads`` bounds the JSON parsing
     threads. With ``with_filter=False`` every row is kept, and rows whose
     state can't be computed have NaN states. Prints a one-line summary
-    unless ``verbose`` is False.
+    unless ``verbose`` is False; a ``stats`` dict, if given, gets its counts.
     """
     t0 = time.perf_counter()
     table = pq.read_table(path, columns=_COLUMNS)
@@ -567,6 +567,11 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True):
     out["cov0"] = c
     t_conv = time.perf_counter() - t2
 
+    if stats is not None:
+        stats.update(rows_read=int(n_read), kept=int(len(out)),
+                     removed=dict(counts) if with_filter else None,
+                     has_cov_false=int((~pd_ok).sum()), cov_missing=int(missing.sum()),
+                     cov_not_psd=int((~missing & ~pd_ok).sum()), cov_clipped_to_psd=int(clipped.sum()))
     if verbose:
         # 0 is the MPC's placeholder in zeroed ("no_orbit") fit statistics
         rms = out["normalized_rms"]
