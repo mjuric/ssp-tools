@@ -65,7 +65,12 @@ ORBIT_DTYPE = np.dtype([
 # orbits.load_orbits(path, with_filter=True) -> np.ndarray[ORBIT_DTYPE]
 #   Reads mpc_orbits Parquet. The filter keeps orbits that aren't comets
 #   (designation without '/', packed not starting with '_'), have all of
-#   q, e, i, node, argperi and peri_time, and arc_length_total > 2 days. It
+#   q, e, i, node, argperi and peri_time, and an arc filtered exactly as
+#   lsst-gen-ephemcache's get-mpcorb.py does: on the JSON
+#   orbit_fit_statistics.arc_length_total *text*, NOT IN ('0 days',
+#   '1 days', '2 days'). (The Parquet arc_length_total column is NULL for
+#   ~0.5M mostly multi-opposition orbits whose JSON arc is a year range,
+#   so a numeric filter on it would wrongly drop them.) It
 #   returns rows sorted by designation, and prints a one-line summary (rows
 #   read, kept, has_cov false and why).
 
