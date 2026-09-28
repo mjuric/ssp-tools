@@ -1,4 +1,7 @@
 import argparse
+import contextlib
+import io
+import os
 import sys
 
 from astropy.coordinates import (
@@ -15,6 +18,20 @@ import pyarrow.parquet as pq
 from . import util, schema
 from .photfit import hg_V_mag
 from .ephem_assist import compute_ephemerides_one, open_ephem
+
+
+# The SSSource fields compute_sssource_entry fills in (and nothing else):
+# what a parallel worker returns to the parent. Keep in sync with it
+# (tests/test_sssource_parallel.py checks).
+EPH_FIELDS = [
+    "ephRateRa", "ephRateDec", "ephRate",
+    "ephRa", "ephDec", "ephOffsetDec", "ephOffsetRa", "ephOffset",
+    "helio_x", "helio_y", "helio_z", "helioRange",
+    "helio_vx", "helio_vy", "helio_vz", "helio_vtot", "helioRangeRate",
+    "topo_x", "topo_y", "topo_z", "topoRange",
+    "topo_vx", "topo_vy", "topo_vz", "topo_vtot", "topoRangeRate",
+    "phaseAngle", "ephVmag",
+]
 
 
 def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
@@ -106,12 +123,108 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
     print(f"{provID}: max/median separation: {max_sep:.4f}, {med_sep:.4f} arcsec")
 
 
-def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0, seed=42):
+#
+# Parallel ephemerides (--workers N > 1)
+#
+# Workers are forked, and read their inputs from this module-level dict,
+# filled in by the parent just before it creates the pool, so the large
+# arrays are inherited through fork, never pickled. Each worker opens its
+# own ASSIST ephemeris (the parent's C-level object isn't shared across the
+# fork). Tasks are ranges of groups (objects); results are EPH_FIELDS
+# arrays for their rows.
+#
+_PARALLEL = {}
+_EPHEM = None   # one ASSIST ephemeris per worker process, opened lazily
+
+
+def _sssource_chunk(g0, g1):
+    """Worker: compute the EPH_FIELDS of the rows of groups [g0, g1)."""
+    global _EPHEM
+    if _EPHEM is None:
+        _EPHEM = open_ephem()
+    sss, obs_state = _PARALLEL["sss"], _PARALLEL["obs_state"]
+    idx_start, idx_end = _PARALLEL["idx_start"], _PARALLEL["idx_end"]
+    r0, r1 = idx_start[g0], idx_end[g1 - 1]   # (groups are in row order)
+
+    # A private array holding only what compute_sssource_entry reads and
+    # EPH_FIELDS: writing any other field fails here, rather than being
+    # silently lost.
+    keys = ["ssObjectId", "designation"]
+    out = np.zeros(r1 - r0, dtype=[(f, sss.dtype[f]) for f in keys + EPH_FIELDS])
+    for f in keys:
+        out[f] = sss[f][r0:r1]
+
+    # (the per-object lines go out in one write per chunk, so lines from
+    # different workers don't mix)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        for g in range(g0, g1):
+            s, e = idx_start[g] - r0, idx_end[g] - r0
+            compute_sssource_entry(out[s:e], obs_state[r0 + s:r0 + e],
+                                   _PARALLEL["mpcorb"], _PARALLEL["dia_eph"], _EPHEM)
+    sys.stdout.write(buf.getvalue())
+    sys.stdout.flush()
+
+    res = np.empty(len(out), dtype=[(f, out.dtype[f]) for f in EPH_FIELDS])
+    for f in EPH_FIELDS:
+        res[f] = out[f]
+    return res
+
+
+def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor=8):
+    """Fill the EPH_FIELDS of ``sss`` with compute_sssource_entry, per
+    object (``sss`` grouped by ssObjectId; ``obs_state`` its rows' observer
+    states and DiaSource rows in ``dia_eph``).
+
+    With ``workers`` > 1, the objects are split into about ``chunk_factor *
+    workers`` chunks, balanced by observation count, and computed in a
+    forked process pool (serially where fork is unavailable). The result
+    is identical.
+    """
+    if workers <= 1 or util.fork_context() is None or len(sss) == 0:
+        # JPL planet and ASSIST asteroid ephemeris files, from the
+        # SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables.
+        ephem = open_ephem()
+        util.group_by(
+            [sss, obs_state], "ssObjectId",
+            partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem),
+        )
+        return
+
+    # Group boundaries as util.group_by computes them, taken in row order
+    # so that each chunk of groups is a contiguous range of rows.
+    keys = sss["ssObjectId"]
+    if not util.values_grouped(keys):
+        raise ValueError("Key 'ssObjectId' is not properly grouped.")
+    _, idx_start, counts = np.unique(keys, return_index=True, return_counts=True)
+    order = np.argsort(idx_start)
+    idx_start, counts = idx_start[order], counts[order]
+    idx_end = idx_start + counts
+    # contiguous runs of groups, balanced by observation count
+    chunks = util.balanced_chunks(counts, chunk_factor * workers)
+    print(f"Computing ephemerides of {len(counts):,} objects in {len(chunks)} chunks "
+          f"on {workers} workers...", flush=True)
+    _PARALLEL.update(sss=sss, obs_state=obs_state, dia_eph=dia_eph, mpcorb=mpcorb,
+                     idx_start=idx_start, idx_end=idx_end)
+    try:
+        results = util.run_chunks(_sssource_chunk, chunks, workers, "ephemerides",
+                                  weights=[int(counts[g0:g1].sum()) for g0, g1 in chunks])
+    finally:
+        _PARALLEL.clear()
+    for (g0, g1), res in zip(chunks, results):
+        r0, r1 = idx_start[g0], idx_end[g1 - 1]
+        for f in EPH_FIELDS:
+            sss[f][r0:r1] = res[f]
+
+
+def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0, seed=42,
+                   workers=1, chunk_factor=8):
     """Build ``{output_dir}/sssource.parquet`` from the DiaSource, MPC
     observation (obs_sbn), identification and orbit tables in ``input_dir``.
 
     ``max_objects`` and ``dia_sample_frac`` subsample the inputs, for
-    testing.
+    testing. ``workers`` > 1 computes the ephemerides in that many forked
+    processes (see compute_ephemerides); the output is identical.
     """
     # Read only the DiaSource columns used below: the extract-submitted-sources
     # output carries every SubmittableSources column (~150), which would
@@ -386,10 +499,6 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     sss["galLon"] = gal.l
     sss["galLat"] = gal.b
 
-    # JPL planet and ASSIST asteroid ephemeris files, from the
-    # SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables.
-    ephem = open_ephem()
-
     # compute_sssource_entry takes DiaSource rows per object; give it only
     # the columns it uses, as a numpy structured array (taking rows of all
     # ~85 pyarrow-backed columns, or even of a DataFrame, dominated the
@@ -401,10 +510,8 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
 
     # ephemerides for the objects with orbits (the first n_orbit rows);
     # every orbit-derived column of the rest is NaN.
-    util.group_by(
-        [sss[:n_orbit], obs_state[:n_orbit]], "ssObjectId",
-        partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem),
-    )
+    compute_ephemerides(sss[:n_orbit], obs_state[:n_orbit], dia_eph, mpcorb,
+                        workers=workers, chunk_factor=chunk_factor)
     measured = ("elongation", "eclLambda", "eclBeta", "galLon", "galLat")
     for name in sss.dtype.names:
         if sss.dtype[name].kind == "f" and name not in measured:
@@ -444,12 +551,32 @@ def main():
         "--reraise", action="store_true",
         help="Re-raise exceptions instead of exiting gracefully (for debugging)",
     )
+    parser.add_argument(
+        "--workers", type=int, default=min(64, os.cpu_count() or 1),
+        help=(
+            "Number of worker processes for the per-object ephemerides "
+            "(default: min(64, number of CPUs)). 1 runs serially, with no "
+            "process pool. The output does not depend on it."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-factor", type=int, default=8,
+        help=(
+            "With --workers > 1, split the work into about this many "
+            "chunks per worker, to balance the load (default: %(default)s)."
+        ),
+    )
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if args.chunk_factor < 1:
+        parser.error("--chunk-factor must be at least 1")
 
     try:
         build_sssource(
             args.input_dir, args.output_dir,
             max_objects=args.max_objects, dia_sample_frac=args.dia_sample_frac, seed=args.seed,
+            workers=args.workers, chunk_factor=args.chunk_factor,
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
