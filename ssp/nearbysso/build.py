@@ -8,12 +8,13 @@ sliced:
    The parent concatenates them into one ``visits`` array over all nights,
    builds one ``VisitIndex`` and computes the observer at the coarse
    sample times.
-2. **Orbits** (``workers`` forked processes, chunks of orbits), per orbit
-   over all nights: ``propagate.coarse``, ``VisitIndex.candidates``, the
-   precise ``compute_ephemerides_one`` at the candidate visits (as
-   SSSource), the error ellipse there (``propagate.ellipse_at``) and the
-   sigma gate. The eligible predictions (``PRED_DTYPE``, 48 bytes each)
-   come back to the parent, which sorts them by visit.
+2. **Orbits** (``workers`` forked processes, chunks of orbits, the
+   costliest first; see ``orbit_schedule``), per orbit over all nights:
+   ``propagate.coarse``, ``VisitIndex.candidates``, the precise
+   ``compute_ephemerides_one`` at the candidate visits (as SSSource), the
+   error ellipse there (``propagate.ellipse_at``) and the sigma gate. The
+   eligible predictions (``PRED_DTYPE``, 48 bytes each) come back to the
+   parent, which sorts them by (visit, orbit).
 3. **Matching** (``read_workers`` processes, one slice each; the
    predictions shared through fork): read the slice again, index it
    (``DiaIndex``), match the slice's predictions (a contiguous range of the
@@ -311,10 +312,10 @@ def process_orbit(i, w, ephem, stage_t):
 
 
 def _orbit_chunk(o0, o1):
-    """Orbits [o0, o1): (predictions, counters, exceptions by type,
-    examples, stage times, {"coarse_all", "coarse_partial", "exception"}:
-    the orbits whose coarse pass failed entirely or in part, or that
-    raised, peak RSS). One bad orbit doesn't stop the rest."""
+    """Orbits ``w["order"][o0:o1]``: (predictions, counters, exceptions by
+    type, examples, stage times, {"coarse_all", "coarse_partial",
+    "exception"}: the orbits whose coarse pass failed entirely or in part,
+    or that raised, peak RSS). One bad orbit doesn't stop the rest."""
     global _EPHEM
     w = _W
     ephem = w.get("ephem")
@@ -328,7 +329,7 @@ def _orbit_chunk(o0, o1):
     errors, examples = Counter(), {}
     bad = {"coarse_all": [], "coarse_partial": [], "exception": []}
     out = []
-    for i in range(o0, o1):
+    for i in w["order"][o0:o1].tolist():
         try:
             p, c = process_orbit(i, w, ephem, stage_t)
         except Exception as ex:     # one bad orbit must not stop a run
@@ -355,40 +356,46 @@ def _orbit_chunk(o0, o1):
     return preds, counts, dict(errors), examples, stage_t, bad, _peak_rss_gb()
 
 
+#: NEOs' (q < NEO_Q_AU) relative cost in the orbit pass: 12x the others,
+#: measured over a synthetic year (138 against 11.5 ms per orbit), with a
+#: heavy tail: the precise pass of an NEO passing within ~0.001 AU, over
+#: every visit of its nights (NEAR_DELTA_AU), can take minutes.
+NEO_Q_AU, NEO_COST = 1.3, 12.0
+
+
 def chunk_weights(orbits, t_lo, t_hi):
-    """A cheap cost proxy per orbit: the integration span in years (the
-    coarse pass integrates from the epoch through [t_lo, t_hi]), with NEOs
-    (q < 1.3 AU), whose close approaches force small steps, counted 3x,
-    plus a fixed cost."""
+    """A cheap cost proxy per orbit: a fixed cost plus the integration span
+    in years (the coarse pass integrates from the epoch through [t_lo,
+    t_hi]), times ``NEO_COST`` for NEOs."""
     years = (np.maximum(orbits["epoch"], t_hi) - np.minimum(orbits["epoch"], t_lo)) / 365.25
-    neo = np.where(orbits["q"] < 1.3, 3.0, 1.0)
-    w = 0.5 + years * neo
-    return np.where(np.isfinite(w), w, 1.0)
+    w = (0.5 + years) * np.where(orbits["q"] < NEO_Q_AU, NEO_COST, 1.0)
+    return np.where(np.isfinite(w), w, NEO_COST)
 
 
-def sort_by_visit(chunks, nvisits):
-    """Concatenate the chunks' predictions sorted by visit, stably (so
-    within a visit in orbit order), freeing each chunk as it's placed: a
-    counting sort, so the peak is the input plus the output. Returns them
-    and the offsets (nvisits + 1,) of each visit's predictions."""
-    counts = np.zeros(nvisits, np.int64)
-    for p in chunks:
-        counts += np.bincount(p["visit"], minlength=nvisits)
-    offsets = np.r_[0, np.cumsum(counts)]
-    cursor = offsets[:-1].copy()
-    out = np.empty(int(counts.sum()), dtype=PRED_DTYPE)
-    for j in range(len(chunks)):
-        p = chunks[j]
-        chunks[j] = None
-        if not p.size:
-            continue
-        o = np.argsort(p["visit"], kind="stable")
-        v = p["visit"][o]
-        first = np.r_[0, np.flatnonzero(v[1:] != v[:-1]) + 1]
-        rank = np.arange(v.size) - np.repeat(first, np.diff(np.r_[first, v.size]))
-        out[cursor[v] + rank] = p[o]
-        cursor += np.bincount(v, minlength=nvisits)
-    return out, offsets
+def orbit_schedule(weights, n_chunks):
+    """The order to process orbits in, and chunks of it: the costliest
+    first (NEOs, then the rest; stably, so designation order within a
+    weight), in ranges of about equal weight, so that the pool's queue
+    hands out the NEOs' heavy tail early, in small chunks. Returns
+    (order, chunks)."""
+    order = np.argsort(-np.asarray(weights, dtype=np.float64), kind="stable")
+    return order, util.balanced_chunks(np.asarray(weights)[order], n_chunks)
+
+
+def sort_predictions(chunks, nvisits):
+    """Concatenate the chunks' predictions (in any order), sorted by (visit,
+    orbit), emptying ``chunks``. Returns them and the offsets (nvisits + 1,)
+    of each visit's predictions. The peak is about twice the predictions,
+    plus an index."""
+    p = np.concatenate(chunks) if chunks else np.zeros(0, dtype=PRED_DTYPE)
+    chunks.clear()
+    # (one prediction per orbit and visit, so the key is unique)
+    key = (p["visit"].astype(np.int64) << 32) | p["orbit"].astype(np.int64)
+    o = np.argsort(key)
+    del key
+    p = p[o]
+    del o
+    return p, np.searchsorted(p["visit"], np.arange(nvisits + 1)).astype(np.int64)
 
 
 # --------------------------------------------------------------------------
@@ -502,7 +509,7 @@ def write_parquet(rows, has_ssobject, path):
 # --------------------------------------------------------------------------
 
 def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_workers=8,
-          slice_days=7, chunk_factor=8, report_path=None, verbose=True):
+          slice_days=7, chunk_factor=64, report_path=None, verbose=True):
     """Build ``out_path`` (``nearbysso.parquet``) from the DiaSources at
     ``dia_path`` and the ``mpc_orbits`` Parquet at ``orbits_path`` (or an
     ``ORBIT_DTYPE`` array, e.g. for tests). ``ssObjectId`` comes from the
@@ -595,15 +602,17 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     # Pass 2: the orbits ---------------------------------------------------
     t = time.perf_counter()
     weights = chunk_weights(orbits, ts.min(), ts.max()) if ts.size else np.ones(orbits.size)
-    chunks = util.balanced_chunks(weights, chunk_factor * workers if workers > 1 else 1) if ts.size else []
+    order, chunks = orbit_schedule(weights, chunk_factor * workers if workers > 1 else 1)
+    if not ts.size:
+        chunks = []
     use_pool = _pooled(workers, len(chunks))
     # (workers open their own ephemeris; in this process, reuse ours)
     _W.update(orbits=orbits, ts=ts, obs_ts=obs_ts, visits=visits, times=times, vindex=vindex,
-              ephem=None if use_pool else ephem)
+              order=order, ephem=None if use_pool else ephem)
     log(f"pass 2: {orbits.size:,} orbits in {len(chunks)} chunks on {workers if use_pool else 1} worker(s)")
     try:
         res = _map(_orbit_chunk, chunks, workers, "pass 2: orbits",
-                   weights=[float(weights[a:b].sum()) for a, b in chunks], unit="orbits")
+                   weights=[float(weights[order[a:b]].sum()) for a, b in chunks], unit="orbits")
     finally:
         _W.clear()
     counts = dict.fromkeys(_COUNTS, 0)
@@ -612,7 +621,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     # (examples; the numbers are in counts)
     failed = {}
     for k in ("coarse_all", "coarse_partial", "exception"):
-        idx = np.concatenate([r[5][k] for r in res]) if res else np.zeros(0, np.int64)
+        idx = np.sort(np.concatenate([r[5][k] for r in res])) if res else np.zeros(0, np.int64)
         failed[k] = orbits["designation"][idx[:_N_EXAMPLES]].tolist()
     for _, c, err, exs, stt, _, _ in res:
         for k, v in c.items():
@@ -628,7 +637,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     del res
     tim["pass2_orbits"] = time.perf_counter() - t
     t = time.perf_counter()
-    preds, poff = sort_by_visit(pchunks, visits.size)
+    preds, poff = sort_predictions(pchunks, visits.size)
     del pchunks
     tim["sort_predictions"] = time.perf_counter() - t
     log(f"pass 2: {counts['with_candidates']:,} orbits with candidates, {counts['candidate_visits']:,} "
@@ -774,9 +783,9 @@ def main():
              "slice; bounds the memory (default: %(default)s). The output does not depend on it.",
     )
     parser.add_argument(
-        "--chunk-factor", type=int, default=8,
-        help="With --workers > 1, split the orbits into about this many chunks per worker, to "
-             "balance the load (default: %(default)s).",
+        "--chunk-factor", type=int, default=64,
+        help="With --workers > 1, split the orbits into about this many chunks per worker, the "
+             "costliest (NEOs) first, to balance the load (default: %(default)s).",
     )
     parser.add_argument("--reraise", action="store_true",
                         help="Re-raise exceptions instead of exiting gracefully (for debugging)")

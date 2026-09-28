@@ -93,12 +93,12 @@ The work is grouped **per object**, not per visit, and each orbit is integrated 
 
 The parent concatenates the visits of all nights, indexes their centres per night (`VisitIndex`), and computes the observer at the coarse sample times. It reads and filters the orbits and converts them to barycentric ICRF states at epoch, with covariance.
 
-**Pass 2: orbits** (`--workers` fork processes, chunks of orbits balanced by a cost proxy; one orbit per ASSIST simulation):
+**Pass 2: orbits** (`--workers` fork processes; one orbit per ASSIST simulation). The orbits are scheduled costliest first: NEOs (12× the others, from the year measurement below), then the rest, in ~64 chunks per worker of about equal estimated cost, so the pool's queue hands out the NEOs' heavy tail early and in small pieces:
 1. **Coarse pass:** integrate from the orbit epoch across all nights, with six variational particles (`testparticle=0`) and IAS15 `adaptive_mode = 2` (set after attaching ASSIST, as layup does). It samples **three times per night**: at its `night_t` (the midpoint of its visits) and at `night_t ± h`, h = max(the farther visit from `night_t`, 1 h). Every visit is then bracketed by samples of its own night, and the rate changes the candidate test estimates come from that night alone. Each sample records the topocentric position, the on-sky rate, the distance, σ and C(t).
 2. **Candidates:** for each night whose `night_t` sample has σ ≤ 10″, the visits whose field, widened by the object's motion within the night, the diurnal parallax, the curvature and a margin, may contain it (`VisitIndex.candidates`; every visit of the night within 0.02 AU). Typically a few to a few hundred visits per object and year.
 3. **Precise pass:** `compute_ephemerides_one` at exactly those visit times: light-time corrected, topocentric, with rates and V, as SSSource.
 4. **Ellipse and σ cut:** C(t) from the two bracketing samples, propagated under free motion, projected on the precise line of sight (`ellipse_at`); predictions with σ > 10″ are dropped.
-5. Return the eligible **predictions** (visit, orbit, position, rates, V, ellipse: 48 bytes each). The parent sorts them by visit (a stable counting sort).
+5. Return the eligible **predictions** (visit, orbit, position, rates, V, ellipse: 48 bytes each). The parent sorts them by (visit, orbit), which restores designation order within a visit whatever the schedule.
 
 **Pass 3: matching** (`--read-workers` processes, one slice each; the predictions shared through fork):
 1. Read the slice again and bin its DiaSources into HEALPix cells per visit (`DiaIndex`: order 15, looked up at order 14, ~13″, since at order 15 neighbour lookups miss at 5″).
@@ -184,7 +184,7 @@ The measurement scripts are in `/lscratch/mjuric/sspwt/nearbysso/wp2_perturbers/
 | total | 258 s | 250 s |
 | load_orbits | 12–20 s | 19 s |
 | pass 1 (read, visits) | 6 s | 1 s |
-| pass 2 (orbits), wall | 223 s | 227 s |
+| pass 2 (orbits), wall | 223 s (166 s with the NEO-first schedule) | 227 s |
 | pass 2 CPU: coarse / candidates / precise / ellipse | 4,686 / 383 / 200 / 8 s | 4,228 / 361 / 92 / 2 s |
 | pass 3 (read, index, match) | 16 s | 2 s |
 | eligible predictions | 2.51M | 1.03M |
@@ -193,14 +193,19 @@ The measurement scripts are in `/lscratch/mjuric/sspwt/nearbysso/wp2_perturbers/
 
 The coarse pass is ~88% of the CPU. On 3 nights it costs ~3 ms per orbit, mostly per-simulation overhead.
 
-**A year** (pass 2 measured on the DP2 visits repeated for 365 nights, their centres rotated with the Sun: 195k visits, 1,095 coarse samples, 600 random orbits):
+**A year of pass 2, measured** (the DP2 visits repeated for 365 nights, their centres rotated with the Sun: 195k visits, 1,095 coarse samples; all 1,548,119 orbits; 32 workers on a node with load 120–155 on 128 cores):
 
-| part | estimate, 64 cores |
+| | |
 |---|---|
-| pass 2: 10.8 ms per orbit (coarse 8.1, candidates 0.65, precise 1.9, ellipse 0.16) × 1.55M | 4.3 min at perfect scaling, **~6 min** at the ~70% efficiency measured |
-| passes 1 and 3: 3.6B DiaSources, read twice (~2 GB/s assumed), 52 slices on 8 read workers | **~3 min** |
-| load_orbits, night ranges, sort, reduce, write | **~1.5 min** |
-| **total** | **~8–10 min**, within the 30-min budget |
+| CPU | 6.3 h = coarse 227 min, candidates 19, precise 126, ellipse 5; **14.6 ms per orbit** (median 9.5) |
+| predictions | 93.9M (4.2 GB), from 369k orbits with candidates; sort 16–26 s |
+| peak RSS | parent 12.6–14.5 GB (the predictions, twice during the sort), workers 1.2–4.2 GB |
+| wall, contiguous chunks (8 per worker, the old cost proxy) | 37 min, efficiency 0.32: 1.51M orbits done at 700 s, the last chunks at 2,200 s |
+| wall, NEO-first schedule (64 chunks per worker) | **11.9 min, efficiency 0.99**; output byte-identical |
+
+- **The stragglers are NEOs at very close approaches, in the precise pass.** 37,793 NEOs (q < 1.3 AU) take 1.45 h (23% of the CPU; 138 ms each against 11.5 ms for the rest). The slowest ~150, all 2025–2026 designations with approaches as close as 0.0003 AU, take 70–127 s each (1.24 h, 20% of all the CPU). Their nights within 0.02 AU take every visit (~537 a night), so they have 2,000–12,000 candidates.
+- **The cost is in `ephem_assist._propagate_one`'s integration, not per epoch.** It runs IAS15 with ASSIST's default step control: 2.9M steps for 2025 WR7's year (128 s), against 84 steps (0.01 s) with `adaptive_mode = 2`, which the coarse pass uses. Without these ~150 orbits the precise pass is ~51 CPU-min for 93.9M evaluations, ~33 µs each including ~4 ms per call; the 79 µs average is theirs. Switching `_propagate_one` (and so SSSource) to `adaptive_mode = 2` would remove ~20% of the CPU, but changes both outputs at the level of integrator noise: an owner decision, not made here.
+- **Estimate for a year at 64 cores:** pass 2 6.3 h / 64 ≈ **6 min** (at the efficiency measured); passes 1 and 3, 3.6B DiaSources read twice (~2 GB/s assumed) on 8 read workers, **~3 min**; loading, night ranges, sort, reduce and write **~1.5 min**; **~10 min in all**, within the 30-min budget.
 
 Memory: the parent peaks at about twice the predictions during the sort (~25–30 GB for 200–300M); each read worker holds one 7-day slice (~5 GB at PPDB rates).
 
