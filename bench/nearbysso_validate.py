@@ -44,6 +44,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -280,11 +281,21 @@ def _empty_orbits(with_json):
     return pd.DataFrame({c: [] for c in cols})
 
 
-def filter_reason(orbits):
+#: Whether an unknown (NaN) arc_length_total passes the "> 2 days" rule.
+#: The contract's rule, read literally, fails it; ~1/3 of mpc_orbits
+#: (2026-09-26: 512,797 rows, mostly multi-opposition orbits) has NaN
+#: there, so the choice matters. Set by --keep-unknown-arc.
+KEEP_UNKNOWN_ARC = False
+
+
+def filter_reason(orbits, keep_unknown_arc=None):
     """Why each orbit is excluded by NearbySSO's rules ('' if kept): the
     first of 'comet' (designation with '/', or packed starting with '_'),
-    'missing_elements' (any of q, e, i, node, argperi, peri_time NaN) and
-    'short_arc' (arc_length_total <= 2 days, or unknown)."""
+    'missing_elements' (any of q, e, i, node, argperi, peri_time NaN),
+    'short_arc' (arc_length_total <= 2 days) and 'unknown_arc'
+    (arc_length_total NaN, unless keep_unknown_arc)."""
+    if keep_unknown_arc is None:
+        keep_unknown_arc = KEEP_UNKNOWN_ARC
     des = orbits["designation"].astype(str).to_numpy()
     packed = orbits["packed"].fillna("").astype(str).to_numpy()
     comet = np.char.find(des.astype(str), "/") >= 0
@@ -293,8 +304,10 @@ def filter_reason(orbits):
     for c in ELEMENTS:
         missing |= ~np.isfinite(orbits[c].to_numpy(dtype=np.float64))
     arc = orbits["arc_length_total"].to_numpy(dtype=np.float64)
-    short = ~(arc > 2.0)
-    return np.select([comet, missing, short], ["comet", "missing_elements", "short_arc"], "")
+    unknown = np.isnan(arc) & (not keep_unknown_arc)
+    short = arc <= 2.0
+    return np.select([comet, missing, short, unknown],
+                     ["comet", "missing_elements", "short_arc", "unknown_arc"], "")
 
 
 def reason_lookup(orbits):
@@ -1099,8 +1112,15 @@ def compare_sigma(ours, hz, gate_below_arcsec=60.0, rel_tol=0.10):
     r["ratio_smia"] = r["our_smia_3sig"] / r["h_SMIA_3sig"]
     r["ratio_ra"] = r["our_ra_3sig"] / r["h_RA_3sigma"]
     r["ratio_dec"] = r["our_dec_3sig"] / r["h_DEC_3sigma"]
-    dth = (r["our_theta"] - r["h_Theta"]) % 180.0
+    # Horizons' Theta is measured from the +RA axis towards +Dec, i.e.
+    # 90 deg - the position angle (east of north). Established empirically
+    # (2026-09-27, 9 epochs of 3 objects: our PA = 90 - Theta to < 1 deg
+    # wherever the ellipse isn't near-circular); a sign error in our
+    # RA/Dec covariance would show up as PA = 180 - (90 - Theta) instead.
+    r["h_pa"] = np.mod(90.0 - r["h_Theta"], 180.0)
+    dth = (r["our_theta"] - r["h_pa"]) % 180.0
     r["d_theta"] = np.where(dth > 90, dth - 180, dth)
+    r["elongated"] = r["h_SMAA_3sig"] > 1.2 * r["h_SMIA_3sig"]
     r["gated"] = (r["our_smaa_3sig"] / 3 < gate_below_arcsec) & np.isfinite(r["h_SMAA_3sig"])
     r["pass"] = ~r["gated"] | (np.abs(r["ratio_smaa"] - 1) <= rel_tol)
     return r
@@ -1111,13 +1131,56 @@ def jpl_command(info):
     return f"'{des};'" if des.isdigit() else f"'DES={des};'"
 
 
+def sky_jacobian(rho):
+    """d (RA cos(dec), Dec) / d position [rad/AU], (N, 2, 3), for
+    topocentric vectors rho (N, 3)."""
+    rho = np.atleast_2d(rho)
+    d = np.linalg.norm(rho, axis=1)
+    ra, dec = np.arctan2(rho[:, 1], rho[:, 0]), np.arcsin(rho[:, 2] / d)
+    e_ra = np.stack([-np.sin(ra), np.cos(ra), np.zeros_like(ra)], axis=1)
+    e_dec = np.stack([-np.sin(dec) * np.cos(ra), -np.sin(dec) * np.sin(ra), np.cos(dec)], axis=1)
+    return np.stack([e_ra, e_dec], axis=1) / d[:, None, None]
+
+
+def fd_track(orbit, mjd_tai, ephem, step_sigma=0.1):
+    """An independent reference for coarse(): the state-transition matrix by
+    central differences of our own ASSIST propagation
+    (ssp.ephem_assist._propagate_one, no variational equations), steps of
+    ``step_sigma`` x each state component's 1-sigma, C(t) = Phi C0 Phi^T
+    projected through `sky_jacobian` (geometric, no light time). Returns a
+    dict like `coarse_at`'s."""
+    from ssp.ephem_assist import _propagate_one
+    mjd_tai = np.asarray(mjd_tai, float)
+    t = tai_to_assist(mjd_tai)
+    obs_pos, _ = observer_states(mjd_tai)
+    s0, c0 = np.asarray(orbit["state0"], float), np.asarray(orbit["cov0"], float)
+    X, _ = _propagate_one(s0[:3], s0[3:], float(orbit["epoch"]), t, ephem)
+    phi = np.empty((len(t), 3, 6))
+    for k in range(6):
+        h = step_sigma * np.sqrt(c0[k, k])
+        d = np.zeros(6)
+        d[k] = h
+        Xp, _ = _propagate_one((s0 + d)[:3], (s0 + d)[3:], float(orbit["epoch"]), t, ephem)
+        Xm, _ = _propagate_one((s0 - d)[:3], (s0 - d)[3:], float(orbit["epoch"]), t, ephem)
+        phi[:, :, k] = ((Xp - Xm) / (2 * h)).T
+    rho = X.T - obs_pos
+    J = sky_jacobian(rho)
+    Cs = np.einsum("nij,njk,nlk->nil", J @ phi, c0[None], J @ phi) * np.degrees(1) ** 2
+    ra, dec = vec_to_radec(rho)
+    ra_err, dec_err = np.sqrt(Cs[:, 0, 0]), np.sqrt(Cs[:, 1, 1])
+    return {"ra": ra, "dec": dec, "ra_err": ra_err, "dec_err": dec_err, "ra_dec_cov": Cs[:, 0, 1],
+            "sigma_major": sigma_major_arcsec(ra_err, dec_err, Cs[:, 0, 1]),
+            "ok": np.ones(len(t), bool)}
+
+
 def cmd_horizons_sigma(args):
     rep = Report("horizons-sigma", args.out)
     polite = Polite(args.min_interval, args.max_queries, args.query_log)
     ephem = open_ephem()
     epochs = np.array([float(x) for x in args.epochs.split(",")])
     rep(f"# Horizons plane-of-sky uncertainty vs ours, JPL orbits; epochs (TAI MJD) {list(epochs)}")
-    out = []
+    rep("  'coarse': ssp.nearbysso.propagate.coarse (WP2, gated); 'fd': finite-difference reference")
+    out, have_coarse = [], True
     for des in args.designations.split(","):
         des = des.strip()
         try:
@@ -1131,11 +1194,14 @@ def cmd_horizons_sigma(args):
             continue
         rep(f"  {des}: {info['fullname']} orbit {info['orbit_id']} epoch(TT MJD) "
             f"{rec['epoch_mjd']:.4f} has_cov={rec['has_cov']} {info['note']}")
+        if not rec["has_cov"]:
+            continue
+        tracks = {"fd": fd_track(rec, epochs, ephem)}
         tr = coarse_at(rec, epochs, ephem)
         if tr is None:
-            rep("  propagate.coarse not implemented: sigma unknown")
-            rep.write(None)
-            return 3
+            have_coarse = False
+        else:
+            tracks["coarse"] = tr
         try:
             hz = horizons_jpl_orbit(jpl_command(info), epochs, polite)
         except QueryBudgetExceededError as exc:
@@ -1144,30 +1210,42 @@ def cmd_horizons_sigma(args):
         except Exception as exc:
             rep(f"  {des}: Horizons failed: {exc}")
             continue
-        r = compare_sigma(tr, hz, args.gate_below, args.rel_tol)
-        r.insert(0, "designation", des)
-        r.insert(1, "mjd_tai", epochs)
-        r["orbit_id"] = info["orbit_id"]
         h_ra, h_dec = _col(hz, "R.A."), _col(hz, "DEC")
-        r["d_pos_arcsec_geometric"] = util.sky_separation_arcsec(tr["ra"], tr["dec"], h_ra, h_dec)
-        out.append(r)
+        for name, trk in tracks.items():
+            r = compare_sigma(trk, hz, args.gate_below, args.rel_tol)
+            r.insert(0, "designation", des)
+            r.insert(1, "mjd_tai", epochs)
+            r.insert(2, "method", name)
+            r["orbit_id"] = info["orbit_id"]
+            r["d_pos_arcsec_geometric"] = util.sky_separation_arcsec(trk["ra"], trk["dec"], h_ra, h_dec)
+            out.append(r)
     res = pd.concat(out, ignore_index=True) if out else pd.DataFrame()
     if len(res):
-        with pd.option_context("display.width", 200, "display.max_columns", 30):
-            rep(res[["designation", "mjd_tai", "our_smaa_3sig", "h_SMAA_3sig", "ratio_smaa",
-                     "ratio_smia", "d_theta", "ratio_ra", "ratio_dec", "gated", "pass"]].to_string())
-        rep("(d_pos_arcsec_geometric: coarse positions are geometric, Horizons' astrometric; "
-            "info only)")
+        with pd.option_context("display.width", 250, "display.max_columns", 30,
+                               "display.float_format", "{:.4g}".format):
+            rep(res[["designation", "mjd_tai", "method", "our_smaa_3sig", "h_SMAA_3sig", "ratio_smaa",
+                     "ratio_smia", "d_theta", "elongated", "ratio_ra", "ratio_dec",
+                     "d_pos_arcsec_geometric",
+                     "gated", "pass"]].to_string(index=False))
+        el = res[res["elongated"]]
+        rep("orientation: |d_theta| where SMAA > 1.2 SMIA:", _stats(el["d_theta"], "deg"))
+        rep("(positions are geometric here and astrometric in Horizons: d_pos is info only)")
     rep(f"SBDB+Horizons requests: {polite.n}")
-    if not len(res) or not res["gated"].any():
-        rep("GATE: nothing gated: INCOMPLETE")
-        rep.write(res)
-        return 3
-    ok = bool(res.loc[res["gated"], "pass"].all())
-    rep(f"GATE: SMAA within {args.rel_tol:.0%} where 1-sigma < {args.gate_below}\": "
-        f"{'PASS' if ok else 'FAIL'} ({int(res['gated'].sum())} gated)")
+    for name in ("fd", "coarse"):
+        g = res[(res["method"] == name) & res["gated"]] if len(res) else res
+        if not len(g):
+            rep(f"GATE [{name}]: nothing gated")
+            continue
+        rep(f"GATE [{name}]: SMAA within {args.rel_tol:.0%} where 1-sigma < {args.gate_below} arcsec: "
+            f"{'PASS' if g['pass'].all() else 'FAIL'} ({len(g)} gated)")
+    if not have_coarse:
+        rep("propagate.coarse not implemented: WP2 not checked (INCOMPLETE)")
     rep.write(res)
-    return 0 if ok else 1
+    g = res[(res["method"] == "coarse") & res["gated"]] if len(res) else res
+    fd_ok = bool(res.loc[(res["method"] == "fd") & res["gated"], "pass"].all()) if len(res) else True
+    if not len(g):
+        return 3 if fd_ok else 1
+    return 0 if g["pass"].all() and fd_ok else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1300,24 @@ def twobody_directions(orbits, mjd_tai, obs_pos, sun_pos):
                           t_tt - orbits["peri_time"].to_numpy(float))
     X = X @ R_ECL2EQ.T + sun_pos - obs_pos
     return X / np.linalg.norm(X, axis=1)[:, None]
+
+
+def match_within(pred_ra, pred_dec, dia_ra, dia_dec, radius=RADIUS):
+    """Every (prediction k, DiaSource h) pair within ``radius`` arcsec, by a
+    KD tree on unit vectors (independent of WP3's HEALPix index); returns
+    (k, h, sep [arcsec]), separations as ssp.util.sky_separation_arcsec."""
+    from scipy.spatial import cKDTree
+    if len(pred_ra) == 0 or len(dia_ra) == 0:
+        return np.zeros(0, int), np.zeros(0, int), np.zeros(0)
+    chord = 2 * np.sin(np.deg2rad(radius / 3600.0) / 2) * (1 + 1e-6)
+    tree = cKDTree(radec_to_vec(dia_ra, dia_dec))
+    hits = tree.query_ball_point(radec_to_vec(pred_ra, pred_dec), chord)
+    k = np.repeat(np.arange(len(hits)), [len(x) for x in hits])
+    h = np.fromiter((i for x in hits for i in x), dtype=np.int64, count=len(k))
+    sep = util.sky_separation_arcsec(np.asarray(pred_ra)[k], np.asarray(pred_dec)[k],
+                                     np.asarray(dia_ra)[h], np.asarray(dia_dec)[h])
+    m = sep <= radius
+    return k[m], h[m], sep[m]
 
 
 def expected_nearest(pairs, sigma_max=SIGMA_MAX, radius=RADIUS):
@@ -1281,7 +1377,6 @@ def _bf_chunk(k0, k1):
 
 
 def cmd_brute_force(args):
-    from scipy.spatial import cKDTree
     rep = Report("brute-force", args.out)
     rng = np.random.default_rng(args.seed)
     vis_all = np.unique(pq.read_table(args.dia, columns=["visit"]).column(0).to_numpy())
@@ -1351,28 +1446,25 @@ def cmd_brute_force(args):
         f"{args.always_exact_q} x {len(V)} visits: error median {np.nanmedian(errs):.3g} deg, "
         f"99.9% {np.nanpercentile(errs, 99.9):.3g}, max {np.nanmax(errs):.3g} deg; "
         f"margin {args.margin_deg} deg")
-    margin_ok = bool(np.nanmax(errs) < args.margin_deg / 2)
+    margin_ok = bool(np.nanmax(errs) < args.margin_deg / 3)
     if not margin_ok:
-        rep("WARNING: 2-body error exceeds margin/2: the prefilter may not be conservative")
+        rep("WARNING: 2-body error exceeds margin/3: the prefilter may not be conservative")
     # (calibration-only objects are matched too; that only adds coverage)
 
     # match exact predictions to DiaSources (KD tree on unit vectors)
-    chord = 2 * np.sin(np.deg2rad(RADIUS / 3600.0) / 2) * 1.0001
-    pairs = []
+    parts = []
+    des_all = orbits["designation"].to_numpy(dtype=object)
     for j in range(len(V)):
         s, e_ = V["dia_start"].iloc[j], V["dia_end"].iloc[j]
         dv = dia.iloc[s:e_]
-        tree = cKDTree(radec_to_vec(dv["ra"].to_numpy(), dv["dec"].to_numpy()))
         ex = exact[exact["vj"] == j]
-        pv = radec_to_vec(ex["ra"].to_numpy(), ex["dec"].to_numpy())
-        for k, hits in enumerate(tree.query_ball_point(pv, chord)):
-            for hidx in hits:
-                r = dv.iloc[hidx]
-                pairs.append((int(r["diaSourceId"]), orbits["designation"].iloc[ex["oi"].iloc[k]],
-                              float(util.sky_separation_arcsec(ex["ra"].iloc[k], ex["dec"].iloc[k],
-                                                               r["ra"], r["dec"])),
-                              float(r["midpointMjdTai"])))
-    pairs = pd.DataFrame(pairs, columns=["diaSourceId", "designation", "sep", "midpointMjdTai"])
+        k, h, sep = match_within(ex["ra"].to_numpy(), ex["dec"].to_numpy(),
+                                 dv["ra"].to_numpy(), dv["dec"].to_numpy(), RADIUS)
+        parts.append(pd.DataFrame({
+            "diaSourceId": dv["diaSourceId"].to_numpy(dtype=np.int64)[h],
+            "designation": des_all[ex["oi"].to_numpy()[k]], "sep": sep,
+            "midpointMjdTai": dv["midpointMjdTai"].to_numpy(dtype=np.float64)[h]}))
+    pairs = pd.concat(parts, ignore_index=True)
     pairs = pairs[pairs["sep"] <= RADIUS].reset_index(drop=True)
     rep(f"(object, DiaSource) pairs within {RADIUS}\": {len(pairs):,} "
         f"({pairs['designation'].nunique():,} objects)")
@@ -1507,7 +1599,8 @@ def main(argv=None):
     p.add_argument("--nearbysso", default=None)
     p.add_argument("--n-visits", type=int, default=4)
     p.add_argument("--visits", default=None, help="comma-separated visit ids (instead of random)")
-    p.add_argument("--margin-deg", type=float, default=3.0, help="2-body prefilter margin")
+    p.add_argument("--margin-deg", type=float, default=1.5,
+                   help="2-body prefilter margin; must exceed 3x the calibrated 2-body error")
     p.add_argument("--always-exact-q", type=float, default=1.3, help="q below which it's always exact")
     p.add_argument("--max-epoch-gap", type=float, default=1500.0, help="days; farther epochs are exact")
     p.add_argument("--calibrate", type=int, default=2000, help="orbits used to calibrate the 2-body error")
@@ -1524,7 +1617,14 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=42)
     p.set_defaults(func=cmd_mock)
 
+    for p in sub.choices.values():
+        p.add_argument("--keep-unknown-arc", action="store_true",
+                       help="treat a NaN arc_length_total as passing the > 2 d rule")
     args = ap.parse_args(argv)
+    # (future epochs: astropy falls back to mean polar motion, sub-mas here)
+    warnings.filterwarnings("ignore", message="Tried to get polar motions")
+    global KEEP_UNKNOWN_ARC
+    KEEP_UNKNOWN_ARC = args.keep_unknown_arc
     return args.func(args)
 
 

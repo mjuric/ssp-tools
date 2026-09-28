@@ -10,9 +10,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bench import nearbysso_validate as V  # noqa: E402
-from ssp import util  # noqa: E402
-from ssp.ephem_assist import cometary_to_helio_ecliptic  # noqa: E402
+from bench import nearbysso_validate as V
+from ssp import util
+from ssp.ephem_assist import cometary_to_helio_ecliptic
 
 
 # --------------------------------------------------------------------------
@@ -34,7 +34,8 @@ def test_filter_reason():
                  q=[2.0, 2.0, 2.0, np.nan, 2.0, 2.0],
                  arc_length_total=[100.0, 100.0, 100.0, 100.0, 2.0, np.nan])
     r = V.filter_reason(df)
-    assert list(r) == ["", "comet", "comet", "missing_elements", "short_arc", "short_arc"]
+    assert list(r) == ["", "comet", "comet", "missing_elements", "short_arc", "unknown_arc"]
+    assert V.filter_reason(df, keep_unknown_arc=True)[-1] == ""
     lk = V.reason_lookup(df)
     assert list(V.reasons_for(["2020 AB", "nope"], lk)) == ["", "not_in_orbits"]
 
@@ -122,7 +123,7 @@ def test_compare_sigma_only_for_unexplained():
 
 def test_compare_nearer_tie_by_designation():
     nss, sss, dia, lookup, sigma_fn = _case()
-    # the other object at the same separation: nearer only if its designation sorts first
+    # the other object at the same separation: nearer only if it sorts first
     sss = sss[sss["diaSourceId"] == 5]
     for other, expect in (("0", "nearer_object"), ("ZZ", "wrong_nearest")):
         n = nss[nss["diaSourceId"] == 5].assign(designation=other, ephOffset=np.float32(3.0))
@@ -321,7 +322,7 @@ def test_compare_sigma_gate():
     ours = {"ra_err": np.array([1, 50, 200]) / 3600, "dec_err": np.array([0.5, 20, 100]) / 3600,
             "ra_dec_cov": np.zeros(3)}
     hz = {"SMAA_3sig": np.array([3.1, 180.0, 600.0]), "SMIA_3sig": np.array([1.5, 60, 300]),
-          "Theta": np.array([90.0, 90.0, 90.0]), "RA_3sigma": np.array([3.0, 150, 600]),
+          "Theta": np.array([0.0, 0.0, 0.0]), "RA_3sigma": np.array([3.0, 150, 600]),
           "DEC_3sigma": np.array([1.5, 60, 300])}
     r = V.compare_sigma(ours, hz)
     assert list(r["gated"]) == [True, True, False]
@@ -417,3 +418,158 @@ def test_expected_nearest_and_compare():
     c = V.compare_expected(e, nss)
     st = dict(zip(c["diaSourceId"], c["status"]))
     assert st == {1: "found", 2: "wrong_object", 4: "missing_sigma_unknown", 5: "missing", 9: "extra"}
+
+
+def test_match_within():
+    arc = 1 / 3600.0
+    # the second prediction is 3.6" from the pole; a DiaSource 1.08" from
+    # it on the other side is 4.68" away, one 1.8" from it 5.4"
+    pr, pd_ = np.array([10.0, 200.0]), np.array([0.0, 89.999])
+    dr = np.array([10.0 + 4.9 * arc, 10.0 + 5.1 * arc, 20.0, 20.0])
+    dd = np.array([0.0, 0.0, 89.9997, 89.9995])
+    k, h, sep = V.match_within(pr, pd_, dr, dd)
+    got = sorted(zip(k.tolist(), h.tolist()))
+    assert got == [(0, 0), (1, 2)]
+    assert np.all(sep <= 5.0)
+    k, h, sep = V.match_within(pr[:0], pd_[:0], dr, dd)
+    assert len(k) == 0
+
+
+# --------------------------------------------------------------------------
+# the sigma oracle's plumbing into propagate.coarse (mocked)
+# --------------------------------------------------------------------------
+
+class _FakeEphem:
+    class _P:
+        x = y = z = vx = vy = vz = 0.0
+
+    def get_particle(self, body, t):
+        return self._P()
+
+
+def _orbit_file(path, jsons):
+    n = len(jsons)
+    pd.DataFrame({
+        "unpacked_primary_provisional_designation": ["2020 AB", "2020 AC"][:n],
+        "packed_primary_provisional_designation": ["K20A00B", "K20A00C"][:n],
+        "mpc_orb_jsonb": jsons,
+        "q": [2.0, 2.5][:n], "e": [0.1, 0.2][:n], "i": [5.0, 6.0][:n], "node": [10.0, 11.0][:n],
+        "argperi": [20.0, 21.0][:n], "peri_time": [60000.0, 60100.0][:n],
+        "epoch_mjd": [61000.0, 61000.0][:n], "h": [15.0, 16.0][:n], "g": [0.15, 0.15][:n],
+        "arc_length_total": [100.0, 100.0][:n], "normalized_rms": [0.5, 0.6][:n],
+    }).to_parquet(path)
+
+
+def test_sigma_oracle_plumbing(tmp_path, monkeypatch):
+    from ssp.nearbysso import _contract as Ct
+    from ssp.nearbysso import propagate
+    cov = np.diag([1e-10, 2e-10, 3e-10, 1e-14, 2e-14, 3e-14])
+    cov[0, 1] = cov[1, 0] = 5e-11
+    cj = {f"cov{i}{j}": (cov[i, j] if j < 6 else None) for i in range(10) for j in range(i, 10)}
+    _orbit_file(tmp_path / "o.parquet", [json.dumps({"CAR": {"covariance": cj}}), "{}"])
+    seen = {}
+
+    def coarse(orbit, t, obs_pos, ephem):
+        assert np.all(np.diff(t) > 0) and obs_pos.shape == (len(t), 3)
+        seen[str(orbit["designation"])] = orbit
+        k = len(t)
+        sig = 1.0 if orbit["has_cov"] else np.inf
+        z = np.zeros(k)
+        return Ct.CoarseTrack(t=t, ra=z, dec=z, rate_ra=z, rate_dec=z, ra_err=z, dec_err=z,
+                              ra_dec_cov=z, sigma_major=sig * (t - t[0] + 1), ok=np.ones(k, bool))
+    monkeypatch.setattr(propagate, "coarse", coarse)
+    monkeypatch.setattr(V, "observer_states", lambda m: (np.zeros((len(m), 3)), np.zeros((len(m), 3))))
+    orc = V.SigmaOracle(str(tmp_path / "o.parquet"), ephem=_FakeEphem())
+    s = orc(np.array(["2020 AB", "2020 AB", "2020 AC", "nope", "2020 AB"], dtype=object),
+            np.array([60802.0, 60800.0, 60800.0, 60800.0, 60800.0]))
+    np.testing.assert_allclose(s[[0, 1, 4]], [3.0, 1.0, 1.0])     # aligned, deduplicated
+    assert np.isinf(s[2]) and np.isnan(s[3])
+    ab = seen["2020 AB"]
+    assert ab["has_cov"] and not seen["2020 AC"]["has_cov"]
+    np.testing.assert_allclose(ab["cov0"], V.R6_ECL2EQ @ cov @ V.R6_ECL2EQ.T)
+    ref = V.cometary_to_state_eq([0.1, 2.0, 60000.0, 10.0, 20.0, 5.0], 61000.0)
+    np.testing.assert_allclose(ab["state0"], ref, rtol=1e-12)
+    assert ab.dtype == Ct.ORBIT_DTYPE and ab["epoch"] == pytest.approx(61000.0 - 51544.5, abs=1e-5)
+
+
+def test_sigma_oracle_unknown_without_wp2(tmp_path, monkeypatch):
+    from ssp.nearbysso import propagate
+
+    def coarse(*a):
+        raise NotImplementedError("WP2")
+    monkeypatch.setattr(propagate, "coarse", coarse)
+    monkeypatch.setattr(V, "observer_states", lambda m: (np.zeros((len(m), 3)), np.zeros((len(m), 3))))
+    _orbit_file(tmp_path / "o.parquet", ["{}"])
+    orc = V.SigmaOracle(str(tmp_path / "o.parquet"), ephem=_FakeEphem())
+    assert np.isnan(orc(np.array(["2020 AB"], dtype=object), np.array([60800.0]))).all()
+    assert "not implemented" in orc.note
+
+
+def test_sky_jacobian():
+    rho = np.array([[0.3, -1.2, 0.4], [1.0, 0.0, 0.0]])
+    J = V.sky_jacobian(rho)
+    for n in range(len(rho)):
+        ra0, dec0 = V.vec_to_radec(rho[n])
+        for k in range(3):
+            d = np.zeros(3)
+            d[k] = 1e-7
+            ra1, dec1 = V.vec_to_radec(rho[n] + d)
+            num = np.array([np.deg2rad(ra1 - ra0) * np.cos(np.deg2rad(dec0)), np.deg2rad(dec1 - dec0)]) / 1e-7
+            np.testing.assert_allclose(J[n, :, k], num, atol=1e-6)
+
+
+# --------------------------------------------------------------------------
+# the CLI end to end on synthetic Parquet files (no ASSIST, no network)
+# --------------------------------------------------------------------------
+
+def _write_case(tmp_path):
+    nss, sss, dia, lookup, _ = _case()
+    dia.assign(visit=1).to_parquet(tmp_path / "dia.parquet", row_group_size=4)
+    sss.to_parquet(tmp_path / "sss.parquet")
+    nss.to_parquet(tmp_path / "nss.parquet")
+    des = sorted(lookup)
+    orb = _orbits(designation=des, packed=[("_x" if "/" in d else "p" + d) for d in des])
+    orb = orb.rename(columns={"designation": "unpacked_primary_provisional_designation",
+                              "packed": "packed_primary_provisional_designation"})
+    orb.to_parquet(tmp_path / "orbits.parquet")
+    return sss
+
+
+def test_cli_same_orbits(tmp_path):
+    _write_case(tmp_path)
+    rc = V.main(["same-orbits", "--nearbysso", str(tmp_path / "nss.parquet"),
+                 "--sssource", str(tmp_path / "sss.parquet"), "--dia", str(tmp_path / "dia.parquet"),
+                 "--orbits", str(tmp_path / "orbits.parquet"), "--out", str(tmp_path / "r"), "--no-sigma"])
+    assert rc == 1
+    rows = pd.read_parquet(tmp_path / "r" / "same-orbits.parquet")
+    st = dict(zip(rows["diaSourceId"], rows["status"]))
+    assert st[1] == "match" and st[3] == "filtered:comet" and st[6] == "sigma_unknown"
+    disc = pd.read_parquet(tmp_path / "r" / "same-orbits.discrepancies.parquet")
+    assert set(disc["diaSourceId"]) == {2}          # 7 and 8 are sigma_unknown without sigma
+    assert "GATE" in (tmp_path / "r" / "same-orbits.txt").read_text()
+
+
+def test_cli_dp2_intersection(tmp_path):
+    sss = _write_case(tmp_path)
+    # DP2-style: ssObjectId only, and 'A' known to DP2 under an old designation
+    packed = pd.Series(["p" + d if "/" not in d else "_x" for d in sss["designation"]],
+                       dtype="string[pyarrow]")
+    packed = packed.where(sss["designation"] != "A", "OLDA")
+    sss.drop(columns="designation").assign(ssObjectId=util.packed_ascii_to_uint64_le(packed)).to_parquet(
+        tmp_path / "dp2.parquet")
+    des = sorted(set(sss["designation"]) | {"Y", "Z"})
+    ident = pd.DataFrame({
+        "unpacked_primary_provisional_designation": des + ["A"],
+        "unpacked_secondary_provisional_designation": des + ["OLD A"],
+        "packed_secondary_provisional_designation": [("_x" if "/" in d else "p" + d) for d in des] + ["OLDA"],
+    })
+    ident.to_parquet(tmp_path / "ident.parquet")
+    rc = V.main(["dp2-intersection", "--nearbysso", str(tmp_path / "nss.parquet"),
+                 "--sssource", str(tmp_path / "dp2.parquet"), "--dia", str(tmp_path / "dia.parquet"),
+                 "--orbits", str(tmp_path / "orbits.parquet"), "--identifications",
+                 str(tmp_path / "ident.parquet"), "--out", str(tmp_path / "r")])
+    assert rc == 0                                   # reported, never gated
+    rows = pd.read_parquet(tmp_path / "r" / "dp2-intersection.parquet")
+    st = dict(zip(rows["diaSourceId"], rows["status"]))
+    assert 3 not in st                               # the comet: not kept by us
+    assert st[1] == "match" and st[2] == "value_mismatch"
