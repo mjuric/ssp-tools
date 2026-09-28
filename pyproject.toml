@@ -45,6 +45,7 @@ fast-export = "ssp.export:main"
 extract-catalog = "ssp.export.butler:main"
 extract-submitted-sources = "ssp.export.submittable:main"
 ssp-build-ssobject = "ssp.ssobject:main"
+ssp-build-nearbysso = "ssp.nearbysso.build:main"
 ssp-generate-dtypes = "ssp.felis:main"
 
 [tool.pytest.ini_options]
