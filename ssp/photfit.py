@@ -1,7 +1,7 @@
 import numpy as np
 from collections import namedtuple
 from scipy.interpolate import CubicSpline
-from scipy.optimize import leastsq, least_squares
+from scipy.optimize import leastsq, least_squares, minimize_scalar
 import warnings
 
 HG12FitResult = namedtuple(
@@ -168,15 +168,275 @@ def fit(mag, phase, sigma, model=HG12_model, params=[0.1]):
 
     return sol
 
+_FAILED = HG12FitResult(*(np.nan,) * 6, nobs=0)
+
+# Coarse grid for the G12 search, and the precision of its refinement.
+_G12_GRID = np.linspace(0.0, 1.0, 101)
+_G12_XATOL = 1e-6
+# Number of the grid's local minima that are refined (the lowest ones).
+_G12_NCELLS = 3
+# Points checked exactly: the bounds, and the G12 -> (G1, G2) branch point.
+_G12_BREAKS = (0.0, 0.2, 1.0)
+
+# IRLS convergence for the profiled robust H (mag), and an iteration cap.
+_IRLS_TOL = 1e-9
+_IRLS_MAXITER = 500
+
+
+def _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor):
+    """Apply the error floor, keep finite magnitudes with positive
+    errors, and reduce the magnitudes to 1 AU. Returns (reduced mag,
+    magSigma, phase in radians), or None if no observation is left.
+    """
+    if len(mag) == 0:
+        return None
+
+    # ensure these are plain ndarrays
+    (mag, magSigma, phaseAngle, tdist, rdist) = map(np.asarray, (mag, magSigma, phaseAngle, tdist, rdist))
+
+    # add systematic error floor in quadrature
+    if magSigmaFloor > 0:
+        magSigma = np.sqrt(magSigma**2 + magSigmaFloor**2)
+
+    # filter to finite magnitudes and positive errors
+    good = (
+        np.isfinite(mag) & np.isfinite(magSigma)
+        & (magSigma > 0)
+    )
+    if not good.any():
+        return None
+    mag = mag[good]
+    magSigma = magSigma[good]
+    phaseAngle = phaseAngle[good]
+    tdist = tdist[good]
+    rdist = rdist[good]
+
+    # correct the mag to 1AU distance
+    dmag = -5. * np.log10(tdist*rdist)
+    return mag + dmag, magSigma, np.deg2rad(phaseAngle)
+
+
+def _HG12_G1G2_vec(G12):
+    """Vectorized ``_HG12_G1G2`` (G1 and G2 only), with the same
+    branches and arithmetic.
+    """
+    hi = G12 >= 0.2
+    G1 = np.where(hi, +0.9529*G12 + 0.02162, +0.7527*G12 + 0.06164)
+    G2 = np.where(hi, -0.6125*G12 + 0.5572, -0.9612*G12 + 0.6270)
+    return G1, G2
+
+
+class _HG12Profile:
+    """The HG12 fit with H profiled out, for a one-parameter search in
+    G12.
+
+    For a given G12 the model is linear in H: the residuals are
+    r_i = (y_i - H) / sigma_i, with y_i = m_i + 2.5 log10 F_i(G12). The
+    best H is then a weighted mean (linear loss) or the IRLS solution
+    (soft_l1 loss). The methods return (cost, H) for one G12; the
+    ``*_grid`` variants evaluate an array of G12 values at once, as a
+    (K, N) array. A cost that isn't finite (F <= 0) is returned as inf.
+    """
+
+    def __init__(self, basis, mag, magSigma):
+        phi_1_ev, phi_2_ev, phi_3_ev = basis
+        self.p3 = phi_3_ev
+        self.d1 = phi_1_ev - phi_3_ev
+        self.d2 = phi_2_ev - phi_3_ev
+        self.mag = mag
+        self.w = magSigma**-2.
+        self.sw = self.w.sum()
+        self.H_last = None  # warm start for the robust H solve
+
+    def y(self, G12):
+        G1, G2, _, _ = _HG12_G1G2(G12)
+        return self.mag + 2.5 * np.log10(self.p3 + G1 * self.d1 + G2 * self.d2)
+
+    def y_grid(self, G12):
+        G1, G2 = _HG12_G1G2_vec(G12[:, np.newaxis])
+        return self.mag + 2.5 * np.log10(self.p3 + G1 * self.d1 + G2 * self.d2)
+
+    def linear(self, G12):
+        y = self.y(G12)
+        H = (self.w @ y) / self.sw
+        d = y - H
+        cost = self.w @ (d * d)
+        return (cost, H) if np.isfinite(cost) else (np.inf, np.nan)
+
+    def linear_grid(self, G12):
+        y = self.y_grid(G12)
+        H = (y @ self.w) / self.sw
+        d = y - H[:, np.newaxis]
+        cost = (d * d) @ self.w
+        return np.where(np.isfinite(cost), cost, np.inf), H
+
+    def irls(self, y, H):
+        """H minimizing sum(soft_l1(r^2)) for each row of y (shape
+        (K, N)), starting from H (shape (K,)).
+
+        Iteratively reweighted least squares, with Newton steps: the
+        IRLS step alone converges only linearly. The minimum is bracketed
+        by the data, and by the sign of the gradient at each iterate; a
+        Newton step that leaves the bracket is replaced by the IRLS step
+        (a weighted mean, so inside the data), or else by bisection.
+        """
+        w = self.w
+        lo, hi = y.min(axis=1), y.max(axis=1)
+        for _ in range(_IRLS_MAXITER):
+            d = y - H[:, np.newaxis]
+            s = 1. + w * d * d
+            wr = w / np.sqrt(s)
+            g = (wr * d).sum(axis=1)        # -1/2 d(cost)/dH
+            h_irls = wr.sum(axis=1)         # IRLS: the reweighted curvature
+            h_newton = (wr / s).sum(axis=1)  # 1/2 d2(cost)/dH2
+            lo = np.where(g > 0, H, lo)
+            hi = np.where(g < 0, H, hi)
+            step = g / h_newton
+            out = ~((lo <= H + step) & (H + step <= hi))
+            step = np.where(out, g / h_irls, step)
+            out &= ~((lo <= H + step) & (H + step <= hi))
+            step = np.where(out, 0.5 * (lo + hi) - H, step)
+            H = H + step
+            if np.max(np.abs(step)) <= _IRLS_TOL:
+                break
+        return H
+
+    def robust(self, G12):
+        """Scalar ``robust_grid``, with the same iteration as ``irls``
+        written for one row (it is called ~20 times per search), and
+        warm-started from the previous call's H.
+        """
+        y = self.y(G12)
+        w = self.w
+        H = (w @ y) / self.sw
+        if not np.isfinite(H):
+            return np.inf, np.nan
+        if self.H_last is not None:
+            H = self.H_last
+        lo, hi = y.min(), y.max()
+        for _ in range(_IRLS_MAXITER):
+            d = y - H
+            s = 1. + w * d * d
+            wr = w / np.sqrt(s)
+            g = wr @ d
+            if g > 0:
+                lo = H
+            elif g < 0:
+                hi = H
+            step = g / (wr @ (1. / s))
+            if not lo <= H + step <= hi:
+                step = g / wr.sum()
+                if not lo <= H + step <= hi:
+                    step = 0.5 * (lo + hi) - H
+            H += step
+            if abs(step) <= _IRLS_TOL:
+                break
+        self.H_last = H
+        d = y - H
+        return 2. * (np.sqrt(1. + w * d * d) - 1.).sum(), H
+
+    def robust_grid(self, G12):
+        y = self.y_grid(G12)
+        cost = np.full(len(y), np.inf)
+        H = np.full(len(y), np.nan)
+        ok = np.all(np.isfinite(y), axis=1)
+        if ok.any():
+            y = y[ok]
+            Ho = self.irls(y, (y @ self.w) / self.sw)
+            d = y - Ho[:, np.newaxis]
+            cost[ok] = 2. * (np.sqrt(1. + self.w * d * d) - 1.).sum(axis=1)
+            H[ok] = Ho
+        return cost, H
+
+
+def _minimize_G12(cost, cost_grid):
+    """Minimize a profiled cost over G12 in [0, 1]: a coarse grid, then
+    a bounded scalar refinement of the best grid cells. Returns
+    (G12, H, cost), or None if the cost is nowhere finite. A solution
+    at a bound is returned as exactly 0.0 or 1.0.
+    """
+    grid = _G12_GRID
+    c, _ = cost_grid(grid)
+    if not np.isfinite(c).any():
+        return None
+
+    # candidate cells: the grid's local minima, lowest first
+    cp = np.concatenate(([np.inf], c, [np.inf]))
+    cand = np.flatnonzero((c <= cp[:-2]) & (c <= cp[2:]))
+    cand = cand[np.argsort(c[cand], kind="stable")][:_G12_NCELLS]
+
+    best = (np.nan, np.nan, np.inf)
+    for k in cand:
+        lo, hi = grid[max(k - 1, 0)], grid[min(k + 1, len(grid) - 1)]
+        res = minimize_scalar(
+            lambda g: cost(g)[0], bounds=(lo, hi), method="bounded",
+            options={"xatol": _G12_XATOL},
+        )
+        # The bounded search never evaluates the ends of its bracket, so
+        # check the bounds of [0, 1] explicitly, and the branch point at
+        # 0.2: the G12 -> (G1, G2) map is slightly discontinuous there,
+        # so the cost jumps, and minima pile up at exactly 0.2.
+        for g in [res.x] + [b for b in _G12_BREAKS if lo <= b <= hi]:
+            cg, Hg = cost(g)
+            if cg < best[2] or (cg == best[2] and g in _G12_BREAKS):
+                best = (float(g), float(Hg), float(cg))
+
+    if not np.isfinite(best[2]):
+        return None
+    return best
+
+
+def _hg12_result(basis, mag, magSigma, H, G12, fixedG12, chi2_total):
+    """Assemble the HG12FitResult of the final (linear-loss) fit at
+    (H, G12). Errors come from inv(J^T J) of the fitted parameters; for
+    a free G12 at a bound (0 or 1), G12_err and HG_cov are NaN and
+    H_err is the fixed-G12 error.
+    """
+    nobsv = len(mag)
+    nparams = 1 if fixedG12 is not None else 2
+    x = np.array([H] if fixedG12 is not None else [H, G12])
+    _, jac = _HG12_residuals_and_jac(basis, mag, magSigma, fixedG12)
+    J = jac(x)
+    try:
+        cov = np.linalg.inv(J.T @ J)
+    except np.linalg.LinAlgError:
+        return _FAILED
+
+    if fixedG12 is not None:
+        G12, G_err, HG_cov = fixedG12, np.nan, np.nan
+        H_err = np.sqrt(cov[0, 0])
+    elif G12 == 0.0 or G12 == 1.0:
+        G_err, HG_cov = np.nan, np.nan
+        H_err = 1. / np.sqrt(np.sum(magSigma**-2.))
+    else:
+        G_err, HG_cov = np.sqrt(cov[1, 1]), cov[0, 1]
+        H_err = np.sqrt(cov[0, 0])
+
+    return HG12FitResult(
+        H=H, G12=G12, H_err=H_err, G12_err=G_err,
+        HG_cov=HG_cov,
+        chi2dof=np.float64(chi2_total) / (nobsv - nparams),
+        nobs=nobsv,
+    )
+
+
 def fitHG12(
     mag, magSigma, phaseAngle, tdist, rdist,
     fixedG12=None, magSigmaFloor=0.0, nSigmaClip=None,
+    _details=None,
 ):
     """Fit the HG12 phase curve model (Muinonen et al. 2010).
 
     Fits absolute magnitude H (and optionally the slope parameter
     G12) to apparent magnitude observations at known phase angles
-    and distances.
+    and distances. A free G12 is bounded to [0, 1].
+
+    For a given G12 the model is linear in H, so H is profiled out (a
+    weighted mean for the least-squares fit, iteratively reweighted
+    least squares for the robust one), and G12 is found by a coarse
+    grid over [0, 1] followed by a bounded scalar refinement.
+    ``_fitHG12_reference`` is the equivalent direct two-parameter
+    ``least_squares`` fit, kept for verification.
 
     Parameters
     ----------
@@ -192,7 +452,7 @@ def fitHG12(
         Heliocentric (sun-target) distances in AU.
     fixedG12 : float or None, optional
         If set, fix G12 to this value and only fit H.
-        If None (default), both H and G12 are fit.
+        If None (default), both H and G12 (in [0, 1]) are fit.
     magSigmaFloor : float, optional
         Systematic error floor (mag) added in quadrature to
         ``magSigma`` before fitting. Default is 0.0.
@@ -212,11 +472,15 @@ def fitHG12(
         ``G12``
             Best-fit (or fixed) slope parameter.
         ``H_err``
-            Uncertainty on H from the covariance matrix.
+            Uncertainty on H from the covariance matrix. If a free
+            G12 ends at a bound (0 or 1), the fixed-G12 error
+            ``1/sqrt(sum(1/sigma^2))``.
         ``G12_err``
-            Uncertainty on G12 (NaN if ``fixedG12`` is set).
+            Uncertainty on G12 (NaN if ``fixedG12`` is set, or if G12
+            is at a bound).
         ``HG_cov``
-            H-G12 covariance (NaN if ``fixedG12`` is set).
+            H-G12 covariance (NaN if ``fixedG12`` is set, or if G12 is
+            at a bound).
         ``chi2dof``
             Reduced chi-squared of the fit.
         ``nobs``
@@ -224,46 +488,96 @@ def fitHG12(
 
         On failure, all float fields are NaN and ``nobs`` is 0.
     """
+    prep = _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor)
+    if prep is None:
+        return _FAILED
+    mag, magSigma, phase_rad = prep
     nobsv = len(mag)
-
-    if nobsv == 0:
-        return HG12FitResult(*(np.nan,) * 6, nobs=0)
-
-    # ensure these are plain ndarrays
-    (mag, magSigma, phaseAngle, tdist, rdist) = map(np.asarray, (mag, magSigma, phaseAngle, tdist, rdist))
-
-    # add systematic error floor in quadrature
-    if magSigmaFloor > 0:
-        magSigma = np.sqrt(magSigma**2 + magSigmaFloor**2)
-
-    # filter to finite magnitudes and positive errors
-    good = (
-        np.isfinite(mag) & np.isfinite(magSigma)
-        & (magSigma > 0)
-    )
-    mag = mag[good]
-    magSigma = magSigma[good]
-    phaseAngle = phaseAngle[good]
-    tdist = tdist[good]
-    rdist = rdist[good]
-    nobsv = len(mag)
-
-    if nobsv == 0:
-        return HG12FitResult(*(np.nan,) * 6, nobs=0)
-
-    # correct the mag to 1AU distance
-    dmag = -5. * np.log10(tdist*rdist)
-    mag = mag + dmag
-
     nparams = 1 if fixedG12 is not None else 2
 
-    phase_rad = np.deg2rad(phaseAngle)
+    # With fewer observations than parameters J^T J is singular: the
+    # unbounded fit failed there through inv(); a bounded one need not.
+    if nobsv < nparams:
+        return _FAILED
+
+    # The basis functions depend only on the phase angles, so evaluate
+    # them once per fit.
+    basis = _HG1G2_basis(phase_rad)
+    prof = _HG12Profile(basis, mag, magSigma)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+
+        if nSigmaClip is not None and nobsv > nparams + 1:
+            # Stage 1: robust fit with soft_l1 loss
+            if fixedG12 is not None:
+                c, H_r = prof.robust(fixedG12)
+                if not np.isfinite(c):
+                    return _FAILED
+                G_r, H_r = fixedG12, float(H_r)
+            else:
+                sol = _minimize_G12(prof.robust, prof.robust_grid)
+                if sol is None:
+                    return _FAILED
+                G_r, H_r, _ = sol
+
+            # Sigma clipping on residuals from robust fit
+            resid = (prof.y(G_r) - H_r) / magSigma
+            keep = np.abs(resid) < nSigmaClip
+            if _details is not None:
+                _details.update(robust=(H_r, G_r), keep=keep)
+            mag = mag[keep]
+            magSigma = magSigma[keep]
+            phase_rad = phase_rad[keep]
+            nobsv = len(mag)
+
+            if nobsv <= nparams:
+                return _FAILED
+
+            basis = _HG1G2_basis(phase_rad)
+            prof = _HG12Profile(basis, mag, magSigma)
+
+        # Final fit (linear loss for proper chi2/covariance)
+        if fixedG12 is not None:
+            c, H = prof.linear(fixedG12)
+            G, H, chi2_total = fixedG12, float(H), float(c)
+        else:
+            sol = _minimize_G12(prof.linear, prof.linear_grid)
+            if sol is None:
+                return _FAILED
+            G, H, chi2_total = sol
+        if not np.isfinite(chi2_total):
+            return _FAILED
+
+        return _hg12_result(basis, mag, magSigma, H, G, fixedG12, chi2_total)
+
+
+def _fitHG12_reference(
+    mag, magSigma, phaseAngle, tdist, rdist,
+    fixedG12=None, magSigmaFloor=0.0, nSigmaClip=None,
+    _details=None,
+):
+    """Reference implementation of ``fitHG12``, for tests and
+    verification only: direct ``least_squares`` fits of (H, G12), with
+    G12 bounded to [0, 1] in both stages. Same parameters and result.
+    """
+    prep = _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor)
+    if prep is None:
+        return _FAILED
+    mag, magSigma, phase_rad = prep
+    nobsv = len(mag)
+
+    nparams = 1 if fixedG12 is not None else 2
+    if nobsv < nparams:
+        return _FAILED
     x0 = np.array(
         [mag[0]] + ([] if fixedG12 is not None else [0.1])
     )
+    bounds = (
+        (-np.inf, np.inf) if fixedG12 is not None
+        else ([-np.inf, 0.], [np.inf, 1.])
+    )
 
-    # The basis functions depend only on the phase angles, so evaluate
-    # them once per fit; residuals and the analytic Jacobian reuse them.
     basis = _HG1G2_basis(phase_rad)
     residuals, jac = _HG12_residuals_and_jac(basis, mag, magSigma, fixedG12)
 
@@ -274,21 +588,25 @@ def fitHG12(
         if nSigmaClip is not None and nobsv > nparams + 1:
             # Stage 1: robust fit with soft_l1 loss
             sol_robust = least_squares(
-                residuals, x0, jac=jac, loss='soft_l1', f_scale=1.0,
+                residuals, x0, jac=jac, bounds=bounds,
+                loss='soft_l1', f_scale=1.0,
             )
             if not sol_robust.success:
-                return HG12FitResult(*(np.nan,) * 6, nobs=0)
+                return _FAILED
 
             # Sigma clipping on residuals from robust fit
             resid = residuals(sol_robust.x)
             keep = np.abs(resid) < nSigmaClip
+            if _details is not None:
+                G_r = fixedG12 if fixedG12 is not None else sol_robust.x[1]
+                _details.update(robust=(sol_robust.x[0], G_r), keep=keep)
             mag = mag[keep]
             magSigma = magSigma[keep]
             phase_rad = phase_rad[keep]
             nobsv = len(mag)
 
             if nobsv <= nparams:
-                return HG12FitResult(*(np.nan,) * 6, nobs=0)
+                return _FAILED
 
             # Redefine residuals (and basis) for clipped data
             basis = _HG1G2_basis(phase_rad)
@@ -297,12 +615,11 @@ def fitHG12(
             x0 = sol_robust.x
 
         # Final fit (linear loss for proper chi2/covariance)
-        sol = least_squares(residuals, x0, jac=jac, loss='linear')
+        sol = least_squares(residuals, x0, jac=jac, bounds=bounds, loss='linear')
 
         if not sol.success:
-            return HG12FitResult(*(np.nan,) * 6, nobs=0)
+            return _FAILED
 
-        # Extract results
         chi2_total = np.sum(sol.fun ** 2)
 
         # Covariance from Jacobian: cov = inv(J^T J)
@@ -310,17 +627,23 @@ def fitHG12(
         try:
             cov = np.linalg.inv(J.T @ J)
         except np.linalg.LinAlgError:
-            return HG12FitResult(*(np.nan,) * 6, nobs=0)
+            return _FAILED
 
         H = sol.x[0]
-        H_err = np.sqrt(cov[0, 0])
-
         if fixedG12 is not None:
             G = fixedG12
+            H_err = np.sqrt(cov[0, 0])
+            G_err = np.nan
+            HG_cov = np.nan
+        elif sol.active_mask[1] != 0:
+            # G12 at a bound
+            G = sol.x[1]
+            H_err = 1. / np.sqrt(np.sum(magSigma**-2.))
             G_err = np.nan
             HG_cov = np.nan
         else:
             G = sol.x[1]
+            H_err = np.sqrt(cov[0, 0])
             G_err = np.sqrt(cov[1, 1])
             HG_cov = cov[0, 1]
 
@@ -330,6 +653,7 @@ def fitHG12(
             chi2dof=chi2_total / (nobsv - nparams),
             nobs=nobsv,
         )
+
 
 ####################
 
