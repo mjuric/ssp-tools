@@ -52,7 +52,7 @@ addopts = "-q"
 python_files = ["test_*.py", "*_test.py", "tests/test_*.py"]
 
 [tool.setuptools]
-packages = ["ssp", "ssp.export"]
+packages = ["ssp", "ssp.export", "ssp.nearbysso"]
 
 [tool.ruff]
 line-length = 110
