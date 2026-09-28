@@ -122,10 +122,16 @@ VISIT_DTYPE = np.dtype([
 #       (amplitude ~R_earth/delta; hundreds to thousands of arcsec for NEOs
 #       within ~0.01 AU), and the rate itself changes. So the tolerance per
 #       visit is at least
-#           radius + |rate|*|dt| + 2*R_earth/delta + 0.5*|drate/dt|*dt^2
-#           + margin_arcsec
+#           radius + |rate|*|dt| + D + 0.5*|drate/dt|*dt^2 + margin_arcsec
 #       where drate/dt is estimated from the rate change between adjacent
-#       nightly samples (conservatively, the larger of the two sides).
+#       nightly samples (conservatively, the larger of the two sides), and
+#       the diurnal-parallax term is
+#           D = A * max(2, |exp(i*W*dt) - 1 - i*W*dt|) * (1 + A),
+#           A = arcsin(R_earth / delta_eff)
+#       with W the sidereal rotation rate and delta_eff = delta reduced by
+#       |d delta/dt| * |dt|. (The exact worst case of a rotating parallax
+#       vector against its linear extrapolation; the 2 covers |dt| <= 0.338 d,
+#       i.e. sampling at VisitIndex.night_t.)
 
 # --------------------------------------------------------------------------
 # WP2: propagation and uncertainty
