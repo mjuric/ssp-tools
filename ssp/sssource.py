@@ -21,27 +21,29 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
     """Fill the ephemeris-derived SSSource columns for one object.
 
     ``mpcorb`` must be indexed by unpacked_primary_provisional_designation;
-    ``assoc`` must carry the observer's barycentric state per observation
-    (obs_x/y/z [AU], obs_vx/vy/vz [km/s]).
+    ``assoc`` is a structured array holding, per observation, its row in
+    ``dia`` (dia_index) and the observer's barycentric state (obs_pos [AU],
+    obs_vel [km/s], each of shape (3,)); ``dia`` is a structured array of
+    midpointMjdTai, ra and dec.
     """
 
     # extract only the subset of observations related to this object
-    dia = dia.iloc[assoc["dia_index"]]
+    dia = dia[assoc["dia_index"]]
 
     # just verify we didn't screw up something
     assert np.all(sss["ssObjectId"] == sss["ssObjectId"][0])
     assert len(dia) == len(sss)
 
     provID = sss["designation"][0]
-    ephTimes = Time(dia["midpointMjdTai"].values, format="mjd", scale="tai")
+    ephTimes = Time(dia["midpointMjdTai"], format="mjd", scale="tai")
     e = compute_ephemerides_one(
         provID,
         ephTimes,
         None,
         ephem,
         row=mpcorb.loc[provID],
-        obs_pos=assoc[["obs_x", "obs_y", "obs_z"]].to_numpy().T,
-        obs_vel=assoc[["obs_vx", "obs_vy", "obs_vz"]].to_numpy().T,
+        obs_pos=assoc["obs_pos"].T,
+        obs_vel=assoc["obs_vel"].T,
     )
 
     sss["ephRateRa"] = e.mu_lon
@@ -51,15 +53,13 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
     # Heliocentric and topocentric vectors are at light-emission time, per
     # the SSSource schema, following JPL Horizons conventions (see
     # ssp.ephem_assist.EphResult).
-    eph = SkyCoord(ra=e.ra_deg * u.deg, dec=e.dec_deg * u.deg, frame="icrs")
+    # (RA wrapped to [0, 360), bitwise as SkyCoord would)
+    sss["ephRa"] = util.wrap_ra_deg(e.ra_deg)
+    sss["ephDec"] = e.dec_deg
 
-    sss["ephRa"] = eph.ra.deg
-    sss["ephDec"] = eph.dec.deg
-    obsv = SkyCoord(ra=dia["ra"], dec=dia["dec"], unit="deg", frame="icrs")
-
-    sss["ephOffsetDec"] = (dia["dec"].to_numpy() - sss["ephDec"]) * 3600
-    sss["ephOffsetRa"] = (dia["ra"].to_numpy() - sss["ephRa"]) * np.cos(np.deg2rad(sss["ephDec"])) * 3600
-    sss["ephOffset"] = eph.separation(obsv).arcsec
+    sss["ephOffsetDec"] = (dia["dec"] - sss["ephDec"]) * 3600
+    sss["ephOffsetRa"] = (dia["ra"] - sss["ephRa"]) * np.cos(np.deg2rad(sss["ephDec"])) * 3600
+    sss["ephOffset"] = util.sky_separation_arcsec(sss["ephRa"], sss["ephDec"], dia["ra"], dia["dec"])
 
     # Compute heliocentric position components
     sss["helio_x"] = e.helio_pos[0]
@@ -367,11 +367,13 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # per time plus a large fixed overhead per call.
     tu, inv = np.unique(t.tai.mjd, return_inverse=True)
     robs, vobs = util.observatory_barycentric_posvel("X05", Time(tu, format="mjd", scale="tai"))
-    robs = robs.to_value(u.au)[:, inv]
-    vobs = vobs.to_value(u.km / u.s)[:, inv]
-    for k, c in enumerate("xyz"):
-        assoc[f"obs_{c}"] = robs[k]
-        assoc[f"obs_v{c}"] = vobs[k]
+    # (a numpy structured array rather than columns of assoc, as slicing a
+    # DataFrame per object cost more than the rest of the bookkeeping)
+    obs_state = np.zeros(totalNumObs, dtype=[
+        ("dia_index", np.int64), ("obs_pos", np.float64, 3), ("obs_vel", np.float64, 3)])
+    obs_state["dia_index"] = assoc["dia_index"].to_numpy()
+    obs_state["obs_pos"] = robs.to_value(u.au)[:, inv].T
+    obs_state["obs_vel"] = vobs.to_value(u.km / u.s)[:, inv].T
 
     # FIXME: verify these coordinate transforms replicate IAU76 at JPL
     p = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, distance=1 * u.au, frame="hcrs")
@@ -388,15 +390,19 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables.
     ephem = open_ephem()
 
-    # compute_sssource_entry slices DiaSource rows per object; give it only
-    # the columns it uses, numpy-backed, as taking rows of all ~85
-    # pyarrow-backed columns dominated the per-object cost.
-    dia_eph = pd.DataFrame({c: dia[c].to_numpy() for c in ("midpointMjdTai", "ra", "dec")})
+    # compute_sssource_entry takes DiaSource rows per object; give it only
+    # the columns it uses, as a numpy structured array (taking rows of all
+    # ~85 pyarrow-backed columns, or even of a DataFrame, dominated the
+    # per-object cost).
+    eph_columns = ("midpointMjdTai", "ra", "dec")
+    dia_eph = np.zeros(len(dia), dtype=[(c, np.float64) for c in eph_columns])
+    for c in eph_columns:
+        dia_eph[c] = dia[c].to_numpy()
 
     # ephemerides for the objects with orbits (the first n_orbit rows);
     # every orbit-derived column of the rest is NaN.
     util.group_by(
-        [sss[:n_orbit], assoc.iloc[:n_orbit]], "ssObjectId",
+        [sss[:n_orbit], obs_state[:n_orbit]], "ssObjectId",
         partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem),
     )
     measured = ("elongation", "eclLambda", "eclBeta", "galLon", "galLat")
