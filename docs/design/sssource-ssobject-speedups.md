@@ -22,7 +22,7 @@ the full dataset: 297,749 objects and 8,069,956 SSSource rows from the
 | build | before | after | how |
 |---|---|---|---|
 | SSSource | 2,045 s (34 min), serial | **92 s** at 64 workers | B, E2, E1 |
-| SSObject | ~2.5 h serial (estimated from 27–31 ms/object) | **68 s** at 64 workers | A, C |
+| SSObject | ~2.5 h serial (estimated from 27–31 ms/object) | **59 s** at 64 workers | A, C, D |
 
 SSSource peak memory at full size: ~20 GB → 16.4 GB serial with B. At 64
 workers it's 22.7 GiB summed PSS, about 100 MB per worker.
@@ -76,10 +76,17 @@ workers it's 22.7 GiB summed PSS, about 100 MB per worker.
       2,969 inside);
     - 663 fits lose points to clipping.
 
+- **D (added after C).** Once C made the fits cheap, pandas overhead was
+  ~36% of the per-object loop: slicing the pyarrow-backed frame per object,
+  and per-object reductions and conversions. The columns
+  `compute_ssobject_entry` reads are now converted to numpy once per build,
+  with the same conversions as before, and each object gets slices of
+  those.
+  - Output byte-identical, serial and parallel, subset and full.
+  - Full SSObject build: 68 s → **59 s** (per-object stage 42 → 33 s).
+
 ### Not done
 
-- **D** (numpy slices in SSObject): the per-object loop is now dominated by
-  the fits, so it isn't worth it.
 - **Fixed costs:** ~55 s of the SSSource build and ~25 s of the SSObject
   build are serial: reading, joins, coordinate transforms, MOID set-up,
   writing. They're now the floor.
