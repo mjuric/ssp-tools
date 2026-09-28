@@ -11,6 +11,15 @@ same osculating elements.
 
 Heavy dependencies (`rebound`, `assist`) are imported lazily so simply
 importing the package does not require a JPL planet ephemeris file on disk.
+
+ASSIST's own perturbers (Pluto and the 16 asteroids of sb441-n16; see
+``self_perturber``) can't be integrated as test particles: the particle
+sits on its own point mass and is slung away. They're detected from the
+state at epoch. The 16 asteroids are integrated with ASSIST's asteroid
+forces off (as JPL leaves the target out of its perturbers; ~1-3 km per
+year of force-model error); Pluto's state is taken from the planet
+ephemeris instead (DE440's Pluto-system barycentre, ~0.06" from its MPC
+orbit). See docs/design/nearbysso.md, "ASSIST's own perturbers".
 """
 
 from __future__ import annotations
@@ -47,6 +56,20 @@ MJD_J2000 = 51544.5
 # ASSIST body id of the Sun. Passing the integer to Ephem.get_particle
 # skips its per-call name lookup, which dominated its cost.
 ASSIST_SUN = 0
+
+# ASSIST's own perturbers that are also small bodies with MPC orbits: Pluto
+# (10, from the planet file: DE440's Pluto-system barycentre, the point
+# MPC's orbit refers to) and the 16 sb441-n16 asteroids (11-26).
+ASSIST_PLUTO = 10
+ASSIST_PERTURBER_IDS = tuple(range(10, 27))
+
+# A state within both of these of one of those bodies at epoch is that
+# body: the MPC states are 11-112 km (Pluto 1,533 km) and 0.001-0.0045 m/s
+# from theirs; the nearest other orbit in the 2026-09-26 snapshot is
+# 876,000 km and 5.6 km/s from one. The velocity is what separates them (a
+# false Pluto would get Pluto's positions).
+SELF_PERTURBER_MAX_AU = 1e-4                               # ~15,000 km
+SELF_PERTURBER_MAX_AU_DAY = 1e-3 * 86400.0 / 149597870.7   # 1 m/s
 
 
 EphResult = namedtuple(
@@ -264,10 +287,122 @@ def open_ephem(planets_path: Optional[str] = None, asteroids_path: Optional[str]
 _open_ephem = open_ephem
 
 
+# The last self_perturber answer: the coarse and the precise pass of one
+# orbit ask about the same state (per process, so safe under fork).
+_SELF_PERTURBER_CACHE = {"ephem": None, "key": None, "body": None}
+
+
+def _body_velocity(body, t, ephem, p=None):
+    """Barycentric velocity [AU/day] of ASSIST body ``body`` at t: the
+    ephemeris's, or (NaN for the sb441 asteroids) a central difference of
+    positions, h = 0.01 d."""
+    p = p if p is not None else ephem.get_particle(body, t)
+    v = np.array([p.vx, p.vy, p.vz])
+    if not np.all(np.isfinite(v)):
+        a = ephem.get_particle(body, t + 0.01)
+        c = ephem.get_particle(body, t - 0.01)
+        v = (np.array([a.x, a.y, a.z]) - np.array([c.x, c.y, c.z])) / 0.02
+    return v
+
+
+def self_perturber(state_X_au, state_V_au_day, t_epoch_assist, ephem):
+    """The ASSIST body id (10-26) whose own state a barycentric state at
+    epoch is (within SELF_PERTURBER_MAX_AU and SELF_PERTURBER_MAX_AU_DAY),
+    or None for an ordinary orbit.
+
+    Integrated with all of ASSIST's forces, such an object feels its own
+    point mass from tens of km away. See the module docstring for what the
+    propagators do with them. Costs a few us: the perturbers' positions are
+    cached per epoch (17 ephemeris lookups for a new one), and the last
+    answer is cached.
+    """
+    X = np.asarray(state_X_au, dtype=np.float64).reshape(-1)[:3]
+    V = np.asarray(state_V_au_day, dtype=np.float64).reshape(-1)[:3]
+    t = float(t_epoch_assist)
+    key = (t, X.tobytes(), V.tobytes())
+    c = _SELF_PERTURBER_CACHE
+    if c["ephem"] is ephem and c["key"] == key:
+        return c["body"]
+    body = None
+    if np.all(np.isfinite(X)) and np.all(np.isfinite(V)) and np.isfinite(t):
+        B = _perturber_positions(t, ephem)
+        if B is not None:
+            dr = B - X
+            k = int(np.argmin(np.einsum("ij,ij->i", dr, dr)))
+            if dr[k] @ dr[k] < SELF_PERTURBER_MAX_AU ** 2:
+                b = ASSIST_PERTURBER_IDS[k]
+                dv = V - _body_velocity(b, t, ephem)
+                if dv @ dv < SELF_PERTURBER_MAX_AU_DAY ** 2:
+                    body = b
+    c.update(ephem=ephem, key=key, body=body)
+    return body
+
+
+# The perturbers' positions at recent epochs (MPC epochs are shared by
+# many orbits, so this makes self_perturber a few microseconds).
+_PERTURBER_POS_CACHE = {"ephem": None, "pos": {}}
+_PERTURBER_POS_CACHE_MAX = 4096
+
+
+def _perturber_positions(t, ephem):
+    """(17, 3) positions of ASSIST_PERTURBER_IDS at t, or None outside the
+    ephemeris; cached per epoch."""
+    c = _PERTURBER_POS_CACHE
+    if c["ephem"] is not ephem:
+        c.update(ephem=ephem, pos={})
+    pos = c["pos"]
+    if t not in pos:
+        try:
+            ps = [ephem.get_particle(b, t) for b in ASSIST_PERTURBER_IDS]
+            pos[t] = np.array([(p.x, p.y, p.z) for p in ps])
+        except Exception:            # outside the ephemeris
+            pos[t] = None
+        if len(pos) > _PERTURBER_POS_CACHE_MAX:
+            pos.pop(next(iter(pos)))
+    return pos[t]
+
+
+def forces_without_self(ax, body):
+    """Set an ASSIST Extras' forces for integrating perturber ``body``
+    (from self_perturber): asteroid perturbers off for bodies 11-26, the
+    planets (Pluto among them) off for Pluto. No-op for None.
+
+    (For Pluto this is only good for a plain integration: ASSIST's
+    variational equations keep the planets' tidal terms even with PLANETS
+    off, and blow up 1,500 km from Pluto.)"""
+    if body is None:
+        return
+    drop = "PLANETS" if body == ASSIST_PLUTO else "ASTEROIDS"
+    ax.forces = [f for f in ax.forces if f != drop]
+
+
+def ephemeris_states(body, t_assist, ephem):
+    """Barycentric ICRF (X, V) of ASSIST body ``body`` at times t_assist,
+    each (3, N) [AU, AU/day]; velocities as in _body_velocity."""
+    t = np.atleast_1d(np.asarray(t_assist, dtype=np.float64))
+    X = np.empty((3, len(t)))
+    V = np.empty((3, len(t)))
+    for k, tk in enumerate(t.tolist()):
+        p = ephem.get_particle(body, tk)
+        X[:, k] = (p.x, p.y, p.z)
+        V[:, k] = _body_velocity(body, tk, ephem, p)
+    return X, V
+
+
+_DETECT = object()
+
+
 def _propagate_one(
-    state_X_au, state_V_au_day, t_epoch_assist, t_targets_assist, ephem
+    state_X_au, state_V_au_day, t_epoch_assist, t_targets_assist, ephem,
+    perturber=_DETECT, integrate_pluto=False,
 ):
     """Integrate one test particle with ASSIST through a sorted list of times.
+
+    ASSIST's own perturbers (``self_perturber``; pass ``perturber`` to
+    skip the detection) are handled as the module docstring says: bodies
+    11-26 are integrated without asteroid forces, and Pluto's states come
+    from the planet ephemeris (or, with ``integrate_pluto``, from an
+    integration without the planets, e.g. to difference for Phi).
 
     Parameters
     ----------
@@ -289,9 +424,19 @@ def _propagate_one(
     import rebound
     import assist as _assist
 
+    if perturber is _DETECT:
+        perturber = self_perturber(state_X_au, state_V_au_day, t_epoch_assist, ephem)
+    if perturber == ASSIST_PLUTO and not integrate_pluto:
+        # DE440's body 10 is the Pluto-system barycentre, which is what MPC's
+        # 1930 BM orbit refers to: Horizons (2026-09-28, JD_TDB 2461200.5)
+        # puts target 9 (the barycentre) 1,534 km and 0.002 m/s from the MPC
+        # state, and 999 (Pluto itself) 2,334 km and 24.3 m/s from it.
+        return ephemeris_states(ASSIST_PLUTO, t_targets_assist, ephem)
+
     sim = rebound.Simulation()
     sim.t = float(t_epoch_assist)
     ax = _assist.Extras(sim, ephem)  # noqa: F841 (sim holds reference)
+    forces_without_self(ax, perturber)
     sim.add(
         x=float(state_X_au[0]), y=float(state_X_au[1]), z=float(state_X_au[2]),
         vx=float(state_V_au_day[0]), vy=float(state_V_au_day[1]), vz=float(state_V_au_day[2]),

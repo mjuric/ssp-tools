@@ -41,7 +41,7 @@ R_EARTH_AU = 6378.137 / AU_KM
 # Test-only helpers
 # ---------------------------------------------------------------------------
 
-def load_orbit_rows(ephem):
+def load_orbit_rows(ephem, path=None):
     """{designation: ORBIT_DTYPE row} for the test orbits: state0 from
     elements_row_to_bary_icrf, cov0 from the CAR 6x6 block (heliocentric
     ecliptic J2000), rotated to equatorial."""
@@ -54,7 +54,7 @@ def load_orbit_rows(ephem):
     R6 = np.zeros((6, 6))
     R6[:3, :3] = R6[3:, 3:] = R
     out = {}
-    for r in json.loads(ORBITS_JSON.read_text()):
+    for r in json.loads((path or ORBITS_JSON).read_text()):
         row = np.zeros((), dtype=ORBIT_DTYPE)
         row["designation"] = r["unpacked_primary_provisional_designation"]
         row["packed"] = r["packed_primary_provisional_designation"]

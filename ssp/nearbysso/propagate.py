@@ -46,6 +46,14 @@ propagation"):
   (a plunge into the Sun would hang IAS15), and a step cap stops any other
   runaway integration (see _MAX_STEPS_BASE); ``STEP_CAP_STOPS`` counts
   those stops, for the run report.
+- **ASSIST's own perturbers** (ephem_assist.self_perturber: Pluto and the
+  16 sb441-n16 asteroids, which would sit on their own point mass): their
+  states are exactly the precise pass's (ephem_assist._propagate_one: the
+  16 asteroids integrated with ASSIST's asteroid forces off, Pluto from the
+  planet ephemeris), and Phi comes from central differences of plain
+  integrations with that force group off. (Not from variational
+  particles: ASSIST's variational equations keep the perturbers' tidal
+  terms even with their force group off, and blow up next to the body.)
 - **Non-PSD sky covariances** (e.g. from a non-PSD cov0) are treated like
   missing ones: NaN errors, infinite sigma_major.
 - **Orbits with has_cov False** get NaN ellipses and sigma_major = inf, but
@@ -58,6 +66,7 @@ import ctypes
 
 import numpy as np
 
+from .. import ephem_assist as ea
 from ._contract import CoarseTrack
 
 # ASSIST body id of the Earth (geocentre).
@@ -164,6 +173,44 @@ def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
     X[done] = S[:m, 0]
     Phi[done] = np.transpose(S[:m, 1:], (0, 2, 1))  # column k: d/d state0_k
     ok[done] = True
+
+
+# Central-difference steps for a self-perturber's Phi [AU, AU/day]
+_FD_STEP = np.array([1e-5] * 3 + [1e-7] * 3)
+
+
+def _self_perturber_track(state0, epoch, t, ephem, body, X, Phi, ok):
+    """States and Phi for one of ASSIST's own perturbers (``body``, from
+    ephem_assist.self_perturber) at the finite times of t. The states are
+    ephem_assist._propagate_one's (the precise pass's): for bodies 11-26 an
+    integration without asteroid forces, for Pluto the planet ephemeris
+    (the Pluto-system barycentre, which is the point MPC's orbit refers
+    to). Phi is a central difference of plain integrations with the same
+    force group off (for Pluto, without the planets: ~0.1" in a year from
+    its own trajectory, which only matters to Phi at the 1e-3 level). 13
+    plain integrations, ~10 ms per orbit-year; there are 17 such orbits."""
+    good = np.flatnonzero(np.isfinite(t))
+    if not len(good):
+        return
+    tg = t[good]
+    kw = dict(perturber=body, integrate_pluto=True)
+    try:
+        Xs, Vs = ea._propagate_one(state0[:3], state0[3:], epoch, tg, ephem, perturber=body)
+        P = np.empty((len(good), 6, 6))
+        for j in range(6):
+            d = np.zeros(6)
+            d[j] = _FD_STEP[j]
+            sp, sm = state0 + d, state0 - d
+            Xp, Vp = ea._propagate_one(sp[:3], sp[3:], epoch, tg, ephem, **kw)
+            Xm, Vm = ea._propagate_one(sm[:3], sm[3:], epoch, tg, ephem, **kw)
+            P[:, :, j] = (np.concatenate([Xp, Vp]) - np.concatenate([Xm, Vm])).T / (2 * d[j])
+    except Exception:       # e.g. outside the ephemeris
+        return
+    S = np.concatenate([Xs, Vs]).T
+    fin = np.all(np.isfinite(P), axis=(1, 2)) & np.all(np.isfinite(S), axis=1)
+    X[good[fin]] = S[fin]
+    Phi[good[fin]] = P[fin]
+    ok[good[fin]] = True
 
 
 # The Earth's states for the last times asked for: every orbit of a run is
@@ -306,9 +353,14 @@ def coarse(orbit, t, obs_pos, ephem, _phi=None):
         good_t = np.isfinite(ts)
         fwd = order[good_t & (ts >= epoch)]
         bwd = order[good_t & (ts < epoch)][::-1]
-        for idx in (fwd, bwd):
-            if len(idx):
-                _integrate(state0, epoch, t[idx], ephem, X, Phi, ok, idx)
+        # ASSIST's own perturbers: see the module docstring
+        body = ea.self_perturber(state0[:3], state0[3:], epoch, ephem)
+        if body is not None:
+            _self_perturber_track(state0, epoch, t, ephem, body, X, Phi, ok)
+        else:
+            for idx in (fwd, bwd):
+                if len(idx):
+                    _integrate(state0, epoch, t[idx], ephem, X, Phi, ok, idx)
     # A sample without a finite observer position has no track.
     bad = ~np.all(np.isfinite(obs_pos), axis=1)
     ok &= ~bad
