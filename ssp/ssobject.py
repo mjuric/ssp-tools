@@ -53,34 +53,50 @@ def nJy_err_to_mag_err(f_njy, f_err_njy):
     """
     return 1.085736 * (f_err_njy / f_njy)
 
+FIT_COLUMNS = ["dia_psfMag", "dia_psfMagErr", "phaseAngle", "topoRange", "helioRange"]
+
+
+def _entry_columns(sss):
+    """The columns of the joined SSSource/DiaSource frame that
+    compute_ssobject_entry reads, as numpy arrays, converted once for the
+    whole table rather than per object (slicing and reducing the
+    pyarrow-backed frame per object cost about a third of the per-object
+    time). The conversions are the ones previously applied per object, so
+    the values are identical."""
+    cols = {c: np.asarray(sss[c]) for c in ["dia_band"] + FIT_COLUMNS}
+    cols["ssObjectId"] = sss["ssObjectId"].to_numpy()
+    cols["designation"] = sss["designation"].to_numpy()
+    cols["dia_midpointMjdTai"] = sss["dia_midpointMjdTai"].to_numpy(dtype=float, na_value=np.nan)
+    cols["dia_extendedness"] = sss["dia_extendedness"].to_numpy(dtype=float, na_value=np.nan)
+    return cols
+
+
 def compute_ssobject_entry(
     row, sss, fixedG12=None, magSigmaFloor=0.0, nSigmaClip=None,
 ):
+    """Fill the SSObject ``row`` of one object. ``sss`` maps each column of
+    ``_entry_columns`` to that object's rows (numpy arrays)."""
     # just verify we didn't screw up something
-    assert sss["ssObjectId"].nunique() == 1
+    assert np.all(sss["ssObjectId"] == sss["ssObjectId"][0])
 
     # Metadata columns
-    row["ssObjectId"] = sss["ssObjectId"].iloc[0]
-    row["firstObservationMjdTai"] = sss["dia_midpointMjdTai"].min()
+    row["ssObjectId"] = sss["ssObjectId"][0]
+    row["firstObservationMjdTai"] = np.nanmin(sss["dia_midpointMjdTai"])
 
     if "discoverySubmissionDate" in row.dtype.names: # DP2 does not have this field
         # FIXME: here I arbitrarily guess we discover everything 7 days
         # after first obsv. we should really pull this out of the obs_sbn tbl.
         row["discoverySubmissionDate"] = row["firstObservationMjdTai"] + 7.
     row["arc"] = np.ptp(sss["dia_midpointMjdTai"])
-    row["designation"] = sss["designation"].iloc[0]
+    row["designation"] = sss["designation"][0]
 
     # observation counts
-    row["nObs"] = len(sss)
+    row["nObs"] = len(sss["ssObjectId"])
 
-    # extract the columns needed for per-band fits as numpy arrays once;
-    # selecting bands on these is much cheaper than filtering the
-    # (pyarrow-backed) frame six times per object.
-    bandCol = np.asarray(sss["dia_band"])
-    fitCols = {
-        col: np.asarray(sss[col]) for col in
-        ["dia_psfMag", "dia_psfMagErr", "phaseAngle", "topoRange", "helioRange"]
-    }
+    # (selecting bands on numpy arrays is much cheaper than filtering the
+    # pyarrow-backed frame six times per object)
+    bandCol = sss["dia_band"]
+    fitCols = {col: sss[col] for col in FIT_COLUMNS}
 
     # per band entries
     for band in "ugrizy":
@@ -138,7 +154,7 @@ def compute_ssobject_entry(
                 row[f'{band}_nObsUsed'] = nobsv
 
     # Extendedness (null for DiaSources that lack it -> NaN)
-    ext = sss["dia_extendedness"].to_numpy(dtype=float, na_value=np.nan)
+    ext = sss["dia_extendedness"]
     ext = ext[~np.isnan(ext)]
     row["extendednessMin"] = ext.min() if len(ext) else np.nan
     row["extendednessMax"] = ext.max() if len(ext) else np.nan
@@ -160,15 +176,18 @@ MOID_COLUMNS = [
     "MOIDEarthTrueAnomaly", "MOIDEarthTrueAnomalyObject",
 ]
 
+def _entry(callback, row, cols, start, end):
+    """Call ``callback`` for the object in rows [start, end) of ``cols``."""
+    callback(row, {c: a[start:end] for c, a in cols.items()})
+
 def _ssobject_chunk(g0, g1):
     """Worker: compute SSObject rows for groups [g0, g1)."""
     sss = _PARALLEL["sss"]
     idx_start, idx_end = _PARALLEL["idx_start"], _PARALLEL["idx_end"]
     callback = _PARALLEL["callback"]
     out = np.zeros(g1 - g0, dtype=schema.SSObjectDtype)
-    # the same slicing and call as util.group_by
     for k, g in enumerate(range(g0, g1)):
-        callback(out[k], sss[idx_start[g]:idx_end[g]])
+        _entry(callback, out[k], sss, idx_start[g], idx_end[g])
     return out
 
 def _moid_chunk(j0, j1):
@@ -302,21 +321,25 @@ def compute_ssobject(
         magSigmaFloor=magSigmaFloor, nSigmaClip=nSigmaClip,
     )
     parallel = workers > 1 and util.fork_context() is not None
+    cols = _entry_columns(sss)
+    # Group boundaries as util.group_by computes them, so the rows come out
+    # in the same (ascending ssObjectId) order.
+    keys = cols["ssObjectId"]
+    if totalNumObjects and not util.values_grouped(keys):
+        raise ValueError("Key 'ssObjectId' is not properly grouped.")
+    _, idx_start, counts = np.unique(keys, return_index=True, return_counts=True)
+    idx_end = idx_start + counts
     if not parallel:
-        util.group_by([sss], "ssObjectId", callback, out=obj)
+        for k in range(totalNumObjects):
+            _entry(callback, obj[k], cols, idx_start[k], idx_end[k])
+            if k % 10_000 == 0:
+                print(f"[objects] {k:,}/{totalNumObjects:,}", flush=True)
     elif totalNumObjects:
-        # Group boundaries as util.group_by computes them, so the rows come
-        # out in the same (ascending ssObjectId) order.
-        keys = sss["ssObjectId"]
-        if not util.values_grouped(keys.to_numpy()):
-            raise ValueError("Key 'ssObjectId' is not properly grouped.")
-        _, idx_start, counts = np.unique(keys, return_index=True, return_counts=True)
-        idx_end = idx_start + counts
         # contiguous runs of groups, balanced by observation count
         chunks = util.balanced_chunks(counts, chunk_factor * workers)
         print(f"Computing {totalNumObjects:,} objects in {len(chunks)} chunks "
               f"on {workers} workers...")
-        _PARALLEL.update(sss=sss, idx_start=idx_start, idx_end=idx_end, callback=callback)
+        _PARALLEL.update(sss=cols, idx_start=idx_start, idx_end=idx_end, callback=callback)
         try:
             results = util.run_chunks(_ssobject_chunk, chunks, workers, "objects",
                                   weights=[int(counts[g0:g1].sum()) for g0, g1 in chunks])
