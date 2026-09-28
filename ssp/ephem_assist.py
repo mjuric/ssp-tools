@@ -20,6 +20,11 @@ forces off (as JPL leaves the target out of its perturbers; ~1-3 km per
 year of force-model error); Pluto's state is taken from the planet
 ephemeris instead (DE440's Pluto-system barycentre, ~0.06" from its MPC
 orbit). See docs/design/nearbysso.md, "ASSIST's own perturbers".
+
+The integrator runs IAS15 with ``adaptive_mode = 2`` at ``epsilon = 1e-11``
+(``PRECISE_ADAPTIVE_MODE``, ``PRECISE_EPSILON``): within 1 mas of a converged
+reference everywhere measured, and up to ~2,800x faster for close-approach
+NEOs than ASSIST's default step control.
 """
 
 from __future__ import annotations
@@ -52,6 +57,16 @@ _SIN_EPS = np.sin(OBLIQUITY_J2000)
 
 # J2000.0 epoch as MJD; ASSIST counts days from this instant in TDB.
 MJD_J2000 = 51544.5
+
+# IAS15 step control for _propagate_one (set after attaching ASSIST, which
+# resets it). Measured 2026-09-28 on 250 orbits over a year of candidate
+# times, against mode 2 at epsilon 1e-15: ASSIST's default control is off by
+# up to 7.3 mas in deep NEO encounters (and takes up to 3 M steps, ~130 s);
+# plain mode 2 (epsilon 1e-9) by up to 120 mas on 0.01-0.03 AU passes; mode 2
+# at 1e-11 by at most 0.93 mas, at 50-550 steps. See docs/design/nearbysso.md,
+# "Precise-pass step control".
+PRECISE_ADAPTIVE_MODE = 2
+PRECISE_EPSILON = 1e-11
 
 # ASSIST body id of the Sun. Passing the integer to Ephem.get_particle
 # skips its per-call name lookup, which dominated its cost.
@@ -437,6 +452,9 @@ def _propagate_one(
     sim.t = float(t_epoch_assist)
     ax = _assist.Extras(sim, ephem)  # noqa: F841 (sim holds reference)
     forces_without_self(ax, perturber)
+    # after attaching: ASSIST resets the step control (see PRECISE_EPSILON)
+    sim.ri_ias15.adaptive_mode = PRECISE_ADAPTIVE_MODE
+    sim.ri_ias15.epsilon = PRECISE_EPSILON
     sim.add(
         x=float(state_X_au[0]), y=float(state_X_au[1]), z=float(state_X_au[2]),
         vx=float(state_V_au_day[0]), vy=float(state_V_au_day[1]), vz=float(state_V_au_day[2]),
