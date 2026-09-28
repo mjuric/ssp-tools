@@ -44,7 +44,8 @@ propagation"):
   So do samples with a non-finite time or observer position. Orbits with
   an osculating perihelion below 0.02 AU at epoch aren't integrated at all
   (a plunge into the Sun would hang IAS15), and a step cap stops any other
-  runaway integration (see _MAX_STEPS_BASE).
+  runaway integration (see _MAX_STEPS_BASE); ``STEP_CAP_STOPS`` counts
+  those stops, for the run report.
 - **Non-PSD sky covariances** (e.g. from a non-PSD cov0) are treated like
   missing ones: NaN errors, infinite sigma_major.
 - **Orbits with has_cov False** get NaN ellipses and sigma_major = inf, but
@@ -86,6 +87,12 @@ _Q_MIN_AU = 0.02
 _MAX_STEPS_BASE = 1000
 _MAX_STEPS_PER_YEAR = 300
 
+#: Number of simulations stopped by the step cap in this process, for the
+#: run report. Read it, and reset it with ``propagate.STEP_CAP_STOPS = 0``;
+#: in forked workers each process counts its own, so a worker must return
+#: its count to the parent.
+STEP_CAP_STOPS = 0
+
 # Relative tolerance of the PSD test of a sky covariance (see _ellipse).
 _PSD_EPS = 1e-10
 
@@ -116,8 +123,12 @@ def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
     years = abs(float(t_seq[-1]) - float(epoch)) / 365.25 if len(t_seq) else 0.0
     max_steps = int(_MAX_STEPS_BASE + _MAX_STEPS_PER_YEAR * years)
 
+    capped = []
+
     def heartbeat(simp):             # the backstop; see _MAX_STEPS_BASE
         if simp.contents.steps_done > max_steps:
+            if not capped:
+                capped.append(True)
             simp.contents.stop()
     sim.heartbeat = heartbeat
 
@@ -142,6 +153,9 @@ def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
         addr = ctypes.addressof(sim._particles.contents)
         S[m] = np.frombuffer(buf_t.from_address(addr)).reshape(n, stride)[:, :6]
         m += 1
+    if capped:
+        global STEP_CAP_STOPS
+        STEP_CAP_STOPS += 1
     # Everything from the first non-finite sample on has failed.
     bad = ~np.all(np.isfinite(S[:m]), axis=(1, 2))
     if bad.any():
@@ -154,31 +168,34 @@ def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
 
 # The Earth's states for the last times asked for: every orbit of a run is
 # sampled at the same times. (Per process, so safe under fork.)
-_EARTH_CACHE = {"key": None, "E": None}
+_EARTH_CACHE = {"ephem": None, "t": None, "E": None}
 
 
 def _earth_states(t, ephem):
     """(K, 6) barycentric Earth states at ASSIST times t, cached for the
     last (t, ephem). NaN where the ephemeris can't give one."""
-    key = (id(ephem), t.tobytes())
-    if _EARTH_CACHE["key"] != key:
-        get = ephem.get_particle
-        fin = np.isfinite(t)   # (get_particle segfaults on a NaN time)
-        E = np.full((len(t), 6), np.nan)
-        try:
-            E[fin] = np.array([(e.x, e.y, e.z, e.vx, e.vy, e.vz)
-                               for e in (get(_ASSIST_EARTH, tk) for tk in t[fin].tolist())]
-                              ).reshape(-1, 6)
-        except Exception:            # a time outside the ephemeris
-            for k in np.flatnonzero(fin):
-                try:
-                    e = get(_ASSIST_EARTH, float(t[k]))
-                except Exception:
-                    continue
-                E[k] = (e.x, e.y, e.z, e.vx, e.vy, e.vz)
-        E.setflags(write=False)
-        _EARTH_CACHE.update(key=key, E=E)
-    return _EARTH_CACHE["E"]
+    # (compare the ephem by identity, holding a reference: an id() could be
+    # reused by a new object once the old one is freed)
+    tb = t.tobytes()
+    if _EARTH_CACHE["ephem"] is ephem and _EARTH_CACHE["t"] == tb:
+        return _EARTH_CACHE["E"]
+    get = ephem.get_particle
+    fin = np.isfinite(t)   # (get_particle segfaults on a NaN time)
+    E = np.full((len(t), 6), np.nan)
+    try:
+        E[fin] = np.array([(e.x, e.y, e.z, e.vx, e.vy, e.vz)
+                           for e in (get(_ASSIST_EARTH, tk) for tk in t[fin].tolist())]
+                          ).reshape(-1, 6)
+    except Exception:            # a time outside the ephemeris
+        for k in np.flatnonzero(fin):
+            try:
+                e = get(_ASSIST_EARTH, float(t[k]))
+            except Exception:
+                continue
+            E[k] = (e.x, e.y, e.z, e.vx, e.vy, e.vz)
+    E.setflags(write=False)
+    _EARTH_CACHE.update(ephem=ephem, t=tb, E=E)
+    return E
 
 
 def _observer_velocity(t, obs_pos, ephem):
@@ -355,10 +372,12 @@ def ellipse_at(track, t, topo_pos=None):
 
     Either way it's a convex combination of PSD matrices (each free-motion
     propagation A C A^T is PSD), so it stays PSD.
-    Times outside the sampled span are **clamped** to the nearest sample
-    (no extrapolation). A non-finite time, a bracketing sample with weight
-    and no covariance (failed, or has_cov False), or a non-PSD result give
-    NaN errors and an infinite sigma_major; a time exactly on a good sample
+
+    Samples with a non-finite time are ignored. Times outside the sampled
+    span are **clamped** to the nearest sample (no extrapolation). A
+    non-finite query time, a bracketing sample with weight and no
+    covariance (failed, or has_cov False), or a non-PSD result give NaN
+    errors and an infinite sigma_major; a time exactly on a good sample
     returns that sample.
     """
     t = np.asarray(t, dtype=np.float64)
@@ -370,10 +389,13 @@ def ellipse_at(track, t, topo_pos=None):
         topo_pos = np.asarray(topo_pos, dtype=np.float64).reshape(N, 3)
         if track.cov is None:
             raise ValueError("ellipse_at: topo_pos needs a track with cov")
-    if len(ts) == 0:
+    # Samples with a non-finite time are dropped (sorted last, a NaN would
+    # otherwise poison the clip for every query).
+    keep = np.flatnonzero(np.isfinite(ts))
+    if len(keep) == 0:
         nan = np.full(shape, np.nan)
         return nan, nan.copy(), nan.copy(), np.full(shape, np.inf)
-    order = np.argsort(ts, kind="stable")
+    order = keep[np.argsort(ts[keep], kind="stable")]
     ts = ts[order]
     if topo_pos is not None:
         C = np.asarray(track.cov, dtype=np.float64)[order]

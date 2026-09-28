@@ -527,6 +527,7 @@ def test_sun_plunge_is_bounded(ephem, orbits, monkeypatch):
         assert time.perf_counter() - t0 < 1.0
         assert not tr.ok.any() and np.all(tr.sigma_major == np.inf)
     monkeypatch.setattr(propagate, "_Q_MIN_AU", -1.0)
+    monkeypatch.setattr(propagate, "STEP_CAP_STOPS", 0)
     for s0 in plunges[1:]:
         o = orbit.copy()
         o["state0"] = s0
@@ -534,6 +535,10 @@ def test_sun_plunge_is_bounded(ephem, orbits, monkeypatch):
         tr = propagate.coarse(o, t, obs_pos, ephem)
         assert time.perf_counter() - t0 < 10.0      # measured 0.6 s; minutes before
         assert not tr.ok[-1]
+    n_capped = 2 * (len(plunges) - 1)      # two simulations each: t straddles the epoch
+    assert propagate.STEP_CAP_STOPS == n_capped
+    propagate.coarse(orbit, t, obs_pos, ephem)             # a real orbit isn't capped
+    assert propagate.STEP_CAP_STOPS == n_capped
     assert propagate._perihelion(orbit["state0"], orbit["epoch"], ephem) > 1.5
 
 
@@ -599,9 +604,15 @@ def test_nonfinite_state_without_error_truncates(ephem, orbits, monkeypatch):
 @needs_assist
 def test_earth_state_cache(ephem):
     t = nights(60790, 60800)
-    propagate._EARTH_CACHE.update(key=None, E=None)
+    propagate._EARTH_CACHE.update(ephem=None, t=None, E=None)
     E1 = propagate._earth_states(t, ephem)
     assert propagate._earth_states(t.copy(), ephem) is E1
+    assert propagate._EARTH_CACHE["ephem"] is ephem       # held by reference
+
+    class OtherEphem:                                     # another ephem: a miss
+        def get_particle(self, body, tk):
+            return ephem.get_particle(body, tk)
+    assert propagate._earth_states(t, OtherEphem()) is not E1
     E2 = propagate._earth_states(t + 1.0, ephem)
     assert E2 is not E1
     e = ephem.get_particle(3, float(t[4] + 1.0))
@@ -637,3 +648,36 @@ def test_ellipse_at_topo_pos_close_approach(ephem, orbits, name, ca):
     for got, want in ((ra_err, direct.ra_err), (dec_err, direct.dec_err)):
         assert np.all(np.abs(got - want) < np.maximum(0.02 * want, 0.02 * smaj)), name
     assert np.all(np.abs(cov - direct.ra_dec_cov) < 0.04 * smaj ** 2), name
+
+
+def test_ellipse_at_ignores_nonfinite_sample_times():
+    """A NaN sample time is dropped rather than poisoning every query."""
+    rng = np.random.default_rng(2)
+    t = np.arange(10.0)
+    s00 = rng.uniform(1, 2, 10) * 1e-8
+    s11 = rng.uniform(1, 2, 10) * 1e-8
+    s01 = rng.uniform(-0.5, 0.5, 10) * 1e-8
+    A = rng.normal(size=(10, 6, 6)) * np.array([1e-6] * 3 + [1e-7] * 3)
+    cov = A @ np.transpose(A, (0, 2, 1))
+    clean = _track(t, s00, s01, s11)._replace(cov=cov)
+    tn = t.copy()
+    tn[4] = np.nan
+    dirty = clean._replace(t=tn)
+    drop = np.arange(10) != 4
+    ref = _track(t[drop], s00[drop], s01[drop], s11[drop])._replace(cov=cov[drop])
+    tq = np.array([0.0, 0.5, 2.9, 3.5, 4.0, 4.5, 6.2, 9.0, 12.0])
+    topo = rng.normal(size=(len(tq), 3))
+    for kw in ({}, {"topo_pos": topo}):
+        got = propagate.ellipse_at(dirty, tq, **kw)
+        want = propagate.ellipse_at(ref, tq, **kw)
+        for g, w in zip(got, want):
+            np.testing.assert_array_equal(g, w)
+        assert np.isfinite(got[3]).all()
+        # away from the dropped sample, the same as the clean track
+        away = np.abs(tq - 4) > 1
+        for g, c in zip(got, propagate.ellipse_at(clean, tq, **kw)):
+            np.testing.assert_array_equal(g[away], c[away])
+    # no finite sample times at all
+    none = clean._replace(t=np.full(10, np.nan))
+    ra_err, dec_err, c, sig = propagate.ellipse_at(none, tq)
+    assert np.all(sig == np.inf) and np.isnan(ra_err).all() and np.isnan(c).all()
