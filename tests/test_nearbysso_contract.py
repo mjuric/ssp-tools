@@ -9,4 +9,4 @@ def test_contract():
     assert set(C.DIA_COLUMNS) <= {"diaSourceId", "visit", "midpointMjdTai", "ra", "dec"}
     assert C.NEARBYSSO_DTYPE.names[0] == "diaSourceId"
     assert len(C.CoarseTrack._fields) == 12
-    assert C.CoarseTrack._field_defaults == {"cpos": None}
+    assert C.CoarseTrack._field_defaults == {"cov": None}

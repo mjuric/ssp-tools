@@ -170,9 +170,9 @@ class CoarseTrack(NamedTuple):
     ok: np.ndarray           # (K,) bool: False where the integration failed
     delta: np.ndarray        # (K,) [AU] topocentric distance (sizes the diurnal-
                              # parallax term of the candidate margin)
-    cpos: np.ndarray | None = None  # (K, 3, 3) [AU^2] barycentric position block
-                             # of C(t) (NaN where not ok or not has_cov), for
-                             # ellipse_at's precise projection
+    cov: np.ndarray | None = None  # (K, 6, 6) barycentric state covariance
+                             # C(t) (AU, AU/day; NaN where not ok or not
+                             # has_cov), for ellipse_at's precise projection
 
 
 # propagate.coarse(orbit, t, obs_pos, ephem) -> CoarseTrack
@@ -194,15 +194,18 @@ class CoarseTrack(NamedTuple):
 #       -> (ra_err, dec_err, ra_dec_cov, sigma_major)
 #   The error ellipse at arbitrary ASSIST times t (inside the sampled span).
 #   With topo_pos ((N, 3) [AU], object - observer at each t, e.g. the
-#   precise pass's EphResult.topo_pos.T), it linearly interpolates
-#   track.cpos between samples (a convex combination, so it stays positive
-#   semidefinite) and projects it on the tangent plane of topo_pos; this is
-#   what the published ephRaErr/ephDecErr/ephRa_ephDec_Cov use. (Interpolating
-#   the sky components instead is ~20% off for NEOs within ~0.01 AU, whose
-#   line of sight turns within a night, and loses size near the poles.)
-#   Without topo_pos, it interpolates the sky components of the samples.
-#   Non-finite t, or a non-PSD result, gives NaN errors and an infinite
-#   sigma_major (never eligible).
+#   precise pass's EphResult.topo_pos.T), it propagates track.cov from each
+#   of the two bracketing samples to t under free motion (position block
+#   C_pp + tau*(C_pv + C_vp) + tau^2*C_vv, tau = t - t_k), blends the two
+#   linearly in time (a convex combination, so it stays positive
+#   semidefinite), and projects the result on the tangent plane of topo_pos;
+#   this is what the published ephRaErr/ephDecErr/ephRa_ephDec_Cov use.
+#   (Interpolating the sky components instead is ~20% off for NEOs within
+#   ~0.01 AU, whose line of sight turns within a night; interpolating the
+#   position block alone overestimates short-arc sigmas by up to ~50x,
+#   because C(t) is quadratic in time.) Without topo_pos, it interpolates
+#   the sky components of the samples. Non-finite t, or a non-PSD result,
+#   gives NaN errors and an infinite sigma_major (never eligible).
 
 # --------------------------------------------------------------------------
 # WP4: the output
