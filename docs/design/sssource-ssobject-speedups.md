@@ -34,10 +34,11 @@ See *Plan* for the order and who does what.
      full build benchmark with both);
    - open one PR per change (B, A, C), or a combined A+C PR if they're easier
      to review together, and merge only after owner approval.
-4. **E after A is merged,** by one subagent in its own worktree, reusing A's
-   pool and chunking. E2 comes first, so that E1's serial-against-parallel
-   equality check compares identical code. The same review, integration and
-   merge flow as above.
+4. **E in two steps.** E2 is independent of A and runs now, in parallel with
+   A and C (one subagent, branch `sssource-numpy`). E1 follows once A and E2
+   are merged, reusing A's pool and chunking. With E2 already in, E1's
+   serial-against-parallel equality check compares identical code. The same
+   review, integration and merge flow as above.
 5. **Order of effect:**
    - A alone is ~30–60× (per-object work across ~64 workers);
    - C alone is ~5–10× per fit, with the robust stage included, since both
