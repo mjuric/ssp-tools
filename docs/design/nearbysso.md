@@ -124,6 +124,52 @@ Since the coarse pass needs Φ for every orbit, it runs one orbit per simulation
 
 `adaptive_mode = 2` made every case 1.3–2× faster than ASSIST's default controller. (It would also speed up the SSSource build, as a separate change, since it alters step choices at the numerical-noise level.)
 
+## ASSIST's own perturbers (measured 2026-09-28)
+
+ASSIST integrates a test particle in the field of the Sun, the planets, Pluto, the Moon and 16 large asteroids (`sb441-n16`). Seventeen `mpc_orbits` objects *are* those perturbers: Pluto (1930 BM, ASSIST body 10, from the DE440 planet file) and the 16 asteroids (bodies 11–26: Ceres, Pallas, Juno, Vesta, Iris, Hygiea, Eunomia, Psyche, Euphrosyne, Europa, Cybele, Sylvia, Thisbe, Camilla, Davida, Interamnia). Integrated as test particles, they sit on their own point mass and are slung away.
+
+| | these 17 |
+|---|---|
+| MPC state at epoch, from its own body | 11–112 km (Pluto 1,533 km), 0.001–0.0045 m/s |
+| coarse pass (variational), steps per year | 21,000–127,000 without the step cap (normal: ~30); with it, every sample fails |
+| precise pass (`compute_ephemerides_one`) | finishes (0.1–0.8 s), but its positions are **16–152° off** |
+
+The last row is SSSource's path too. There are no SSSource rows for these objects today, so no output was affected.
+
+**Options** (errors over ±1 year unless stated; the costs are per orbit-year):
+
+| option | 16 asteroids | Pluto | cost |
+|---|---|---|---|
+| (a) integrate without the self-perturbing force group (ASTEROIDS; for Pluto, all of PLANETS) | force-model error on JPL's own state: 1–3 km (±1 yr), 2–5 km (±2 yr), 5–42 km (±5 yr), i.e. ≤ 0.002″ in a year; the MPC orbit is 40–147 km (0.02–0.11″) from JPL's | 2,700 km (0.11″) at ±1 yr, 11,000 km (0.46″) at ±2 yr, 79,000 km (3.2″) at ±5 yr | as any orbit |
+| (b) positions from the ASSIST ephemeris | 11–147 km (0.02–0.11″) from the MPC-orbit prediction | 1,533 km (0.06″) from it | ~10 µs per sample |
+| (c) leave out only the target's own body, as JPL does | not available in ASSIST (no per-body mask); an upstream feature | same | — |
+
+(a) matches Horizons with MPC elements (JPL leaves the target out of its perturbers) to the force-model error. Planets can't be dropped one at a time, so (a) is poor for Pluto.
+
+**Owner decision (2026-09-28): hybrid.** (a) for the 16 asteroids, (b) for Pluto, in both passes (`ssp.ephem_assist`, so SSSource too). Pluto is a known exception in WP5's check against Horizons with MPC elements.
+
+- **Pluto's point:** DE440's body 10 is the Pluto-system barycentre, and MPC's 1930 BM orbit refers to the same point. Horizons (two serial VECTORS queries, centre 500@0, ICRF, JD_TDB 2461200.5, the MPC epoch) against `load_orbits`' state0:
+
+  | Horizons target | Δpos | Δvel |
+  |---|---|---|
+  | 999 (Pluto itself) | 2,334 km | 24.3 m/s (its motion about the barycentre) |
+  | 9 (Pluto-system barycentre) | 1,534 km | 0.002 m/s |
+
+  The 1,534 km is the difference between MPC's and JPL's orbit solutions.
+- **Detection** (`ephem_assist.self_perturber`), automatic at epoch: within 1e-4 AU (~15,000 km) **and** 1 m/s of one of bodies 10–26. The velocity is what separates them (a false match would give an orbit Pluto's positions):
+
+  | | Δr | Δv |
+  |---|---|---|
+  | the 17 self-perturbers | 11–112 km (Pluto 1,533 km) | 0.001–0.0045 m/s |
+  | nearest other orbit to any body | 876,000 km (2014 RE55, body 17) | 5.6 km/s |
+  | the next few | 1.1–1.4 million km | 3.0–3.7 km/s |
+
+  On the full 2026-09-26 snapshot (1,548,119 orbits) it finds exactly these 17, at ~21 µs per orbit (the bodies' positions are cached per epoch).
+- **The coarse pass's Φ** for these 17 comes from central differences of plain integrations (13 per orbit, with the same force group off), not from variational particles: ASSIST's variational equations keep the perturbers' tidal terms even with their force group off, and blow up next to the body. That's ~40–60 ms per orbit-year for 17 orbits, against ~5 ms for any other. Their σ is 3–18 mas.
+- **Ordinary orbits are bitwise unchanged** in both passes (checked on 205 orbits against the code before the change).
+
+The measurement scripts are in `/lscratch/mjuric/sspwt/nearbysso/wp2_perturbers/` (`scan.py`, `probe.py`, `pluto.py`, `astlong.py`, `detect_all.py`, `bitwise.py`, and their outputs); they are not in the repo.
+
 ## Performance estimate
 
 For a year of data, ~1.4M orbits, at 64 workers:
