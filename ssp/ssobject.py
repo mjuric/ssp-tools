@@ -115,7 +115,10 @@ def compute_ssobject_entry(
                     fixedG12=fixedG12, magSigmaFloor=magSigmaFloor,
                     nSigmaClip=nSigmaClip,
                 )
-                nDof = nBandObs - (1 if fixedG12 is not None else 2)
+                # chi2dof is per degree of freedom of the points the fit
+                # used (after clipping), so scale back by those, not by all
+                # of the band's observations.
+                nDof = nobsv - (1 if fixedG12 is not None else 2)
                 # print(provID, band, H, G12, sigmaH, sigmaG12, covHG12,
                 #       chi2dof, nobsv)
 
