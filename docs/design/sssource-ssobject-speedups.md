@@ -330,8 +330,7 @@ value and only G12 is searched.
     bound isn't meaningful;
   - `H_err` is the fixed-G12 error `1/sqrt(Σ w_i)`.
 
-  **Flagged for owner review:** the alternative is to report the
-  two-parameter formula even at a bound.
+  **Owner decision (2026-09-27):** NaN at a bound, as above.
 - **Failure:** `nobs = 0` and NaNs, as today (no finite observations, too
   few points left after clipping, a singular `JᵀJ`).
 
