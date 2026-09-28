@@ -139,13 +139,27 @@ The cost grows about linearly with survey length. When full regeneration outgrow
 
 ## Validation
 
-1. **Agreement with SSSource.** On a catalog with SSSource rows (e.g. DP2-DS), every associated DiaSource should appear in NearbySSO with the same designation and identical `eph*` values (same ASSIST code). Report the recovered fraction and account for every miss (quality filter, σ gate, radius).
-2. **Coarse-pass safety.** On a sample of visits, compare the candidate list against brute force (all eligible orbits, exact ephemerides) to show the margins lose nothing.
-3. **Uncertainty checks:**
+**The references, and what each can show:**
+- **JPL Horizons, with our own elements, is the arbiter for ephemerides.** `bench/ephem_bench.py`'s `horizons_observer` sends each orbit's own `mpc_orbits` osculating elements (`COMMAND=';'`, cometary TP/QR), so Horizons and ASSIST see the same orbit, and a difference is ours. The existing gate is < 1 mas RMS.
+- **SSSource is a consistency reference, not truth,** and only when it was built from the same orbits (below).
+- **Horizons etiquette:** queries are single-threaded, with a pause (1 s) between them and epochs chunked (≤ 60 per query), as ssp-submit does. It's never run in parallel or automatically in CI; parallel querying risks a JPL ban.
+
+**Checks:**
+1. **Agreement with SSSource, from the same orbits.** A DiaSource's SSSource ephemeris and its NearbySSO ephemeris are only comparable if both came from the **same `mpc_orbits` snapshot** with the same code. So:
+   - **The main check** builds SSSource with this repo's `ssp.sssource` from the **same** `mpc_orbits` file NearbySSO uses, on the same DiaSource catalog. Every SSSource row should then appear in NearbySSO with the same designation and **identical** `eph*` values (same ASSIST code and conventions), apart from rows excluded by NearbySSO's own rules: the quality filter, the σ gate, the 5″ radius, and nearest-only.
+   - **A comparison against DP2's published SSSource** is valid only with the orbit catalog DP2 used, and **DP2's quality cuts were different.** Its SSSource includes objects our filter excludes, and the reverse. So that comparison is restricted to the objects both keep, run with DP2's orbit snapshot, and reported, not gated. Designations are reconciled via `current_identifications` first.
+   - **Every discrepancy is checked against Horizons** with that orbit's elements: which side matches Horizons? A NearbySSO discrepancy that Horizons confirms is a bug. One where SSSource disagrees with Horizons goes to the SSSource code.
+2. **Horizons spot checks, independent of SSSource,** run as part of validating each release of the tool, not every day:
+   - a stratified random sample of ~100 NearbySSO rows: main belt, NEOs (including one at close approach), Jupiter Trojans, TNOs, short-arc orbits, and rows near the 5″ radius and near the σ = 10″ gate;
+   - for each, Horizons' astrometric RA/Dec at the DiaSource's time and observer X05, from the orbit's own elements;
+   - gated at the existing < 1 mas RMS criterion, and the per-row `ephOffset`, rates and `ephVmag` compared too.
+3. **Coarse-pass safety.** On a sample of visits, compare the candidate list against brute force (all eligible orbits, exact ephemerides) to show the margins lose nothing.
+4. **Uncertainty checks:**
    - Φ from the variational particles against finite differences, for a sample including NEOs;
-   - the propagated σ against a Monte Carlo sample of orbits drawn from C₀, for a few short-arc and long-arc objects.
-4. **Serial against parallel:** byte-identical output.
-5. **Tests:** synthetic orbits with a fake ephemeris, as E1's tests use, for the matching, reduction and σ gate. ASSIST-dependent tests are skipped when `SSP_ASSIST_*` isn't set.
+   - the propagated σ against a Monte Carlo sample of orbits drawn from C₀ (each integrated), for a few short-arc and long-arc objects. This can't be checked against Horizons with user-supplied elements, since Horizons reports uncertainties only for JPL's own orbits.
+   - **Optional, qualitative:** Horizons' RA/Dec 3σ (quantity 36) for JPL's orbit of the same objects, as a sanity check on the order of magnitude. The orbit solutions differ, so it's not gated.
+5. **Serial against parallel:** byte-identical output.
+6. **Tests:** synthetic orbits with a fake ephemeris, as E1's tests use, for the matching, reduction and σ gate. ASSIST-dependent tests are skipped when `SSP_ASSIST_*` isn't set; Horizons checks are never in the test suite.
 
 ## Out of scope
 
