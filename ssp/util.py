@@ -612,7 +612,8 @@ def run_chunks(func, chunks, workers, label, weights=None, unit="objects"):
     Run ``func(start, end)`` for each (start, end) chunk in a forked
     process pool and return the results in chunk order.
 
-    Prints progress once per finished chunk; the time left is estimated
+    Prints progress once per finished chunk (with more than 200 chunks,
+    about 200 times in all); the time left is estimated
     from the chunks' ``weights`` (default: their sizes), counting
     ``unit``. The first exception in any worker cancels the remaining
     chunks and is re-raised in the parent; a worker process that dies (e.g.
@@ -624,7 +625,8 @@ def run_chunks(func, chunks, workers, label, weights=None, unit="objects"):
     total, total_weight = chunks[-1][1] - chunks[0][0], float(sum(weights))
     t0 = time.monotonic()
     results = [None] * len(chunks)
-    done, done_weight = 0, 0.0
+    done, done_weight, n_done = 0, 0.0, 0
+    every = max(1, len(chunks) // 200)
     pool = ProcessPoolExecutor(max_workers=min(workers, len(chunks)), mp_context=fork_context())
     try:
         futures = {pool.submit(func, s, e): n for n, (s, e) in enumerate(chunks)}
@@ -634,6 +636,9 @@ def run_chunks(func, chunks, workers, label, weights=None, unit="objects"):
             s, e = chunks[n]
             done += e - s
             done_weight += weights[n]
+            n_done += 1
+            if n_done % every and n_done < len(chunks):
+                continue
             elapsed = time.monotonic() - t0
             left = elapsed * (total_weight - done_weight) / done_weight if done_weight else float("nan")
             print(f"[{label}] {done:,}/{total:,} {unit}, "

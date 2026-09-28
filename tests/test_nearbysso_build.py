@@ -418,6 +418,8 @@ def test_serial_parallel_and_slice_sizes_identical(tmp_path, synth, orbits, monk
     assert pq.read_metadata(a).num_rows > 0
     ref = a.read_bytes()
     b, _ = _run(tmp_path, synth, orbits, "parallel", workers=3, read_workers=2, chunk_factor=2)
+    b2, _ = _run(tmp_path, synth, orbits, "parallel64", workers=2, read_workers=2)   # (chunks of 1 orbit)
+    assert b2.read_bytes() == ref
     assert b.read_bytes() == ref
     # one slice per night: each slice's first and last visits have rows
     # (test_end_to_end), so a slice losing either shows here
@@ -432,20 +434,37 @@ def test_serial_parallel_and_slice_sizes_identical(tmp_path, synth, orbits, monk
     assert d.read_bytes() == ref
 
 
-def test_sort_by_visit_is_stable():
+def test_sort_predictions():
+    """Chunks in any order (the schedule permutes the orbits) come out
+    sorted by (visit, orbit), with each visit's offsets."""
     rng = np.random.default_rng(3)
-    chunks, full = [], []
-    for j in range(4):
-        p = np.zeros(rng.integers(0, 50), dtype=B.PRED_DTYPE)
-        p["visit"] = rng.integers(0, 7, p.size)
-        p["orbit"] = np.sort(rng.integers(100 * j, 100 * j + 100, p.size))
-        chunks.append(p)
-        full.append(p.copy())
-    full = np.concatenate(full)
-    out, off = B.sort_by_visit(chunks, 7)
-    assert np.array_equal(out, full[np.argsort(full["visit"], kind="stable")])
-    assert all(c is None for c in chunks)
-    np.testing.assert_array_equal(off, np.searchsorted(out["visit"], np.arange(8)))
+    p = np.zeros(300, dtype=B.PRED_DTYPE)
+    p["visit"] = rng.integers(0, 7, p.size)
+    p["orbit"] = rng.permutation(p.size)
+    p["ra"] = rng.uniform(0, 360, p.size)
+    want = p[np.lexsort((p["orbit"], p["visit"]))]
+    cuts = np.sort(rng.choice(np.arange(1, p.size), 5, replace=False))
+    chunks = np.split(p[rng.permutation(p.size)], cuts)
+    out, off = B.sort_predictions(chunks, 9)
+    assert np.array_equal(out, want)
+    assert chunks == []
+    np.testing.assert_array_equal(off, np.searchsorted(out["visit"], np.arange(10)))
+
+
+def test_orbit_schedule():
+    """The NEOs first, stably, in chunks covering every orbit once."""
+    o = np.zeros(1000, dtype=ORBIT_DTYPE)
+    o["q"] = np.where(np.arange(1000) % 10 == 3, 0.9, 2.5)
+    o["epoch"] = 9000.0
+    w = B.chunk_weights(o, 9000.0, 9365.0)
+    order, chunks = B.orbit_schedule(w, 64)
+    neo = np.flatnonzero(o["q"] < B.NEO_Q_AU)
+    np.testing.assert_array_equal(order[:neo.size], neo)
+    np.testing.assert_array_equal(np.sort(order), np.arange(1000))
+    assert chunks[0][0] == 0 and chunks[-1][1] == 1000
+    assert all(a[1] == b[0] for a, b in zip(chunks, chunks[1:]))
+    # the NEO chunks are the small ones
+    assert chunks[0][1] - chunks[0][0] < chunks[-1][1] - chunks[-1][0]
 
 
 @needs_assist
