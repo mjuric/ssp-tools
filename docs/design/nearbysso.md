@@ -257,7 +257,7 @@ The fixtures' wall time is dominated by the coarse pass and doesn't change measu
 **Output changes:**
 - **DP2-DS NearbySSO:** md5 `f2e8f9086a501b4a190486fc229f79db` → `c77fdf556c20ab93abe0de1e7418b671`. The same rows, designations and nearest matches; max position change 0.69 mas (1999 CU79), p99.9 < 0.0001 mas.
 - **AP-DS:** `556df1a1a45d06713cdce976bebb2575` → `1b5c4c447d1cdbee920ce48393d01cdd`, max change < 0.001 mas.
-- **WP5 same-orbits** against the SSSource fixture, which was built with the old integrator: max 0.69 mas. 97 rows exceed its 0.1 mas tolerance: 2015 BZ220 (89 rows, 0.36 mas) and 1999 CU79 (8 rows, 0.69 mas). The gate passes again once that fixture is rebuilt with the same code.
+- **WP5 same-orbits** against the SSSource fixture, which was built with the old integrator: max 0.69 mas. 97 rows exceed its 0.1 mas tolerance: 2015 BZ220 (89 rows, 0.36 mas) and 1999 CU79 (8 rows, 0.69 mas). The fixture was then regenerated with the new precise pass (`sssource_dp2ds_20250501-03.same-orbits.precise-adaptive2.parquet`; see the fixtures README). Against it the gate **passes**: 812,686 rows match, 810,542 of them bitwise, with a maximum position difference of 3.9e-6 mas; rates and V are exact.
 
 The measurement scripts and logs are in `/lscratch/mjuric/sspwt/nearbysso/adaptive/`, not in the repo.
 
