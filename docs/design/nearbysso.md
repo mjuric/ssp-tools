@@ -1,6 +1,6 @@
 # Design: building the NearbySSO table
 
-Status: **proposed**, for review. Nothing here is implemented yet.
+Status: **implemented** (`ssp/nearbysso/`, `ssp-build-nearbysso`); validated on the fixtures (below), a full year of PPDB data pending.
 
 ## Context
 
@@ -81,30 +81,35 @@ One row per DiaSource that has an eligible known object's prediction within 5″
 - **Orbits without a covariance** (~0.3% of arcs under 10 days) are ineligible, and counted in the run report.
 - **Formal errors may be optimistic;** they're used as given. The report records the distribution of `normalized_rms`, to show whether scaling by it would matter.
 
-## Algorithm: one parallel pass, per object
+## Algorithm: three passes, each orbit integrated once
 
-The work is grouped **per object**, not per visit, so each orbit is integrated once per stage. It reuses the fork-pool helpers from the SSSource/SSObject speed-ups (`util.run_chunks`, `util.balanced_chunks`).
+The work is grouped **per object**, not per visit, and each orbit is integrated once, over all nights. Only the DiaSources are sliced, to bound memory. It reuses the fork-pool helpers from the SSSource/SSObject speed-ups (`util.run_chunks`, `util.balanced_chunks`). Implemented in `ssp/nearbysso/build.py` (`ssp-build-nearbysso`).
 
-**Parent (serial, fast):**
-1. Read the DiaSources: 5 columns, sorted by visit. For each visit, derive its time, field centre and radius, and build its sky index: DiaSources binned into HEALPix cells of ~13″ (order 14, via `cdshealpix`; at order 15, ~6.4″, neighbour lookups miss at 5″).
-2. Index visit centres per night, and compute the observer (X05) barycentric state at every visit time (vectorized, as SSSource does).
-3. Read and filter the orbits, and convert them to barycentric ICRF states at epoch, with covariance.
+**Slices:** blocks of `--slice-days` (default 7) consecutive day_obs dates (`night = visit // 100000`). A slice is read with time bounds covering its nights, then cut on the night itself, so a night is never split and every DiaSource is in exactly one slice.
 
-Everything is shared with the workers through fork.
+**Pass 1: visits** (`--read-workers` fork processes, default 8, one slice each):
+1. Read the slice's DiaSources: 5 columns, sorted by visit.
+2. Derive each visit's time, field centre and radius, and the observer (X05) barycentric state (vectorized, as SSSource does).
 
-**Worker, per orbit (one orbit per ASSIST simulation):**
-1. **Coarse pass:** integrate from the orbit epoch across the nights covered by the input, with six variational particles (`testparticle=0`) and IAS15 `adaptive_mode = 2` (set after attaching ASSIST, as layup does). At each night's reference time, record the topocentric position, the on-sky rate and σ.
-2. **Candidates:** for each night where σ ≤ 10″, the visits whose field, widened by the object's motion within the night plus a safety margin, contains the coarse position. Typically a few to a few hundred visits per object and year.
-3. **Precise pass:** `compute_ephemerides_one` at exactly those visit times: light-time corrected, topocentric, with rates and V, as SSSource. σ and the ellipse at each visit come from the coarse pass's Φ at that night, interpolated in time.
-4. **Match:** look up the predicted position's HEALPix cell and its neighbours in that visit's DiaSource index. Emit `(diaSourceId, designation, ephOffset, eph…, ellipse)` for every DiaSource within 5″.
+The parent concatenates the visits of all nights, indexes their centres per night (`VisitIndex`), and computes the observer at the coarse sample times. It reads and filters the orbits and converts them to barycentric ICRF states at epoch, with covariance.
 
-**Parent (reduce):**
-1. Keep the nearest row per `diaSourceId`.
-2. Attach `ssObjectId`.
-3. Write `nearbysso.parquet`.
-4. Write a run report: counts, eligibility statistics, orbits without a covariance, and timings.
+**Pass 2: orbits** (`--workers` fork processes, chunks of orbits balanced by a cost proxy; one orbit per ASSIST simulation):
+1. **Coarse pass:** integrate from the orbit epoch across all nights, with six variational particles (`testparticle=0`) and IAS15 `adaptive_mode = 2` (set after attaching ASSIST, as layup does). It samples **three times per night**: at its `night_t` (the midpoint of its visits) and at `night_t ± h`, h = max(the farther visit from `night_t`, 1 h). Every visit is then bracketed by samples of its own night, and the rate changes the candidate test estimates come from that night alone. Each sample records the topocentric position, the on-sky rate, the distance, σ and C(t).
+2. **Candidates:** for each night whose `night_t` sample has σ ≤ 10″, the visits whose field, widened by the object's motion within the night, the diurnal parallax, the curvature and a margin, may contain it (`VisitIndex.candidates`; every visit of the night within 0.02 AU). Typically a few to a few hundred visits per object and year.
+3. **Precise pass:** `compute_ephemerides_one` at exactly those visit times: light-time corrected, topocentric, with rates and V, as SSSource.
+4. **Ellipse and σ cut:** C(t) from the two bracketing samples, propagated under free motion, projected on the precise line of sight (`ellipse_at`); predictions with σ > 10″ are dropped.
+5. Return the eligible **predictions** (visit, orbit, position, rates, V, ellipse: 48 bytes each). The parent sorts them by visit (a stable counting sort).
 
-**Memory bound:** DiaSources are processed in time slices, one month by default. At PPDB rates, 10M a night is ~150 GB a year for 5 columns, so orbits are re-integrated per slice. That's cheap next to holding all DiaSources in memory at once.
+**Pass 3: matching** (`--read-workers` processes, one slice each; the predictions shared through fork):
+1. Read the slice again and bin its DiaSources into HEALPix cells per visit (`DiaIndex`: order 15, looked up at order 14, ~13″, since at order 15 neighbour lookups miss at 5″).
+2. Match the slice's predictions (a contiguous range of the sorted ones) in batches: the predicted position's cell and its neighbours, then every DiaSource within 5″.
+3. Keep the nearest per `diaSourceId`, ties by designation. A slice owns its DiaSources, so this is exact.
+
+**Parent (reduce):** concatenate, attach `ssObjectId`, write `nearbysso.parquet` and the run report (counts, eligibility statistics, failed orbits and exceptions, timings, peak memory), each to a temporary file renamed into place.
+
+**Determinism:** the output is byte-identical for any `--workers`, `--read-workers`, chunking and `--slice-days`: the orbit pass sees all nights whatever the slicing, and matching and the reduction are per visit and per DiaSource. One bad orbit is counted and skipped, never fatal.
+
+**Memory:** the parent holds the predictions (~200–300M a year, 10–14 GB; about twice that while sorting); a read worker holds one slice (at PPDB rates, 70M DiaSources a week, ~5 GB).
 
 ## Why one orbit per simulation (measured 2026-09-28)
 
@@ -170,16 +175,34 @@ The last row is SSSource's path too. There are no SSSource rows for these object
 
 The measurement scripts are in `/lscratch/mjuric/sspwt/nearbysso/wp2_perturbers/` (`scan.py`, `probe.py`, `pluto.py`, `astlong.py`, `detect_all.py`, `bitwise.py`, and their outputs); they are not in the repo.
 
-## Performance estimate
+## Performance (measured 2026-09-28)
 
-For a year of data, ~1.4M orbits, at 64 workers:
+**On the fixtures** (3 nights each; 1,548,119 orbits; 32 workers on a shared node; one 7-day slice):
 
-| part | estimate |
+| | DP2-DS (63.1M DiaSources, 1,603 visits) | AP-DS (1.7M, 1,409 visits) |
+|---|---|---|
+| total | 258 s | 250 s |
+| load_orbits | 12–20 s | 19 s |
+| pass 1 (read, visits) | 6 s | 1 s |
+| pass 2 (orbits), wall | 223 s | 227 s |
+| pass 2 CPU: coarse / candidates / precise / ellipse | 4,686 / 383 / 200 / 8 s | 4,228 / 361 / 92 / 2 s |
+| pass 3 (read, index, match) | 16 s | 2 s |
+| eligible predictions | 2.51M | 1.03M |
+| output rows (matches before the nearest reduction) | 957,017 (957,476) | 564,580 (565,026) |
+| peak RSS: parent, largest worker | 6.7 GB, 6.7 GB | 6.7 GB, 6.7 GB |
+
+The coarse pass is ~88% of the CPU. On 3 nights it costs ~3 ms per orbit, mostly per-simulation overhead.
+
+**A year** (pass 2 measured on the DP2 visits repeated for 365 nights, their centres rotated with the Sun: 195k visits, 1,095 coarse samples, 600 random orbits):
+
+| part | estimate, 64 cores |
 |---|---|
-| coarse pass with variational particles | ~2.4 ms × 1.4M ≈ 56 CPU-min ≈ **~1 min** |
-| precise pass (candidates only; SSSource's ~5 ms per object-year as the bound) | ≈ 2 CPU-h ≈ **~2 min** |
-| reading ~3.6B DiaSources (5 columns), indexing, matching | **several min** (I/O-bound) |
-| **total** | **~5–10 min**, within the 30-min budget |
+| pass 2: 10.8 ms per orbit (coarse 8.1, candidates 0.65, precise 1.9, ellipse 0.16) × 1.55M | 4.3 min at perfect scaling, **~6 min** at the ~70% efficiency measured |
+| passes 1 and 3: 3.6B DiaSources, read twice (~2 GB/s assumed), 52 slices on 8 read workers | **~3 min** |
+| load_orbits, night ranges, sort, reduce, write | **~1.5 min** |
+| **total** | **~8–10 min**, within the 30-min budget |
+
+Memory: the parent peaks at about twice the predictions during the sort (~25–30 GB for 200–300M); each read worker holds one 7-day slice (~5 GB at PPDB rates).
 
 The cost grows about linearly with survey length. When full regeneration outgrows the budget (likely year 3–5), switch to incremental updates.
 

@@ -86,7 +86,7 @@ def test_detection(ephem, perturbers, ordinary):
 
 
 def test_precise_pass(ephem, perturbers):
-    """compute_ephemerides_one (the SSSource path) is within 0.2" of the
+    """compute_ephemerides_one (the SSSource path) is within 0.1" of the
     ephemeris body; it used to be 16-152 deg off (the particle was slung
     off its own point mass). Pluto's is the ephemeris itself: DE440's body
     10 is the Pluto-system barycentre, which is what MPC's 1930 BM orbit
@@ -104,14 +104,14 @@ def test_precise_pass(ephem, perturbers):
         eph = ea.compute_ephemerides_one(None, times, None, ephem, row=row, obs_pos=obs_pos.T,
                                          obs_vel=obs_vel.T * AU_KM / 86400)
         sep = _sep_arcsec(eph.xx.T - obs_pos, _body_pos(ephem, BODY[name], t) - obs_pos)
-        assert sep.max() < 0.2, (name, sep.max())
+        assert sep.max() < 0.1, (name, sep.max())
         if BODY[name] == ea.ASSIST_PLUTO:
             assert sep.max() < 1e-6
         assert np.all(np.isfinite(eph.ra_deg)) and np.all(np.isfinite(eph.mu_lon))
 
 
 def test_coarse_pass(ephem, perturbers):
-    """coarse() is ok, within 0.2" of the ephemeris body, and has a small,
+    """coarse() is ok, within 0.1" of the ephemeris body, and has a small,
     finite sigma (these orbits' uncertainties are milliarcseconds)."""
     from ssp.nearbysso import propagate
 
@@ -126,7 +126,7 @@ def test_coarse_pass(ephem, perturbers):
                       np.cos(np.radians(tr.dec)) * np.sin(np.radians(tr.ra)),
                       np.sin(np.radians(tr.dec))], axis=1)
         sep = _sep_arcsec(u, _body_pos(ephem, BODY[name], t) - obs_pos)
-        assert sep.max() < 0.2, (name, sep.max())
+        assert sep.max() < 0.1, (name, sep.max())
         smax = tr.sigma_major.max()
         assert np.all(np.isfinite(tr.sigma_major)) and smax < 1.0, (name, smax)
         assert np.all(np.isfinite(tr.rate_ra)) and np.all(np.isfinite(tr.cov))

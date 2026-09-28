@@ -20,6 +20,7 @@ import pyarrow.compute as pc
 import multiprocessing
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 
 
 def assoc_validate(dia, assoc):
@@ -606,15 +607,17 @@ def balanced_chunks(weights, n_chunks):
     return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:]) if b > a]
 
 
-def run_chunks(func, chunks, workers, label, weights=None):
+def run_chunks(func, chunks, workers, label, weights=None, unit="objects"):
     """
     Run ``func(start, end)`` for each (start, end) chunk in a forked
     process pool and return the results in chunk order.
 
     Prints progress once per finished chunk; the time left is estimated
-    from the chunks' ``weights`` (default: their sizes). The first
-    exception in any worker cancels the remaining chunks and is re-raised
-    in the parent.
+    from the chunks' ``weights`` (default: their sizes), counting
+    ``unit``. The first exception in any worker cancels the remaining
+    chunks and is re-raised in the parent; a worker process that dies (e.g.
+    killed for memory) raises BrokenProcessPool naming ``label`` and the
+    chunks that hadn't finished.
     """
     if weights is None:
         weights = [e - s for s, e in chunks]
@@ -633,8 +636,13 @@ def run_chunks(func, chunks, workers, label, weights=None):
             done_weight += weights[n]
             elapsed = time.monotonic() - t0
             left = elapsed * (total_weight - done_weight) / done_weight if done_weight else float("nan")
-            print(f"[{label}] {done:,}/{total:,} objects, "
+            print(f"[{label}] {done:,}/{total:,} {unit}, "
                   f"{elapsed:.1f} s elapsed, ~{left:.0f} s left", flush=True)
+    except BrokenProcessPool as ex:
+        pool.shutdown(wait=False, cancel_futures=True)
+        lost = [chunks[n] for f, n in futures.items() if not f.done() or f.exception() is not None]
+        raise BrokenProcessPool(f"[{label}] a worker process died (killed, e.g. for memory?); "
+                                f"{len(lost)} chunk(s) unfinished, e.g. {lost[:5]}") from ex
     except BaseException:
         pool.shutdown(wait=False, cancel_futures=True)
         raise
