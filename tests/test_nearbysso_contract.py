@@ -7,4 +7,5 @@ def test_contract():
     assert C.ORBIT_DTYPE["cov0"].shape == (6, 6)
     assert set(C.DIA_COLUMNS) <= {"diaSourceId", "visit", "midpointMjdTai", "ra", "dec"}
     assert C.NEARBYSSO_DTYPE.names[0] == "diaSourceId"
-    assert len(C.CoarseTrack._fields) == 11
+    assert len(C.CoarseTrack._fields) == 12
+    assert C.CoarseTrack._field_defaults == {"cpos": None}
