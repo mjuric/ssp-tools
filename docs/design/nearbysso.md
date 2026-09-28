@@ -86,7 +86,7 @@ One row per DiaSource that has an eligible known object's prediction within 5″
 The work is grouped **per object**, not per visit, so each orbit is integrated once per stage. It reuses the fork-pool helpers from the SSSource/SSObject speed-ups (`util.run_chunks`, `util.balanced_chunks`).
 
 **Parent (serial, fast):**
-1. Read the DiaSources: 5 columns, sorted by visit. For each visit, derive its time, field centre and radius, and build its sky index: DiaSources binned into HEALPix cells of ~10″ (order 15, via `cdshealpix`).
+1. Read the DiaSources: 5 columns, sorted by visit. For each visit, derive its time, field centre and radius, and build its sky index: DiaSources binned into HEALPix cells of ~13″ (order 14, via `cdshealpix`; at order 15, ~6.4″, neighbour lookups miss at 5″).
 2. Index visit centres per night, and compute the observer (X05) barycentric state at every visit time (vectorized, as SSSource does).
 3. Read and filter the orbits, and convert them to barycentric ICRF states at epoch, with covariance.
 
