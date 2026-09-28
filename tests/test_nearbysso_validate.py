@@ -411,7 +411,7 @@ def test_strata_masks():
 
 
 # --------------------------------------------------------------------------
-# brute force: 2-body, visits, expected nearest
+# brute force: epoch states, visits, expected nearest
 # --------------------------------------------------------------------------
 
 def test_twobody_matches_scalar_conversion():
@@ -421,11 +421,12 @@ def test_twobody_matches_scalar_conversion():
     e = np.concatenate([rng.uniform(0, 0.95, n - 5), rng.uniform(1.05, 3, 5)])
     inc, node, peri = rng.uniform(0, 180, n), rng.uniform(0, 360, n), rng.uniform(0, 360, n)
     dt = rng.uniform(-3000, 3000, n)
-    X = V.twobody_helio_ecl(q, e, inc, node, peri, dt)
+    X, Vv = V.twobody_state_helio_ecl(q, e, inc, node, peri, dt)
     for k in range(n):
-        ref, _ = cometary_to_helio_ecliptic(q[k], e[k], np.deg2rad(inc[k]), np.deg2rad(node[k]),
-                                            np.deg2rad(peri[k]), dt[k])
+        ref, vref = cometary_to_helio_ecliptic(q[k], e[k], np.deg2rad(inc[k]), np.deg2rad(node[k]),
+                                               np.deg2rad(peri[k]), dt[k])
         np.testing.assert_allclose(X[k], ref, rtol=1e-9, atol=1e-11)
+        np.testing.assert_allclose(Vv[k], vref, rtol=1e-9, atol=1e-13)
 
 
 def test_derive_visits():
@@ -613,3 +614,31 @@ def test_cli_dp2_intersection(tmp_path):
     st = dict(zip(rows["diaSourceId"], rows["status"]))
     assert 3 not in st                               # the comet: not kept by us
     assert st[1] == "match" and st[2] == "value_mismatch"
+
+
+def test_angle_between():
+    a = np.array([[1.0, 0, 0], [1.0, 0, 0], [0, 0, 2.0]])
+    b = np.array([[np.cos(1e-9), np.sin(1e-9), 0], [-1.0, 0, 0], [0, 3.0, 0]])
+    np.testing.assert_allclose(V.angle_between(a, b), [1e-9, np.pi, np.pi / 2], rtol=1e-9)
+
+
+def test_pluto_is_a_known_exception(tmp_path, monkeypatch):
+    mas = 1 / 3.6e6
+    disc = pd.DataFrame({
+        "designation": ["1930 BM", "A"], "nss_designation": ["1930 BM", "A"], "diaSourceId": [1, 2],
+        "midpointMjdTai": [60800.0, 60800.0], "status": "value_mismatch",
+        "sss_ephRa": [10.0, 10.0], "sss_ephDec": [0.0, 0.0], "nss_ephRa": [10.0 + 50 * mas, 10.0],
+        "nss_ephDec": [0.0, 0.0], "dia_ra": [10.0, 10.0], "dia_dec": [0.0, 0.0]})
+    disc.to_parquet(tmp_path / "d.parquet")
+    _orbit_file(tmp_path / "o.parquet", ["{}", "{}"])
+    o = pd.read_parquet(tmp_path / "o.parquet")
+    o["unpacked_primary_provisional_designation"] = ["1930 BM", "A"]
+    o.to_parquet(tmp_path / "o.parquet")
+    monkeypatch.setattr(V, "horizons_own_elements",
+                        lambda row, t, polite, **kw: {"R.A.": np.full(len(t), 10.0), "DEC": np.zeros(len(t))})
+    rc = V.main(["horizons-adjudicate", "--discrepancies", str(tmp_path / "d.parquet"),
+                 "--orbits", str(tmp_path / "o.parquet"), "--out", str(tmp_path / "r")])
+    res = pd.read_parquet(tmp_path / "r" / "horizons-adjudicate.parquet").set_index("designation")
+    assert res.loc["1930 BM", "verdict"].startswith("known exception: sss_matches")
+    assert res.loc["A", "verdict"] == "both_match"
+    assert rc == 0                      # Pluto's 50 mas isn't a NearbySSO bug

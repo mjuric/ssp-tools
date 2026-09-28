@@ -5,7 +5,7 @@ Black-box checks of the builder's *outputs* (``nearbysso.parquet``, of
 ``_contract.NEARBYSSO_DTYPE``) against its inputs (the DiaSource Parquet,
 ``mpc_orbits``) and independent references (SSSource, JPL Horizons, the JPL
 SBDB). It is written from the design and the contract only: the orbit
-filter, the visits, the 2-body prefilter and the matching are
+filter, the visits, the brute-force prefilter and the matching are
 re-implemented here, and the builder's code is called only through the
 contract (``propagate.coarse`` for sigma), so a shared bug is unlikely.
 
@@ -62,6 +62,7 @@ from bench.ephem_bench import horizons_observer, horizons_request  # noqa: E402
 from ssp import util  # noqa: E402
 from ssp.ephem_assist import (  # noqa: E402
     ASSIST_SUN,
+    C_AU_PER_DAY,
     GM_SUN,
     MJD_J2000,
     cometary_to_helio_ecliptic,
@@ -89,6 +90,14 @@ ELEMENTS = ["q", "e", "i", "node", "argperi", "peri_time"]
 #: code and inputs should agree bitwise; these allow for integrator step
 #: choices that depend on the set of requested times (numerical noise).
 TOL = dict(pos_mas=0.1, rate_deg_day=1e-7, vmag=1e-4)
+
+#: Objects whose NearbySSO ephemerides are, by design, not from their own
+#: mpc_orbits elements, so a Horizons check "with our own elements" can't
+#: gate them: reported separately (docs/design/nearbysso.md, "ASSIST's own
+#: perturbers", owner decision 2026-09-28).
+KNOWN_EXCEPTIONS = {
+    "1930 BM": "Pluto: DE440 positions (ASSIST body 10), not its MPC orbit",
+}
 
 #: Statuses that fail the same-orbits gate.
 FAIL_STATUSES = ("value_mismatch", "wrong_nearest", "unexplained")
@@ -1011,11 +1020,15 @@ def cmd_horizons_adjudicate(args):
             continue
         h_ra[idx], h_dec[idx] = _col(cols, "R.A."), _col(cols, "DEC")
     res = adjudicate_rows(disc, h_ra, h_dec, args.tol_mas)
+    exc = res["designation"].isin(list(KNOWN_EXCEPTIONS)).to_numpy()
+    res.loc[exc, "verdict"] = "known exception: " + res.loc[exc, "verdict"]
+    for d in sorted(set(res.loc[exc, "designation"])):
+        rep(f"  {d}: known exception, not gated ({KNOWN_EXCEPTIONS[d]})")
     for k, v in res["verdict"].value_counts().items():
         rep(f"  {k:52s} {v:>6}")
     rep(f"Horizons requests: {polite.n}")
     rep.write(res)
-    bugs = res["verdict"].str.contains("NearbySSO").sum()
+    bugs = (res["verdict"].str.contains("NearbySSO") & ~exc).sum()
     return 1 if bugs else 0
 
 
@@ -1116,10 +1129,14 @@ def cmd_horizons_positions(args):
         if "APmag" in cols:
             h["vmag"][idx] = cols["APmag"][:k]
     res = horizons_position_residuals(s, h, half)
+    res["known_exception"] = res["designation"].isin(list(KNOWN_EXCEPTIONS))
     rep(f"Horizons requests: {polite.n}")
-    ok = np.isfinite(res["d_pos_mas"])
+    for _, r in res[res["known_exception"]].iterrows():
+        rep(f"  known exception, not gated: {r['designation']} ({KNOWN_EXCEPTIONS[r['designation']]}): "
+            f"d position {r['d_pos_mas']:.4g} mas")
+    ok = np.isfinite(res["d_pos_mas"]) & ~res["known_exception"]
     rms = float(np.sqrt(np.mean(res["d_pos_mas"][ok] ** 2))) if ok.any() else np.nan
-    for st, g in res.groupby("stratum"):
+    for st, g in res[~res["known_exception"]].groupby("stratum"):
         rep(f"  {st:12s} n={len(g):3d}  pos: {_stats(g['d_pos_mas'], 'mas')}")
     rep("d rate [arcsec/h] (vs central difference of Horizons astrometric, +-60 s):",
         _stats(res["d_rate_arcsec_h"]))
@@ -1315,14 +1332,15 @@ def cmd_horizons_sigma(args):
 # 6. Brute force: coarse-pass safety
 # ---------------------------------------------------------------------------
 
-def twobody_helio_ecl(q, e, inc, node, peri, dt_peri, mu=GM_SUN):
-    """Vectorized heliocentric ecliptic position [AU] (N, 3) from cometary
-    elements (angles in deg; dt_peri = t - peri_time [day]); e != 1."""
+def twobody_state_helio_ecl(q, e, inc, node, peri, dt_peri, mu=GM_SUN):
+    """Vectorized heliocentric ecliptic state (X [AU], V [AU/day]), each
+    (N, 3), from cometary elements (angles in deg; dt_peri = t -
+    peri_time [day]); e != 1. Used for the prefilter's states at epoch."""
     q, e, dt = (np.asarray(x, float) for x in (q, e, dt_peri))
     a = q / (1.0 - e)
     n = np.sqrt(mu / np.abs(a) ** 3)
     M = n * dt
-    x, y = np.empty_like(q), np.empty_like(q)
+    x, y, vx, vy = (np.empty_like(q) for _ in range(4))
     ell = e < 1
     if ell.any():
         Me = np.mod(M[ell] + np.pi, 2 * np.pi) - np.pi
@@ -1333,9 +1351,10 @@ def twobody_helio_ecl(q, e, inc, node, peri, dt_peri, mu=GM_SUN):
             E -= dE
             if np.all(np.abs(dE) < 1e-13):
                 break
-        ae = a[ell]
-        x[ell] = ae * (np.cos(E) - ee)
-        y[ell] = ae * np.sqrt(1 - ee * ee) * np.sin(E)
+        ae, b_ = a[ell], a[ell] * np.sqrt(1 - ee * ee)
+        Edot = n[ell] / (1 - ee * np.cos(E))
+        x[ell], y[ell] = ae * (np.cos(E) - ee), b_ * np.sin(E)
+        vx[ell], vy[ell] = -ae * np.sin(E) * Edot, b_ * np.cos(E) * Edot
     hyp = ~ell
     if hyp.any():
         Mh, eh = M[hyp], e[hyp]
@@ -1346,23 +1365,113 @@ def twobody_helio_ecl(q, e, inc, node, peri, dt_peri, mu=GM_SUN):
             if np.all(np.abs(dH) < 1e-13 * np.maximum(1, np.abs(H))):
                 break
         ah = -a[hyp]
-        x[hyp] = ah * (eh - np.cosh(H))
-        y[hyp] = ah * np.sqrt(eh * eh - 1) * np.sinh(H)
+        b_ = ah * np.sqrt(eh * eh - 1)
+        Hdot = n[hyp] / (eh * np.cosh(H) - 1)
+        x[hyp], y[hyp] = ah * (eh - np.cosh(H)), b_ * np.sinh(H)
+        vx[hyp], vy[hyp] = -ah * np.sinh(H) * Hdot, b_ * np.cosh(H) * Hdot
     i, Om, w = (np.deg2rad(np.asarray(v, float)) for v in (inc, node, peri))
     cO, sO, ci, si, cw, sw = np.cos(Om), np.sin(Om), np.cos(i), np.sin(i), np.cos(w), np.sin(w)
     P = np.stack([cO * cw - sO * sw * ci, sO * cw + cO * sw * ci, sw * si], axis=-1)
     Q = np.stack([-cO * sw - sO * cw * ci, -sO * sw + cO * cw * ci, cw * si], axis=-1)
-    return x[:, None] * P + y[:, None] * Q
+    return x[:, None] * P + y[:, None] * Q, vx[:, None] * P + vy[:, None] * Q
 
 
-def twobody_directions(orbits, mjd_tai, obs_pos, sun_pos):
-    """Unit vectors (N, 3) from the observer to each orbit's 2-body
-    position at mjd_tai (no light time; TT ~ TAI + 32.184 s)."""
-    t_tt = mjd_tai + 32.184 / 86400.0
-    X = twobody_helio_ecl(orbits["q"], orbits["e"], orbits["i"], orbits["node"], orbits["argperi"],
-                          t_tt - orbits["peri_time"].to_numpy(float))
-    X = X @ R_ECL2EQ.T + sun_pos - obs_pos
-    return X / np.linalg.norm(X, axis=1)[:, None]
+def angle_between(a, b):
+    """Angle [rad] between vectors (..., 3), accurate at small angles too
+    (atan2 of |a x b| and a.b, not arccos of the dot product)."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    return np.arctan2(np.linalg.norm(np.cross(a, b), axis=-1), np.sum(a * b, axis=-1))
+
+
+def bary_states_at_epoch(orbits, ephem):
+    """Barycentric ICRF states (N, 6) at each orbit's epoch, vectorized (the
+    same conversion as ssp.ephem_assist.elements_row_to_bary_icrf), and the
+    epochs in ASSIST time."""
+    ep = orbits["epoch_mjd"].to_numpy(float)
+    X, Vv = twobody_state_helio_ecl(orbits["q"], orbits["e"], orbits["i"], orbits["node"],
+                                    orbits["argperi"], ep - orbits["peri_time"].to_numpy(float))
+    t0 = np.empty(len(ep))
+    sun = np.empty((len(ep), 6))
+    uniq, inv = np.unique(ep, return_inverse=True)
+    t_u = tt_to_assist(uniq)
+    for k, t in enumerate(t_u):
+        sp = ephem.get_particle(ASSIST_SUN, float(t))
+        sun[inv == k] = (sp.x, sp.y, sp.z, sp.vx, sp.vy, sp.vz)
+        t0[inv == k] = t
+    return np.hstack([X @ R_ECL2EQ.T, Vv @ R_ECL2EQ.T]) + sun, t0
+
+
+_PF = {}
+
+
+def _pf_chunk(b0, b1):
+    """Worker: plain ASSIST integration of prefilter batches b0..b1 (test
+    particles sharing an epoch) to the visit times. Returns, per batch, the
+    orbit indices and their geometric topocentric unit vectors (n, K, 3)
+    and barycentric speeds (n, K) [AU/day]."""
+    global _BF_EPHEM
+    import assist
+    import rebound
+    if _BF_EPHEM is None:
+        _BF_EPHEM = open_ephem()
+    t, obs = _PF["t"], _PF["obs_pos"]
+    out = []
+    for idx in _PF["batches"][b0:b1]:
+        st, t0 = _PF["state"][idx], float(_PF["t0"][idx[0]])
+        u_ = np.full((len(idx), len(t), 3), np.nan)
+        spd = np.full((len(idx), len(t)), np.nan)
+        for side in (np.flatnonzero(t >= t0), np.flatnonzero(t < t0)[::-1]):
+            if not len(side):
+                continue
+            sim = rebound.Simulation()
+            sim.t = t0
+            ax = assist.Extras(sim, _BF_EPHEM)
+            for x in st:
+                sim.add(x=x[0], y=x[1], z=x[2], vx=x[3], vy=x[4], vz=x[5])
+            sim.ri_ias15.adaptive_mode = 2
+            xyz = np.empty((len(idx), 3))
+            vxyz = np.empty((len(idx), 3))
+            for j in side[np.argsort(np.abs(t[side] - t0), kind="stable")]:
+                try:
+                    ax.integrate_or_interpolate(float(t[j]))
+                except Exception:
+                    break
+                sim.serialize_particle_data(xyz=xyz, vxvyvz=vxyz)
+                rho = xyz - obs[j]
+                u_[:, j] = rho / np.linalg.norm(rho, axis=1)[:, None]
+                spd[:, j] = np.linalg.norm(vxyz, axis=1)
+            del ax, sim
+        out.append((idx, u_, spd))
+    return out
+
+
+def assist_prefilter(orbits, state, t0, t_assist, obs_pos, ephem, workers, batch=64, neo_batch=8):
+    """Geometric topocentric directions (N, K, 3) and barycentric speeds
+    (N, K) of every orbit at the K times, by plain ASSIST integrations of
+    ``batch`` test particles sharing an epoch (``neo_batch`` for q < 1.3,
+    whose close approaches force small steps on the whole batch). NaN
+    where an integration failed."""
+    key = pd.DataFrame({"t0": t0, "neo": orbits["q"].to_numpy(float) < 1.3})
+    batches = []
+    for (_, neo), g in key.groupby(["t0", "neo"], sort=True):
+        ix = g.index.to_numpy()
+        n = neo_batch if neo else batch
+        batches += [ix[s:s + n] for s in range(0, len(ix), n)]
+    _PF.update(batches=batches, state=state, t0=t0, t=np.asarray(t_assist, float), obs_pos=obs_pos)
+    try:
+        chunks = util.balanced_chunks(np.array([len(b) for b in batches]), 16 * max(workers, 1))
+        if workers > 1 and util.fork_context() is not None:
+            res = util.run_chunks(_pf_chunk, chunks, workers, "prefilter")
+        else:
+            res = [_pf_chunk(a, b) for a, b in chunks]
+    finally:
+        _PF.clear()
+    U = np.full((len(orbits), len(t_assist), 3), np.nan)
+    S = np.full((len(orbits), len(t_assist)), np.nan)
+    for part in res:
+        for idx, u_, spd in part:
+            U[idx], S[idx] = u_, spd
+    return U, S
 
 
 def match_within(pred_ra, pred_dec, dia_ra, dia_dec, radius=RADIUS):
@@ -1452,39 +1561,56 @@ def cmd_brute_force(args):
     rep(f"# brute force over {len(V)} visits ({len(dia):,} DiaSources): {list(V['visit'])}")
     obs_pos, obs_vel = observer_states(V["t_tai_mjd"].to_numpy())
     ephem = open_ephem()
-    sun_pos = np.array([[s.x, s.y, s.z] for s in (ephem.get_particle(ASSIST_SUN, float(x))
-                                                   for x in tai_to_assist(V["t_tai_mjd"]))])
+    t_vis = tai_to_assist(V["t_tai_mjd"].to_numpy())
 
     orbits = read_orbits(args.orbits)
     reason = filter_reason(orbits)
     orbits = orbits[reason == ""].reset_index(drop=True)
     rep(f"orbits kept by the filter: {len(orbits):,}")
-    q, e = orbits["q"].to_numpy(float), orbits["e"].to_numpy(float)
-    ep = orbits["epoch_mjd"].to_numpy(float)
+    e = orbits["e"].to_numpy(float)
     near_parabolic = np.abs(1 - e) < 1e-6
-    safe = orbits.assign(e=np.where(near_parabolic, 0.5, e))
+    t0_clock = time.monotonic()
+    state, t0 = bary_states_at_epoch(orbits.assign(e=np.where(near_parabolic, 0.5, e)), ephem)
+    # ASSIST's own perturbers (Pluto and the 16 asteroids; all have H < 8)
+    # get special handling in compute_ephemerides_one: always exact
+    from ssp.ephem_assist import self_perturber
+    big = np.flatnonzero(orbits["h"].to_numpy(float) < 8)
+    selfp = np.zeros(len(orbits), bool)
+    selfp[big] = [self_perturber(state[k, :3], state[k, 3:], t0[k], ephem) is not None for k in big]
+    always = near_parabolic | selfp
+    rep(f"always exact: {int(near_parabolic.sum())} near-parabolic, {int(selfp.sum())} ASSIST perturbers")
+
+    # The prefilter: plain ASSIST integrations (the exact pass's force
+    # model) to the visit times, geometric. Its only difference from the
+    # exact (light-time corrected) direction is the light-time shift,
+    # |V_perp| tau / Delta <= |V| / c (plus O(tau^2)), bounded per orbit
+    # from its speed; --margin-deg covers the rest, and the calibration
+    # below measures it.
+    pf = np.flatnonzero(~always)
+    U, S = assist_prefilter(orbits.iloc[pf].reset_index(drop=True), state[pf], t0[pf], t_vis, obs_pos,
+                            ephem, args.workers, args.batch)
+    lt_bound = S / C_AU_PER_DAY * 1.01           # rad
+    failed = ~np.isfinite(U[:, :, 0])
+    rep(f"prefilter: {len(pf):,} orbits x {len(V)} visits in {time.monotonic() - t0_clock:.0f} s; "
+        f"{int(failed.any(axis=1).sum())} failed integrations (-> exact); light-time bound max "
+        f"{np.degrees(np.nanmax(lt_bound)):.3g} deg")
     margin = np.deg2rad(args.margin_deg)
-
-    # candidates: always exact for NEOs, near-parabolic, far epochs
-    cand = {}
+    cand = {int(oi): list(range(len(V))) for oi in np.flatnonzero(always)}
     for j in range(len(V)):
-        t = V["t_tai_mjd"].iloc[j]
-        always = (q < args.always_exact_q) | near_parabolic | (np.abs(ep - t) > args.max_epoch_gap)
-        u_ = twobody_directions(safe, t, obs_pos[j], sun_pos[j])
-        ang = np.arccos(np.clip(u_ @ V["center"].iloc[j], -1, 1))
-        sel = np.flatnonzero(always | (ang < V["radius"].iloc[j] + margin))
-        for oi in sel:
-            cand.setdefault(oi, []).append(j)
-        rep(f"  visit {V['visit'].iloc[j]}: {len(sel):,} candidates "
-            f"({int((ang < V['radius'].iloc[j] + margin).sum()):,} by 2-body, {int(always.sum()):,} always)")
+        cen = np.asarray(V["center"].iloc[j], float)
+        ang = angle_between(U[:, j], cen[None, :])
+        sel = (ang - np.nan_to_num(lt_bound[:, j]) < V["radius"].iloc[j] + margin) | failed[:, j]
+        for oi in pf[sel]:
+            cand.setdefault(int(oi), []).append(j)
+        rep(f"  visit {V['visit'].iloc[j]}: {int(sel.sum()):,} prefilter candidates")
 
-    # calibration of the 2-body prefilter against exact ephemerides: random
-    # orbits of the kind the prefilter handles, at every sampled visit time
-    pool = np.flatnonzero((q >= args.always_exact_q) & ~near_parabolic)
-    cal_idx = rng.choice(pool, size=min(args.calibrate, len(pool)), replace=False)
-    items = sorted(cand.items()) + [(int(oi), list(range(len(V)))) for oi in cal_idx]
+    # calibration: random orbits of the kind the prefilter handles, exact at
+    # every sampled visit time, against the prefilter's directions
+    cal_k = rng.choice(len(pf), size=min(args.calibrate, len(pf)), replace=False)
+    items = sorted(cand.items()) + [(int(pf[k]), list(range(len(V)))) for k in cal_k]
     _BF.update(orbits=orbits, cand=items, t=V["t_tai_mjd"].to_numpy(), obs_pos=obs_pos, obs_vel=obs_vel)
     chunks = util.balanced_chunks(np.array([len(v) for _, v in items]), 8 * args.workers)
+    t1_clock = time.monotonic()
     try:
         if args.workers > 1 and util.fork_context() is not None:
             res = util.run_chunks(_bf_chunk, chunks, args.workers, "exact ephemerides")
@@ -1494,24 +1620,26 @@ def cmd_brute_force(args):
         _BF.clear()
     exact = pd.DataFrame([r for part in res for r in part], columns=["oi", "vj", "ra", "dec"])
     exact = exact.drop_duplicates(["oi", "vj"]).reset_index(drop=True)
-    cal = exact[exact["oi"].isin(set(int(x) for x in cal_idx))]
-    errs = []
-    for j in range(len(V)):
-        c = cal[cal["vj"] == j]
-        if not len(c):
-            continue
-        u2 = twobody_directions(safe.iloc[c["oi"].to_numpy()], V["t_tai_mjd"].iloc[j], obs_pos[j],
-                                sun_pos[j])
-        ue = radec_to_vec(c["ra"].to_numpy(), c["dec"].to_numpy())
-        errs.append(np.degrees(np.arccos(np.clip(np.sum(u2 * ue, axis=1), -1, 1))))
-    errs = np.concatenate(errs) if errs else np.array([np.nan])
-    rep(f"2-body prefilter calibration on {len(cal_idx)} random orbits with q >= "
-        f"{args.always_exact_q} x {len(V)} visits: error median {np.nanmedian(errs):.3g} deg, "
-        f"99.9% {np.nanpercentile(errs, 99.9):.3g}, max {np.nanmax(errs):.3g} deg; "
+    rep(f"exact ephemerides: {len(items):,} objects in {time.monotonic() - t1_clock:.0f} s")
+    pos_of = np.full(len(orbits), -1)
+    pos_of[pf] = np.arange(len(pf))
+    cal = exact[np.isin(exact["oi"].to_numpy(), pf[cal_k])]
+    k_ = pos_of[cal["oi"].to_numpy()]
+    j_ = cal["vj"].to_numpy()
+    ue = radec_to_vec(cal["ra"].to_numpy(), cal["dec"].to_numpy())
+    err = np.degrees(angle_between(U[k_, j_], ue))
+    excess = err - np.degrees(lt_bound[k_, j_])      # what the margin must cover
+    ok = np.isfinite(err)
+    q = orbits["q"].to_numpy(float)[cal["oi"].to_numpy()]
+    rep(f"prefilter calibration on {len(cal_k)} random orbits x {len(V)} visits ({ok.sum():,} points): "
+        f"error median {np.median(err[ok]):.3g} deg, 99.9% {np.percentile(err[ok], 99.9):.3g}, "
+        f"max {err[ok].max():.3g} deg (q < 1.3: max {np.max(err[ok & (q < 1.3)], initial=0):.3g}); "
+        f"beyond the light-time bound: max {np.max(excess[ok], initial=-np.inf):.3g} deg; "
         f"margin {args.margin_deg} deg")
-    margin_ok = bool(np.nanmax(errs) < args.margin_deg / 3)
+    margin_ok = bool(ok.any() and np.max(excess[ok]) < args.margin_deg / 3)
     if not margin_ok:
-        rep("WARNING: 2-body error exceeds margin/3: the prefilter may not be conservative")
+        rep("WARNING: prefilter error beyond the light-time bound exceeds margin/3: "
+            "the prefilter may not be conservative")
     # (calibration-only objects are matched too; that only adds coverage)
 
     # match exact predictions to DiaSources (KD tree on unit vectors)
@@ -1662,11 +1790,11 @@ def main(argv=None):
     p.add_argument("--nearbysso", default=None)
     p.add_argument("--n-visits", type=int, default=4)
     p.add_argument("--visits", default=None, help="comma-separated visit ids (instead of random)")
-    p.add_argument("--margin-deg", type=float, default=1.5,
-                   help="2-body prefilter margin; must exceed 3x the calibrated 2-body error")
-    p.add_argument("--always-exact-q", type=float, default=1.3, help="q below which it's always exact")
-    p.add_argument("--max-epoch-gap", type=float, default=1500.0, help="days; farther epochs are exact")
-    p.add_argument("--calibrate", type=int, default=2000, help="orbits used to calibrate the 2-body error")
+    p.add_argument("--margin-deg", type=float, default=0.1,
+                   help="prefilter margin beyond the per-orbit light-time bound; must exceed 3x the "
+                        "calibrated excess")
+    p.add_argument("--batch", type=int, default=64, help="test particles per prefilter simulation")
+    p.add_argument("--calibrate", type=int, default=2000, help="orbits used to calibrate the prefilter")
     p.add_argument("--workers", type=int, default=8)
     p.set_defaults(func=cmd_brute_force)
 
