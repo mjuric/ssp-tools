@@ -184,6 +184,25 @@ def test_rank_preferences():
     assert list(win) == [0] and not amb[0]
 
 
+def test_dp2_rule():
+    oi = np.array([0, 0, 0, 1, 1, 2])
+    c = np.array(["DP2-DS", "pDP2-DS", "NV-S", "DP2-DS", "pDP2-DS", "DP2-DS"], dtype=object)
+    early = np.array([True, True, True, False, False, True])
+    d = S.dp2_demoted(oi, c, early)
+    # early: DP2-DS demoted, late: pDP2-DS; others and lone DP2-DS never
+    assert list(d) == [True, False, False, False, True, False]
+    # the rule outranks a (slightly) smaller separation, and is not "ambiguous"
+    sep = np.array([0.100, 0.105, 0.5, 0.105, 0.100, 1.0])
+    win, n, amb = S.rank(oi, c, np.full(6, 7), sep, np.ones(6, bool), d)
+    assert list(c[win]) == ["pDP2-DS", "DP2-DS", "DP2-DS"] and not amb.any()
+    # "always": between the two DP2 processings it outranks the band
+    # preference too (it only ever demotes one of them, so a third
+    # processing with a matching band would still beat a mismatched one)
+    c2 = c[:2]
+    win, _, _ = S.rank(oi[:2], c2, np.full(2, 7), sep[:2], np.array([True, False]), d[:2])
+    assert c2[win[0]] == "pDP2-DS"
+
+
 def test_rank_groups():
     oi = np.array([3, 1, 3, 1, 1])
     c = np.array(["A"] * 5, dtype=object)
@@ -206,8 +225,12 @@ def _scenario():
     rows = [
         # labelled id; the view also has it in pDP2-DS (must not be used)
         dict(obsid="o1", obssubid="LSST-DP2-DS-100", ra=10.0, dec=1.0, obstime=t, band="Lr", mag=20.0),
-        # bare id, identical in DP2-DS and pDP2-DS -> ambiguous
-        dict(obsid="o2", obssubid="200", ra=11.0, dec=1.0, obstime=t, band="Lg", mag=20.0),
+        # bare id, identical in DP2-DS and pDP2-DS: the DP2 rule decides by
+        # submission date (DP2-DS from 2026-06-04 on, pDP2-DS before)
+        dict(obsid="o2", obssubid="200", ra=11.0, dec=1.0, obstime=t, band="Lg", mag=20.0,
+             submission_id="2026-06-04T00:00:00.000_0000late"),
+        dict(obsid="o2e", obssubid="200", ra=11.0, dec=1.0, obstime=t, band="Lg", mag=20.0,
+             submission_id="2026-06-03T23:59:59.999_0000erly"),
         # submitted band y, view says z: resolves, band_ok false
         dict(obsid="o3", obssubid="300", ra=12.0, dec=1.0, obstime=t, band="Ly", mag=20.0),
         # A/B trail pair; the view's trail centroid is the midpoint
@@ -249,10 +272,12 @@ def test_extract_end_to_end(tmp_path):
     assert rc == 0
     out = pq.read_table(tmp_path / "dia.parquet").to_pylist()
     by = {r["obsid"]: r for r in out}
-    assert sorted(by) == ["o1", "o2", "o3", "o4a", "o4b", "o5", "o6"]
+    assert sorted(by) == ["o1", "o2", "o2e", "o3", "o4a", "o4b", "o5", "o6"]
 
     assert (by["o1"]["processing"], by["o1"]["diaSourceId"], by["o1"]["match"]) == ("DP2-DS", 100, "id")
-    assert (by["o2"]["processing"], by["o2"]["ambiguous"], by["o2"]["n_pass"]) == ("DP2-DS", True, 2)
+    # decided by the DP2 rule, so no longer ambiguous
+    assert (by["o2"]["processing"], by["o2"]["ambiguous"], by["o2"]["n_pass"]) == ("DP2-DS", False, 2)
+    assert (by["o2e"]["processing"], by["o2e"]["ambiguous"], by["o2e"]["n_pass"]) == ("pDP2-DS", False, 2)
     assert by["o3"]["band_ok"] is False and by["o3"]["dt_ms"] == pytest.approx(1.4, abs=1e-3)
     # an A/B pair: two rows, one source, matched once at the midpoint;
     # the -A row is primary

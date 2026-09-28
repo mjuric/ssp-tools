@@ -73,6 +73,20 @@ AMBIGUOUS_MAS = 0.01
 #: (Copied from ssp-submit/ops/psv_crossmatch.py.)
 DEPRIORITIZED_LABELS = ("002-DS",)
 
+#: DP2 was submitted from twice: the April 2026 submissions (combsub-20260422,
+#: preredo-20260422) from a DP2 prerelease run (pDP2-DS), the 2026-06-04 ones
+#: (post-dp2-*) and later from the final run (DP2-DS). The PSV headers don't
+#: say so; the linker inputs do -- their positions and magnitudes are copied
+#: bit-for-bit from dia_source_dp2_v30_0_0 (April) and dia_source_dp2 (June),
+#: and no June observation matches pDP2-DS alone, nor any April one DP2-DS
+#: alone. The two runs share most ids and are mostly -- not always --
+#: identical, so a bare obsSubID that both accept is resolved by submission
+#: date, not by separation: pDP2-DS if submitted before the cutoff, else
+#: DP2-DS. (Later submissions should carry the LSST-DP2-DS- prefix anyway.)
+#: The cutoff is compared with submission_id, which starts with its ISO UTC
+#: timestamp.
+DP2_PRERELEASE, DP2_FINAL, DP2_CUTOFF = "pDP2-DS", "DP2-DS", "2026-06-04"
+
 # Position fallback blocking (see psv_crossmatch.CELL_ORDER): an order-16
 # cell is ~3.2", and hpix29 >> CELL_SHIFT is the order-16 cell index.
 CELL_ORDER = 16
@@ -256,7 +270,8 @@ def load_obs(tbl):
     label, ids, part = parse_obssubid(tbl["obssubid"])
     obs = dict(row=np.arange(len(tbl)), obsid=tbl["obsid"].to_numpy(),
                obssubid=pc.utf8_trim_whitespace(_arr(tbl["obssubid"])).to_numpy(zero_copy_only=False),
-               label=label, id=ids, tai=utc_to_tai_mjd(tbl["obstime"]), band_stripped=strip_band(tbl["band"]))
+               label=label, id=ids, tai=utc_to_tai_mjd(tbl["obstime"]), band_stripped=strip_band(tbl["band"]),
+               submission_id=pc.fill_null(tbl["submission_id"], "").to_numpy(zero_copy_only=False))
     obs["ra"], obs["dec"], obs["mag"] = (_f64(tbl, c) for c in ("ra", "dec", "mag"))
     obs["row_b"] = np.full(len(ids), -1)
     obs["reason"] = np.where(ids < 0, "no_id", "").astype(object)
@@ -342,22 +357,36 @@ def score(obs, oi, cand, ci):
     return dict(sep_mas=sep, dt_ms=dt, band_ok=band_ok, dmag=dmag, passed=passed)
 
 
-def rank(oi, processing, ids, sep, band_ok):
+def dp2_demoted(oi, processing, early):
+    """Per pair: True for the DP2 processing that loses under the DP2 rule
+    (see DP2_CUTOFF) -- DP2-DS for a row submitted before the cutoff,
+    pDP2-DS after it -- on rows where both DP2-DS and pDP2-DS pass.
+    ``early`` is per pair. Other processings are never demoted."""
+    oi = np.asarray(oi)
+    both = np.intersect1d(oi[processing == DP2_PRERELEASE], oi[processing == DP2_FINAL])
+    loser = np.where(early, DP2_FINAL, DP2_PRERELEASE)
+    return np.isin(oi, both) & (processing == loser)
+
+
+def rank(oi, processing, ids, sep, band_ok, demoted=None):
     """Pick one winner per obs row among (already passing) pairs.
 
-    Sort key, ascending: (deprioritized label, not band_ok, sep_mas,
-    processing, id) -- the last two only make the choice deterministic.
-    Returns ``(pair index of each winner, n_pass, ambiguous)``, one entry
-    per distinct obs row, in ascending ``oi`` order. ``ambiguous`` means
-    the runner-up ties the winner on (deprioritized, band_ok) and is
-    within AMBIGUOUS_MAS in separation.
+    Sort key, ascending: (deprioritized label, demoted, not band_ok,
+    sep_mas, processing, id) -- the last two only make the choice
+    deterministic. ``demoted`` (per pair, default none) is the DP2 rule's
+    loser, see dp2_demoted. Returns ``(pair index of each winner, n_pass,
+    ambiguous)``, one entry per distinct obs row, in ascending ``oi``
+    order. ``ambiguous`` means the runner-up ties the winner on
+    (deprioritized, demoted, band_ok) and is within AMBIGUOUS_MAS in
+    separation.
     """
     oi = np.asarray(oi)
     if len(oi) == 0:
         return np.zeros(0, int), np.zeros(0, int), np.zeros(0, bool)
     deprio = np.isin(processing, DEPRIORITIZED_LABELS)
+    demoted = np.zeros(len(oi), bool) if demoted is None else np.asarray(demoted)
     _, ccode = np.unique(processing.astype(str), return_inverse=True)
-    order = np.lexsort((ids, ccode, sep, ~band_ok, deprio, oi))
+    order = np.lexsort((ids, ccode, sep, ~band_ok, demoted, deprio, oi))
     so = oi[order]
     start = np.flatnonzero(np.r_[True, so[1:] != so[:-1]])
     n_pass = np.diff(np.r_[start, len(so)])
@@ -366,7 +395,7 @@ def rank(oi, processing, ids, sep, band_ok):
     ambiguous = np.zeros(len(win), dtype=bool)
     two = n_pass > 1
     w, r = win[two], order[start[two] + 1]
-    ambiguous[two] = ((deprio[w] == deprio[r]) & (band_ok[w] == band_ok[r])
+    ambiguous[two] = ((deprio[w] == deprio[r]) & (demoted[w] == demoted[r]) & (band_ok[w] == band_ok[r])
                       & (np.abs(sep[r] - sep[w]) < AMBIGUOUS_MAS))
     return win, n_pass, ambiguous
 
@@ -379,10 +408,14 @@ def resolve(obs, oi, cand, ci):
     p = sc["passed"]
     processing = cand["processing"].to_numpy(zero_copy_only=False)[ci]
     ids = cand["id"].to_numpy()[ci]
-    win, n_pass, ambiguous = rank(oi[p], processing[p], ids[p], sc["sep_mas"][p], sc["band_ok"][p])
+    early = obs["submission_id"][oi[p]] < DP2_CUTOFF
+    demoted = dp2_demoted(oi[p], processing[p], early)
+    win, n_pass, ambiguous = rank(oi[p], processing[p], ids[p], sc["sep_mas"][p], sc["band_ok"][p], demoted)
+    # rows the DP2 rule decided: both DP2 processings passed
+    dp2_rule = np.isin(oi[p][win], oi[p][demoted])
     win = np.flatnonzero(p)[win]
     info = dict(sep_mas=sc["sep_mas"][win], dt_ms=sc["dt_ms"][win], dmag=sc["dmag"][win],
-                band_ok=sc["band_ok"][win], n_pass=n_pass, ambiguous=ambiguous)
+                band_ok=sc["band_ok"][win], n_pass=n_pass, ambiguous=ambiguous, dp2_rule=dp2_rule)
 
     # Best (closest) failing candidate, for the unresolved report.
     fail = np.setdiff1d(np.unique(oi), oi[win])
@@ -659,6 +692,9 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     info = i_id if i_pos is None else {k: np.concatenate([i_id[k], i_pos[k]]) for k in i_id}
     match = np.array(["id"] * len(r_id) + ["position"] * len(r_pos), dtype=object)
     out, is_b = build_output(obs, tbl, cand, rows_all, np.concatenate([c_id, c_pos]), match, info)
+    # rows the DP2 rule decided, by the processing it picked
+    won = cand["processing"].to_numpy(zero_copy_only=False)[np.concatenate([c_id, c_pos])]
+    dp2_won = won[info["dp2_rule"]]
 
     # obsid is the key; each source has exactly one primary row
     key = ["processing", "diaSourceId"]
@@ -694,6 +730,8 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     for r in claimed.to_pylist():
         print("   claimed by several submissions:", r)
     print(f"ambiguous:                        {pc.sum(out['ambiguous']).as_py() or 0:,}")
+    print(f"DP2-DS vs pDP2-DS, by date:       {len(dp2_won):,}  ({_counts(dp2_won)}; "
+          f"pDP2-DS if submitted before {DP2_CUTOFF})")
     print(f"band_ok = false:                  {pc.sum(pc.invert(out['band_ok'])).as_py() or 0:,}")
     print(f"per processing:                   {_counts(out['processing'].to_numpy(False))}")
     print(f"wrote {out_path} and {stem}.unresolved.parquet")
