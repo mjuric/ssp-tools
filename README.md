@@ -331,9 +331,18 @@ Arguments:
 - `dia_sources.parquet` – DiaSource Parquet file with photometric measurements
 - `mpc_orbits.parquet` – MPC orbit Parquet file with orbital elements
 - `--output ssobject.parquet` – Output SSObject Parquet file
+- `--hg12MagSigmaFloor` – error floor (mag) added in quadrature to the magnitude errors before the H/G12 fits (default 0.05; 0 for none)
+- `--hg12NSigmaClip` – reject points beyond this many sigma of an initial robust fit (default 10; `inf` to keep every point)
+- `--hg12FixedG12` – fix G12 to this value and fit only H (default: unset, G12 is fit)
 
 The tool performs:
-- Photometric fitting (H/G12 parameters) for each band (ugrizy)
+- Photometric fitting (H/G12 parameters) for each band (ugrizy). By default
+  each band's fit follows DP2's robust recipe: a 0.05 mag error floor, a
+  robust (`soft_l1`) fit, rejection of points beyond 10σ, and a final
+  least-squares fit of the rest. Unlike DP2, which fixed G12 at 0.5 (use
+  `--hg12FixedG12 0.5` for that), G12 is fit, bounded to [0, 1]. A G12 that
+  ends at a bound has no `G12Err` or H–G12 covariance (both NaN), and its
+  `HErr` is that of the fixed-G12 fit.
 - Orbital analysis including Tisserand parameter and MOID calculations
 - Quality metrics and observation statistics per object
 

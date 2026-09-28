@@ -141,8 +141,8 @@ def compute_ssobject_entry(
     row["extendednessMedian"] = np.median(ext) if len(ext) else np.nan
 
 def compute_ssobject(
-    sss, dia, mpcorb, fixedG12=None, magSigmaFloor=0.0,
-    nSigmaClip=None,
+    sss, dia, mpcorb, fixedG12=None, magSigmaFloor=0.05,
+    nSigmaClip=10.0,
 ):
     """
     Compute solar system object properties by joining and processing
@@ -334,19 +334,21 @@ Examples:
     parser.add_argument(
         "--hg12MagSigmaFloor",
         type=float,
-        default=0.0,
+        default=0.05,
         help=(
             "Systematic magnitude error floor (mag) added in quadrature "
-            "to measurement errors before HG12 fitting."
+            "to measurement errors before HG12 fitting (default: 0.05, "
+            "as in DP2; 0 for none)."
         ),
     )
     parser.add_argument(
         "--hg12NSigmaClip",
         type=float,
-        default=None,
+        default=10.0,
         help=(
-            "If set, reject outliers beyond this many sigma after an "
-            "initial robust fit. If unset, no clipping."
+            "Reject outliers beyond this many sigma after an initial "
+            "robust (soft_l1) fit, then refit the rest (default: 10, as "
+            "in DP2; inf to keep every point)."
         ),
     )
 
