@@ -6,7 +6,8 @@ import pandas as pd
 import pytest
 
 from ssp import photfit, ssobject
-from ssp.ssobject import _balanced_chunks, compute_ssobject
+from ssp.ssobject import compute_ssobject
+from ssp.util import balanced_chunks as _balanced_chunks
 
 
 def _tables(n_obj=40, seed=2):

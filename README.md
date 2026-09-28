@@ -296,9 +296,12 @@ python -m ssp.sssource --max-objects 10              # quick test on 10 random o
 python -m ssp.sssource --input-dir in/ --output-dir out/
 ```
 
-Options: `--max-objects N` and `--dia-sample-frac F` subsample the inputs for
-testing (`--seed` sets the random seed); `--reraise` re-raises exceptions for
-debugging.
+Options: `--workers N` sets the number of worker processes for the
+per-object ephemerides (default: `min(64, CPUs)`; each opens its own ASSIST
+ephemeris, ~100 MB). `--workers 1` runs serially, with no process pool. The
+output is identical for any `N`. `--max-objects N` and `--dia-sample-frac F`
+subsample the inputs for testing (`--seed` sets the random seed); `--reraise`
+re-raises exceptions for debugging.
 
 An end-to-end run is SSSource followed by SSObject:
 
