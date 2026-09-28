@@ -49,6 +49,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from astropy.time import Time
 import astropy.units as u
@@ -80,8 +81,7 @@ AU_DAY_TO_KM_S = (1.0 * u.au / u.day).to_value(u.km / u.s)
 #: mpc_orbits columns read (renamed: designation, packed)
 ORBIT_COLUMNS = [
     "unpacked_primary_provisional_designation", "packed_primary_provisional_designation",
-    "q", "e", "i", "node", "argperi", "peri_time", "epoch_mjd", "h", "g",
-    "arc_length_total", "normalized_rms",
+    "q", "e", "i", "node", "argperi", "peri_time", "epoch_mjd", "h", "g", "normalized_rms",
 ]
 ELEMENTS = ["q", "e", "i", "node", "argperi", "peri_time"]
 
@@ -259,43 +259,100 @@ def sbdb_query(sstr, polite):
 # Orbits: reading, the filter (re-implemented from the design), classes
 # ---------------------------------------------------------------------------
 
+#: The JSON orbit_fit_statistics.arc_length_total texts NearbySSO
+#: excludes (lsst-gen-ephemcache's get-mpcorb.py: NOT IN these).
+SHORT_ARC_TEXTS = ("0 days", "1 days", "2 days")
+
+# "arc_length_total": followed by a JSON string or a bare value (a number,
+# or null). The key occurs at most once per mpc_orb_jsonb (only in
+# orbit_fit_statistics; checked on the 2026-09-26 snapshot).
+_ARC_RE = r'"arc_length_total"\s*:\s*(?:"(?P<s>[^"]*)"|(?P<o>[^,}\s]+))'
+
+
+def arc_text_from_json(json_col):
+    """orbit_fit_statistics.arc_length_total as text, as SQL's ->> gives
+    it (so a JSON number 0 is '0'), None where it is null or absent, for an
+    array of mpc_orb_jsonb strings. Vectorized with a regex (json.loads
+    of 1.5M documents is slow); the tests check it against json.loads."""
+    arr = json_col
+    if isinstance(arr, pa.ChunkedArray):   # chunk by chunk (a combined array can overflow)
+        parts = [arc_text_from_json(c) for c in arr.chunks]
+        return np.concatenate(parts) if parts else np.zeros(0, dtype=object)
+    if not isinstance(arr, pa.Array):
+        arr = pa.array([x if isinstance(x, str) else None for x in arr], type=pa.string())
+    m = pc.extract_regex(arr, _ARC_RE)
+    quoted = pc.struct_field(m, "s").to_numpy(zero_copy_only=False).astype(object)
+    other = pc.struct_field(m, "o").to_numpy(zero_copy_only=False).astype(object)
+    out = np.where(pd.isna(other) | (other == ""), quoted, other).astype(object)
+    out[pd.isna(out) | (out == "null")] = None
+    out[~pc.is_valid(m).to_numpy(zero_copy_only=False)] = None
+    return out
+
+
+def arc_days(text):
+    """The day count of arc texts of the form 'N days' (float), inf for
+    anything else (a year range such as '2014-2024' is a long arc), NaN
+    where unknown (None)."""
+    out = np.full(len(text), np.inf)
+    for k, t in enumerate(text):
+        if t is None or (isinstance(t, float) and np.isnan(t)):
+            out[k] = np.nan
+            continue
+        parts = str(t).split()
+        if len(parts) == 2 and parts[1] in ("day", "days"):
+            try:
+                out[k] = float(parts[0])
+            except ValueError:
+                pass
+    return out
+
+
 def read_orbits(path, designations=None, with_json=False):
-    """mpc_orbits columns as a DataFrame with ``designation`` and ``packed``,
-    optionally only the given designations, optionally with mpc_orb_jsonb."""
-    cols = ORBIT_COLUMNS + (["mpc_orb_jsonb"] if with_json else [])
+    """mpc_orbits columns as a DataFrame with ``designation``, ``packed``
+    and ``arc_text`` (see `arc_text_from_json`), optionally only the given
+    designations, optionally keeping mpc_orb_jsonb. Reads row group by row
+    group, so the JSON of the whole catalog is never in memory at once."""
     present = set(pq.read_schema(path).names)
-    cols = [c for c in cols if c in present]
-    filters = None
+    cols = [c for c in ORBIT_COLUMNS + ["mpc_orb_jsonb"] if c in present]
     if designations is not None:
-        filters = [("unpacked_primary_provisional_designation", "in", sorted(set(designations)))]
-        if not len(filters[0][2]):
+        want = sorted(set(designations))
+        if not want:
             return _empty_orbits(with_json)
-    df = pq.read_table(path, columns=cols, filters=filters).to_pandas()
+        tables = [pq.read_table(path, columns=cols,
+                                filters=[("unpacked_primary_provisional_designation", "in", want)])]
+    else:
+        pf = pq.ParquetFile(path)
+        tables = (pf.read_row_group(k, columns=cols) for k in range(pf.num_row_groups))
+    parts = []
+    for t in tables:
+        if "mpc_orb_jsonb" in t.column_names:
+            arc = arc_text_from_json(t.column("mpc_orb_jsonb"))
+            if not with_json:
+                t = t.drop_columns(["mpc_orb_jsonb"])
+        else:
+            arc = np.full(t.num_rows, None, dtype=object)
+        df = t.to_pandas()
+        df["arc_text"] = arc
+        parts.append(df)
+    df = pd.concat(parts, ignore_index=True)
     df = df.rename(columns={"unpacked_primary_provisional_designation": "designation",
                             "packed_primary_provisional_designation": "packed"})
     return df.sort_values("designation", kind="stable").reset_index(drop=True)
 
 
 def _empty_orbits(with_json):
-    cols = ["designation", "packed"] + ORBIT_COLUMNS[2:] + (["mpc_orb_jsonb"] if with_json else [])
+    cols = ["designation", "packed"] + ORBIT_COLUMNS[2:] + ["arc_text"] + (
+        ["mpc_orb_jsonb"] if with_json else [])
     return pd.DataFrame({c: [] for c in cols})
 
 
-#: Whether an unknown (NaN) arc_length_total passes the "> 2 days" rule.
-#: The contract's rule, read literally, fails it; ~1/3 of mpc_orbits
-#: (2026-09-26: 512,797 rows, mostly multi-opposition orbits) has NaN
-#: there, so the choice matters. Set by --keep-unknown-arc.
-KEEP_UNKNOWN_ARC = False
-
-
-def filter_reason(orbits, keep_unknown_arc=None):
+def filter_reason(orbits):
     """Why each orbit is excluded by NearbySSO's rules ('' if kept): the
     first of 'comet' (designation with '/', or packed starting with '_'),
-    'missing_elements' (any of q, e, i, node, argperi, peri_time NaN),
-    'short_arc' (arc_length_total <= 2 days) and 'unknown_arc'
-    (arc_length_total NaN, unless keep_unknown_arc)."""
-    if keep_unknown_arc is None:
-        keep_unknown_arc = KEEP_UNKNOWN_ARC
+    'missing_elements' (any of q, e, i, node, argperi, peri_time NaN) and
+    'short_arc' (the JSON arc text is one of SHORT_ARC_TEXTS; a null or
+    absent arc passes, as in get-mpcorb.py). ``orbits`` needs ``arc_text``
+    (from `read_orbits`) or ``mpc_orb_jsonb``."""
     des = orbits["designation"].astype(str).to_numpy()
     packed = orbits["packed"].fillna("").astype(str).to_numpy()
     comet = np.char.find(des.astype(str), "/") >= 0
@@ -303,11 +360,12 @@ def filter_reason(orbits, keep_unknown_arc=None):
     missing = np.zeros(len(orbits), bool)
     for c in ELEMENTS:
         missing |= ~np.isfinite(orbits[c].to_numpy(dtype=np.float64))
-    arc = orbits["arc_length_total"].to_numpy(dtype=np.float64)
-    unknown = np.isnan(arc) & (not keep_unknown_arc)
-    short = arc <= 2.0
-    return np.select([comet, missing, short, unknown],
-                     ["comet", "missing_elements", "short_arc", "unknown_arc"], "")
+    if "arc_text" in orbits:
+        arc = orbits["arc_text"].to_numpy(dtype=object)
+    else:
+        arc = arc_text_from_json(orbits["mpc_orb_jsonb"])
+    short = np.array([a is not None and a in SHORT_ARC_TEXTS for a in arc], dtype=bool)
+    return np.select([comet, missing, short], ["comet", "missing_elements", "short_arc"], "")
 
 
 def reason_lookup(orbits):
@@ -971,7 +1029,7 @@ def strata_masks(nss, orbits, short_arc_days=30.0):
     o = orbits.set_index("designation")
     q = o["q"].reindex(nss["designation"]).to_numpy(dtype=float)
     e = o["e"].reindex(nss["designation"]).to_numpy(dtype=float)
-    arc = o["arc_length_total"].reindex(nss["designation"]).to_numpy(dtype=float)
+    arc = arc_days(o["arc_text"].reindex(nss["designation"]).to_numpy(dtype=object))
     cls = dynamical_class(q, e)
     sig = sigma_major_arcsec(nss["ephRaErr"].to_numpy(float), nss["ephDecErr"].to_numpy(float),
                              nss["ephRa_ephDec_Cov"].to_numpy(float))
@@ -1617,14 +1675,9 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=42)
     p.set_defaults(func=cmd_mock)
 
-    for p in sub.choices.values():
-        p.add_argument("--keep-unknown-arc", action="store_true",
-                       help="treat a NaN arc_length_total as passing the > 2 d rule")
     args = ap.parse_args(argv)
     # (future epochs: astropy falls back to mean polar motion, sub-mas here)
     warnings.filterwarnings("ignore", message="Tried to get polar motions")
-    global KEEP_UNKNOWN_ARC
-    KEEP_UNKNOWN_ARC = args.keep_unknown_arc
     return args.func(args)
 
 

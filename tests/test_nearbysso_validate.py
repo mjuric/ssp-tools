@@ -22,7 +22,7 @@ from ssp.ephem_assist import cometary_to_helio_ecliptic
 def _orbits(**cols):
     base = dict(designation=["2020 AB"], packed=["K20A00B"], q=[2.0], e=[0.1], i=[5.0],
                 node=[10.0], argperi=[20.0], peri_time=[60000.0], epoch_mjd=[61000.0],
-                h=[15.0], g=[0.15], arc_length_total=[100.0], normalized_rms=[0.5])
+                h=[15.0], g=[0.15], arc_text=["2014-2024"], normalized_rms=[0.5])
     n = max(len(v) for v in cols.values()) if cols else 1
     df = pd.DataFrame({k: (cols.get(k) or v * n) for k, v in base.items()})
     return df
@@ -32,12 +32,35 @@ def test_filter_reason():
     df = _orbits(designation=["2020 AB", "P/2019 A1", "2020 AC", "2020 AD", "2020 AE", "2020 AF"],
                  packed=["K20A00B", "PK19A010", "_K20A00C", "K20A00D", "K20A00E", "K20A00F"],
                  q=[2.0, 2.0, 2.0, np.nan, 2.0, 2.0],
-                 arc_length_total=[100.0, 100.0, 100.0, 100.0, 2.0, np.nan])
+                 arc_text=["3 days", "2014-2024", "2014-2024", "2014-2024", "2 days", None])
     r = V.filter_reason(df)
-    assert list(r) == ["", "comet", "comet", "missing_elements", "short_arc", "unknown_arc"]
-    assert V.filter_reason(df, keep_unknown_arc=True)[-1] == ""
+    assert list(r) == ["", "comet", "comet", "missing_elements", "short_arc", ""]
+    for arc, expect in (("0 days", "short_arc"), ("1 days", "short_arc"), ("0", ""), ("30 days", "")):
+        assert V.filter_reason(df.iloc[:1].assign(arc_text=[arc]))[0] == expect
     lk = V.reason_lookup(df)
     assert list(V.reasons_for(["2020 AB", "nope"], lk)) == ["", "not_in_orbits"]
+
+
+def test_arc_text_from_json():
+    docs = [
+        {"orbit_fit_statistics": {"nopp": 5, "arc_length_total": "2007-2021", "x": 1}},
+        {"orbit_fit_statistics": {"arc_length_total": "2 days", "arc_length_sel": "1 days"}},
+        {"orbit_fit_statistics": {"arc_length_total": 0, "nopp": 1}},
+        {"orbit_fit_statistics": {"arc_length_total": None}},
+        {"orbit_fit_statistics": {"nopp": 1}},
+        {"CAR": {}, "orbit_fit_statistics": {"arc_length_total": "13 days"}},
+    ]
+    texts = [json.dumps(d) for d in docs] + [None, json.dumps(docs[1], separators=(",", ":"))]
+    got = V.arc_text_from_json(texts)
+    assert list(got) == ["2007-2021", "2 days", "0", None, None, "13 days", None, "2 days"]
+    # the same through a DataFrame without arc_text
+    df = _orbits().iloc[[0] * 8].reset_index(drop=True).drop(columns="arc_text").assign(mpc_orb_jsonb=texts)
+    assert list(V.filter_reason(df)) == ["", "short_arc", "", "", "", "", "", "short_arc"]
+
+
+def test_arc_days():
+    d = V.arc_days(["3 days", "2014-2024", None, "1 day", "0"])
+    assert d[0] == 3 and np.isinf(d[1]) and np.isnan(d[2]) and d[3] == 1 and np.isinf(d[4])
 
 
 def test_dynamical_class():
@@ -358,7 +381,7 @@ def test_stratified_sample():
 
 def test_strata_masks():
     orbits = _orbits(designation=["N", "M", "T"], packed=["a", "b", "c"], q=[0.9, 2.2, 5.0],
-                     e=[0.5, 0.1, 0.02], arc_length_total=[10.0, 1000.0, 1000.0])
+                     e=[0.5, 0.1, 0.02], arc_text=["10 days", "2014-2024", "45 days"])
     nss = pd.DataFrame({"designation": ["N", "N", "M", "T"], "ephOffset": [1.0, 4.8, 1.0, 1.0],
                         "ephRaErr": np.array([1, 1, 9, 1]) / 3600, "ephDecErr": np.array([1, 1, 1, 1]) / 3600,
                         "ephRa_ephDec_Cov": 0.0, "ephRateRa": [1.0, 2.0, 0.1, 0.01],
@@ -476,7 +499,8 @@ def test_sigma_oracle_plumbing(tmp_path, monkeypatch):
         sig = 1.0 if orbit["has_cov"] else np.inf
         z = np.zeros(k)
         return Ct.CoarseTrack(t=t, ra=z, dec=z, rate_ra=z, rate_dec=z, ra_err=z, dec_err=z,
-                              ra_dec_cov=z, sigma_major=sig * (t - t[0] + 1), ok=np.ones(k, bool))
+                              ra_dec_cov=z, sigma_major=sig * (t - t[0] + 1), ok=np.ones(k, bool),
+                              delta=np.ones(k))
     monkeypatch.setattr(propagate, "coarse", coarse)
     monkeypatch.setattr(V, "observer_states", lambda m: (np.zeros((len(m), 3)), np.zeros((len(m), 3))))
     orc = V.SigmaOracle(str(tmp_path / "o.parquet"), ephem=_FakeEphem())
