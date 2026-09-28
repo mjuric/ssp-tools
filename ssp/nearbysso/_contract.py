@@ -36,6 +36,10 @@ MATCH_RADIUS_ARCSEC = 5.0
 #: on-sky error ellipse is at most this.
 SIGMA_MAX_ARCSEC = 10.0
 
+#: Nights where the orbit is nearer than this [AU] take every visit of the
+#: night as a candidate (see VisitIndex.candidates).
+NEAR_DELTA_AU = 0.02
+
 #: Observatory code of the observer.
 OBSCODE = "X05"
 
@@ -68,7 +72,8 @@ ORBIT_DTYPE = np.dtype([
 #   q, e, i, node, argperi and peri_time, and an arc filtered exactly as
 #   lsst-gen-ephemcache's get-mpcorb.py does: on the JSON
 #   orbit_fit_statistics.arc_length_total *text*, NOT IN ('0 days',
-#   '1 days', '2 days'). (The Parquet arc_length_total column is NULL for
+#   '1 days', '2 days'), in SQL, so an absent or null arc (SQL NULL) is
+#   dropped. (The Parquet arc_length_total column is NULL for
 #   ~0.5M mostly multi-opposition orbits whose JSON arc is a year range,
 #   so a numeric filter on it would wrongly drop them.) It
 #   returns rows sorted by designation, and prints a one-line summary (rows
@@ -132,6 +137,13 @@ VISIT_DTYPE = np.dtype([
 #       |d delta/dt| * |dt|. (The exact worst case of a rotating parallax
 #       vector against its linear extrapolation; the 2 covers |dt| <= 0.338 d,
 #       i.e. sampling at VisitIndex.night_t.)
+#
+#       Even so, for very close approaches the rate itself (~1/delta^2) can
+#       grow faster within a night than the nightly differences show (misses
+#       were found below ~0.007 AU). So a night whose sample has
+#       delta[k] < NEAR_DELTA_AU, or a non-finite delta, takes every visit of
+#       that night. (In |dt| <= 0.338 d, at <= 40 km/s, delta changes by
+#       < 0.008 AU, so the formula above is only relied on beyond ~0.012 AU.)
 
 # --------------------------------------------------------------------------
 # WP2: propagation and uncertainty
