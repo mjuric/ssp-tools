@@ -58,9 +58,18 @@ _MIN_WIDTH_15_ARCSEC = 4.0
 #: the track).
 MAX_SAMPLE_GAP_DAYS = 1.0
 
-#: A margin for ``VisitIndex.candidates`` that covers the differences between
-#: the coarse track and the precise prediction (see ``candidates``).
-DEFAULT_CANDIDATE_MARGIN_ARCSEC = 600.0
+#: The ``margin_arcsec`` for ``VisitIndex.candidates``: what its explicit
+#: terms don't cover of the difference between the coarse track and the
+#: precise prediction, i.e. the 5" match radius + <= 55" of light time + 30"
+#: of safety (see ``candidates``).
+DEFAULT_CANDIDATE_MARGIN_ARCSEC = 90.0
+
+#: Earth's equatorial radius [AU] (6378.1 km), the largest distance of any
+#: site from the geocentre, so it bounds the diurnal parallax amplitude.
+R_EARTH_AU = 6378.1 / 149597870.7
+
+#: Earth's rotation rate [rad/day], sidereal.
+OMEGA_EARTH = 2.0 * np.pi * 1.00273781191
 
 # Rows processed at a time, to bound temporaries.
 _CHUNK = 1 << 20
@@ -397,12 +406,55 @@ class DiaIndex:
 # VisitIndex
 # --------------------------------------------------------------------------
 
+class _SkyGrid:
+    """Dec bands of ``h`` deg, each cut into RA bins at least ``h`` deg of
+    arc wide at its centre: pure NumPy, so a lookup costs a few us (a
+    ``cdshealpix`` call costs ~80 us, which dominated ``candidates``)."""
+
+    def __init__(self, h=2.0):
+        self.h = h
+        self.nband = int(np.ceil(180.0 / h))
+        mid = -90.0 + (np.arange(self.nband) + 0.5) * h
+        self.nra = np.maximum(1, np.floor(360.0 * np.cos(np.radians(mid)) / h)).astype(np.int64)
+        self.offset = np.concatenate([[0], np.cumsum(self.nra)[:-1]])
+        self.ncells = int(self.nra.sum())
+
+    def cell(self, ra_deg, dec_deg):
+        b = np.clip(np.floor((dec_deg + 90.0) / self.h).astype(np.int64), 0, self.nband - 1)
+        n = self.nra[b]
+        i = np.minimum(np.floor((ra_deg % 360.0) / 360.0 * n).astype(np.int64), n - 1)
+        return self.offset[b] + i
+
+    def disk(self, ra_deg, dec_deg, r_deg):
+        """Every cell the disk of radius r about (ra, dec) may overlap
+        (conservatively: its full RA extent in every Dec band it touches)."""
+        lo, hi = dec_deg - r_deg, dec_deg + r_deg
+        b0 = int(np.clip(np.floor((lo + 90.0) / self.h), 0, self.nband - 1))
+        b1 = int(np.clip(np.floor((hi + 90.0) / self.h), 0, self.nband - 1))
+        if hi >= 90.0 or lo <= -90.0 or r_deg >= 90.0:
+            half = 180.0                                   # contains a pole
+        else:
+            half = np.degrees(np.arcsin(min(1.0, np.sin(np.radians(r_deg)) / np.cos(np.radians(dec_deg)))))
+        out = []
+        for b in range(b0, b1 + 1):
+            n = int(self.nra[b])
+            if half >= 180.0 or 2 * half / 360.0 * n >= n - 1:
+                idx = np.arange(n)
+            else:
+                i0 = int(np.floor((ra_deg - half) / 360.0 * n))
+                i1 = int(np.floor((ra_deg + half) / 360.0 * n))
+                idx = np.unique(np.arange(i0, i1 + 1) % n)
+            out.append(self.offset[b] + idx)
+        return np.concatenate(out)
+
+
 class VisitIndex:
     """Per-night spatial index of the visits, for ``candidates``.
 
-    Each visit is registered in the HEALPix cells (order ``depth``, ~1.8 deg
-    at the default 5) that its disk of radius ``radius + pad_deg`` about its
-    centre overlaps, under the key ``night index * ncells + cell``. A track
+    Each visit is registered in the cells of a sky grid (Dec bands of
+    ``cell_deg``, cut into RA bins about as wide) that its disk of radius
+    ``radius + pad_deg`` about its centre may overlap, under the key
+    ``night index * ncells + cell``. A track
     position then finds, with one ``searchsorted``, every visit of the night
     whose centre is within ``radius + pad`` of it. Nights where the object
     may move farther than the pad allows are tested against all of their
@@ -414,7 +466,7 @@ class VisitIndex:
     extrapolation interval).
     """
 
-    def __init__(self, visits, pad_deg=2.0, depth=5):
+    def __init__(self, visits, pad_deg=2.0, cell_deg=2.0):
         self.visits = visits
         nv = len(visits)
         night = visits["night"]
@@ -433,21 +485,18 @@ class VisitIndex:
         self.night_tmax = np.maximum.reduceat(self.t, ns) if nv else np.zeros(0)
         self.night_t = 0.5 * (self.night_tmin + self.night_tmax)
 
-        self.depth = depth
-        self.ncells = 12 * 4**depth
-        # cone_search reports every cell the disk overlaps; the usable pad is
-        # a bit smaller than the registered one, against edge effects
-        self.pad_rad = np.radians(pad_deg) * 0.98
+        self.grid = _SkyGrid(cell_deg)
+        self.ncells = self.grid.ncells
+        # the usable pad is a bit smaller than the registered one, against
+        # rounding at the cell edges
+        self.pad_rad = np.radians(pad_deg) * 0.99
         keys, vids = [], []
         c = self.center
         lon = np.degrees(np.arctan2(c[:, 1], c[:, 0])) % 360.0
         lat = np.degrees(np.arcsin(np.clip(c[:, 2], -1.0, 1.0)))
         for v in range(nv):
-            rad = min(np.degrees(self.radius[v]) + pad_deg, 179.0)
-            cells, cdepth, _ = nested.cone_search(Longitude(lon[v], u.deg), Latitude(lat[v], u.deg),
-                                                  rad * u.deg, depth, flat=True)
-            assert (cdepth == depth).all()
-            keys.append(self.night_of_visit[v] * self.ncells + cells.astype(np.int64))
+            cells = self.grid.disk(lon[v], lat[v], np.degrees(self.radius[v]) + pad_deg)
+            keys.append(self.night_of_visit[v] * self.ncells + cells)
             vids.append(np.full(cells.size, v, dtype=np.int64))
         key = np.concatenate(keys) if keys else np.zeros(0, np.int64)
         vid = np.concatenate(vids) if vids else np.zeros(0, np.int64)
@@ -461,45 +510,55 @@ class VisitIndex:
         Each night of the index takes the track sample nearest in time to
         its ``night_t`` (nights more than ``MAX_SAMPLE_GAP_DAYS`` from every
         sample are skipped). If that sample k has ``ok`` and
-        ``sigma_major <= SIGMA_MAX_ARCSEC``, a visit v of the night is a
-        candidate if
+        ``sigma_major <= SIGMA_MAX_ARCSEC``, a visit v of the night, with
+        dt = t_v - t_k, is a candidate if
 
-            angle(center_v, p_k(t_v)) <= radius_v + w_k |t_v - t_k| + margin,
+            angle(center_v, p_k(t_v)) <= radius_v + w_k |dt|
+                + D_k(|dt|) + 0.5 a_k dt^2 + margin,
 
-        where w_k = hypot(rate_ra, rate_dec) and p_k(t) is the sample position
-        moved along the great circle of its rate by w_k (t - t_k).
+        - p_k(t): the sample position moved along the great circle of its
+          rate by w_k (t - t_k), w_k = hypot(rate_ra, rate_dec);
+        - D_k: the diurnal-parallax curvature, below;
+        - a_k: the rate change per day, |v_j - v_k| / |t_j - t_k| of the rate
+          vectors v (in 3D, so free of the RA/Dec basis) to the adjacent
+          usable samples j, the larger of the two sides (0 for a lone
+          sample).
 
-        Choosing the margin. A visit contains a prediction q (the precise
-        pass's, which the match compares with DiaSources) only if
-        angle(center, q) <= radius + r_match; and angle(center, p_k(t_v)) <=
-        angle(center, q) + |q - p_k(t_v)|. So the test never misses a visit if
-        margin >= r_match + |q - p_k(t_v)| - w_k |dt|, i.e. if the margin
-        covers what the w_k |dt| term doesn't of the difference between the
-        linear extrapolation and the precise prediction:
+        Why. A visit contains the prediction q (the precise pass's, which
+        the match compares with DiaSources) only if angle(center, q) <=
+        radius + r_match; and angle(center, p_k(t_v)) <= angle(center, q) +
+        |q - p_k(t_v)|. So nothing is missed if the terms after the radius
+        bound |q - p_k(t_v)| + r_match. Split the topocentric track into the
+        geocentric one plus the diurnal parallax offset d(t):
 
-        - the match radius, 5";
+        - geocentric curvature: <= 0.5 max|accel| dt^2, which the 0.5 a_k dt^2
+          term estimates from the nightly samples (d(t) nearly cancels in the
+          difference of rates a day apart). The w_k |dt| term (not needed for
+          linear motion) is the slack for where the nightly estimate
+          underestimates the acceleration within the night.
+        - diurnal parallax: d(t) is the site's geocentric vector, rotating at
+          the sidereal rate W, projected onto the sky and scaled by 1/delta:
+          its rotating part traces an ellipse of semi-axes <= A = R_E/delta.
+          The linear extrapolation includes d's rate at t_k, so what's left
+          is d(t) - d(t_k) - d'(t_k) dt, whose length for a circle of radius
+          A is exactly A f(W dt) with f(x) = |exp(ix) - 1 - ix| (and at most
+          that for an ellipse inside it). f = 1.16 at 6 h, 1.62 at 0.3 d,
+          2.0 at 0.338 d (8.1 h), 3.74 at 12 h. So D = A max(2, f(W |dt|))
+          (1 + A): the contract's 2A holds up to |dt| = 0.338 d, and f takes
+          over beyond; the (1 + A) covers the second order in R_E/delta.
+          A = arcsin(R_E / delta_eff), with delta_eff = delta_k - r_k |dt|
+          lower-bounding the distance at t_v, r_k being |d delta / dt| from
+          the adjacent samples as for a_k. A non-finite delta takes every
+          visit of the night.
         - light time: the coarse track is geometric, the prediction
-          light-time corrected, which moves it by (rate x light time) =
-          v_perp / c, independently of the distance; <= 55" for any bound
-          orbit near 1 AU (v_perp <= ~80 km/s);
-        - the curvature of the (geocentric) path within |dt|: the object's
-          motion departs from the linear extrapolation by less than its
-          extrapolated displacement w |dt| unless its rate more than doubles
-          within |dt|, which takes a passage within a few Earth-Moon
-          distances in that time; the w_k |dt| term covers the rest;
-        - diurnal parallax, A = R_earth / distance: its rate is part of w_k,
-          but its curvature over |dt| is not, and it can cancel the geocentric
-          rate. With w_d = 2 pi / day, it adds at most
-          A (w_d |dt| + (w_d dt)^2 / 2): 3.7 A for |dt| <= 0.3 d (samples at
-          ``night_t``, Rubin nights being < 12 h), 8 A for |dt| <= 0.5 d.
+          light-time corrected, which moves it by (barycentric velocity x
+          light time) / distance = v_perp / c, whatever the distance: <= 55"
+          for v_perp <= 80 km/s, beyond any object observed near 1 AU.
+        - the match radius, 5".
 
-        ``DEFAULT_CANDIDATE_MARGIN_ARCSEC`` = 600" thus guarantees no miss for
-        objects farther than 0.06 AU when sampled at ``night_t`` (0.13 AU if
-        |dt| reaches 12 h). Closer ones are covered in practice by their
-        large rates (at < 0.1 AU a relative velocity of just 5 km/s is
-        >1.5 deg/day, i.e. a w |dt| slack of ~0.5 deg), but not guaranteed:
-        WP5's brute-force check is the test of that. The margin is cheap:
-        600" adds ~20% to the area searched around a 1.75-deg-radius field.
+        The last two, plus 30" of safety for what isn't modelled (e.g. the
+        coarse pass vs the precise one) are the margin:
+        ``DEFAULT_CANDIDATE_MARGIN_ARCSEC`` = 90".
         """
         nn = self.nights.size
         empty = np.zeros(0, dtype=np.int64)
@@ -522,25 +581,51 @@ class VisitIndex:
         dec = np.asarray(track.dec, dtype=np.float64)
         rra = np.asarray(track.rate_ra, dtype=np.float64)
         rdec = np.asarray(track.rate_dec, dtype=np.float64)
-        elig = (np.asarray(track.ok, dtype=bool)
-                & (np.asarray(track.sigma_major, dtype=np.float64) <= SIGMA_MAX_ARCSEC)
-                & np.isfinite(ra) & np.isfinite(dec) & np.isfinite(rra) & np.isfinite(rdec))
+        delta = np.asarray(track.delta, dtype=np.float64)
+        usable = (np.asarray(track.ok, dtype=bool)
+                  & np.isfinite(ra) & np.isfinite(dec) & np.isfinite(rra) & np.isfinite(rdec))
+        elig = usable & (np.asarray(track.sigma_major, dtype=np.float64) <= SIGMA_MAX_ARCSEC)
         nights = np.flatnonzero((gap <= MAX_SAMPLE_GAP_DAYS) & elig[k_n])
         if not nights.size:
             return empty
+
+        # per sample: position, rate vector (3D, rad/day), and the rate change
+        # and distance change per day to the adjacent usable samples
+        p_all, vel_all = _pos_vel(ra, dec, rra, rdec)
+        acc_all = np.zeros(tk.size)
+        ddel_all = np.zeros(tk.size)
+        u = srt[usable[srt]]                     # usable samples, time-sorted
+        if u.size > 1:
+            dtu = np.diff(tk[u])
+            with np.errstate(invalid="ignore", divide="ignore"):
+                acc = np.linalg.norm(np.diff(vel_all[u], axis=0), axis=1) / dtu
+                ddel = np.abs(np.diff(delta[u])) / dtu
+            acc = np.where(dtu > 0, acc, np.inf)
+            ddel = np.where(dtu > 0, ddel, np.inf)
+            acc_all[u[:-1]] = acc                  # the side after
+            acc_all[u[1:]] = np.maximum(acc_all[u[1:]], acc)
+            ddel_all[u[:-1]] = ddel
+            ddel_all[u[1:]] = np.maximum(ddel_all[u[1:]], ddel)
+        # (NaN changes, e.g. from a NaN delta, count as infinite)
+        acc_all = np.where(np.isnan(acc_all), np.inf, acc_all)
+        ddel_all = np.where(np.isnan(ddel_all), np.inf, ddel_all)
+
         k = k_n[nights]
-        w = np.radians(np.hypot(rra[k], rdec[k]))                     # rad/day
+        w = np.linalg.norm(vel_all[k], axis=1)                        # rad/day
         dt_max = np.maximum(np.abs(self.night_tmax[nights] - tk[k]), np.abs(self.night_tmin[nights] - tk[k]))
-        # the centre of a candidate is within radius + 2 w dt + margin of the
-        # sample itself; the cell lookup finds those within radius + pad
-        fall = 2.0 * w * dt_max + margin > self.pad_rad
+        # the centre of a candidate is within radius + 2 w dt + (the other
+        # terms) of the sample itself; the cell lookup finds those within
+        # radius + pad. (Every term grows with |dt|.)
+        extra_max = (2.0 * w * dt_max + _diurnal(delta[k], ddel_all[k], dt_max)
+                     + _curvature(acc_all[k], dt_max) + margin)
+        fall = ~(extra_max <= self.pad_rad)
 
         pair_n, pair_v = [], []
         # lookup
         lk = ~fall
         if lk.any():
             nl = nights[lk]
-            cell = _healpix(ra[k[lk]], dec[k[lk]], self.depth)
+            cell = self.grid.cell(ra[k[lk]], dec[k[lk]])
             key = nl * self.ncells + cell
             i0 = np.searchsorted(self.reg_key, key, side="left")
             i1 = np.searchsorted(self.reg_key, key, side="right")
@@ -565,18 +650,50 @@ class VisitIndex:
 
         # the exact test, per (night's sample, visit)
         kk = k[pn]
-        a, d = np.radians(ra[kk]), np.radians(dec[kk])
-        sa, ca, sd, cd = np.sin(a), np.cos(a), np.sin(d), np.cos(d)
-        p = np.stack([cd * ca, cd * sa, sd], axis=-1)
-        e_ra = np.stack([-sa, ca, np.zeros_like(a)], axis=-1)
-        e_dec = np.stack([-sd * ca, -sd * sa, cd], axis=-1)
-        vel = np.radians(rra[kk])[:, None] * e_ra + np.radians(rdec[kk])[:, None] * e_dec   # rad/day
         wk = w[pn]
         dt = self.t[pv] - tk[kk]
+        adt = np.abs(dt)
         ang = wk * dt
         with np.errstate(invalid="ignore", divide="ignore"):
-            dirn = np.where(wk[:, None] > 0, vel / wk[:, None], 0.0)
-        p_ext = p * np.cos(ang)[:, None] + dirn * np.sin(ang)[:, None]
+            dirn = np.where(wk[:, None] > 0, vel_all[kk] / wk[:, None], 0.0)
+        p_ext = p_all[kk] * np.cos(ang)[:, None] + dirn * np.sin(ang)[:, None]
         sep = _angle(self.center[pv], p_ext)
-        keep = sep <= self.radius[pv] + wk * np.abs(dt) + margin
+        tol = (self.radius[pv] + wk * adt + _diurnal(delta[kk], ddel_all[kk], adt)
+               + _curvature(acc_all[kk], adt) + margin)
+        keep = sep <= tol
         return np.unique(pv[keep])
+
+
+def _pos_vel(ra, dec, rate_ra, rate_dec):
+    """Unit vectors (K, 3) of RA, Dec [deg] and their on-sky rate vectors
+    (K, 3) [rad/day] from rate_ra (cos dec included), rate_dec [deg/day]."""
+    a, d = np.radians(ra), np.radians(dec)
+    sa, ca, sd, cd = np.sin(a), np.cos(a), np.sin(d), np.cos(d)
+    p = np.stack([cd * ca, cd * sa, sd], axis=-1)
+    e_ra = np.stack([-sa, ca, np.zeros_like(a)], axis=-1)
+    e_dec = np.stack([-sd * ca, -sd * sa, cd], axis=-1)
+    vel = np.radians(rate_ra)[..., None] * e_ra + np.radians(rate_dec)[..., None] * e_dec
+    return p, vel
+
+
+def diurnal_coefficient(adt):
+    """max(2, f(W |dt|)), f(x) = |exp(ix) - 1 - ix|: the bound, in units of
+    the parallax amplitude, on how far the diurnal parallax departs from its
+    linear extrapolation over |dt| [day] (see ``VisitIndex.candidates``)."""
+    x = OMEGA_EARTH * np.asarray(adt, dtype=np.float64)
+    return np.maximum(2.0, np.hypot(np.cos(x) - 1.0, np.sin(x) - x))
+
+
+def _curvature(acc, adt):
+    """0.5 acc dt^2 [rad], 0 at dt = 0 even for an infinite acc."""
+    with np.errstate(invalid="ignore"):
+        return np.where(adt > 0, 0.5 * acc * adt**2, 0.0)
+
+
+def _diurnal(delta, ddelta, adt):
+    """The diurnal-parallax term D [rad] of ``VisitIndex.candidates``."""
+    with np.errstate(invalid="ignore"):
+        d_eff = delta - ddelta * adt
+        d_eff = np.where(np.isfinite(d_eff), d_eff, 0.0)
+        A = np.arcsin(np.minimum(R_EARTH_AU / np.maximum(d_eff, R_EARTH_AU), 1.0))
+    return diurnal_coefficient(adt) * A * (1.0 + A)

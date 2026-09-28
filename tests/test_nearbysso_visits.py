@@ -334,7 +334,7 @@ def truth_in_visit(vis, pos_at, r_arcsec):
                               <= vis["radius"] + np.radians(r_arcsec / 3600)).tolist())
 
 
-def make_track(pos_at, t, sigma=1.0, ok=True, h=1e-4):
+def make_track(pos_at, t, sigma=1.0, ok=True, h=1e-4, delta=2.0):
     ra, dec = pos_at(t)
     ra1, dec1 = pos_at(t + h)
     ra0, dec0 = pos_at(t - h)
@@ -343,7 +343,7 @@ def make_track(pos_at, t, sigma=1.0, ok=True, h=1e-4):
     K = t.size
     return C.CoarseTrack(t=t, ra=ra, dec=dec, rate_ra=dra, rate_dec=ddec, ra_err=np.full(K, 1e-4),
                          dec_err=np.full(K, 1e-4), ra_dec_cov=np.zeros(K), sigma_major=np.full(K, sigma),
-                         ok=np.full(K, ok))
+                         ok=np.full(K, ok), delta=np.broadcast_to(np.asarray(delta, float), (K,)).copy())
 
 
 def great_circle_path(ra0, dec0, pa_deg, rate, t0, accel=0.0):
@@ -402,21 +402,57 @@ def test_candidates_brute_force_formula():
         pos_at = great_circle_path(rng.uniform(0, 360), rng.uniform(-40, 40), rng.uniform(0, 360), rate,
                                    26356.0)
         track = make_track(pos_at, vi.night_t + rng.normal(0, 0.1, 3))
+        track = track._replace(delta=rng.uniform(0.03, 3.0) + rng.uniform(-0.01, 0.01) * (track.t - 26357))
         margin = 30.0
         got = vi.candidates(track, margin)
-        # brute force
+        # brute force, the terms computed independently
+        vel = [rate_vector(track, i) for i in range(3)]
+        order = np.argsort(track.t)
         exp = []
         for v in range(len(vis)):
             n = np.searchsorted(vi.nights, vis["night"][v])
             k = np.argmin(np.abs(track.t - vi.night_t[n]))
             w = np.radians(np.hypot(track.rate_ra[k], track.rate_dec[k]))
             dt = vis["t"][v] - track.t[k]
+            pos = list(order).index(k)
+            nb = [order[j] for j in (pos - 1, pos + 1) if 0 <= j < 3]
+            acc = max(np.linalg.norm(vel[j] - vel[k]) / abs(track.t[j] - track.t[k]) for j in nb)
+            ddel = max(abs(track.delta[j] - track.delta[k]) / abs(track.t[j] - track.t[k]) for j in nb)
+            A = np.arcsin(V.R_EARTH_AU / max(track.delta[k] - ddel * abs(dt), V.R_EARTH_AU))
+            x = V.OMEGA_EARTH * abs(dt)
+            coef = max(2.0, abs(np.exp(1j * x) - 1 - 1j * x))
             # the great-circle extrapolation is the path itself
             ra, dec = pos_at(np.array(vis["t"][v]))
             sep = V._angle(vis["center"][v], unit(ra, dec))
-            if sep <= vis["radius"][v] + w * abs(dt) + np.radians(margin / 3600):
+            tol = (vis["radius"][v] + w * abs(dt) + coef * A * (1 + A) + 0.5 * acc * dt**2
+                   + np.radians(margin / 3600))
+            if sep <= tol:
                 exp.append(v)
         np.testing.assert_array_equal(got, exp)
+
+
+def rate_vector(track, k):
+    """The 3D on-sky rate vector [rad/day] of sample k."""
+    a, d = np.radians(track.ra[k]), np.radians(track.dec[k])
+    e_ra = np.array([-np.sin(a), np.cos(a), 0.0])
+    e_dec = np.array([-np.sin(d) * np.cos(a), -np.sin(d) * np.sin(a), np.cos(d)])
+    return np.radians(track.rate_ra[k]) * e_ra + np.radians(track.rate_dec[k]) * e_dec
+
+
+def test_diurnal_coefficient():
+    """f(W dt) = |exp(i W dt) - 1 - i W dt| exceeds 2 beyond 0.338 d."""
+    assert V.diurnal_coefficient(0.0) == 2.0 and V.diurnal_coefficient(0.3) == 2.0
+    assert abs(V.diurnal_coefficient(0.5) - 3.7387) < 1e-3
+    assert 1.99 < V.diurnal_coefficient(0.3378) <= 2.0 < V.diurnal_coefficient(0.3395)
+    # it bounds the departure of a rotating unit vector from its linear
+    # extrapolation, for any phase and any projection (ellipse) of it
+    th = np.linspace(0, 2 * np.pi, 721)
+    for dt in (0.1, 0.3, 0.45, 0.6):
+        x = V.OMEGA_EARTH * dt
+        for a, c in ((1, 1), (1, 0.3), (0.2, 1)):
+            e1 = a * (np.sin(th + x) - np.sin(th) - x * np.cos(th))
+            e2 = c * (np.cos(th + x) - np.cos(th) + x * np.sin(th))
+            assert np.hypot(e1, e2).max() <= V.diurnal_coefficient(dt) * (1 + 1e-12)
 
 
 def test_candidates_eligibility():
@@ -443,7 +479,7 @@ def test_candidates_eligibility():
     # samples far from every night: nothing
     assert vi.candidates(tr._replace(t=tr.t + 5.0), 60.0).size == 0
     # empty track
-    e = C.CoarseTrack(*[np.zeros(0)] * 10)
+    e = C.CoarseTrack(*[np.zeros(0)] * 11)
     assert vi.candidates(e, 60.0).size == 0
 
 
@@ -463,7 +499,7 @@ def test_candidates_field_edge_and_fast():
     assert list(vi.candidates(tr, 0.0)) == [0]
     # the same but just outside: needs the margin
     edge2 = great_circle_path(np.array(100.0 + 1.75 + 4 / 3600), np.array(0.0), 90.0, 0.0, 26356.0)
-    tr2 = make_track(edge2, np.array([26356.2]))
+    tr2 = make_track(edge2, np.array([26356.2]), delta=1e6)
     assert list(vi.candidates(tr2, 0.0)) == []
     assert list(vi.candidates(tr2, 5.0)) == [0]
     # 500 deg/day eastward: at 100 deg at t=0, 150 at 0.1, 300 at 0.4
@@ -471,3 +507,130 @@ def test_candidates_field_edge_and_fast():
     trf = make_track(fast, np.array([26356.2]))
     got = vi.candidates(trf, 0.0)
     assert {0, 1} <= set(got.tolist())
+
+
+# --------------------------------------------------------------------------
+# close approaches: diurnal parallax and a changing rate
+# --------------------------------------------------------------------------
+
+SITE_LAT = np.radians(-30.24)
+
+
+def flyby(rng, delta0, t0):
+    """A geocentric object at delta0 [AU] at t0, moving mostly radially
+    (so its geocentric rate on the sky is small, 0.02-1 deg/day, or passes
+    through zero), with a random acceleration, seen from a site rotating
+    with the Earth: returns topo(t) -> (ra, dec, delta)."""
+    xhat = unit(rng.uniform(0, 360), np.degrees(np.arcsin(rng.uniform(-0.9, 0.9))))
+    perp = np.cross(xhat, rng.normal(size=3))
+    perp /= np.linalg.norm(perp)
+    v_rad = rng.uniform(-3, 3) / 1731.46             # km/s -> AU/day
+    v_perp = np.radians(rng.uniform(0.02, 1.0)) * delta0 * rng.choice([-1, 1])
+    G = rng.normal(size=3) * 1e-6                      # AU/day^2
+    X0, V0 = xhat * delta0, v_rad * xhat + v_perp * perp
+    th0 = rng.uniform(0, 2 * np.pi)
+
+    def topo(t):
+        t = np.asarray(t, dtype=np.float64)
+        dt = (t - t0)[..., None]
+        X = X0 + V0 * dt + 0.5 * G * dt**2
+        th = th0 + V.OMEGA_EARTH * (t - t0)
+        rho = V.R_EARTH_AU * np.stack([np.cos(SITE_LAT) * np.cos(th), np.cos(SITE_LAT) * np.sin(th),
+                                       np.full(th.shape, np.sin(SITE_LAT))], -1)
+        Y = X - rho
+        d = np.linalg.norm(Y, axis=-1)
+        ra, dec = radec(Y / d[..., None])
+        return ra, dec, d
+    return topo
+
+
+def flyby_track(topo, t, h=1e-5):
+    ra, dec, d = topo(t)
+    p0, p1 = unit(*topo(t - h)[:2]), unit(*topo(t + h)[:2])
+    v = (p1 - p0) / (2 * h)                            # rad/day, tangent to the sky
+    a = np.radians(ra)
+    dd = np.radians(dec)
+    e_ra = np.stack([-np.sin(a), np.cos(a), 0 * a], -1)
+    e_dec = np.stack([-np.sin(dd) * np.cos(a), -np.sin(dd) * np.sin(a), np.cos(dd)], -1)
+    K = t.size
+    return C.CoarseTrack(t=t, ra=ra, dec=dec, rate_ra=np.degrees((v * e_ra).sum(-1)),
+                         rate_dec=np.degrees((v * e_dec).sum(-1)), ra_err=np.full(K, 1e-4),
+                         dec_err=np.full(K, 1e-4), ra_dec_cov=np.zeros(K), sigma_major=np.ones(K),
+                         ok=np.ones(K, bool), delta=d)
+
+
+def flyby_visits(rng, topo, nights=4, per_night=120):
+    """Visits (radius 1.75 deg) with times over 9 h of each night, centred
+    near where the object is at some other time of that night, many of them
+    near the edge of the field."""
+    rows = []
+    for n in range(nights):
+        tn = 26356.1 + n + np.sort(rng.uniform(0.0, 0.375, per_night))
+        tc = 26356.1 + n + rng.uniform(0.0, 0.375, per_night)
+        ra, dec, _ = topo(tc)
+        off = np.degrees(rng.uniform(0, 1, per_night) ** 0.3 * np.radians(2.5)) * 3600
+        cra, cdec = offset(ra, dec, off, rng.uniform(0, 2 * np.pi, per_night))
+        for i in range(per_night):
+            rows.append((20250501 + n, i, tn[i], cra[i], cdec[i]))
+    vis = np.zeros(len(rows), dtype=C.VISIT_DTYPE)
+    vis["night"] = [r[0] for r in rows]
+    vis["visit"] = vis["night"] * 100000 + [r[1] for r in rows]
+    vis["t"] = [r[2] for r in rows]
+    vis["t_tai_mjd"] = vis["t"] + 51544.5
+    vis["center"] = unit(np.array([r[3] for r in rows]), np.array([r[4] for r in rows]))
+    vis["radius"] = np.radians(1.75)
+    return vis
+
+
+@pytest.mark.parametrize("delta0", [0.002, 0.005, 0.01, 0.02, 0.05])
+def test_candidates_close_approach(delta0):
+    """Nearby objects with small on-sky rates, whose diurnal parallax (up to
+    1.2 deg at 0.002 AU) dominates their motion within a night: no visit the
+    object is in is missed, against brute force, with just the match radius
+    as the margin (the geometric truth has no light time). Without the
+    diurnal term (delta -> infinity) there are misses."""
+    rng = np.random.default_rng(int(delta0 * 1e4))
+    n_true = n_miss_nodiurnal = n_cand = 0
+    for trial in range(40):
+        topo = flyby(rng, delta0, 26357.3)
+        vis = flyby_visits(rng, topo)
+        vi = V.VisitIndex(vis)
+        track = flyby_track(topo, vi.night_t)
+        ra, dec, _ = topo(vis["t"])
+        truth = set(np.flatnonzero(V._angle(vis["center"], unit(ra, dec))
+                                   <= vis["radius"] + np.radians(R / 3600)).tolist())
+        got = set(vi.candidates(track, R * 1.001).tolist())
+        assert truth <= got, (trial, sorted(truth - got))
+        # and with the default margin, as in production
+        assert truth <= set(vi.candidates(track, V.DEFAULT_CANDIDATE_MARGIN_ARCSEC).tolist())
+        far = set(vi.candidates(track._replace(delta=np.full(track.t.size, 1e9)), R * 1.001).tolist())
+        n_true += len(truth)
+        n_cand += len(got)
+        n_miss_nodiurnal += len(truth - far)
+    assert n_true > 1000
+    if delta0 <= 0.01:
+        assert n_miss_nodiurnal > 0
+    print(f"delta {delta0}: {n_true} true, {n_cand} candidates, {n_miss_nodiurnal} missed without the "
+          "diurnal term")
+
+
+def test_sky_grid_disk_complete():
+    """Every point of a disk lies in one of the cells the grid registers the
+    disk in: random disks, near the poles and across RA 0/360."""
+    rng = np.random.default_rng(10)
+    g = V._SkyGrid(2.0)
+    c = g.cell(np.array([0.0, 360.0, -1e-9]), np.array([0.0, 0.0, 0.0]))
+    assert c[0] == c[1] == g.cell(0.0, 0.0) and c[2] == c[0] + g.nra[45] - 1
+    for trial in range(400):
+        ra = rng.choice([rng.uniform(0, 360), rng.uniform(-2, 2) % 360])
+        dec = rng.choice([np.degrees(np.arcsin(rng.uniform(-1, 1))),
+                          rng.uniform(80, 90) * rng.choice([-1, 1])])
+        r = rng.uniform(0.01, 5.0)
+        cells = set(g.disk(ra, dec, r).tolist())
+        m = 3000
+        pr, pd = offset(np.full(m, ra), np.full(m, dec), r * 3600 * np.sqrt(rng.uniform(0, 1, m)),
+                        rng.uniform(0, 2 * np.pi, m))
+        pr2, pd2 = offset(np.full(m, ra), np.full(m, dec), np.full(m, r * 3600 * 0.999999),
+                          rng.uniform(0, 2 * np.pi, m))
+        got = set(g.cell(np.r_[pr, pr2], np.r_[pd, pd2]).tolist())
+        assert got <= cells, (ra, dec, r)
