@@ -10,6 +10,7 @@ import astropy.units as u
 from functools import partial
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from . import util, schema
 from .photfit import hg_V_mag
@@ -112,16 +113,35 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     ``max_objects`` and ``dia_sample_frac`` subsample the inputs, for
     testing.
     """
+    # Read only the DiaSource columns used below: the extract-submitted-sources
+    # output carries every SubmittableSources column (~150), which would
+    # otherwise all be loaded. Extend this list when a new column is used.
+    dia_path = f"{input_dir}/dia_sources.parquet"
+    dia_columns = [
+        "diaSourceId", "ra", "dec", "midpointMjdTai",
+        # from extract-submitted-sources only
+        "obsid", "processing", "primary", "submission_id", "trksub", "trkid", "sep_mas", "dt_ms",
+    ]
+    present = set(pq.read_schema(dia_path).names)
     dia = pd.read_parquet(
-        f"{input_dir}/dia_sources.parquet", engine="pyarrow", dtype_backend="pyarrow"
+        dia_path, engine="pyarrow", dtype_backend="pyarrow",
+        columns=[c for c in dia_columns if c in present],
     ).reset_index(drop=True)
     if dia_sample_frac < 1.0:
         # Testing aid: drop some DIA sources and shuffle the rest, to
         # exercise the association logic with missing / unsorted indices.
         dia = dia.sample(frac=dia_sample_frac, random_state=seed).reset_index(drop=True)
 
+    # Likewise only the obs_sbn columns used below (the dump has ~90).
+    det_path = f"{input_dir}/obs_sbn.parquet"
+    det_columns = [
+        "obsid", "trkid", "trksub", "obssubid", "provid", "permid", "submission_id",
+        "ra", "dec", "obstime", "designation_asterisk",
+    ]
+    present = set(pq.read_schema(det_path).names)
     det = pd.read_parquet(
-        f"{input_dir}/obs_sbn.parquet", engine="pyarrow", dtype_backend="pyarrow"
+        det_path, engine="pyarrow", dtype_backend="pyarrow",
+        columns=[c for c in det_columns if c in present],
     ).reset_index()
 
     if max_objects is not None:
