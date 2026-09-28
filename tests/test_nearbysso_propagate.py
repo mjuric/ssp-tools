@@ -105,18 +105,11 @@ def plain_states(state0, epoch, t, ephem):
 
 
 def phi_variational(orbit, t, ephem):
-    """(K, 6, 6) Phi(t) from coarse()'s own integration routine."""
-    K = len(t)
-    X = np.full((K, 6), np.nan)
-    Phi = np.full((K, 6, 6), np.nan)
-    ok = np.zeros(K, bool)
-    fwd = np.flatnonzero(t >= orbit["epoch"])
-    bwd = np.flatnonzero(t < orbit["epoch"])[::-1]
-    for idx in (fwd, bwd):
-        if len(idx):
-            propagate._integrate(orbit["state0"], orbit["epoch"], t[idx], ephem, X, Phi, ok, idx)
-    assert ok.all()
-    return X, Phi
+    """(K, 6) states and (K, 6, 6) Phi(t), through coarse()'s _phi hook."""
+    out = {}
+    tr = propagate.coarse(orbit, t, np.zeros((len(t), 3)), ephem, _phi=out)
+    assert tr.ok.all()
+    return out["state"], out["phi"]
 
 
 def sky_offsets(u0, u):
@@ -147,7 +140,8 @@ def _track(t, s00, s01, s11):
     K = len(t)
     z = np.zeros(K)
     return CoarseTrack(t=np.asarray(t, float), ra=z, dec=z, rate_ra=z, rate_dec=z, ra_err=ra_err,
-                       dec_err=dec_err, ra_dec_cov=cov, sigma_major=sig, ok=np.ones(K, bool))
+                       dec_err=dec_err, ra_dec_cov=cov, sigma_major=sig, ok=np.ones(K, bool),
+                       delta=np.ones(K))
 
 
 def test_ellipse_algebra():
@@ -292,6 +286,17 @@ def test_topocentric_matches_precise_pass(ephem, orbits):
         assert np.all(drate < bound), (name, (drate / bound).max())
         assert np.all(drate < 1e-3 * np.degrees(vrel / d) + 2e-4), name
         assert np.all(np.isfinite(tr.sigma_major))
+        # delta is the geometric |X(t) - O(t)| of the precise pass's state
+        # (to the integration difference; see the Phi test), and exceeds
+        # its light-time-corrected distance |X(t - tau) - O(t)| by the
+        # radial motion during the light time, tau (u . V), to second
+        # order in tau (~1e-8 AU, i.e. a few km)
+        np.testing.assert_allclose(tr.delta, np.linalg.norm(eph.xx.T - obs_pos, axis=1),
+                                   rtol=0, atol=2e-8)
+        dd = tr.delta - d
+        expect_d = eph.light_time * np.sum(u_p * V, axis=1)
+        err = np.abs(dd - expect_d)
+        assert np.all(err < 1e-3 * np.abs(expect_d) + 3e-8), (name, err.max())
 
 
 @needs_assist
@@ -314,6 +319,7 @@ def test_no_covariance_and_failures(ephem, orbits):
     orbit["state0"][0] = np.nan
     tr = propagate.coarse(orbit, t, obs_pos, ephem)
     assert not tr.ok.any() and np.all(tr.sigma_major == np.inf) and np.isnan(tr.ra).all()
+    assert np.isnan(tr.delta).all()
 
     # beyond the ephemeris range (the DE440/441 file ends in 2650, at ASSIST
     # time ~237430): the samples inside are fine, those outside fail. (The
@@ -324,6 +330,7 @@ def test_no_covariance_and_failures(ephem, orbits):
     op = np.tile(obs_pos[:1], (4, 1))
     tr = propagate.coarse(orbit, tt, op, ephem)
     assert tr.ok.tolist() == [True, True, False, False]
+    assert np.isfinite(tr.delta[:2]).all() and np.isnan(tr.delta[2:]).all()
     assert np.all(tr.sigma_major[2:] == np.inf) and np.isfinite(tr.sigma_major[:2]).all()
 
     # no samples

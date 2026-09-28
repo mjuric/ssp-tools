@@ -163,10 +163,15 @@ def _ellipse(s00, s01, s11):
     return ra_err, dec_err, s01.copy(), sigma
 
 
-def coarse(orbit, t, obs_pos, ephem):
+def coarse(orbit, t, obs_pos, ephem, _phi=None):
     """Sample one orbit at ASSIST times ``t`` (K,), observed from
     ``obs_pos`` (K, 3). Returns a CoarseTrack; see ``_contract`` and the
-    module docstring.
+    module docstring. ``delta`` is the geometric topocentric distance
+    |object - observer| [AU] (NaN where ``ok`` is False).
+
+    ``_phi``, for tests: a dict, which gets ``state`` (K, 6) and ``phi``
+    (K, 6, 6), Phi[k, i, j] = d state_i(t_k) / d state0_j (NaN where not
+    ok).
 
     The times need not be sorted; samples on either side of the epoch are
     integrated by two simulations, each moving away from the epoch."""
@@ -190,6 +195,8 @@ def coarse(orbit, t, obs_pos, ephem):
         for idx in (fwd, bwd):
             if len(idx):
                 _integrate(state0, epoch, t[idx], ephem, X, Phi, ok, idx)
+    if _phi is not None:
+        _phi.update(state=X, phi=Phi)
 
     # Topocentric geometry ---------------------------------------------------
     rho = X[:, :3] - obs_pos
@@ -225,7 +232,7 @@ def coarse(orbit, t, obs_pos, ephem):
     return CoarseTrack(
         t=t.copy(), ra=ra, dec=dec, rate_ra=rate_ra, rate_dec=rate_dec,
         ra_err=ra_err, dec_err=dec_err, ra_dec_cov=ra_dec_cov,
-        sigma_major=sigma_major, ok=ok,
+        sigma_major=sigma_major, ok=ok, delta=d,
     )
 
 
