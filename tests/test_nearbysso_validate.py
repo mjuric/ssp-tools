@@ -34,7 +34,7 @@ def test_filter_reason():
                  q=[2.0, 2.0, 2.0, np.nan, 2.0, 2.0],
                  arc_text=["3 days", "2014-2024", "2014-2024", "2014-2024", "2 days", None])
     r = V.filter_reason(df)
-    assert list(r) == ["", "comet", "comet", "missing_elements", "short_arc", ""]
+    assert list(r) == ["", "comet", "comet", "missing_elements", "short_arc", "null_arc"]
     for arc, expect in (("0 days", "short_arc"), ("1 days", "short_arc"), ("0", ""), ("30 days", "")):
         assert V.filter_reason(df.iloc[:1].assign(arc_text=[arc]))[0] == expect
     lk = V.reason_lookup(df)
@@ -55,7 +55,21 @@ def test_arc_text_from_json():
     assert list(got) == ["2007-2021", "2 days", "0", None, None, "13 days", None, "2 days"]
     # the same through a DataFrame without arc_text
     df = _orbits().iloc[[0] * 8].reset_index(drop=True).drop(columns="arc_text").assign(mpc_orb_jsonb=texts)
-    assert list(V.filter_reason(df)) == ["", "short_arc", "", "", "", "", "", "short_arc"]
+    assert list(V.filter_reason(df)) == ["", "short_arc", "", "null_arc", "null_arc", "", "null_arc",
+                                         "short_arc"]
+
+
+def test_null_arc_excluded():
+    # get-mpcorb.py: WHERE NOT ...->>'arc_length_total' IN (...) is NULL
+    # for a null/absent arc (or orbit_fit_statistics null), so it's dropped
+    texts = [json.dumps({"orbit_fit_statistics": None}), json.dumps({"orbit_fit_statistics": {}}),
+             json.dumps({"orbit_fit_statistics": {"arc_length_total": None}}), None,
+             json.dumps({"orbit_fit_statistics": {"arc_length_total": "3 days"}})]
+    df = _orbits().iloc[[0] * 5].reset_index(drop=True).drop(columns="arc_text").assign(mpc_orb_jsonb=texts)
+    assert list(V.filter_reason(df)) == ["null_arc"] * 4 + [""]
+    # the earlier reasons take precedence
+    comet = _orbits(designation=["P/2019 A1"], packed=["PK19A010"], arc_text=[None])
+    assert list(V.filter_reason(comet)) == ["comet"]
 
 
 def test_arc_days():
@@ -555,6 +569,8 @@ def _write_case(tmp_path):
     orb = _orbits(designation=des, packed=[("_x" if "/" in d else "p" + d) for d in des])
     orb = orb.rename(columns={"designation": "unpacked_primary_provisional_designation",
                               "packed": "packed_primary_provisional_designation"})
+    orb = orb.drop(columns="arc_text").assign(
+        mpc_orb_jsonb=json.dumps({"orbit_fit_statistics": {"arc_length_total": "2014-2024"}}))
     orb.to_parquet(tmp_path / "orbits.parquet")
     return sss
 
