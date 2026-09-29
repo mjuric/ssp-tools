@@ -84,7 +84,7 @@ def _synthetic_table(rng):
         # designation, packed, json, q (None: missing)
         ("2000 AA", "K00A00A", _orbit_json(good, "2001-2020"), 2.0),        # kept
         ("C/2024 G7", "CK24G070", _orbit_json(good, "2001-2020"), 2.0),     # comet ('/')
-        ("2025 OF623", "_PO001I", _orbit_json(good, "2001-2020"), 2.0),     # comet ('_')
+        ("2025 OF623", "_PO001I", _orbit_json(good, "2001-2020"), 2.0),     # kept: extended packed asteroid
         ("2001 BB", "K01B00B", _orbit_json(good, "2001-2020"), None),       # elements missing
         ("2002 CC", "K02C00C", _orbit_json(good, "2 days"), 2.0),           # short arc
         ("2002 CD", "K02C00D", _orbit_json(good, "0 days"), 2.0),           # short arc
@@ -127,7 +127,8 @@ def test_filter_masks():
     arc = ['"2001-2020"', '"4 days"', '"4 days"', '"4 days"', '"4 days"', '"2 days"', '"1 days"', None,
            '"3 days"']
     not_comet, has_el, long_arc = O.filter_masks(desig, packed, el, arc)
-    np.testing.assert_array_equal(not_comet, [1, 0, 0, 0, 1, 1, 1, 1, 1])
+    # 2025 OF623 (_PO001I): an asteroid in the extended packed format
+    np.testing.assert_array_equal(not_comet, [1, 0, 0, 1, 1, 1, 1, 1, 1])
     np.testing.assert_array_equal(has_el, [1, 1, 1, 1, 0, 1, 1, 1, 1])
     np.testing.assert_array_equal(long_arc, [1, 1, 1, 1, 1, 0, 0, 0, 1])
     # JSON null and "0 days" drop; the number 0 (MPC "no_orbit" statistics)
@@ -148,18 +149,20 @@ def test_load_synthetic(tmp_path, capsys):
     out = O.load_orbits(path, ephem=ephem, stats=stats)
     line = capsys.readouterr().out
     # rows without an arc (no JSON, or none in it) drop, as in get-mpcorb.py
-    assert "14 rows read" in line and "removed 2 comets, 1 missing elements, 5 arcs <= 2 d" in line
-    assert "6 kept" in line and "has_cov false 1 (0 missing, 1 not PSD)" in line
+    assert "14 rows read" in line and "removed 1 comets, 1 missing elements, 5 arcs <= 2 d" in line
+    assert "7 kept" in line and "has_cov false 1 (0 missing, 1 not PSD)" in line
     rms = stats.pop("normalized_rms")
-    assert stats == dict(rows_read=14, kept=6, removed=dict(comet=2, elements=1, arc=5), has_cov_false=1,
+    assert stats == dict(rows_read=14, kept=7, removed=dict(comet=1, elements=1, arc=5), has_cov_false=1,
                          cov_missing=0, cov_not_psd=1, cov_clipped_to_psd=stats["cov_clipped_to_psd"])
-    assert set(rms) == {"p5", "p50", "p95", "p99", "n", "n_zero"} and rms["n"] + rms["n_zero"] <= 6
+    assert set(rms) == {"p5", "p50", "p95", "p99", "n", "n_zero"} and rms["n"] + rms["n_zero"] <= 7
     assert f"{rms['p50']:.3f}" in line
 
     assert out.dtype == ORBIT_DTYPE
-    assert list(out["designation"]) == ["1993 TT", "1994 UU", "1995 VV", "1998 YY", "1999 ZZ", "2000 AA"]
-    assert list(out["has_cov"]) == [True, True, True, False, True, True]
-    assert list(out["packed"]) == ["J93T00T", "J94U00U", "J95V00V", "J98Y00Y", "J99Z00Z", "K00A00A"]
+    assert list(out["designation"]) == ["1993 TT", "1994 UU", "1995 VV", "1998 YY", "1999 ZZ", "2000 AA",
+                                        "2025 OF623"]
+    assert list(out["has_cov"]) == [True, True, True, False, True, True, True]
+    assert list(out["packed"]) == ["J93T00T", "J94U00U", "J95V00V", "J98Y00Y", "J99Z00Z", "K00A00A",
+                                   "_PO001I"]
 
     Ceq = O.R6 @ good @ O.R6.T
     for r in out[out["has_cov"]]:
@@ -286,7 +289,14 @@ def test_real_ordering_and_filter(sample):
     d = sample.out["designation"]
     assert np.all(d[:-1] < d[1:])                      # sorted, unique
     assert not np.any(np.char.find(d.astype(str), "/") >= 0)
-    assert not np.any(np.char.startswith(sample.out["packed"].astype(str), "_"))
+    # extended-format packed designations ("_...") are asteroids: never comets
+    t = sample.table
+    packed = t["packed_primary_provisional_designation"].to_numpy(zero_copy_only=False).astype(str)
+    desig = t["unpacked_primary_provisional_designation"].to_numpy(zero_copy_only=False).astype(str)
+    ext = np.char.startswith(packed, "_")
+    not_comet, _, _ = O.filter_masks(desig[ext], packed[ext], {k: np.ones(ext.sum()) for k in O.ELEMENTS},
+                                     ['"2001-2020"'] * int(ext.sum()))
+    assert not_comet.all()
     assert 0.9 * NSAMPLE < len(sample.out) < NSAMPLE
 
 
@@ -361,6 +371,8 @@ def test_real_frame_and_units(sample):
     checked = 0
     for k in rng.choice(idx, 200, replace=False):
         ev = np.array(json.loads(js[int(k)].as_py())["CAR"]["eigenvalues"], dtype=float)
+        if ev.size != 6:                  # e.g. a Yarkovsky fit: 7 parameters, of which we keep the state's 6
+            continue
         lam = np.linalg.eigvalsh(cov[k])
         if lam[0] < 1e-10 * lam[-1]:      # ill-conditioned: the small ones are rounding noise
             continue

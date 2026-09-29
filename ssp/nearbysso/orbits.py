@@ -484,10 +484,18 @@ def filter_masks(designation, packed, elements, arc):
     third of the orbits, most of them multi-opposition. Here arc values are
     the JSON text, strings still quoted (as ``_parse_car_chunk`` returns
     them).
+
+    Comets are the designations containing "/" (C/, P/, D/, and also A/
+    and S/, which are dropped with them). A packed designation starting
+    with "_" is *not* a comet. It is the MPC's extended packed format for
+    asteroid provisional designations with a cycle count above 619 (e.g.
+    ``_FB0088`` = 2015 BE640, ``_PO001I`` = 2025 OF623). Rejecting those
+    removed 6,140 asteroids from the 2026-09-29 catalog, and no comet's
+    packed designation starts with "_". ``packed`` is kept in the
+    signature for callers.
     """
     designation = np.asarray(designation, dtype=str)
-    packed = np.asarray(packed, dtype=str)
-    not_comet = ~(np.char.find(designation, "/") >= 0) & ~np.char.startswith(packed, "_")
+    not_comet = ~(np.char.find(designation, "/") >= 0)
     has_elements = np.ones(len(designation), dtype=bool)
     for k in ELEMENTS:
         has_elements &= np.isfinite(np.asarray(elements[k], dtype=np.float64))

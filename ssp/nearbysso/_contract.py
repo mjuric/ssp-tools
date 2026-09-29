@@ -68,7 +68,8 @@ ORBIT_DTYPE = np.dtype([
 
 # orbits.load_orbits(path, with_filter=True) -> np.ndarray[ORBIT_DTYPE]
 #   Reads mpc_orbits Parquet. The filter keeps orbits that aren't comets
-#   (designation without '/', packed not starting with '_'), have all of
+#   (designation without '/'; a packed designation starting with '_' is an
+#   asteroid in the MPC's extended format, not a comet), have all of
 #   q, e, i, node, argperi and peri_time, and an arc filtered exactly as
 #   lsst-gen-ephemcache's get-mpcorb.py does: on the JSON
 #   orbit_fit_statistics.arc_length_total *text*, NOT IN ('0 days',
