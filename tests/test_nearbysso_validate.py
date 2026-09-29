@@ -34,7 +34,8 @@ def test_filter_reason():
                  q=[2.0, 2.0, 2.0, np.nan, 2.0, 2.0],
                  arc_text=["3 days", "2014-2024", "2014-2024", "2014-2024", "2 days", None])
     r = V.filter_reason(df)
-    assert list(r) == ["", "comet", "comet", "missing_elements", "short_arc", "null_arc"]
+    # "_K20A00C" (extended packed format) is an asteroid, not a comet
+    assert list(r) == ["", "comet", "", "missing_elements", "short_arc", "null_arc"]
     for arc, expect in (("0 days", "short_arc"), ("1 days", "short_arc"), ("0", ""), ("30 days", "")):
         assert V.filter_reason(df.iloc[:1].assign(arc_text=[arc]))[0] == expect
     lk = V.reason_lookup(df)

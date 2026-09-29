@@ -63,7 +63,7 @@ One row per DiaSource that has an eligible known object's prediction within 5″
    - the `CAR` covariance from `mpc_orb_jsonb` (present for ~100% of orbits).
 
    The filter, as in `lsst-gen-ephemcache`'s `get-mpcorb.py`:
-   - no comets (designations containing `/`, or packed designations starting with `_`), since their non-gravitational motion makes formal covariances unreliable;
+   - no comets (designations containing `/`), since their non-gravitational motion makes formal covariances unreliable. A packed designation starting with `_` is *not* a comet: it is the MPC's extended format for asteroid provisional designations with cycle counts above 619 (e.g. `_FB0088` = 2015 BE640). An earlier version rejected those too, and so wrongly removed 6,140 asteroids;
    - all six elements present.
 
    The ">2-day arc" filter becomes redundant with the σ gate; it's kept anyway, since it's harmless.
