@@ -102,6 +102,10 @@ class ShapeError(ValueError):
     """An MPC table cannot be shaped to the delivery schema."""
 
 
+def _log(*args):
+    print(*args, flush=True)
+
+
 def _utcnow():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
@@ -364,7 +368,7 @@ def shape_batch(table, batch, columns):
     return pa.RecordBatch.from_arrays(arrays, schema=arrow_schema(columns))
 
 
-def shape_mpc_table(table, src, dst, schema=None, workers=1, batch_rows=MPC_BATCH_ROWS, log=print):
+def shape_mpc_table(table, src, dst, schema=None, workers=1, batch_rows=MPC_BATCH_ROWS, log=_log):
     """Shape MPC input ``src`` to delivered ``table`` at ``dst``
     (zstd Parquet): exactly delivery_schema()'s columns, in order, cast to
     their types (cast_column), with the MPC_DERIVED columns added and the
@@ -469,7 +473,7 @@ def have_sssource_validate():
     return (REPO_ROOT / "bench" / "sssource_validate.py").is_file()
 
 
-def step_check(run_dir, log=print):
+def step_check(run_dir, log=_log):
     """The delivery check of every delivered table, and SSSource's content
     checks; writes ``RUN_DIR/checks/<check>.txt`` and ``results.json``
     ({check: {status, report}}). Returns True if every check passed."""
@@ -660,7 +664,7 @@ def _clear_step_outputs(run_dir, steps):
             log.unlink()
 
 
-def build(inputs_dir, run_dir, from_step=None, workers=1, log=print):
+def build(inputs_dir, run_dir, from_step=None, workers=1, log=_log):
     """Run stage 2 (see the module docstring); return the report. A failed
     step or invalid inputs do not raise: see the report's ``deliverable``
     (and, for the inputs, ``error``). Raises ValueError if ``from_step``
