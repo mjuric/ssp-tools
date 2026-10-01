@@ -1,3 +1,12 @@
+"""Build the SSObject table from the (widened) SSSource and mpc_orbits.
+
+Per object and band, an H/G12 fit of SSSource's photometry (``fit_band``):
+a band's slope fit fails (``{band}_slope_fit_failed``) when the free G12
+ends at a bound, the fit isn't invertible, it uses fewer than 3 points, or
+its points span less than 2 deg in phase angle; H is then refit at a
+fiducial G12 (0.5). See ``compute_ssobject`` for the details. Every value
+is a function of the set of an object's SSSource rows, whatever their order.
+"""
 import pandas as pd
 import numpy as np
 from functools import partial
@@ -73,8 +82,103 @@ def _entry_columns(sss):
     return cols
 
 
+# The slope (G12) fit of a band fails (``{band}_slope_fit_failed``) when
+# any of these holds; fit_band returns them as a bit mask.
+FAIL_BOUND = 1        # the free G12 ends at a bound (within G12_BOUND_TOL of 0 or 1)
+FAIL_SINGULAR = 2     # the fit failed: J^T J singular, or no finite result (other than FAIL_FEW)
+FAIL_FEW = 4          # fewer than MIN_SLOPE_OBS points used (after clipping)
+FAIL_SPAN = 8         # the points used span less than minPhaseSpan in phase angle
+FAILURES = {"bound": FAIL_BOUND, "singular": FAIL_SINGULAR, "few": FAIL_FEW, "span": FAIL_SPAN}
+
+#: A free G12 this close to 0 or 1 is at the bound: ~10x the bounded
+#: search's tolerance (its minima at a bound land within ~1e-6 of it).
+G12_BOUND_TOL = 1e-5
+#: The fewest points (after clipping) a slope fit may use.
+MIN_SLOPE_OBS = 3
+#: The fiducial G12 of a failed slope fit (DP2's fixed value).
+FIDUCIAL_G12 = 0.5
+#: The smallest phase-angle span [deg] of the points a slope fit uses.
+MIN_PHASE_SPAN = 2.0
+
+
+def fit_band(
+    mag, magSigma, phaseAngle, tdist, rdist, fixedG12=None,
+    magSigmaFloor=0.0, nSigmaClip=None, fiducialG12=None,
+    minPhaseSpan=MIN_PHASE_SPAN,
+):
+    """The H/G12 fit of one band, as the SSObject columns (without the
+    band prefix; "Cov" is the H-G12 covariance), plus ``failures``, the
+    FAIL_* mask.
+
+    With a free G12 (``fixedG12`` None), the slope fit fails when any
+    FAIL_* rule holds. A band with fewer than MIN_SLOPE_OBS observations
+    gets no free fit at all (it would fail FAIL_FEW). On failure, H is
+    refit with G12 fixed at ``fiducialG12`` (default FIDUCIAL_G12),
+    with the same error floor and clipping; G12 is stored as that
+    value, G12Err and Cov are NaN, and HErr, nObsUsed and Chi2 are the
+    fixed-G12 fit's. If that fit fails too (no usable point), H is NaN.
+    slope_fit_failed is set in either case.
+
+    With ``fixedG12`` set, G12 isn't fit and these rules don't apply:
+    the fit is the fixed-G12 one, and slope_fit_failed is set only if
+    it fails.
+
+    Every input is taken as a set (photfit.fitHG12 orders them
+    canonically; the phase span is max - min), so the result doesn't
+    depend on their order.
+    """
+    if fiducialG12 is None:
+        fiducialG12 = FIDUCIAL_G12 if fixedG12 is None else fixedG12
+    kw = dict(magSigmaFloor=magSigmaFloor, nSigmaClip=nSigmaClip)
+    phaseAngle = np.asarray(phaseAngle)
+    failures = 0
+    if fixedG12 is None:
+        res = None
+        if len(mag) >= MIN_SLOPE_OBS:
+            det = {}
+            res = photfit.fitHG12(mag, magSigma, phaseAngle, tdist, rdist, _details=det, **kw)
+        if res is None:
+            failures = FAIL_FEW
+        elif not (np.isfinite(res.H) and np.isfinite(res.G12) and np.isfinite(res.H_err)):
+            # (clipped to fewer than MIN_SLOPE_OBS points, fitHG12 returns
+            # no result: that is FAIL_FEW)
+            few = "keep" in det and det["keep"].sum() < MIN_SLOPE_OBS
+            failures = FAIL_FEW if few else FAIL_SINGULAR
+        else:
+            if min(res.G12, 1. - res.G12) <= G12_BOUND_TOL:
+                failures |= FAIL_BOUND
+            if res.nobs < MIN_SLOPE_OBS:
+                failures |= FAIL_FEW
+            pa = phaseAngle[det["used"]]
+            if np.nanmax(pa) - np.nanmin(pa) < minPhaseSpan:
+                failures |= FAIL_SPAN
+        G = fiducialG12
+    else:
+        G = fixedG12
+
+    if fixedG12 is not None or failures:
+        res = photfit.fitHG12(mag, magSigma, phaseAngle, tdist, rdist, fixedG12=G, **kw)
+        nDof = res.nobs - 1
+        failed = bool(failures) or not np.isfinite(res.H)
+        out = dict(H=res.H, HErr=res.H_err, G12=G if np.isfinite(res.H) else np.nan,
+                   G12Err=np.nan, Cov=np.nan)
+    else:
+        nDof = res.nobs - 2
+        failed = False
+        out = dict(H=res.H, HErr=res.H_err, G12=res.G12, G12Err=res.G12_err, Cov=res.HG_cov)
+    if res.nobs == 0:
+        out["H"] = out["HErr"] = np.nan
+    # chi2dof is per degree of freedom of the points the fit used (after
+    # clipping), so scale back by those, not by all of the band's points.
+    with np.errstate(invalid="ignore"):
+        out.update(Chi2=res.chi2dof * nDof, nObsUsed=res.nobs, slope_fit_failed=failed,
+                   failures=failures)
+    return out
+
+
 def compute_ssobject_entry(
     row, sss, fixedG12=None, magSigmaFloor=0.0, nSigmaClip=None,
+    fiducialG12=None, minPhaseSpan=MIN_PHASE_SPAN,
 ):
     """Fill the SSObject ``row`` of one object. ``sss`` maps each column of
     ``_entry_columns`` to that object's rows (numpy arrays), in any order:
@@ -126,36 +230,16 @@ def compute_ssobject_entry(
             row[f"{band}_phaseAngleMin"] = paMin
             row[f"{band}_phaseAngleMax"] = paMax
 
-            if nBandObs > 1:
-                # do the absmag/slope fits, if there are at least two
-                # data points
-                H, G12, sigmaH, sigmaG12, covHG12, chi2dof, nobsv = photfit.fitHG12(
-                    df["psfMag"], df["psfMagErr"],
-                    df["phaseAngle"], df["topoRange"], df["helioRange"],
-                    fixedG12=fixedG12, magSigmaFloor=magSigmaFloor,
-                    nSigmaClip=nSigmaClip,
-                )
-                # chi2dof is per degree of freedom of the points the fit
-                # used (after clipping), so scale back by those, not by all
-                # of the band's observations.
-                nDof = nobsv - (1 if fixedG12 is not None else 2)
-                # print(provID, band, H, G12, sigmaH, sigmaG12, covHG12,
-                #       chi2dof, nobsv)
-
-                # mark if the fit failed
-                if np.isnan(G12):
-                    row[f'{band}_slope_fit_failed'] = True
-                    # FIXME: if fitting fails, we should revert to simple
-                    # estimation of H using a fiducial G12 value, storing
-                    # that G12 as well.
-
-                row[f'{band}_Chi2'] = chi2dof * nDof
-                row[f'{band}_G12'] = G12
-                row[f'{band}_G12Err'] = sigmaG12
-                row[f'{band}_H'] = H
-                row[f'{band}_H_{band}_G12_Cov'] = covHG12
-                row[f'{band}_HErr'] = sigmaH
-                row[f'{band}_nObsUsed'] = nobsv
+            fit = fit_band(
+                df["psfMag"], df["psfMagErr"],
+                df["phaseAngle"], df["topoRange"], df["helioRange"],
+                fixedG12=fixedG12, magSigmaFloor=magSigmaFloor,
+                nSigmaClip=nSigmaClip, fiducialG12=fiducialG12,
+                minPhaseSpan=minPhaseSpan,
+            )
+            for col, val in fit.items():
+                if col != "failures":
+                    row[f"{band}_{col}" if col != "Cov" else f"{band}_H_{band}_G12_Cov"] = val
 
     # Extendedness (null for DiaSources that lack it -> NaN)
     ext = sss["extendedness"]
@@ -210,6 +294,7 @@ def _moid_chunk(j0, j1):
 def compute_ssobject(
     sss, mpcorb, fixedG12=None, magSigmaFloor=0.05,
     nSigmaClip=10.0, workers=1, chunk_factor=8,
+    fiducialG12=None, minPhaseSpan=MIN_PHASE_SPAN,
 ):
     """
     Compute solar system object properties from SSSource and MPC orbit
@@ -229,6 +314,27 @@ def compute_ssobject(
         MPC orbit data with columns like
         'unpacked_primary_provisional_designation', 'q', 'e', 'i',
         'node', 'argperi'.
+    fixedG12, magSigmaFloor, nSigmaClip, fiducialG12, minPhaseSpan
+        The per-band H/G12 fits, as ``fit_band``. A band's slope fit
+        fails (``{band}_slope_fit_failed``, "G12 fit failed in {band}
+        band. G12 contains a fiducial value used to fit H.") when:
+
+        1. the free G12 ends at a bound, within G12_BOUND_TOL (1e-5) of
+           0 or 1;
+        2. the fit isn't invertible (J^T J singular) or has no finite
+           result;
+        3. it uses fewer than MIN_SLOPE_OBS (3) points, after clipping;
+        4. the points it uses span less than ``minPhaseSpan`` (default
+           2 deg) in phase angle.
+
+        H is then refit with G12 fixed at ``fiducialG12`` (default
+        ``fixedG12`` if set, else 0.5); G12 is stored as that value,
+        G12Err and the H-G12 covariance are NaN, and HErr, nObsUsed and
+        Chi2 come from the fixed-G12 fit. If that fit is impossible too
+        (no usable point), H is NaN; the flag is set either way. With
+        ``fixedG12`` set G12 isn't fit, and the flag means the fixed fit
+        failed. Each fit is a function of the set of its band's points,
+        whatever their order.
     workers : int
         Number of worker processes for the per-object and MOID stages.
         1 (the default) runs everything serially in this process. More
@@ -296,6 +402,7 @@ def compute_ssobject(
     callback = partial(
         compute_ssobject_entry, fixedG12=fixedG12,
         magSigmaFloor=magSigmaFloor, nSigmaClip=nSigmaClip,
+        fiducialG12=fiducialG12, minPhaseSpan=minPhaseSpan,
     )
     parallel = workers > 1 and util.fork_context() is not None
     cols = _entry_columns(sss)
@@ -445,6 +552,25 @@ between the two, is still accepted; that file is not read.
     )
 
     parser.add_argument(
+        "--hg12FiducialG12",
+        type=float,
+        default=None,
+        help=(
+            "G12 of the fixed-G12 refit of H where a band's slope fit "
+            "fails (default: --hg12FixedG12 if set, else 0.5, as in DP2)."
+        ),
+    )
+    parser.add_argument(
+        "--hg12MinPhaseSpan",
+        type=float,
+        default=MIN_PHASE_SPAN,
+        help=(
+            "A slope fit whose points span less than this phase angle "
+            f"(deg) fails (default: {MIN_PHASE_SPAN})."
+        ),
+    )
+
+    parser.add_argument(
         "--workers",
         type=int,
         default=min(64, os.cpu_count() or 1),
@@ -503,6 +629,8 @@ between the two, is still accepted; that file is not read.
             fixedG12=args.hg12FixedG12,
             magSigmaFloor=args.hg12MagSigmaFloor,
             nSigmaClip=args.hg12NSigmaClip,
+            fiducialG12=args.hg12FiducialG12,
+            minPhaseSpan=args.hg12MinPhaseSpan,
             workers=args.workers,
             chunk_factor=args.chunk_factor,
         )

@@ -206,11 +206,13 @@ def _canonical_order(mag, magSigma, phaseAngle, tdist, rdist):
 def _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor):
     """Apply the error floor, keep finite magnitudes with positive
     errors, and reduce the magnitudes to 1 AU. Returns (reduced mag,
-    magSigma, phase in radians, idx), or None if no observation is left.
+    magSigma, phase in radians, idx, sel), or None if no observation is
+    left.
 
     The observations come back in ``_canonical_order``; ``idx`` maps
     them to their positions among the kept (finite, positive-error)
-    input observations, in the input order.
+    input observations, in the input order, and ``sel`` to their
+    positions in the input.
     """
     if len(mag) == 0:
         return None
@@ -242,7 +244,7 @@ def _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor)
 
     # correct the mag to 1AU distance
     dmag = -5. * np.log10(tdist*rdist)
-    return mag + dmag, magSigma, np.deg2rad(phaseAngle), order
+    return mag + dmag, magSigma, np.deg2rad(phaseAngle), order, sel
 
 
 def _input_order(keep, idx):
@@ -527,12 +529,17 @@ def fitHG12(
         ``nobs``
             Number of observations used (after clipping).
 
+        If ``_details`` is a dict, it gets ``used``, a mask of the input
+        observations the final fit used (set unless the fit failed), and
+        with clipping ``robust`` (H, G12) and ``keep`` (the clipping mask
+        of the finite, positive-error observations, in input order).
+
         On failure, all float fields are NaN and ``nobs`` is 0.
     """
     prep = _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor)
     if prep is None:
         return _FAILED
-    mag, magSigma, phase_rad, idx = prep
+    mag, magSigma, phase_rad, idx, sel = prep
     nobsv = len(mag)
     nparams = 1 if fixedG12 is not None else 2
 
@@ -567,6 +574,7 @@ def fitHG12(
             keep = np.abs(resid) < nSigmaClip
             if _details is not None:
                 _details.update(robust=(H_r, G_r), keep=_input_order(keep, idx))
+            sel = sel[keep]
             mag = mag[keep]
             magSigma = magSigma[keep]
             phase_rad = phase_rad[keep]
@@ -590,6 +598,10 @@ def fitHG12(
         if not np.isfinite(chi2_total):
             return _FAILED
 
+        if _details is not None:
+            used = np.zeros(len(phaseAngle), bool)
+            used[sel] = True
+            _details.update(used=used)
         return _hg12_result(basis, mag, magSigma, H, G, fixedG12, chi2_total)
 
 
@@ -605,7 +617,7 @@ def _fitHG12_reference(
     prep = _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor)
     if prep is None:
         return _FAILED
-    mag, magSigma, phase_rad, idx = prep
+    mag, magSigma, phase_rad, idx, sel = prep
     nobsv = len(mag)
 
     nparams = 1 if fixedG12 is not None else 2
