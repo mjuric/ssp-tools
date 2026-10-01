@@ -41,6 +41,8 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from astropy.time import Time
 
+from ssp.sssource_contract import MATCH_METHODS
+
 DEFAULT_HOST = "sdfiana035.sdf.slac.stanford.edu"
 DEFAULT_PORT = 8123
 DEFAULT_DATABASE = "ssp"
@@ -109,8 +111,8 @@ REQUIRED_COLUMNS = {
 }
 
 # Columns build_output appends to the view's.
-EXTRA_COLUMNS = ["obsid", "obssubid", "submission_id", "trksub", "trkid", "primary", "match", "sep_mas",
-                 "dt_ms", "dmag", "band_ok", "n_pass", "ambiguous"]
+EXTRA_COLUMNS = ["obsid", "obssubid", "submission_id", "trksub", "trkid", "primary", "match", "matchMethod",
+                 "sep_mas", "dt_ms", "dmag", "band_ok", "n_pass", "ambiguous"]
 
 # obs_sbn columns we read; the ones after "band" are only passed through
 # to the unresolved report.
@@ -536,8 +538,11 @@ def run_queries(tasks, host, port, database, user, workers):
 def build_output(obs, tbl, cand, rows, ci, match, info):
     """The dia_sources table, one row per resolved obs_sbn row (of
     ``tbl``): the winning view rows (all columns, renamed), required
-    columns null-filled, plus linkage and match diagnostics. The -B row of
-    a trail pair repeats its -A row's match. Returns ``(table, is_b)``."""
+    columns null-filled, plus linkage and match diagnostics. ``match`` is
+    "id"/"position" per row of ``rows``; ``matchMethod`` refines "id" to
+    "obssubid_trail" for a merged -A/-B pair, else "obssubid" (see
+    MATCH_METHODS). The -B row of a trail pair repeats its -A row's match.
+    Returns ``(table, is_b)``."""
     names = [RENAMES.get(c, c) for c in cand.column_names]
     clash = sorted({c for c in names if names.count(c) > 1} | (set(names) & set(EXTRA_COLUMNS)))
     if clash:
@@ -545,6 +550,9 @@ def build_output(obs, tbl, cand, rows, ci, match, info):
                          f"or with the columns this tool adds; refusing to write duplicate names")
 
     rb = obs["row_b"][rows]
+    match = np.asarray(match, dtype=object)
+    method = np.where(match == "position", "position", np.where(rb >= 0, "obssubid_trail", "obssubid"))
+    assert set(method) <= set(MATCH_METHODS)
     k = np.concatenate([np.arange(len(rows)), np.flatnonzero(rb >= 0)])
     trow = np.concatenate([obs["row"][rows], rb[rb >= 0]])
     is_b = np.arange(len(k)) >= len(rows)
@@ -565,7 +573,8 @@ def build_output(obs, tbl, cand, rows, ci, match, info):
         **{c: ident[c] for c in ("submission_id", "trksub", "trkid")},
         primary=primary_flags(out["processing"], out["diaSourceId"], is_b, ident["submission_id"],
                               ident["obsid"]),
-        match=pa.array(np.asarray(match, dtype=object)[k], pa.string()),
+        match=pa.array(match[k], pa.string()),
+        matchMethod=pa.array(method[k], pa.string()),
         sep_mas=info["sep_mas"][k], dt_ms=info["dt_ms"][k],
         dmag=pa.array(info["dmag"][k], pa.float64(), from_pandas=True),
         band_ok=info["band_ok"][k], n_pass=pa.array(np.asarray(info["n_pass"])[k], pa.int32()),
@@ -720,6 +729,7 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     print(f"obsSubIDs used more than once:    {n_reused:,}")
     print(f"resolved by id:                   {len(r_id):,}")
     print(f"resolved by position:             {len(r_pos):,}  (id-pass reason: {_counts(reason[r_pos])})")
+    print(f"per matchMethod:                  {_counts(out['matchMethod'].to_numpy(False))}")
     print(f"unresolved:                       {len(unres):,}  ({_counts(unres['reason'].to_numpy(False))})")
     print(f"rows written:                     {len(out):,}, for {n_sources:,} distinct sources")
     n_b = int(is_b.sum())

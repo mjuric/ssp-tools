@@ -643,3 +643,51 @@ def test_pluto_is_a_known_exception(tmp_path, monkeypatch):
     assert res.loc["1930 BM", "verdict"].startswith("known exception: sss_matches")
     assert res.loc["A", "verdict"] == "both_match"
     assert rc == 0                      # Pluto's 50 mas isn't a NearbySSO bug
+
+
+def _sss_table():
+    """The columns _read_sss reads of a widened SSSource: DiaSource and
+    Source rows of several processings, a non-primary repeat, 64-bit ids
+    beyond float64's exact range, and NULL diaSourceIds (Source rows)."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    big = 2**62 + 12345
+    t = {
+        "diaSourceId": pa.array([big + 1, big + 2, big + 2, None, big + 1, None], pa.int64()),
+        "designation": pa.array(["2025 AA1", "2025 AA1", "2025 AA1", "2025 AA1", None, "2024 BB2"]),
+        "ssObjectId": pa.array([7, 7, 7, 7, None, 9], pa.int64()),
+        "processing": pc.dictionary_encode(pa.array(["AP-DS", "AP-DS", "AP-DS", "NV-S", "DP2-DS", "AP-S"])),
+        "measuredOn": pc.dictionary_encode(pa.array(["difference"] * 3
+                                                    + ["science", "difference", "science"])),
+        "primary": pa.array([True, True, False, True, True, True]),
+    }
+    for c in V.EPH_COMPARED + ["ephOffset"]:
+        t[c] = pa.array(np.arange(6, dtype=float))
+    return pa.table(t), big
+
+
+def test_read_sss_widened(tmp_path):
+    import pyarrow.parquet as pq
+    t, big = _sss_table()
+    pq.write_table(t, tmp_path / "w.parquet")
+    sss = V._read_sss(tmp_path / "w.parquet")                  # (AP-DS, the default)
+    assert sss["diaSourceId"].dtype == np.int64
+    assert sss["diaSourceId"].tolist() == [big + 1, big + 2]   # exact; no repeat, no Source rows
+    assert sss["designation"].tolist() == ["2025 AA1", "2025 AA1"]
+    # DP2-DS: its ssObjectId is NULL, a nullable Int64 (not float64)
+    sss = V._read_sss(tmp_path / "w.parquet", processing="DP2-DS")
+    assert sss["diaSourceId"].tolist() == [big + 1]
+    assert str(sss["ssObjectId"].dtype) == "Int64" and sss["ssObjectId"].isna().all()
+    # all processings: AP-DS and DP2-DS share an id (the join can't tell)
+    with pytest.raises(ValueError, match="repeats across processings"):
+        V._read_sss(tmp_path / "w.parquet", processing="all")
+
+
+def test_read_sss_old_layout(tmp_path):
+    import pyarrow.parquet as pq
+    t, big = _sss_table()
+    old = t.drop_columns(["processing", "measuredOn", "primary"]).slice(0, 2)
+    pq.write_table(old, tmp_path / "o.parquet")
+    sss = V._read_sss(tmp_path / "o.parquet")
+    assert sss["diaSourceId"].dtype == np.int64 and sss["diaSourceId"].tolist() == [big + 1, big + 2]
+    assert list(sss.columns) == ["diaSourceId", "designation", "ssObjectId"] + V.EPH_COMPARED + ["ephOffset"]
