@@ -1,5 +1,6 @@
 # pip install psycopg2-binary pyarrow
 
+import contextlib
 import os
 import argparse
 import tempfile
@@ -88,6 +89,7 @@ def export_query_to_parquet(
     row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
     block_size: int = DEFAULT_BLOCK_SIZE,
     keep_temp: bool = False,
+    tmp_dir=None,
 ):
     """Export a single SQL query to a Parquet file using the provided cursor.
 
@@ -98,6 +100,8 @@ def export_query_to_parquet(
         row_group_size: Rows per Parquet row group
         block_size: Arrow CSV block size in bytes
         keep_temp: Keep the intermediate CSV for debugging
+        tmp_dir: Directory for the intermediate CSV (default: $TMPDIR);
+            it can be as large as the table
     """
     # Introspect column names and types
     cur.execute(f"SELECT * FROM ({sql}) t LIMIT 0")
@@ -107,44 +111,45 @@ def export_query_to_parquet(
         for name, d in zip(colnames, cur.description)  # type: ignore
     }
 
-    # COPY to temp CSV
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-        tmp_name = tmp.name
-        cur.copy_expert(
-            f"COPY ({sql}) TO STDOUT WITH (FORMAT CSV, HEADER FALSE)", tmp
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", dir=tmp_dir)
+    tmp_name = tmp.name
+    writer = None
+    try:
+        # COPY to temp CSV
+        with tmp:
+            cur.copy_expert(
+                f"COPY ({sql}) TO STDOUT WITH (FORMAT CSV, HEADER FALSE)", tmp
+            )
+
+        # Stream CSV → Parquet
+        reader = pacsv.open_csv(
+            tmp_name,
+            read_options=pacsv.ReadOptions(column_names=colnames, block_size=block_size),
+            convert_options=pacsv.ConvertOptions(
+                column_types=column_types,
+                null_values=["", "NULL"],
+                true_values=["t"],
+                false_values=["f"],
+                strings_can_be_null=True,
+                quoted_strings_can_be_null=True,
+            ),
         )
 
-    # Stream CSV → Parquet
-    reader = pacsv.open_csv(
-        tmp_name,
-        read_options=pacsv.ReadOptions(column_names=colnames, block_size=block_size),
-        convert_options=pacsv.ConvertOptions(
-            column_types=column_types,
-            null_values=["", "NULL"],
-            true_values=["t"],
-            false_values=["f"],
-            strings_can_be_null=True,
-            quoted_strings_can_be_null=True,
-        ),
-    )
+        batches, rows_accum = [], 0
 
-    writer = None
-    batches, rows_accum = [], 0
+        def flush():
+            nonlocal batches, rows_accum, writer
+            if not batches:
+                return
+            tbl = pa.Table.from_batches(batches)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    parquet_out, tbl.schema, compression="zstd", use_dictionary=False
+                )
+            writer.write_table(tbl, row_group_size=row_group_size)
+            batches.clear()
+            rows_accum = 0
 
-    def flush():
-        nonlocal batches, rows_accum, writer
-        if not batches:
-            return
-        tbl = pa.Table.from_batches(batches)
-        if writer is None:
-            writer = pq.ParquetWriter(
-                parquet_out, tbl.schema, compression="zstd", use_dictionary=False
-            )
-        writer.write_table(tbl, row_group_size=row_group_size)
-        batches.clear()
-        rows_accum = 0
-
-    try:
         for rb in reader:
             batches.append(rb)
             rows_accum += rb.num_rows
@@ -159,6 +164,43 @@ def export_query_to_parquet(
                 os.remove(tmp_name)
             except OSError:
                 pass
+
+
+def export_in_transaction(dsn, exports, row_group_size=DEFAULT_ROW_GROUP_SIZE,
+                          block_size=DEFAULT_BLOCK_SIZE, keep_temp=False, tmp_dir=None, log=print):
+    """Run every ``{sql, out[, row_group_size]}`` of ``exports`` in one
+    REPEATABLE READ, READ ONLY transaction, so that all outputs are one
+    consistent snapshot. Returns the transaction's start time (Postgres
+    ``now()``, a timezone-aware ``datetime``), taken by the transaction's
+    first statement, which is also when the snapshot is fixed. The
+    intermediate CSVs go to ``tmp_dir`` (default: $TMPDIR)."""
+    with contextlib.closing(psycopg2.connect(dsn)) as conn:
+        conn.set_session(isolation_level=psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ,
+                         readonly=True)
+        with conn.cursor() as cur:
+            # The first statement begins it and fixes the snapshot.
+            cur.execute("SELECT now()")
+            started = cur.fetchone()[0]
+            log(f"Starting batch export of {len(exports)} tables in single transaction "
+                f"(started {started})...")
+
+            for i, export_spec in enumerate(exports, 1):
+                out = export_spec["out"]
+                log(f"[{i}/{len(exports)}] Exporting to {out}...")
+                export_query_to_parquet(
+                    cur=cur,
+                    sql=export_spec["sql"],
+                    parquet_out=out,
+                    row_group_size=export_spec.get("row_group_size", row_group_size),
+                    block_size=block_size,
+                    keep_temp=keep_temp,
+                    tmp_dir=tmp_dir,
+                )
+                log(f"✓ Exported to {out}")
+
+        conn.commit()
+        log(f"All {len(exports)} exports completed successfully in single transaction!")
+    return started
 
 
 def main():
@@ -210,32 +252,8 @@ def main():
         # Batch export mode: multiple exports in a single transaction
         exports = load_config(args.config)
 
-        with psycopg2.connect(DSN) as conn:
-            # Start explicit transaction
-            conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ)
-            with conn.cursor() as cur:
-                # BEGIN transaction implicitly started
-                print(f"Starting batch export of {len(exports)} tables in single transaction...")
-
-                for i, export_spec in enumerate(exports, 1):
-                    sql = export_spec["sql"]
-                    out = export_spec["out"]
-                    row_group_size = export_spec.get("row_group_size", args.row_group_size)
-
-                    print(f"[{i}/{len(exports)}] Exporting to {out}...")
-                    export_query_to_parquet(
-                        cur=cur,
-                        sql=sql,
-                        parquet_out=out,
-                        row_group_size=row_group_size,
-                        block_size=args.block_size,
-                        keep_temp=args.keep_temp,
-                    )
-                    print(f"✓ Exported to {out}")
-
-                # Commit transaction
-                conn.commit()
-                print(f"All {len(exports)} exports completed successfully in single transaction!")
+        export_in_transaction(DSN, exports, row_group_size=args.row_group_size,
+                              block_size=args.block_size, keep_temp=args.keep_temp)
     else:
         # Single export mode (original behavior)
         with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
