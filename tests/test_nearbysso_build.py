@@ -382,8 +382,7 @@ def test_end_to_end(tmp_path, synth, orbits, ephem, expected):
     # the eph* values are SSSource's, for the same orbit and DiaSource: to
     # integrator noise (it depends on the set of times integrated through,
     # here all the candidate visits, there only the matched ones), 3.6 uas
-    from ssp import schema
-    from ssp.sssource import compute_sssource_entry
+    from ssp.sssource import WORK_DTYPE, compute_sssource_entry
     from ssp.util import observatory_barycentric_posvel
     import astropy.units as u
     mpcorb = pd.DataFrame({k: orbits[k] for k in ("q", "e", "i", "node", "argperi", "peri_time", "epoch_mjd",
@@ -393,7 +392,7 @@ def test_end_to_end(tmp_path, synth, orbits, ephem, expected):
         de = np.zeros(len(ids), dtype=[(c, "f8") for c in ("midpointMjdTai", "ra", "dec")])
         for c in de.dtype.names:
             de[c] = dia.loc[ids, c].to_numpy()
-        sss = np.zeros(len(ids), dtype=schema.SSSourceDtype)
+        sss = np.zeros(len(ids), dtype=WORK_DTYPE)
         sss["designation"] = desig
         tt = Time(de["midpointMjdTai"], format="mjd", scale="tai")
         rp, vp = observatory_barycentric_posvel("X05", tt)

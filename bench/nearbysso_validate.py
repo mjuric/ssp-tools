@@ -871,18 +871,58 @@ def _read_nss(path, ids=None):
     return pd.read_parquet(path, columns=cols)
 
 
-def _read_sss(path, extra=()):
+#: The DiaSource processing NearbySSO's DiaSources are (PPDB DiaSource).
+SSS_PROCESSING = "AP-DS"
+
+
+def _read_sss(path, extra=(), processing=SSS_PROCESSING):
+    """The SSSource columns compared, one row per DiaSource, keyed by
+    diaSourceId.
+
+    A widened SSSource (with ``measuredOn``) mixes DiaSources and Sources
+    from several processings, with a NULL diaSourceId on Source rows and a
+    DiaSource repeated on non-primary rows: keep its ``primary``,
+    ``measuredOn == 'difference'`` rows of ``processing`` (None or 'all':
+    every processing), and check that (processing, diaSourceId) and, as the
+    comparisons join on it, diaSourceId are unique. Read through Arrow, so
+    the 64-bit ids stay exact (default pandas would make a NULL-containing
+    integer column float64); integer columns with NULLs become pandas Int64.
+    An earlier-layout SSSource is read as is.
+    """
     present = set(pq.read_schema(path).names)
     cols = [c for c in ["diaSourceId", "designation", "ssObjectId"] + EPH_COMPARED + ["ephOffset"]
             + list(extra) if c in present]
-    return pd.read_parquet(path, columns=cols)
+    widened = "measuredOn" in present
+    key = ["processing", "measuredOn", "primary"] if widened else []
+    t = pq.read_table(path, columns=list(dict.fromkeys(cols + key)))
+    if widened:
+        keep = pc.and_(pc.equal(t["measuredOn"].cast(pa.string()), "difference"), t["primary"])
+        if processing not in (None, "all"):
+            keep = pc.and_(keep, pc.equal(t["processing"].cast(pa.string()), processing))
+        t = t.filter(pc.fill_null(keep, False))
+        k = pa.table({"p": t["processing"].cast(pa.string()), "i": t["diaSourceId"]})
+        if k.group_by(["p", "i"]).aggregate([]).num_rows != t.num_rows:
+            raise ValueError(f"{path}: (processing, diaSourceId) is not unique on the primary rows")
+        if len(pc.unique(t["diaSourceId"])) != t.num_rows:
+            raise ValueError(f"{path}: diaSourceId repeats across processings; pick one (--sss-processing)")
+        t = t.select(cols)
+    out = {}
+    for c in t.column_names:
+        a = t[c]
+        if pa.types.is_dictionary(a.type):
+            a = a.cast(a.type.value_type)
+        if pa.types.is_integer(a.type) and a.null_count:
+            out[c] = pd.array(a.to_pylist(), dtype="Int64")
+        else:
+            out[c] = a.to_pandas()
+    return pd.DataFrame(out, columns=t.column_names)
 
 
 def cmd_same_orbits(args):
     rep = Report("same-orbits", args.out)
     rep("# NearbySSO vs SSSource built from the same mpc_orbits")
     rep(f"nearbysso={args.nearbysso}\nsssource={args.sssource}\ndia={args.dia}\norbits={args.orbits}")
-    nss, sss = _read_nss(args.nearbysso), _read_sss(args.sssource)
+    nss, sss = _read_nss(args.nearbysso), _read_sss(args.sssource, processing=args.sss_processing)
     dia = read_dia_subset(args.dia, ids=np.union1d(sss["diaSourceId"], nss["diaSourceId"]))
     orbits = read_orbits(args.orbits, designations=set(sss["designation"].dropna()))
     sigma_fn = None if args.no_sigma else SigmaOracle(args.orbits)
@@ -923,7 +963,7 @@ def reconcile_designations(des, ident):
 def cmd_dp2_intersection(args):
     rep = Report("dp2-intersection", args.out)
     rep("# NearbySSO vs DP2 SSSource (different orbits and cuts): REPORT ONLY, not gated")
-    nss, sss = _read_nss(args.nearbysso), _read_sss(args.sssource)
+    nss, sss = _read_nss(args.nearbysso), _read_sss(args.sssource, processing=args.sss_processing)
     ident = pd.read_parquet(args.identifications, columns=[
         "unpacked_primary_provisional_designation", "unpacked_secondary_provisional_designation",
         "packed_secondary_provisional_designation"])
@@ -1708,7 +1748,7 @@ def mock_from_sssource(sss, dia, reason_of, rng=None, n_drop=0, n_perturb=0):
 
 
 def cmd_mock(args):
-    sss = _read_sss(args.sssource)
+    sss = _read_sss(args.sssource, processing=args.sss_processing)
     dia = read_dia_subset(args.dia, ids=sss["diaSourceId"].to_numpy())
     orbits = read_orbits(args.orbits, designations=set(sss["designation"].dropna()))
     out, faults = mock_from_sssource(sss, dia, reason_lookup(orbits), args.seed, args.drop, args.perturb)
@@ -1751,6 +1791,8 @@ def main(argv=None):
     p.add_argument("--pos-tol-mas", type=float, default=TOL["pos_mas"])
     p.add_argument("--rate-tol", type=float, default=TOL["rate_deg_day"], help="deg/day")
     p.add_argument("--vmag-tol", type=float, default=TOL["vmag"])
+    p.add_argument("--sss-processing", default=SSS_PROCESSING,
+                   help="widened SSSource: the processing to compare (default: %(default)s; 'all')")
     p.set_defaults(func=cmd_same_orbits)
 
     p = sub.add_parser("dp2-intersection", help="vs DP2 SSSource on the objects both keep (report)")
@@ -1758,6 +1800,8 @@ def main(argv=None):
     p.add_argument("--sssource", required=True, help="DP2 SSSource (designation or ssObjectId)")
     p.add_argument("--identifications", required=True, help="current_identifications Parquet")
     p.add_argument("--sigma", action="store_true", help="compute sigma for unexplained misses")
+    p.add_argument("--sss-processing", default=SSS_PROCESSING,
+                   help="widened SSSource: the processing to compare (default: %(default)s; 'all')")
     p.set_defaults(func=cmd_dp2_intersection)
 
     p = sub.add_parser("horizons-adjudicate", help="Horizons verdict on discrepancies")
@@ -1805,6 +1849,8 @@ def main(argv=None):
     p.add_argument("--drop", type=int, default=5)
     p.add_argument("--perturb", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--sss-processing", default=SSS_PROCESSING,
+                   help="widened SSSource: the processing to compare (default: %(default)s; 'all')")
     p.set_defaults(func=cmd_mock)
 
     args = ap.parse_args(argv)

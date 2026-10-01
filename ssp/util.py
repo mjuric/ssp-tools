@@ -1,7 +1,5 @@
 import numpy as np
-import astropy
 from astropy.time import Time
-import pandas as pd
 import astropy.units as u
 from astropy.coordinates import get_sun, angular_separation
 import numpy.ma as ma
@@ -23,42 +21,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 
 
-def assoc_validate(dia, assoc):
-    # verify coordinates and times match
-    dia = dia[["ra", "dec", "midpointMjdTai"]].iloc[assoc["dia_index"].values]
-
-    # verify coordinates match
-    obs = astropy.coordinates.SkyCoord(ra=dia["ra"].values, dec=dia["dec"].values, unit="deg")
-    mpc = astropy.coordinates.SkyCoord(ra=assoc["mpc_ra"].values, dec=assoc["mpc_dec"].values, unit="deg")
-    sep = obs.separation(mpc)
-
-    print("Separation diffeerence range (arcsec): ", sep.min().arcsec, sep.max().arcsec)
-    assert sep.min().arcsec >= 0
-    assert sep.max().arcsec <= 0.005  # FIXME: this should be further
-    # tightened once we start submitting extra precision to the MPC
-
-    # verify times match
-    t_utc = Time(dia["midpointMjdTai"].to_numpy(), format="mjd", scale="tai").utc
-    midpoint_utc = pd.to_datetime(t_utc.to_datetime())
-    mpc_time = pd.to_datetime(assoc["mpc_obstime"])
-    delta_sec = (mpc_time - midpoint_utc).dt.total_seconds()
-    delta_sec
-
-    print("Time diffeerence range (sec):          ", delta_sec.min(), delta_sec.max())
-
-    # FIXME: this was relaxed as USDF replica's obstime datatype is borked
-    # and rounds (or truncates?) the timestamps to 1 second. E-mailed Dan S.
-    # to get it fixed.
-    # assert abs(delta_sec).max() < 0.01
-    assert abs(delta_sec).max() < 0.51
-
-    print(f"All OK, {len(assoc):,} observations.")
-
-
 def assoc_validate_recorded(dia, assoc):
-    """assoc_validate for DiaSources from extract-submitted-sources: check
-    the offsets it recorded per match (``sep_mas``, ``dt_ms``) against the
-    same tolerances as assoc_validate."""
+    """Check the offsets extract-submitted-sources recorded per match
+    (``sep_mas``, ``dt_ms``) of the ``assoc`` rows of ``dia``: at most 5 mas,
+    and under 0.51 s (the USDF replica's obstime is rounded to 1 s)."""
     rec = dia[["sep_mas", "dt_ms"]].iloc[assoc["dia_index"].values]
     sep = rec["sep_mas"].to_numpy(dtype=float, na_value=np.nan) / 1000
     dt = rec["dt_ms"].to_numpy(dtype=float, na_value=np.nan) / 1000

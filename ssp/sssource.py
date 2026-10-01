@@ -1,8 +1,21 @@
+"""Build the SSSource table (``ssp-build-sssource``, or ``python -m
+ssp.sssource``): the widened SSSource of docs/design/sssource-widened.md.
+
+One row per row of ``dia_sources.parquet`` (extract-submitted-sources), i.e.
+per resolved X05 ``obs_sbn`` row, with exactly the columns of
+``ssp.sssource_contract.SSSourceDtype`` in six blocks: the obs_sbn link
+columns, the identification (ssObjectId, designation), the measurement's
+metadata and identifiers, the measurement itself (copied from
+dia_sources.parquet and cast to the schema's types), and the ephemeris and
+geometry columns, computed per object with ASSIST from mpc_orbits.
+"""
+
 import argparse
 import contextlib
 import io
 import os
 import sys
+import time
 
 from astropy.coordinates import (
     SkyCoord,
@@ -13,11 +26,47 @@ import astropy.units as u
 from functools import partial
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from . import util, schema
+from . import util
 from .photfit import hg_V_mag
-from .ephem_assist import compute_ephemerides_one, open_ephem
+from .ephem_assist import MJD_J2000, compute_ephemerides_one, open_ephem
+from .nearbysso import propagate as _propagate
+# (a module attribute, so tests can substitute it)
+from . import sssource_ellipse as _ellipse
+from .sssource_contract import (
+    ELLIPSE_COLUMNS, ID_SPLIT, MATCH_METHODS, SSSOURCE_DICTIONARY, SSSOURCE_NONNULL, SSSOURCE_SORT,
+    VIEW_DROPPED, SSSourceDtype,
+)
+
+
+# --------------------------------------------------------------------------
+# The column blocks of SSSourceDtype (see docs/design/sssource-widened.md)
+# --------------------------------------------------------------------------
+_NAMES = SSSourceDtype.names
+
+#: Block 1 columns copied from dia_sources.parquet (status comes from
+#: obs_sbn, matchMethod from dia_sources.parquet or _derive_match_method).
+LINK_COLUMNS = ("obsid", "trksub", "trkid", "submission_id", "primary")
+#: Block 3 columns copied from dia_sources.parquet (the ids are split, see
+#: ID_SPLIT).
+MEASURED_ON_COLUMNS = ("measuredOn", "processing", "processingTable")
+#: Block 4: the measurement, copied from dia_sources.parquet.
+MEASUREMENT_COLUMNS = _NAMES[_NAMES.index("visit"):_NAMES.index("glint_trail") + 1]
+#: Block 6: the ephemeris and geometry, computed here.
+EPHEMERIS_COLUMNS = _NAMES[_NAMES.index("eclLambda"):]
+#: Block 6 columns that are measured (from the observed position and time),
+#: not orbit-derived: they are filled for rows without an orbit too.
+MEASURED_EPH_COLUMNS = ("elongation", "eclLambda", "eclBeta", "galLon", "galLat")
+
+#: dia_sources.parquet columns not carried into SSSource: the view's query
+#: helpers, the view's ``parentId`` (split into parentDiaSourceId /
+#: parentSourceId), and extract-submitted-sources' match diagnostics (which
+#: stay in dia_sources.parquet).
+DIA_DROPPED = VIEW_DROPPED + ("parentId", "obssubid", "match",
+                              "sep_mas", "dt_ms", "dmag", "band_ok", "n_pass", "ambiguous")
 
 
 # The SSSource fields compute_sssource_entry fills in (and nothing else):
@@ -31,17 +80,28 @@ EPH_FIELDS = [
     "topo_x", "topo_y", "topo_z", "topoRange",
     "topo_vx", "topo_vy", "topo_vz", "topo_vtot", "topoRangeRate",
     "phaseAngle", "ephVmag",
+    *ELLIPSE_COLUMNS,
 ]
 
+#: The working array the ephemerides are computed in, one row per SSSource
+#: row: the object's key and designation, and the block-6 columns, with the
+#: SSSourceDtype types (as today's SSSource, so the values are bitwise the
+#: same).
+WORK_DTYPE = np.dtype([("ssObjectId", "<i8"), ("designation", SSSourceDtype["designation"])]
+                      + [(c, SSSourceDtype[c]) for c in EPHEMERIS_COLUMNS])
 
-def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
-    """Fill the ephemeris-derived SSSource columns for one object.
+
+def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None):
+    """Fill the ephemeris-derived SSSource columns (EPH_FIELDS) for one
+    object.
 
     ``mpcorb`` must be indexed by unpacked_primary_provisional_designation;
     ``assoc`` is a structured array holding, per observation, its row in
     ``dia`` (dia_index) and the observer's barycentric state (obs_pos [AU],
     obs_vel [km/s], each of shape (3,)); ``dia`` is a structured array of
-    midpointMjdTai, ra and dec.
+    midpointMjdTai, ra and dec. ``covs`` maps designations to their orbits
+    with covariances (from ssp.sssource_ellipse.load_orbit_covariances);
+    objects not in it, or all if it is None, get a NaN error ellipse.
     """
 
     # extract only the subset of observations related to this object
@@ -118,6 +178,21 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem):
 
     sss["ephVmag"] = hg_V_mag(e.H, e.G, sss["helioRange"], sss["topoRange"], e.phase_angle)
 
+    # The predicted position's error ellipse, at the observation times (TDB
+    # days since J2000, as compute_ephemerides_one integrates in; astropy
+    # caches ephTimes.tdb), from the same observer positions, along the
+    # precise pass's float64 line of sight (e.topo_pos, not the float32
+    # topo_x/y/z: see ssp.sssource_ellipse.ephemeris_ellipse).
+    orbit = covs.get(provID) if covs is not None else None
+    if orbit is None:
+        for c in ELLIPSE_COLUMNS:
+            sss[c] = np.nan
+    else:
+        t_assist = ephTimes.tdb.mjd - MJD_J2000
+        ellipse = _ellipse.ephemeris_ellipse(orbit, t_assist, assoc["obs_pos"], e.topo_pos.T, ephem)
+        for c, v in zip(ELLIPSE_COLUMNS, ellipse):
+            sss[c] = v
+
     max_sep = np.max(sss["ephOffset"])
     med_sep = np.median(sss["ephOffset"])
     print(f"{provID}: max/median separation: {max_sep:.4f}, {med_sep:.4f} arcsec")
@@ -138,10 +213,13 @@ _EPHEM = None   # one ASSIST ephemeris per worker process, opened lazily
 
 
 def _sssource_chunk(g0, g1):
-    """Worker: compute the EPH_FIELDS of the rows of groups [g0, g1)."""
+    """Worker: compute the EPH_FIELDS of the rows of groups [g0, g1);
+    returns them, and the number of the ellipse's coarse propagations the
+    step cap stopped (counted per process, see ssp.nearbysso.propagate)."""
     global _EPHEM
     if _EPHEM is None:
         _EPHEM = open_ephem()
+    _propagate.STEP_CAP_STOPS = 0
     sss, obs_state = _PARALLEL["sss"], _PARALLEL["obs_state"]
     idx_start, idx_end = _PARALLEL["idx_start"], _PARALLEL["idx_end"]
     r0, r1 = idx_start[g0], idx_end[g1 - 1]   # (groups are in row order)
@@ -161,35 +239,41 @@ def _sssource_chunk(g0, g1):
         for g in range(g0, g1):
             s, e = idx_start[g] - r0, idx_end[g] - r0
             compute_sssource_entry(out[s:e], obs_state[r0 + s:r0 + e],
-                                   _PARALLEL["mpcorb"], _PARALLEL["dia_eph"], _EPHEM)
+                                   _PARALLEL["mpcorb"], _PARALLEL["dia_eph"], _EPHEM,
+                                   covs=_PARALLEL["covs"])
     sys.stdout.write(buf.getvalue())
     sys.stdout.flush()
 
     res = np.empty(len(out), dtype=[(f, out.dtype[f]) for f in EPH_FIELDS])
     for f in EPH_FIELDS:
         res[f] = out[f]
-    return res
+    return res, int(_propagate.STEP_CAP_STOPS)
 
 
-def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor=8):
+def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor=8, covs=None):
     """Fill the EPH_FIELDS of ``sss`` with compute_sssource_entry, per
     object (``sss`` grouped by ssObjectId; ``obs_state`` its rows' observer
-    states and DiaSource rows in ``dia_eph``).
+    states and DiaSource rows in ``dia_eph``; ``covs`` the orbit
+    covariances for the error ellipse, see compute_sssource_entry).
 
     With ``workers`` > 1, the objects are split into about ``chunk_factor *
     workers`` chunks, balanced by observation count, and computed in a
     forked process pool (serially where fork is unavailable). The result
     is identical.
+
+    Returns the number of the ellipse's coarse propagations stopped by the
+    step cap.
     """
     if workers <= 1 or util.fork_context() is None or len(sss) == 0:
         # JPL planet and ASSIST asteroid ephemeris files, from the
         # SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables.
         ephem = open_ephem()
+        _propagate.STEP_CAP_STOPS = 0
         util.group_by(
             [sss, obs_state], "ssObjectId",
-            partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem),
+            partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem, covs=covs),
         )
-        return
+        return int(_propagate.STEP_CAP_STOPS)
 
     # Group boundaries as util.group_by computes them, taken in row order
     # so that each chunk of groups is a contiguous range of rows.
@@ -204,42 +288,209 @@ def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor
     chunks = util.balanced_chunks(counts, chunk_factor * workers)
     print(f"Computing ephemerides of {len(counts):,} objects in {len(chunks)} chunks "
           f"on {workers} workers...", flush=True)
-    _PARALLEL.update(sss=sss, obs_state=obs_state, dia_eph=dia_eph, mpcorb=mpcorb,
+    _PARALLEL.update(sss=sss, obs_state=obs_state, dia_eph=dia_eph, mpcorb=mpcorb, covs=covs,
                      idx_start=idx_start, idx_end=idx_end)
     try:
         results = util.run_chunks(_sssource_chunk, chunks, workers, "ephemerides",
                                   weights=[int(counts[g0:g1].sum()) for g0, g1 in chunks])
     finally:
         _PARALLEL.clear()
-    for (g0, g1), res in zip(chunks, results):
+    for (g0, g1), (res, _) in zip(chunks, results):
         r0, r1 = idx_start[g0], idx_end[g1 - 1]
         for f in EPH_FIELDS:
             sss[f][r0:r1] = res[f]
+    return sum(stops for _, stops in results)
 
+
+# --------------------------------------------------------------------------
+# Writing sssource.parquet: casts and checks to the contract's types
+# --------------------------------------------------------------------------
+
+def arrow_type(name):
+    """The Arrow type of SSSource column ``name``, from SSSourceDtype:
+    ``U<n>`` is a string (dictionary-encoded for SSSOURCE_DICTIONARY), the
+    rest the NumPy type's equivalent."""
+    dt = SSSourceDtype[name]
+    if dt.kind == "U":
+        return pa.dictionary(pa.int32(), pa.string()) if name in SSSOURCE_DICTIONARY else pa.string()
+    return pa.from_numpy_dtype(dt)
+
+
+def sssource_schema():
+    """The Arrow schema of sssource.parquet: SSSourceDtype's columns, in
+    order, with their arrow_type, non-null exactly for SSSOURCE_NONNULL."""
+    return pa.schema([pa.field(n, arrow_type(n), nullable=n not in SSSOURCE_NONNULL) for n in _NAMES])
+
+
+def cast_column(name, arr):
+    """Cast ``arr`` (an Arrow array, chunked or not, or a NumPy array) to
+    SSSource column ``name``'s type, and check it.
+
+    Raises ValueError if a narrowing integer cast would overflow, a finite
+    float64 would overflow float32, a string is longer than the column's
+    ``char`` length, or a non-null column (SSSOURCE_NONNULL) has a NULL.
+    float64 -> float32 rounding is expected, not an error.
+    """
+    dt = SSSourceDtype[name]
+    target = arrow_type(name)
+    if not isinstance(arr, (pa.Array, pa.ChunkedArray)):
+        arr = pa.array(arr)
+    if pa.types.is_dictionary(arr.type) and arr.type != target:
+        arr = arr.cast(arr.type.value_type)
+    value_type = target.value_type if pa.types.is_dictionary(target) else target
+
+    if arr.type != target and arr.type != value_type:
+        try:
+            if pa.types.is_floating(value_type):
+                out = pc.cast(arr, value_type, safe=False)
+                if pa.types.is_floating(arr.type) and pc.any(
+                        pc.and_kleene(pc.is_finite(arr), pc.invert(pc.is_finite(out)))).as_py():
+                    raise ValueError(f"values overflow {value_type}")
+            else:
+                # (safe: raises on integer overflow and float truncation)
+                out = pc.cast(arr, value_type, safe=True)
+        except (pa.ArrowInvalid, ValueError) as e:
+            raise ValueError(f"SSSource column {name!r}: cannot cast {arr.type} to {value_type}: {e}") from e
+        arr = out
+
+    if dt.kind == "U" and arr.type == value_type and len(arr) and arr.null_count < len(arr):
+        maxlen = pc.max(pc.utf8_length(arr)).as_py()
+        if maxlen > dt.itemsize // 4:
+            raise ValueError(f"SSSource column {name!r}: a value of {maxlen} characters "
+                             f"is longer than the column's {dt.itemsize // 4}")
+
+    if name in SSSOURCE_NONNULL and arr.null_count:
+        raise ValueError(f"SSSource column {name!r} is non-null, but has {arr.null_count:,} NULL values")
+
+    if arr.type != target:
+        arr = pc.dictionary_encode(arr)
+        if arr.type != target:   # (the index type)
+            arr = arr.cast(target)
+    if isinstance(arr, pa.ChunkedArray):
+        arr = arr.combine_chunks()
+    return arr
+
+
+def sssource_table(columns, cast=True):
+    """The SSSource table from ``columns`` (name -> array, every column of
+    SSSourceDtype and nothing else), in schema order, each cast and checked
+    with cast_column; with ``cast=False`` the columns must already be
+    cast_column's output (their types are checked, not their values)."""
+    names = set(columns)
+    if names != set(_NAMES):
+        raise ValueError(f"SSSource columns: missing {sorted(set(_NAMES) - names)}, "
+                         f"unexpected {sorted(names - set(_NAMES))}")
+    schema = sssource_schema()
+    if not cast:
+        bad = [n for n in _NAMES if columns[n].type != schema.field(n).type]
+        if bad:
+            raise ValueError(f"SSSource columns not cast (see cast_column): {bad}")
+        return pa.Table.from_arrays([columns[n] for n in _NAMES], schema=schema)
+    return pa.Table.from_arrays([cast_column(n, columns[n]) for n in _NAMES], schema=schema)
+
+
+def sort_indices(ssObjectId, midpointMjdTai, obsid):
+    """The row order of sssource.parquet (SSSOURCE_SORT): ascending, NULL
+    ssObjectId last."""
+    keys = pa.table(dict(zip(SSSOURCE_SORT, (ssObjectId, midpointMjdTai, obsid))))
+    # (NULLs last by an explicit key: where null_placement goes differs
+    # across pyarrow versions)
+    keys = keys.append_column("_null", pc.is_null(keys[SSSOURCE_SORT[0]]))
+    return pc.sort_indices(keys, sort_keys=[(k, "ascending") for k in ("_null", *SSSOURCE_SORT)]).to_numpy()
+
+
+def write_sssource(table, path):
+    """Write the SSSource ``table`` (from sssource_table, rows already in
+    sort_indices order) to ``path``, zstd-compressed."""
+    if table.schema != sssource_schema():
+        raise ValueError("not an SSSource table (see sssource_table)")
+    pq.write_table(table, path, compression="zstd")
+
+
+def _derive_match_method(match, obssubid):
+    """matchMethod for a dia_sources.parquet that predates it, from the
+    extractor's ``match`` (``id``/``position``) and the obs_sbn
+    ``obssubid``: ``position`` where match is position; ``obssubid_trail``
+    where an id match's obssubid ends in -A or -B (one of a trail pair: the
+    extractor resolves an -A/-B row by id only as a pair, a lone one by
+    position); else ``obssubid``. A documented fallback, for older files."""
+    obssubid = pc.utf8_trim_whitespace(obssubid)
+    trail = pc.fill_null(pc.or_(pc.ends_with(obssubid, "-A"), pc.ends_with(obssubid, "-B")), False)
+    is_id = pc.equal(match, "id")
+    return pc.if_else(pc.equal(match, "position"), "position",
+                      pc.if_else(pc.and_(is_id, trail), "obssubid_trail",
+                                 pc.if_else(is_id, "obssubid", pa.scalar(None, pa.string()))))
+
+
+def _check_values(name, arr, allowed):
+    """Raise ValueError if ``arr`` has a non-null value not in ``allowed``."""
+    bad = pc.filter(arr, pc.invert(pc.fill_null(pc.is_in(arr, pa.array(allowed)), True)))
+    if len(bad):
+        raise ValueError(f"{name}: unexpected values {pc.unique(bad).to_pylist()[:10]} "
+                         f"(expected one of {list(allowed)})")
+
+
+def _split_ids(measuredOn, id_, parent_id):
+    """The block-3 identifier columns (ID_SPLIT): the view's ``id`` and
+    ``parentId`` go to the pair matching ``measuredOn``; the other pair is
+    NULL."""
+    _check_values("measuredOn", measuredOn, list(ID_SPLIT))
+    out = {}
+    for kind, (id_col, parent_col) in ID_SPLIT.items():
+        sel = pc.fill_null(pc.equal(measuredOn, kind), False)
+        out[id_col] = pc.if_else(sel, id_, pa.scalar(None, id_.type))
+        out[parent_col] = pc.if_else(sel, parent_id, pa.scalar(None, parent_id.type))
+    return out
+
+
+def _dia_read_columns(dia_present):
+    """The dia_sources.parquet columns the build copies (block 1, 3 and 4),
+    and whether matchMethod is among them; raises ValueError if some are
+    missing."""
+    has_match_method = "matchMethod" in dia_present
+    need = (list(LINK_COLUMNS) + list(MEASURED_ON_COLUMNS) + ["diaSourceId", "parentId"]
+            + list(MEASUREMENT_COLUMNS) + (["matchMethod"] if has_match_method else ["match", "obssubid"]))
+    missing = [c for c in need + ["sep_mas", "dt_ms"] if c not in dia_present]
+    if missing:
+        raise ValueError(f"dia_sources.parquet lacks {missing}: SSSource is built from the output of "
+                         "extract-submitted-sources")
+    return need, has_match_method
+
+
+# --------------------------------------------------------------------------
+# The build
+# --------------------------------------------------------------------------
 
 def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0, seed=42,
                    workers=1, chunk_factor=8):
-    """Build ``{output_dir}/sssource.parquet`` from the DiaSource, MPC
-    observation (obs_sbn), identification and orbit tables in ``input_dir``.
+    """Build ``{output_dir}/sssource.parquet`` from the dia_sources (from
+    extract-submitted-sources), MPC observation (obs_sbn), identification
+    and orbit tables in ``input_dir``.
 
     ``max_objects`` and ``dia_sample_frac`` subsample the inputs, for
     testing. ``workers`` > 1 computes the ephemerides in that many forked
     processes (see compute_ephemerides); the output is identical.
     """
-    # Read only the DiaSource columns used below: the extract-submitted-sources
-    # output carries every SubmittableSources column (~150), which would
-    # otherwise all be loaded. Extend this list when a new column is used.
+    t_start = time.perf_counter()
     dia_path = f"{input_dir}/dia_sources.parquet"
-    dia_columns = [
-        "diaSourceId", "ra", "dec", "midpointMjdTai",
-        # from extract-submitted-sources only
-        "obsid", "processing", "primary", "submission_id", "trksub", "trkid", "sep_mas", "dt_ms",
-    ]
-    present = set(pq.read_schema(dia_path).names)
+    dia_file = pq.ParquetFile(dia_path)
+    dia_present = dia_file.schema_arrow.names
+    copy_columns, has_match_method = _dia_read_columns(set(dia_present))
+    unexpected = sorted(set(dia_present) - set(_NAMES) - set(DIA_DROPPED) - set(copy_columns))
+    if unexpected:
+        print(f"WARNING: dia_sources.parquet columns not in SSSource, dropped: {unexpected}",
+              file=sys.stderr)
+
+    # Read only the columns linking and the ephemerides need here; the rest
+    # are copied column by column at the end (the file has ~150).
     dia = pd.read_parquet(
         dia_path, engine="pyarrow", dtype_backend="pyarrow",
-        columns=[c for c in dia_columns if c in present],
+        columns=["obsid", "ra", "dec", "midpointMjdTai", "sep_mas", "dt_ms"],
     ).reset_index(drop=True)
+    if not dia["obsid"].is_unique:
+        raise ValueError("dia_sources.parquet: obsid is not unique")
+    dia["file_row"] = np.arange(len(dia))     # (its row in dia_sources.parquet)
+    n_dia = len(dia)
     if dia_sample_frac < 1.0:
         # Testing aid: drop some DIA sources and shuffle the rest, to
         # exercise the association logic with missing / unsorted indices.
@@ -247,102 +498,53 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
 
     # Likewise only the obs_sbn columns used below (the dump has ~90).
     det_path = f"{input_dir}/obs_sbn.parquet"
-    det_columns = [
-        "obsid", "trkid", "trksub", "obssubid", "provid", "permid", "submission_id",
-        "ra", "dec", "obstime", "designation_asterisk",
-    ]
-    present = set(pq.read_schema(det_path).names)
-    det = pd.read_parquet(
-        det_path, engine="pyarrow", dtype_backend="pyarrow",
-        columns=[c for c in det_columns if c in present],
-    ).reset_index()
+    det_columns = ["obsid", "status", "provid", "permid"]
+    det = pd.read_parquet(det_path, engine="pyarrow", dtype_backend="pyarrow",
+                          columns=det_columns).reset_index(drop=True)
+    # verify types didn't get mangled somewhere along the way
+    # from the database to here
+    for col in det_columns:
+        assert det[col].dtype == "string[pyarrow]", (col, det[col].dtype)
+    if not det["obsid"].is_unique:
+        raise ValueError("obs_sbn.parquet: obsid is not unique")
 
     if max_objects is not None:
         # Testing aid: keep only a random subset of objects.
         sampled_provids = det["provid"].drop_duplicates().sample(max_objects, random_state=seed)
-        det = det[det["provid"].isin(sampled_provids)].reset_index()
+        det = det[det["provid"].isin(sampled_provids)].reset_index(drop=True)
     print(f"{len(det):,} MPC observations")
 
-    # DiaSources from extract-submitted-sources carry the obs_sbn obsid
-    # they were resolved from; link on it. Otherwise (Butler extraction)
-    # obssubid is the bare diaSourceId.
-    by_obsid = "obsid" in dia.columns
-    if not by_obsid:
-        det["obssubid"] = det["obssubid"].astype(int)
-    det = det[
-        (["obsid"] if by_obsid else []) + (["trkid"] if "trkid" in det.columns else []) + [
-            "trksub",
-            "obssubid",
-            "provid",
-            "permid",
-            "submission_id",
-            "ra",
-            "dec",
-            "obstime",
-            "designation_asterisk",
-        ]
-    ].copy()
-
-    # verify types didn't get mangled somewhere along the way
-    # from the database to here
-    expect_dtypes = dict(
-        obsid="string[pyarrow]",
-        trkid="string[pyarrow]",
-        trksub="string[pyarrow]",
-        obssubid="string[pyarrow]" if by_obsid else "int64",
-        provid="string[pyarrow]",
-        permid="string[pyarrow]",
-        submission_id="string[pyarrow]",
-        ra="double[pyarrow]",
-        dec="double[pyarrow]",
-        obstime="timestamp[us][pyarrow]",
-        designation_asterisk="bool[pyarrow]",
+    # The association side table: from extract-submitted-sources, dia has
+    # one row per obs_sbn row (obsid is unique), so each obs_sbn row gets
+    # one SSSource row; a source claimed by several (both endpoints of a
+    # trail, or repeated submissions) has one of them marked primary.
+    assoc = (
+        dia[["obsid", "file_row"]]
+        .reset_index()
+        .merge(det.add_prefix("mpc_"), left_on="obsid", right_on="mpc_obsid", how="inner")
     )
-
-    for col in det.columns:
-        assert det[col].dtype == expect_dtypes[col]
-
-    # create the association side table. From extract-submitted-sources,
-    # dia has one row per obs_sbn row (obsid is unique), so each obs_sbn row
-    # gets one SSSource row; a source claimed by several (both endpoints of
-    # a trail, or repeated submissions) has one of them marked primary.
-    if by_obsid:
-        assoc = (
-            dia[["diaSourceId", "obsid"]]
-            .reset_index()
-            .merge(det.add_prefix("mpc_"), left_on="obsid", right_on="mpc_obsid", how="inner")
-        )
-    else:
-        assoc = (
-            dia[["diaSourceId"]]
-            .reset_index()
-            .merge(det.add_prefix("mpc_"), left_on="diaSourceId", right_on="mpc_obssubid", how="inner")
-        )
     assoc.rename(columns={"index": "dia_index"}, inplace=True)
+    if max_objects is None and len(assoc) != len(dia):
+        raise ValueError(f"{len(dia) - len(assoc):,} dia_sources.parquet rows have no obs_sbn row "
+                         "(by obsid): are they from the same obs_sbn?")
 
-    # verify all went well
-    assert np.all(dia["diaSourceId"].iloc[assoc["dia_index"]].to_numpy() == assoc["diaSourceId"].to_numpy())
-
-    # verify contents of the association table
-    if by_obsid:
-        # extract-submitted-sources already verified each match against
-        # the PSF *or trail* centroid and the midpoint of -A/-B endpoint
-        # pairs, neither of which assoc_validate (PSF position vs. the
-        # submitted row) can reproduce; check its recorded offsets against
-        # the same tolerances instead.
-        util.assoc_validate_recorded(dia, assoc)
-    else:
-        util.assoc_validate(dia, assoc)
+    # extract-submitted-sources already verified each match against the PSF
+    # *or trail* centroid and the midpoint of -A/-B endpoint pairs; check
+    # its recorded offsets against the usual tolerances.
+    util.assoc_validate_recorded(dia, assoc)
 
     # obs_sbn also holds observations of unidentified tracklets (status
     # 'I', no provid nor permid). They are in SSSource too -- they were
-    # sent to and accepted by the MPC -- with ssObjectId 0, no designation
-    # and no orbit-derived columns. Set them aside while resolving the
-    # designations of the rest.
-    if by_obsid:
-        undesignated = assoc["mpc_provid"].isna() & assoc["mpc_permid"].isna()
-        und = assoc[undesignated].reset_index(drop=True)
-        assoc = assoc[~undesignated].reset_index(drop=True)
+    # sent to and accepted by the MPC -- with a NULL ssObjectId and
+    # designation, and NULL orbit-derived columns. Set them aside while
+    # resolving the designations of the rest.
+    undesignated = assoc["mpc_provid"].isna() & assoc["mpc_permid"].isna()
+    # (status 'I', the Isolated Tracklet File, is unidentified by definition)
+    n_bad = int(((assoc["mpc_status"] == "I").fillna(False) & ~undesignated).sum())
+    if n_bad:
+        raise ValueError(f"obs_sbn: {n_bad:,} status 'I' rows have a provid or permid")
+    und = assoc[undesignated].reset_index(drop=True)
+    assoc = assoc[~undesignated].reset_index(drop=True)
 
     totalNumObs = len(assoc)
 
@@ -391,8 +593,9 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
 
     assert len(assoc) == totalNumObs
 
+    mpc_orbits_path = f"{input_dir}/mpc_orbits.parquet"
     mpcorb = pd.read_parquet(
-        f"{input_dir}/mpc_orbits.parquet",
+        mpc_orbits_path,
         engine="pyarrow",
         dtype_backend="pyarrow",
         columns=[
@@ -413,56 +616,32 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     ).set_index("unpacked_primary_provisional_designation", drop=False, verify_integrity=True)
 
     # Rows without an orbit to compute ephemerides from: the undesignated
-    # ones and, on the obsid path, designated objects missing from
-    # mpc_orbits (which the Butler path treats as an error).
-    assoc["no_orbit"] = False
-    if by_obsid:
-        assoc["no_orbit"] = ~assoc["mpc_provid"].isin(mpcorb.index)
-        missing = assoc.loc[assoc["no_orbit"], "mpc_provid"]
-        print(f"{len(und):,} observations of undesignated objects; {len(missing):,} observations of "
-              f"{missing.nunique():,} designated objects without an orbit: {sorted(missing.unique())[:10]}")
-        und["no_orbit"] = True
-        assoc = pd.concat([assoc, und], ignore_index=True)
-        totalNumObs = len(assoc)
+    # ones and designated objects missing from mpc_orbits (issue #7). They
+    # have no SSObject row, so their ssObjectId is NULL.
+    assoc["no_orbit"] = ~assoc["mpc_provid"].isin(mpcorb.index)
+    missing = assoc.loc[assoc["no_orbit"], "mpc_provid"]
+    print(f"{len(und):,} observations of undesignated objects; {len(missing):,} observations of "
+          f"{missing.nunique():,} designated objects without an orbit: {sorted(missing.unique())[:10]}")
+    und["no_orbit"] = True
+    assoc = pd.concat([assoc, und], ignore_index=True)
+    totalNumObs = len(assoc)
 
     # sort the association table by object, those without an orbit last
+    # (the order the ephemerides are computed in)
     assoc.sort_values(["no_orbit", "mpc_provid"], inplace=True)
-    n_orbit = int(np.sum(~assoc["no_orbit"].to_numpy(dtype=bool)))
+    no_orbit = assoc["no_orbit"].to_numpy(dtype=bool)
+    n_orbit = int(np.sum(~no_orbit))
+    assert not no_orbit[:n_orbit].any() and no_orbit[n_orbit:].all()
 
-    # create the output array for SSSource, plus the DiaSource processing
-    # (from extract-submitted-sources; null for Butler DiaSources), which
-    # together with diaSourceId identifies the source, and the submitted
-    # tracklet: (submission_id, trksub), and MPC's finer trkid. These group
-    # the detections of undesignated objects. On the obsid path also the
-    # obsid (the key SSObject joins DiaSource on) and whether this row is
-    # the primary one of its source (the one SSObject counts).
-    tracklet = ("submission_id", "trksub", "trkid")
-    sss = np.zeros(totalNumObs, dtype=np.dtype(
-        schema.SSSourceDtype.descr + [("processing", object)] + [(c, object) for c in tracklet]
-        + [("obsid", object), ("primary", bool)]))
+    # (checked here, as the working array's designation is fixed-width)
+    designation = cast_column("designation", pa.array(assoc["mpc_provid"], type=pa.string()))
 
     #
-    # construct SSSource -- start with easily vectorizable columns
+    # The working array: the object's key and the ephemeris columns
     #
-    sss["diaSourceId"] = assoc["diaSourceId"].values
-    # (ssObjectId 0 and an empty designation for undesignated objects)
-    has_id = assoc["mpc_packed"].notna().to_numpy(dtype=bool)
-    sss["ssObjectId"][has_id] = util.packed_ascii_to_uint64_le(assoc["mpc_packed"][has_id])
+    sss = np.zeros(totalNumObs, dtype=WORK_DTYPE)
+    sss["ssObjectId"][:n_orbit] = util.packed_ascii_to_uint64_le(assoc["mpc_packed"].iloc[:n_orbit])
     sss["designation"] = assoc["mpc_provid"].fillna("")
-    if "processing" in dia.columns:
-        sss["processing"] = dia["processing"].iloc[assoc["dia_index"]].to_numpy(dtype=object, na_value=None)
-    else:
-        sss["processing"] = None
-    if by_obsid:
-        sss["obsid"] = dia["obsid"].iloc[assoc["dia_index"]].to_numpy(dtype=object)
-        sss["primary"] = dia["primary"].iloc[assoc["dia_index"]].to_numpy(dtype=bool)
-    else:
-        sss["obsid"] = None
-        sss["primary"] = True
-    for c in tracklet:
-        # (on the obsid path from dia: the obs_sbn row it is linked to)
-        src = dia[c].iloc[assoc["dia_index"]] if by_obsid else assoc.get(f"mpc_{c}")
-        sss[c] = None if src is None else src.to_numpy(dtype=object, na_value=None)
 
     df = dia[["ra", "dec", "midpointMjdTai"]].iloc[assoc["dia_index"]]
     ra, dec, t = (
@@ -507,37 +686,112 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     dia_eph = np.zeros(len(dia), dtype=[(c, np.float64) for c in eph_columns])
     for c in eph_columns:
         dia_eph[c] = dia[c].to_numpy()
+    del dia, df, p, ecl, gal
 
+    print(f"[{time.perf_counter() - t_start:.1f} s] linked and set up", flush=True)
+    # The orbits' covariances, for the error ellipse, of the objects present.
+    covs = _ellipse.load_orbit_covariances(mpc_orbits_path, np.unique(sss["designation"][:n_orbit]),
+                                           open_ephem())
+
+    print(f"[{time.perf_counter() - t_start:.1f} s] orbit covariances loaded", flush=True)
     # ephemerides for the objects with orbits (the first n_orbit rows);
-    # every orbit-derived column of the rest is NaN.
-    compute_ephemerides(sss[:n_orbit], obs_state[:n_orbit], dia_eph, mpcorb,
-                        workers=workers, chunk_factor=chunk_factor)
-    measured = ("elongation", "eclLambda", "eclBeta", "galLon", "galLat")
-    for name in sss.dtype.names:
-        if sss.dtype[name].kind == "f" and name not in measured:
+    # every orbit-derived column of the rest is NaN (NULL when written).
+    t_eph = time.perf_counter()
+    step_cap_stops = compute_ephemerides(sss[:n_orbit], obs_state[:n_orbit], dia_eph, mpcorb,
+                                         workers=workers, chunk_factor=chunk_factor, covs=covs)
+    t_eph = time.perf_counter() - t_eph
+    n_ell = int(np.sum(np.isnan(sss["ephRaErr"][:n_orbit])))
+    print(f"Ephemerides in {t_eph:.1f} s; error ellipse NULL on {n_ell:,} of {n_orbit:,} rows with an "
+          f"orbit; {step_cap_stops:,} ellipse propagations stopped by the step cap.", flush=True)
+    for name in EPHEMERIS_COLUMNS:
+        if sss.dtype[name].kind == "f" and name not in MEASURED_EPH_COLUMNS:
             sss[name][n_orbit:] = np.nan
+    del obs_state, mpcorb, covs
 
-    totalNumObjects = np.unique(sss["ssObjectId"][sss["ssObjectId"] != 0]).size
-    print(f"{totalNumObjects:,} unique objects with {len(sss):,} total observations "
-          f"({np.sum(sss['ssObjectId'] == 0):,} of them undesignated, "
-          f"{len(sss) - n_orbit:,} without an orbit).")
+    #
+    # Assemble the SSSource columns, in the output's row order
+    #
+    order = sort_indices(pa.array(sss["ssObjectId"], mask=no_orbit),
+                         dia_eph["midpointMjdTai"][assoc["dia_index"].to_numpy()],
+                         pa.array(assoc["obsid"], type=pa.string()))
+    src = pa.array(assoc["file_row"].to_numpy()[order])   # (rows of dia_sources.parquet)
+    sss, no_orbit = sss[order], no_orbit[order]
+    columns = {
+        "status": cast_column("status", pa.array(assoc["mpc_status"], type=pa.string()).take(order)),
+        "ssObjectId": cast_column("ssObjectId", pa.array(sss["ssObjectId"], mask=no_orbit)),
+        "designation": designation.take(order),
+    }
+    del assoc, designation
 
-    util.struct_to_parquet(sss, f"{output_dir}/sssource.parquet")
+    # Block 6: NaN is NULL (a computed column with no value). The rest is
+    # as today's SSSource, bitwise, including the never-computed
+    # placeholders: diaDistanceRank (0) and, where there is an orbit,
+    # ephOffsetAlongTrack/ephOffsetCrossTrack (0.0).
+    for name in EPHEMERIS_COLUMNS:
+        v = sss[name]
+        mask = np.isnan(v) if v.dtype.kind == "f" else None
+        columns[name] = cast_column(name, pa.array(v, mask=mask if mask is not None and mask.any() else None))
+    del sss
+
+    # Blocks 1, 3 and 4, copied from dia_sources.parquet (a few columns at
+    # a time, to bound the memory)
+    pending = {}
+    for k in range(0, len(copy_columns), 16):
+        group = copy_columns[k:k + 16]
+        tbl = dia_file.read(columns=group, use_threads=True)
+        for name in group:
+            arr = tbl.column(name).take(src)
+            if name in ("diaSourceId", "parentId", "match", "obssubid", "measuredOn"):
+                pending[name] = arr
+            if name in SSSourceDtype.names:
+                columns[name] = cast_column(name, arr)
+        del tbl
+    if has_match_method:
+        _check_values("matchMethod", columns["matchMethod"], MATCH_METHODS)
+    else:
+        print("dia_sources.parquet has no matchMethod (it predates it); "
+              "derived it from match and obssubid")
+        columns["matchMethod"] = cast_column(
+            "matchMethod", _derive_match_method(pending["match"], pending["obssubid"]))
+    for name, arr in _split_ids(pending["measuredOn"], pending["diaSourceId"], pending["parentId"]).items():
+        columns[name] = cast_column(name, arr)
+    del pending
+
+    table = sssource_table(columns, cast=False)   # (each was cast above)
+    del columns
+    print(f"[{time.perf_counter() - t_start:.1f} s] assembled", flush=True)
+    n_null = table["ssObjectId"].null_count
+    n_undesignated = table["designation"].null_count
+    n_objects = len(pc.unique(table["ssObjectId"].drop_null()))
+    print(f"{n_objects:,} unique objects with {table.num_rows:,} total observations "
+          f"({n_null:,} with a NULL ssObjectId: {n_undesignated:,} undesignated, "
+          f"{n_null - n_undesignated:,} designated without an orbit).")
+    if max_objects is None and dia_sample_frac >= 1.0:
+        assert table.num_rows == n_dia
+
+    path = f"{output_dir}/sssource.parquet"
+    write_sssource(table, path)
+    print(f"Wrote {path}: {table.num_rows:,} rows, {table.num_columns} columns "
+          f"(ephemerides {t_eph:.1f} s, total {time.perf_counter() - t_start:.1f} s).")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build the SSSource table from DiaSource and MPC Parquet files",
+        prog="ssp-build-sssource",
+        description="Build the SSSource table from the submitted-source and MPC Parquet files",
         epilog=(
-            "Reads dia_sources, obs_sbn, numbered_identifications, "
-            "current_identifications and mpc_orbits .parquet files from the input "
-            "directory and writes sssource.parquet to the output directory. The ASSIST "
-            "ephemeris files are taken from the SSP_ASSIST_PLANETS and "
-            "SSP_ASSIST_ASTEROIDS environment variables."
+            "Reads dia_sources (from extract-submitted-sources), obs_sbn, "
+            "numbered_identifications, current_identifications and mpc_orbits "
+            ".parquet files from the input directory and writes sssource.parquet "
+            "(one row per dia_sources row, with the columns of the PPDB SSSource "
+            "table) to the output directory. The ASSIST ephemeris files are taken "
+            "from the SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables."
         ),
     )
-    parser.add_argument("--input-dir", default="./analysis/inputs", help="Input directory (default: %(default)s)")
-    parser.add_argument("--output-dir", default="./analysis/outputs", help="Output directory (default: %(default)s)")
+    parser.add_argument("--input-dir", default="./analysis/inputs",
+                        help="Input directory (default: %(default)s)")
+    parser.add_argument("--output-dir", default="./analysis/outputs",
+                        help="Output directory (default: %(default)s)")
     parser.add_argument(
         "--max-objects", type=int, default=None,
         help="Process only this many randomly chosen objects (default: all)",
@@ -546,7 +800,8 @@ def main():
         "--dia-sample-frac", type=float, default=1.0,
         help="Randomly keep this fraction of DIA sources, shuffled (default: %(default)s)",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for subsampling (default: %(default)s)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for subsampling (default: %(default)s)")
     parser.add_argument(
         "--reraise", action="store_true",
         help="Re-raise exceptions instead of exiting gracefully (for debugging)",

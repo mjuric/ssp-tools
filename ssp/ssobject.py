@@ -55,6 +55,13 @@ def nJy_err_to_mag_err(f_njy, f_err_njy):
 
 FIT_COLUMNS = ["dia_psfMag", "dia_psfMagErr", "phaseAngle", "topoRange", "helioRange"]
 
+# The only SSSource columns compute_ssobject uses (obsid and primary from
+# extract-submitted-sources-based SSSource; diaSourceId to join DiaSource
+# where there is no obsid). The measurement itself still comes from
+# DiaSource (dia_sources.parquet), in its original (double) precision.
+SSS_COLUMNS = ["ssObjectId", "designation", "obsid", "primary", "diaSourceId",
+               "phaseAngle", "topoRange", "helioRange", "ephRa"]
+
 
 def _entry_columns(sss):
     """The columns of the joined SSSource/DiaSource frame that
@@ -262,13 +269,16 @@ def compute_ssobject(
     - MOID computation uses a MOIDSolver for each matched object.
     """
 
-    # Sources without an orbit -- undesignated (ssObjectId 0) or with no
-    # mpc_orbits row, so with NaN ephemerides -- get no SSObject.
-    # (NaN, not null: np.isnan, as pyarrow-backed isna() misses NaN)
-    no_orbit = (sss["ssObjectId"] == 0) | np.isnan(sss["ephRa"].to_numpy(dtype=float, na_value=np.nan))
+    # Sources without an orbit get no SSObject: unmatched ones (a NULL
+    # ssObjectId in the widened SSSource; 0 in older files), and any other
+    # with NULL/NaN ephemerides (older files: designated objects with no
+    # mpc_orbits row). (np.isnan as well, as pyarrow-backed isna() misses NaN)
+    oid = sss["ssObjectId"]
+    unmatched = oid.isna().to_numpy(dtype=bool) | (oid.fillna(0) == 0).to_numpy(dtype=bool)
+    no_orbit = unmatched | np.isnan(sss["ephRa"].to_numpy(dtype=float, na_value=np.nan))
     if no_orbit.any():
         print(f"Skipping {no_orbit.sum():,} SSSource rows without an orbit "
-              f"({(sss['ssObjectId'] == 0).sum():,} undesignated)")
+              f"({unmatched.sum():,} unmatched)")
         sss = sss[~no_orbit]
 
     # A source claimed by several obs_sbn rows (both endpoints of a trail,
@@ -299,8 +309,19 @@ def compute_ssobject(
     # the whole thing gloriously explodes).
     dia_tmp["dia_diaSourceId"] = dia_tmp["dia_diaSourceId"].astype("int64[pyarrow]")
     if by_obsid:
+        dia_tmp["dia_row"] = np.arange(len(dia_tmp))
         sss = sss.merge(dia_tmp, left_on="obsid", right_on="dia_obsid", how="inner")
         del sss["dia_obsid"]
+        # The per-object fits depend on the order of the object's rows: on
+        # the full 2026-09-30 fixture, taking them in the widened SSSource's
+        # (time) order instead changes thousands of fits, including
+        # nObsUsed and slope_fit_failed, with HErr and G12 differing by up
+        # to 99%. Until that's decided, take them in DiaSource
+        # (dia_sources.parquet) order, which is what the earlier SSSource
+        # had, whatever the SSSource's own order.
+        order = np.lexsort((sss["dia_row"].to_numpy(), sss["ssObjectId"].to_numpy()))
+        sss = sss.iloc[order].reset_index(drop=True)
+        del sss["dia_row"]
     else:
         sss = sss.merge(dia_tmp, left_on="diaSourceId", right_on="dia_diaSourceId", how="inner")
     assert num == len(sss), f"{num - len(sss)} DiaSources found missing (or duplicated)."
@@ -495,10 +516,12 @@ Examples:
         parser.error("--chunk-factor must be at least 1")
 
     try:
-        # Load SSSource
+        # Load SSSource: only the columns compute_ssobject uses (the
+        # widened SSSource has ~180)
         print(f"Loading SSSource from {args.sssource_parquet}...")
-        sss = pd.read_parquet(args.sssource_parquet, engine="pyarrow",
-                              dtype_backend="pyarrow").reset_index(drop=True)
+        present = set(pq.read_schema(args.sssource_parquet).names)
+        sss = pd.read_parquet(args.sssource_parquet, engine="pyarrow", dtype_backend="pyarrow",
+                              columns=[c for c in SSS_COLUMNS if c in present]).reset_index(drop=True)
         num = len(sss)
         print(f"Loaded {num:,} SSSource rows")
 
@@ -564,8 +587,10 @@ if __name__ == "__main__":
     #
 
     # load SSObject
+    present = set(pq.read_schema(f'{output_dir}/sssource.parquet').names)
     sss = pd.read_parquet(f'{output_dir}/sssource.parquet',
-                          engine="pyarrow", dtype_backend="pyarrow"
+                          engine="pyarrow", dtype_backend="pyarrow",
+                          columns=[c for c in SSS_COLUMNS if c in present]
                           ).reset_index(drop=True)
     num = len(sss)
 
