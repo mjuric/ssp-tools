@@ -247,6 +247,8 @@ def _scenario():
         dict(obsid="o7", obssubid="LSST-DP2-DS-700", ra=16.0, dec=1.0, obstime=t, band="Lr", mag=20.0),
         # nothing anywhere -> unresolved no_id
         dict(obsid="o8", obssubid=None, ra=17.0, dec=1.0, obstime=t, band="Lr", mag=20.0),
+        # an -A row without its -B: unpaired_trail, so found by position
+        dict(obsid="o9", obssubid="LSST-AP-DS-900-A", ra=18.0, dec=1.0, obstime=t, band="Lr", mag=20.0),
     ]
     tt = tai(t)
     view = [
@@ -261,6 +263,7 @@ def _scenario():
         dict(processing="DP2-DS", id=500, band="r", midpointMjdTai=tt, ra=14.0, dec=1.0 + 1 * MAS),
         dict(processing="DP2-DS", id=601, band="r", midpointMjdTai=tt, ra=15.0, dec=1.0),
         dict(processing="DP2-DS", id=700, band="r", midpointMjdTai=tt, ra=16.0, dec=1.0 + 1000 * MAS),
+        dict(processing="AP-DS", id=900, band="r", midpointMjdTai=tt, ra=18.0, dec=1.0),
     ]
     return obs_table(rows), view_table(view)
 
@@ -272,7 +275,7 @@ def test_extract_end_to_end(tmp_path):
     assert rc == 0
     out = pq.read_table(tmp_path / "dia.parquet").to_pylist()
     by = {r["obsid"]: r for r in out}
-    assert sorted(by) == ["o1", "o2", "o2e", "o3", "o4a", "o4b", "o5", "o6"]
+    assert sorted(by) == ["o1", "o2", "o2e", "o3", "o4a", "o4b", "o5", "o6", "o9"]
 
     assert (by["o1"]["processing"], by["o1"]["diaSourceId"], by["o1"]["match"]) == ("DP2-DS", 100, "id")
     # decided by the DP2 rule, so no longer ambiguous
@@ -290,6 +293,15 @@ def test_extract_end_to_end(tmp_path):
     assert all(r["primary"] for k, r in by.items() if k != "o4b")
     assert (by["o5"]["diaSourceId"], by["o5"]["match"]) == (500, "position")
     assert (by["o6"]["diaSourceId"], by["o6"]["match"]) == (601, "position")
+    assert (by["o9"]["diaSourceId"], by["o9"]["match"]) == (900, "position")
+
+    # matchMethod: the id pass split into single rows and trail pairs (both
+    # rows); position includes the unpaired -A row; never null
+    method = {k: r["matchMethod"] for k, r in by.items()}
+    assert method == dict(o1="obssubid", o2="obssubid", o2e="obssubid", o3="obssubid",
+                          o4a="obssubid_trail", o4b="obssubid_trail", o5="position", o6="position",
+                          o9="position")
+    assert set(method.values()) == set(S.MATCH_METHODS)
 
     # all view columns pass through, renamed; missing required ones null-filled
     r = by["o1"]
@@ -299,6 +311,9 @@ def test_extract_end_to_end(tmp_path):
     schema = pq.read_schema(tmp_path / "dia.parquet")
     for name, typ in S.REQUIRED_COLUMNS.items():
         assert schema.field(name).type == typ
+    assert schema.names[-len(S.EXTRA_COLUMNS):] == S.EXTRA_COLUMNS
+    assert schema.field("matchMethod").type == pa.string()
+    assert pq.read_table(tmp_path / "dia.parquet")["matchMethod"].null_count == 0
 
     unres = {r["obsid"]: r for r in pq.read_table(tmp_path / "dia.unresolved.parquet").to_pylist()}
     assert unres["o7"]["reason"] == "no_pass" and unres["o7"]["best_sep_mas"] == pytest.approx(1000, abs=0.01)
