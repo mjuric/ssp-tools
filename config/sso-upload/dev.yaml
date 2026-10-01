@@ -8,4 +8,13 @@
 bucket_name: ppdb-dev-sso-ingest
 topic: load-sso-topic
 project: ppdb-dev-5c07          # the Pub/Sub topic's project
-# tables: [...]                 # optional; default: every DELIVERY_TABLES table
+# The complete set: the five tables the loader (dax_ppdb SSO_TABLES, load_sso)
+# accepts. NearbySSO is built and staged, but not uploaded until DM-55678's
+# dax_ppdb SSO_TABLES and load_sso add it; sending it today fails the entire
+# load. Uploading a subset of these needs --allow-partial.
+tables:
+  - SSSource
+  - SSObject
+  - numbered_identifications
+  - current_identifications
+  - mpc_orbits

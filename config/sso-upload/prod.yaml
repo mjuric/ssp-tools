@@ -9,3 +9,14 @@
 # topic: load-sso-topic
 # project: TODO                         # the prod ppdb project id (random-suffixed,
 #                                       # like ppdb-dev-5c07 and ppdb-int-6c62)
+#
+# The complete set: the five tables the loader (dax_ppdb SSO_TABLES, load_sso)
+# accepts. NearbySSO is built and staged, but not uploaded until DM-55678's
+# dax_ppdb SSO_TABLES and load_sso add it; sending it today fails the entire
+# load. Uploading a subset of these needs --allow-partial.
+# tables:
+#   - SSSource
+#   - SSObject
+#   - numbered_identifications
+#   - current_identifications
+#   - mpc_orbits

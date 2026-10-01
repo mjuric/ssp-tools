@@ -1,7 +1,7 @@
 """ssp-sso-daily's sequencing, with stub stage commands on PATH."""
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -24,6 +24,7 @@ def stubs(tmp_path, monkeypatch):
         p.write_text(STUB.format(python=sys.executable))
         p.chmod(0o755)
     log = tmp_path / "calls.log"
+    monkeypatch.setattr(D, "_local_bin", lambda: tmp_path / "no-local-bin")
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("STUB_LOG", str(log))
     return lambda: log.read_text().splitlines() if log.exists() else []
@@ -48,7 +49,7 @@ def test_all_three_in_order(stubs, tmp_path):
 def test_default_stamp_is_utc_date(stubs, tmp_path):
     w = tmp_path / "work"
     assert D.main([str(w)]) == 0
-    day = w / datetime.now(UTC).strftime("%Y-%m-%d")
+    day = w / datetime.now(timezone.utc).strftime("%Y-%m-%d")
     assert day.is_dir()
     assert stubs() == [f"ssp-extract-sso-inputs {day}/inputs", f"ssp-build-sso {day}/inputs {day}/run"]
 
@@ -97,5 +98,46 @@ def test_refuses_an_existing_day(stubs, tmp_path):
 
 
 def test_missing_command(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "_local_bin", lambda: tmp_path)
     monkeypatch.setenv("PATH", str(tmp_path))     # nothing on PATH
     assert D.main([str(tmp_path / "w"), "--stamp", "a"]) == 127
+
+
+class _FakeDatetime(datetime):
+    """now() at 2026-10-02T03:00Z; local (naive) time is the day before."""
+    @classmethod
+    def now(cls, tz=None):
+        instant = datetime(2026, 10, 2, 3, 0, tzinfo=timezone.utc)
+        return instant.astimezone(tz) if tz else datetime(2026, 10, 1, 20, 0)
+
+
+def test_stamp_pinned_to_utc(monkeypatch):
+    monkeypatch.setattr(D, "datetime", _FakeDatetime)
+    assert D.utc_stamp() == "2026-10-02"
+
+
+def test_local_bin_searched_before_path(stubs, tmp_path, monkeypatch):
+    local = tmp_path / "venvbin"
+    local.mkdir()
+    for name in (D.EXTRACT, D.BUILD):
+        p = local / name
+        p.write_text(STUB.format(python=sys.executable).replace("os.path.basename(sys.argv[0])]",
+                                                               "'local:' + os.path.basename(sys.argv[0])]"))
+        p.chmod(0o755)
+    monkeypatch.setattr(D, "_local_bin", lambda: local)
+    assert D.main([str(tmp_path / "w"), "--stamp", "a"]) == 0
+    assert [c.split()[0] for c in stubs()] == ["local:" + D.EXTRACT, "local:" + D.BUILD]
+
+
+def test_signal_maps_to_128_plus(stubs, tmp_path, monkeypatch):
+    bindir = tmp_path / "bin"
+    (bindir / D.EXTRACT).write_text("#!/bin/sh\nkill -TERM $$\n")
+    assert D.main([str(tmp_path / "w"), "--stamp", "a"]) == 128 + 15
+    assert "killed by signal 15" in (tmp_path / "w" / "a" / "daily.log").read_text()
+
+
+@pytest.mark.parametrize("stamp", ["a/b", "..", "../x", "x..y"])
+def test_bad_stamp(stubs, tmp_path, stamp):
+    with pytest.raises(SystemExit, match="plain name"):
+        D.main([str(tmp_path / "w"), "--stamp", stamp])
+    assert stubs() == []

@@ -10,18 +10,26 @@ UTC date, YYYY-MM-DD):
     ssp-build-sso DAY/inputs DAY/run         (or DIR in place of DAY/inputs)
     ssp-upload-sso CONFIG DAY/run [--dry-run]   (only with --upload)
 
-Each stage is its own console script, run as a subprocess; the first that
-fails stops the run, and its exit status is the wrapper's. Every command
-and its outcome is appended to DAY/daily.log.
+Each stage is its own console script, run as a subprocess and looked up
+first next to the running Python (Path(sys.executable).parent, the venv's
+bin/), then on PATH. The first that fails stops the run, and its exit status
+is the wrapper's (128+N for a stage killed by signal N). Every command and
+its outcome is appended to DAY/daily.log.
+
+Run it at most once per load window when uploading: the loader silently
+drops an upload made while its previous load is still running (see
+ssp.sso_upload).
 """
 
 import argparse
 import logging
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 _LOG = logging.getLogger("ssp.sso_daily")
@@ -29,6 +37,23 @@ _LOG = logging.getLogger("ssp.sso_daily")
 EXTRACT = "ssp-extract-sso-inputs"
 BUILD = "ssp-build-sso"
 UPLOAD = "ssp-upload-sso"
+
+
+def _local_bin():
+    """The running Python's bin/ (the venv's), searched before PATH."""
+    return Path(sys.executable).parent
+
+
+def resolve_command(name):
+    """``name`` in the running Python's bin/ if it is there, else on PATH."""
+    local = _local_bin() / name
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    return shutil.which(name) or name
+
+
+def utc_stamp():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def plan(day, upload=None, dry_run=False, reuse_inputs=None):
@@ -45,7 +70,7 @@ def plan(day, upload=None, dry_run=False, reuse_inputs=None):
 
 
 def _log(day, msg):
-    line = f"{datetime.now(UTC).isoformat(timespec='seconds')} {msg}"
+    line = f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {msg}"
     _LOG.info("%s", msg)
     with open(day / "daily.log", "a") as f:
         f.write(line + "\n")
@@ -57,7 +82,9 @@ def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None):
         raise SystemExit("ssp-sso-daily: --dry-run applies to the upload; give --upload CONFIG")
     if reuse_inputs and not Path(reuse_inputs).is_dir():
         raise SystemExit(f"ssp-sso-daily: --reuse-inputs {reuse_inputs}: not a directory")
-    stamp = stamp or datetime.now(UTC).strftime("%Y-%m-%d")
+    stamp = stamp or utc_stamp()
+    if "/" in stamp or os.sep in stamp or stamp in (".", "..") or ".." in stamp:
+        raise SystemExit(f"ssp-sso-daily: --stamp {stamp!r}: must be a plain name (no '/' or '..')")
     day = Path(work_dir) / stamp
     if day.exists() and any(day.iterdir()):
         raise SystemExit(f"ssp-sso-daily: {day} exists already; remove it, or pick another --stamp")
@@ -65,13 +92,17 @@ def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None):
 
     _log(day, f"ssp-sso-daily in {day}" + (f", reusing inputs {reuse_inputs}" if reuse_inputs else ""))
     for stage, argv in plan(day, upload, dry_run, reuse_inputs):
+        argv = [resolve_command(argv[0])] + argv[1:]
         _log(day, f"{stage}: {shlex.join(argv)}")
         t0 = time.monotonic()
         try:
             rc = subprocess.run(argv).returncode
         except FileNotFoundError:
-            _log(day, f"{stage}: {argv[0]} not found on PATH")
+            _log(day, f"{stage}: {argv[0]} not found in {_local_bin()} or on PATH")
             return 127
+        if rc < 0:                      # killed by signal -rc: report it as a shell would
+            _log(day, f"{stage}: killed by signal {-rc}")
+            rc = 128 - rc
         _log(day, f"{stage}: exit {rc} after {time.monotonic() - t0:.1f} s")
         if rc != 0:
             _log(day, f"stopping: {stage} failed")
