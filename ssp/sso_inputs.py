@@ -455,7 +455,8 @@ def main(argv=None):
     try:
         run(args)
     except ExtractError as e:
-        print(f"{PROG}: error: {e}; no manifest written", file=sys.stderr)
+        kept = (Path(args.inputs_dir) / MANIFEST_FILE).exists()
+        print(f"{PROG}: error: {e}" + ("" if kept else "; no manifest written"), file=sys.stderr)
         sys.exit(1)
     print(f"total wall time: {time.time() - t0:.1f} s")
 

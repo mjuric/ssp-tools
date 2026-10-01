@@ -110,7 +110,7 @@ def test_existing_manifest_needs_force(tmp_path, stubs, capsys):
     with pytest.raises(SystemExit) as e:
         M.main([str(tmp_path / "inputs")])
     assert e.value.code == 1
-    assert "no manifest written" in capsys.readouterr().err
+    assert "--force" in capsys.readouterr().err
     run(tmp_path, "--force")
     assert stubs["mpc"] == 2
 
