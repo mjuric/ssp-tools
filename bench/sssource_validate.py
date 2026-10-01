@@ -25,8 +25,9 @@ Subcommands (each prints a text report, optionally also to ``--out FILE``)::
       the ephemeris/geometry columns bitwise equal to today's SSSource
       (except the computed ellipse and along/cross-track columns)
   ssobject-permutation SSSOURCE DIA MPCORB [--max-objects N]
-      ssp-build-ssobject, run as a black box on row-permuted copies of
-      SSSource, must write byte-identical SSObject files
+      ssp-build-ssobject, run as a black box on copies of SSSource with
+      the rows of each object permuted, must write byte-identical SSObject
+      files
   ellipse SSSOURCE NEARBYSSO --orbits-a A --orbits-b B
       the error ellipse against NearbySSO's, for rows in both whose orbit is
       identical in the two mpc_orbits snapshots
@@ -1231,11 +1232,28 @@ def diff_tables(a, b, key="ssObjectId"):
     return out
 
 
+def permutation(sid, seed, shuffle_objects=False):
+    """Row order of a permuted SSSource copy: the rows of each object (and
+    the NULL-ssObjectId rows, as one group) shuffled among themselves, the
+    groups kept together, in their order in the file (the builder requires
+    SSSource grouped by ssObjectId) or, with ``shuffle_objects``, shuffled
+    too. ``sid``: the ssObjectId column (Arrow)."""
+    v, valid, _ = to_np(sid)
+    group = pd.factorize(pd.Series(np.where(valid, v, -1)), sort=False)[0]
+    rng = np.random.default_rng(seed)
+    if shuffle_objects:
+        group = rng.permutation(group.max() + 1)[group] if len(group) else group
+    return np.lexsort((rng.random(len(group)), group))
+
+
 def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=None, object_seed=0,
-                               workdir=None, cmd=None, extra_args=(), include_original=False, rep=None):
-    """Run ssp-build-ssobject (a black box, via its CLI) on row-permuted
-    copies of SSSource (one per seed; also the file's own order with
-    ``include_original``) and require byte-identical outputs."""
+                               workdir=None, cmd=None, extra_args=(), include_original=False,
+                               shuffle_objects=False, permute_dia=False, rep=None):
+    """Run ssp-build-ssobject (a black box, via its CLI) on permuted copies
+    of SSSource (one per seed: see ``permutation``; also the file's own
+    order with ``include_original``) and require byte-identical outputs.
+    With ``permute_dia``, the DiaSource file is also given a random row
+    order per seed (restricted to the SSSource rows' obsids)."""
     import shlex
     import subprocess
     import tempfile
@@ -1252,6 +1270,15 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
         n_obj = len(pc.unique(t["ssObjectId"].drop_null())) if "ssObjectId" in t.column_names else 0
         rep.info(f"SSSource: {len(t):,} rows, {n_obj:,} objects"
                  + (f" (a random {max_objects:,}, seed {object_seed})" if max_objects else " (all)"))
+        rep.info("permutation: rows within each object" + (", and the objects' order" if shuffle_objects
+                                                            else " (objects kept in the file's order)"))
+        dia_t = None
+        if permute_dia:
+            dia_t = pq.read_table(dia)
+            if max_objects:
+                keep = pc.is_in(dia_t["obsid"], value_set=pc.unique(t["obsid"]))
+                dia_t = dia_t.filter(keep)
+            rep.info(f"DiaSource: {len(dia_t):,} rows, permuted per seed")
         rep.info(f"builder: {shlex.join(cmd)} SSSOURCE {dia} {mpcorb} --output OUT {shlex.join(extra_args)}")
         runs = [("original", None)] if include_original else []
         runs += [(f"seed {s}", s) for s in seeds]
@@ -1260,11 +1287,17 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
             tag = "original" if s is None else f"seed{s}"
             src = os.path.join(workdir, f"sssource.{tag}.parquet")
             out = os.path.join(workdir, f"ssobject.{tag}.parquet")
-            perm = np.arange(len(t)) if s is None else np.random.default_rng(s).permutation(len(t))
+            perm = np.arange(len(t)) if s is None else permutation(t["ssObjectId"], s, shuffle_objects)
             pq.write_table(t.take(pa.array(perm)), src, compression="zstd")
+            dia_src = dia
+            if dia_t is not None:
+                dia_src = os.path.join(workdir, f"dia_sources.{tag}.parquet")
+                dperm = (np.arange(len(dia_t)) if s is None
+                         else np.random.default_rng([s, 1]).permutation(len(dia_t)))
+                pq.write_table(dia_t.take(pa.array(dperm)), dia_src, compression="zstd")
             t0 = time.time()
             with open(os.path.join(workdir, f"ssobject.{tag}.log"), "w") as log:
-                r = subprocess.run([*cmd, src, dia, mpcorb, "--output", out, *extra_args],
+                r = subprocess.run([*cmd, src, dia_src, mpcorb, "--output", out, *extra_args],
                                    stdout=log, stderr=subprocess.STDOUT)
             ok = r.returncode == 0 and os.path.exists(out)
             rep.check(f"builder succeeded ({name})", ok,
@@ -1273,6 +1306,8 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
             if ok:
                 outs.append((name, out))
                 os.remove(src)
+                if dia_src != dia:
+                    os.remove(dia_src)
         if len(outs) < 2:
             rep.check("at least two outputs to compare", False, f"{len(outs)}")
             return rep
@@ -1591,6 +1626,10 @@ def main(argv=None):
     p.add_argument("mpcorb")
     p.add_argument("--seeds", default="1,2", help="comma-separated permutation seeds (default: %(default)s)")
     p.add_argument("--include-original", action="store_true", help="also run on the file's own row order")
+    p.add_argument("--permute-dia", action="store_true",
+                   help="also permute the DiaSource file's rows (per seed)")
+    p.add_argument("--shuffle-objects", action="store_true",
+                   help="also shuffle the order of the objects (rows stay grouped by ssObjectId)")
     p.add_argument("--max-objects", type=int, default=None,
                    help="use the rows of this many random objects only (for speed)")
     p.add_argument("--object-seed", type=int, default=0, help="seed of the --max-objects draw")
@@ -1635,7 +1674,8 @@ def main(argv=None):
         extra = shlex.split(a.builder_args) + (["--workers", str(a.workers)] if a.workers else [])
         seeds = [int(x) for x in a.seeds.split(",") if x.strip()]
         rep = check_ssobject_permutation(a.sssource, a.dia_sources, a.mpcorb, seeds, a.max_objects,
-                                         a.object_seed, a.workdir, a.builder, extra, a.include_original)
+                                         a.object_seed, a.workdir, a.builder, extra, a.include_original,
+                                         a.shuffle_objects, a.permute_dia)
     elif a.cmd == "mock":
         t = build_mock(a.ref, a.dia_sources, a.obs_sbn, a.out, a.nearbysso, a.fault, a.schema)
         print(f"wrote {a.out}: {len(t):,} rows, {t.num_columns} columns; faults: {a.fault or 'none'}")

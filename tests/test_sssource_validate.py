@@ -675,13 +675,21 @@ args = sys.argv[1:]
 out = args[args.index("--output") + 1]
 mode = args[args.index("--mode") + 1] if "--mode" in args else "sorted"
 t = pq.read_table(args[0], columns=["ssObjectId", "midpointMjdTai", "psfFlux"]).to_pandas()
+sid = t["ssObjectId"].fillna(-1).to_numpy()
+starts = sid[1:] != sid[:-1]
+if len(set(sid[1:][starts])) != starts.sum() or (len(sid) and sid[0] in set(sid[1:][starts])):
+    sys.exit(4)               # as the real builder: SSSource must be grouped by ssObjectId
 t = t[t["ssObjectId"].notna()]
 if mode == "fail":
     sys.exit(3)
 if mode == "sorted":          # order-independent: sort within each object first
     t = t.sort_values(["ssObjectId", "midpointMjdTai"])
+if mode == "unsorted_rows":   # by time within each object, objects in file order
+    t = t.sort_values(["midpointMjdTai"], kind="stable")
 g = t.groupby("ssObjectId", sort=(mode != "unsorted_rows"))
 res = g.agg(first=("psfFlux", "first"), n=("psfFlux", "size")).reset_index()
+if "--dia-first" in args:     # depends on the DiaSource file's order
+    res["dia0"] = pq.read_table(args[1], columns=["obsid"])["obsid"][0].as_py()
 pq.write_table(pa.Table.from_pandas(res, preserve_index=False), out)
 '''
 
@@ -725,8 +733,12 @@ def test_ssobject_permutation_fail(tmp_path, builder):
     assert "SSObject byte-identical (seed 2 vs seed 1)" in failed(rep)
     assert "first: " in rep.text() and "objects differ in some column" in rep.text()
     # objects in first-seen order: the same values, rows out of place
+    # (only once the objects' order is shuffled too)
     rep = V.check_ssobject_permutation(ss, "d", "m", seeds=(1, 2), cmd=builder,
                                        extra_args=["--mode", "unsorted_rows"])
+    assert rep.ok, rep.text()
+    rep = V.check_ssobject_permutation(ss, "d", "m", seeds=(1, 2), cmd=builder,
+                                       extra_args=["--mode", "unsorted_rows"], shuffle_objects=True)
     assert "SSObject byte-identical (seed 2 vs seed 1)" in failed(rep)
     assert "row order differs" in rep.text()
     # the builder fails
@@ -735,12 +747,37 @@ def test_ssobject_permutation_fail(tmp_path, builder):
     assert {"builder succeeded (seed 1)", "at least two outputs to compare"} <= failed(rep)
 
 
+def test_ssobject_permutation_dia(tmp_path, builder):
+    ss = _many(tmp_path)
+    dia = write(pq.read_table(ss, columns=["obsid"]), tmp_path / "dia.parquet")
+    args = ["--mode", "sorted", "--dia-first"]
+    assert V.check_ssobject_permutation(ss, dia, "m", cmd=builder, extra_args=args).ok
+    rep = V.check_ssobject_permutation(ss, dia, "m", cmd=builder, extra_args=args, permute_dia=True,
+                                       max_objects=10)
+    assert "SSObject byte-identical (seed 2 vs seed 1)" in failed(rep)
+    assert "DiaSource: 70 rows, permuted per seed" in rep.text()
+
+
 def test_ssobject_permutation_cli(tmp_path, builder):
     ss = _many(tmp_path)
     assert V.main(["ssobject-permutation", ss, "d", "m", "--builder", builder, "--builder-args",
                    "--mode sorted", "--max-objects", "3"]) == 0
     assert V.main(["ssobject-permutation", ss, "d", "m", "--builder", builder, "--builder-args",
                    "--mode first"]) == 1
+
+
+def test_permutation():
+    sid = pa.array([1, 1, 1, 2, 2, 5, 5, 5, 5, None, None])
+    for shuffle in (False, True):
+        p = V.permutation(sid, 3, shuffle)
+        assert sorted(p) == list(range(len(sid)))
+        g = [sid[i].as_py() for i in p]
+        blocks = [k for k, prev in zip(g, [object()] + g[:-1]) if k != prev]
+        assert len(blocks) == 4                     # still grouped
+        if not shuffle:
+            assert blocks == [1, 2, 5, None]          # objects in the file's order
+    assert list(V.permutation(sid, 3)) != list(range(len(sid)))
+    assert list(V.permutation(sid, 3)) != list(V.permutation(sid, 4))
 
 
 def test_diff_tables():
