@@ -161,6 +161,40 @@ def export_query_to_parquet(
                 pass
 
 
+def export_in_transaction(dsn, exports, row_group_size=DEFAULT_ROW_GROUP_SIZE,
+                          block_size=DEFAULT_BLOCK_SIZE, keep_temp=False, log=print):
+    """Run every ``{sql, out[, row_group_size]}`` of ``exports`` in one
+    REPEATABLE READ transaction, so that all outputs are one consistent
+    snapshot. Returns the transaction's start time (Postgres ``now()``, a
+    timezone-aware ``datetime``), taken by the transaction's first
+    statement, which is also when the snapshot is fixed."""
+    with psycopg2.connect(dsn) as conn:
+        conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ)
+        with conn.cursor() as cur:
+            # The first statement begins it and fixes the snapshot.
+            cur.execute("SELECT now()")
+            started = cur.fetchone()[0]
+            log(f"Starting batch export of {len(exports)} tables in single transaction "
+                f"(started {started})...")
+
+            for i, export_spec in enumerate(exports, 1):
+                out = export_spec["out"]
+                log(f"[{i}/{len(exports)}] Exporting to {out}...")
+                export_query_to_parquet(
+                    cur=cur,
+                    sql=export_spec["sql"],
+                    parquet_out=out,
+                    row_group_size=export_spec.get("row_group_size", row_group_size),
+                    block_size=block_size,
+                    keep_temp=keep_temp,
+                )
+                log(f"✓ Exported to {out}")
+
+            conn.commit()
+            log(f"All {len(exports)} exports completed successfully in single transaction!")
+    return started
+
+
 def main():
     """CLI entry point for exporting Postgres tables to Parquet."""
     parser = argparse.ArgumentParser(description="Stream Postgres table to Parquet via Arrow")
@@ -210,32 +244,8 @@ def main():
         # Batch export mode: multiple exports in a single transaction
         exports = load_config(args.config)
 
-        with psycopg2.connect(DSN) as conn:
-            # Start explicit transaction
-            conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ)
-            with conn.cursor() as cur:
-                # BEGIN transaction implicitly started
-                print(f"Starting batch export of {len(exports)} tables in single transaction...")
-
-                for i, export_spec in enumerate(exports, 1):
-                    sql = export_spec["sql"]
-                    out = export_spec["out"]
-                    row_group_size = export_spec.get("row_group_size", args.row_group_size)
-
-                    print(f"[{i}/{len(exports)}] Exporting to {out}...")
-                    export_query_to_parquet(
-                        cur=cur,
-                        sql=sql,
-                        parquet_out=out,
-                        row_group_size=row_group_size,
-                        block_size=args.block_size,
-                        keep_temp=args.keep_temp,
-                    )
-                    print(f"✓ Exported to {out}")
-
-                # Commit transaction
-                conn.commit()
-                print(f"All {len(exports)} exports completed successfully in single transaction!")
+        export_in_transaction(DSN, exports, row_group_size=args.row_group_size,
+                              block_size=args.block_size, keep_temp=args.keep_temp)
     else:
         # Single export mode (original behavior)
         with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
