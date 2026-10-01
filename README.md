@@ -338,22 +338,26 @@ An end-to-end run is extraction, SSSource, then SSObject:
 ```bash
 extract-submitted-sources analysis/inputs/obs_sbn.parquet analysis/inputs/dia_sources.parquet
 ssp-build-sssource
-ssp-build-ssobject analysis/outputs/sssource.parquet analysis/inputs/dia_sources.parquet \
-  analysis/inputs/mpc_orbits.parquet --output analysis/outputs/ssobject.parquet
+ssp-build-ssobject analysis/outputs/sssource.parquet analysis/inputs/mpc_orbits.parquet \
+  --output analysis/outputs/ssobject.parquet
 ```
 
 ### SSObject Table Construction
 
-`ssp-build-ssobject` constructs SSObject tables from SSSource, DiaSource, and MPC orbit data. This tool processes photometric and orbital data to create comprehensive solar system object catalogs with fitted parameters.
+`ssp-build-ssobject` constructs SSObject tables from SSSource and MPC orbit data. This tool processes photometric and orbital data to create comprehensive solar system object catalogs with fitted parameters.
 
 Basic usage:
 ```bash
-ssp-build-ssobject sssource.parquet dia_sources.parquet mpc_orbits.parquet --output ssobject.parquet
+ssp-build-ssobject sssource.parquet mpc_orbits.parquet --output ssobject.parquet
 ```
 
+(The older form, `sssource.parquet dia_sources.parquet mpc_orbits.parquet`, is
+still accepted; the DiaSource file is not read.)
+
 Arguments:
-- `sssource.parquet` – SSSource Parquet file (from `ssp-build-sssource`; only the columns used are read)
-- `dia_sources.parquet` – DiaSource Parquet file with photometric measurements
+- `sssource.parquet` – SSSource Parquet file (from `ssp-build-sssource`; only the columns used are read).
+  The photometry is SSSource's own: `band`, and the float32 `psfFlux` and `psfFluxErr`, so SSObject
+  can be reproduced from the published SSSource.
 - `mpc_orbits.parquet` – MPC orbit Parquet file with orbital elements
 - `--output ssobject.parquet` – Output SSObject Parquet file
 - `--workers N` – Number of worker processes for the per-object fits and the MOIDs (default: `min(64, CPUs)`).
@@ -369,7 +373,10 @@ The tool performs:
   least-squares fit of the rest. Unlike DP2, which fixed G12 at 0.5 (use
   `--hg12FixedG12 0.5` for that), G12 is fit, bounded to [0, 1]. A G12 that
   ends at a bound has no `G12Err` or H–G12 covariance (both NaN), and its
-  `HErr` is that of the fixed-G12 fit.
+  `HErr` is that of the fixed-G12 fit. The fits don't depend on the order of
+  the rows: each takes its observations in a canonical order (by phase angle,
+  magnitude, error, distances), so any permutation gives bitwise identical
+  results.
 - Orbital analysis including Tisserand parameter and MOID calculations
 - Quality metrics and observation statistics per object
 

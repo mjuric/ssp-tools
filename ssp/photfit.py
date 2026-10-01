@@ -183,10 +183,34 @@ _IRLS_TOL = 1e-9
 _IRLS_MAXITER = 500
 
 
+def _canonical_order(mag, magSigma, phaseAngle, tdist, rdist):
+    """The order in which a fit takes its observations: by (phaseAngle,
+    mag, magSigma, tdist, rdist), a total order on everything the fit
+    uses. Observations that tie are equal in every input, so the fit is
+    a function of the set of observations, whatever order they are
+    given in.
+
+    Why this is needed: the fit's reductions (weighted means, the IRLS
+    sums, the costs, J^T J) round differently in a different order, by
+    an ulp or so. That alone moves G12 within the scalar search's
+    tolerance (~1e-6..1e-5), and in degenerate fits, whose G12 profile
+    is flat to rounding (2 points for 2 parameters, or a single phase
+    angle), it decides G12 outright, whether it ends at a bound, and
+    whether J^T J is invertible: H_err, G12_err, nObsUsed and the
+    failure flag then change by any amount.
+    """
+    # np.lexsort sorts by the last key first
+    return np.lexsort((rdist, tdist, magSigma, mag, phaseAngle))
+
+
 def _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor):
     """Apply the error floor, keep finite magnitudes with positive
     errors, and reduce the magnitudes to 1 AU. Returns (reduced mag,
-    magSigma, phase in radians), or None if no observation is left.
+    magSigma, phase in radians, idx), or None if no observation is left.
+
+    The observations come back in ``_canonical_order``; ``idx`` maps
+    them to their positions among the kept (finite, positive-error)
+    input observations, in the input order.
     """
     if len(mag) == 0:
         return None
@@ -194,26 +218,39 @@ def _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor)
     # ensure these are plain ndarrays
     (mag, magSigma, phaseAngle, tdist, rdist) = map(np.asarray, (mag, magSigma, phaseAngle, tdist, rdist))
 
+    # filter to finite magnitudes and positive errors (with the floor
+    # below, as before: the floor can't make an error positive)
+    sig = np.sqrt(magSigma**2 + magSigmaFloor**2) if magSigmaFloor > 0 else magSigma
+    good = (
+        np.isfinite(mag) & np.isfinite(sig)
+        & (sig > 0)
+    )
+    if not good.any():
+        return None
+    kept = np.flatnonzero(good)
+    order = _canonical_order(mag[kept], magSigma[kept], phaseAngle[kept], tdist[kept], rdist[kept])
+    sel = kept[order]
+    mag = mag[sel]
+    magSigma = magSigma[sel]
+    phaseAngle = phaseAngle[sel]
+    tdist = tdist[sel]
+    rdist = rdist[sel]
+
     # add systematic error floor in quadrature
     if magSigmaFloor > 0:
         magSigma = np.sqrt(magSigma**2 + magSigmaFloor**2)
 
-    # filter to finite magnitudes and positive errors
-    good = (
-        np.isfinite(mag) & np.isfinite(magSigma)
-        & (magSigma > 0)
-    )
-    if not good.any():
-        return None
-    mag = mag[good]
-    magSigma = magSigma[good]
-    phaseAngle = phaseAngle[good]
-    tdist = tdist[good]
-    rdist = rdist[good]
-
     # correct the mag to 1AU distance
     dmag = -5. * np.log10(tdist*rdist)
-    return mag + dmag, magSigma, np.deg2rad(phaseAngle)
+    return mag + dmag, magSigma, np.deg2rad(phaseAngle), order
+
+
+def _input_order(keep, idx):
+    """``keep`` (in the fit's canonical order) in the input order of the
+    kept observations; ``idx`` as returned by ``_prepare_hg12_inputs``."""
+    out = np.empty_like(keep)
+    out[idx] = keep
+    return out
 
 
 def _HG12_G1G2_vec(G12):
@@ -438,6 +475,10 @@ def fitHG12(
     ``_fitHG12_reference`` is the equivalent direct two-parameter
     ``least_squares`` fit, kept for verification.
 
+    The result is a function of the set of observations: any
+    permutation of the inputs gives a bitwise identical result (the fit
+    takes them in ``_canonical_order``).
+
     Parameters
     ----------
     mag : array_like
@@ -491,7 +532,7 @@ def fitHG12(
     prep = _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor)
     if prep is None:
         return _FAILED
-    mag, magSigma, phase_rad = prep
+    mag, magSigma, phase_rad, idx = prep
     nobsv = len(mag)
     nparams = 1 if fixedG12 is not None else 2
 
@@ -525,7 +566,7 @@ def fitHG12(
             resid = (prof.y(G_r) - H_r) / magSigma
             keep = np.abs(resid) < nSigmaClip
             if _details is not None:
-                _details.update(robust=(H_r, G_r), keep=keep)
+                _details.update(robust=(H_r, G_r), keep=_input_order(keep, idx))
             mag = mag[keep]
             magSigma = magSigma[keep]
             phase_rad = phase_rad[keep]
@@ -564,7 +605,7 @@ def _fitHG12_reference(
     prep = _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor)
     if prep is None:
         return _FAILED
-    mag, magSigma, phase_rad = prep
+    mag, magSigma, phase_rad, idx = prep
     nobsv = len(mag)
 
     nparams = 1 if fixedG12 is not None else 2
@@ -599,7 +640,7 @@ def _fitHG12_reference(
             keep = np.abs(resid) < nSigmaClip
             if _details is not None:
                 G_r = fixedG12 if fixedG12 is not None else sol_robust.x[1]
-                _details.update(robust=(sol_robust.x[0], G_r), keep=keep)
+                _details.update(robust=(sol_robust.x[0], G_r), keep=_input_order(keep, idx))
             mag = mag[keep]
             magSigma = magSigma[keep]
             phase_rad = phase_rad[keep]

@@ -10,6 +10,17 @@ from ssp.ssobject import compute_ssobject
 from ssp.util import balanced_chunks as _balanced_chunks
 
 
+def widen(sss, dia):
+    """``sss`` with the measurement columns SSObject reads from the widened
+    SSSource (as ssp-build-sssource copies them from dia_sources.parquet,
+    float32 where SSSourceDtype has it), joined on obsid."""
+    m = dia[["obsid", "midpointMjdTai", "band", "psfFlux", "psfFluxErr", "extendedness"]]
+    m = m.astype({"psfFlux": np.float32, "psfFluxErr": np.float32, "extendedness": np.float32})
+    out = sss.merge(m, on="obsid", how="left", validate="one_to_one")
+    assert len(out) == len(sss) and out["band"].notna().all()
+    return out
+
+
 def _tables(n_obj=40, seed=2):
     rng = np.random.default_rng(seed)
     sss, dia, orbits = [], [], []
@@ -63,7 +74,7 @@ def _tables(n_obj=40, seed=2):
     sss = pd.concat([und, sss] + extra_sss, ignore_index=True)
     sss = sss.sort_values("ssObjectId", kind="stable", ignore_index=True)
     dia = pd.concat([dia] + extra_dia, ignore_index=True)
-    return sss, dia, pd.DataFrame(orbits)
+    return widen(sss, dia), pd.DataFrame(orbits)
 
 
 def _assert_identical(a, b):
@@ -78,10 +89,10 @@ def _assert_identical(a, b):
 
 
 def test_parallel_matches_serial(capsys):
-    sss, dia, orb = _tables()
-    serial = compute_ssobject(sss, dia, orb, workers=1)
+    sss, orb = _tables()
+    serial = compute_ssobject(sss, orb, workers=1)
     capsys.readouterr()
-    par = compute_ssobject(sss, dia, orb, workers=3)
+    par = compute_ssobject(sss, orb, workers=3)
     out = capsys.readouterr().out
     assert "[objects] 39/39 objects" in out and "[MOID] 38/38 objects" in out   # ran in the pool
 
@@ -99,24 +110,24 @@ def test_parallel_matches_serial(capsys):
 
 def test_parallel_matches_serial_few_chunks():
     # fewer chunks than workers, and more workers than objects per chunk
-    sss, dia, orb = _tables(n_obj=6, seed=3)
-    _assert_identical(compute_ssobject(sss, dia, orb, workers=1),
-                      compute_ssobject(sss, dia, orb, workers=4, chunk_factor=1))
+    sss, orb = _tables(n_obj=6, seed=3)
+    _assert_identical(compute_ssobject(sss, orb, workers=1),
+                      compute_ssobject(sss, orb, workers=4, chunk_factor=1))
 
 
 def test_parallel_without_orbits():
-    sss, dia, _ = _tables(n_obj=10, seed=4)
-    _assert_identical(compute_ssobject(sss, dia, None, workers=1),
-                      compute_ssobject(sss, dia, None, workers=2))
+    sss, _ = _tables(n_obj=10, seed=4)
+    _assert_identical(compute_ssobject(sss, None, workers=1),
+                      compute_ssobject(sss, None, workers=2))
 
 
 def test_worker_exception_fails_the_build(monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("fit exploded")
     monkeypatch.setattr(photfit, "fitHG12", boom)   # inherited by the forked workers
-    sss, dia, orb = _tables(n_obj=10, seed=5)
+    sss, orb = _tables(n_obj=10, seed=5)
     with pytest.raises(RuntimeError, match="fit exploded"):
-        compute_ssobject(sss, dia, orb, workers=2)
+        compute_ssobject(sss, orb, workers=2)
     assert ssobject._PARALLEL == {}
 
 
