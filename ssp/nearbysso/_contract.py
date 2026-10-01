@@ -236,5 +236,7 @@ NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
 #   visit's DiaSources within MATCH_RADIUS_ARCSEC of that prediction (an
 #   eligible one, i.e. past the sigma cut), whichever object each of those
 #   DiaSources' own NearbySSO row ends up naming. Ties: the lower diaSourceId
-#   ranks first. It is computed from the matches of each (orbit, visit)
+#   ranks first. The pool counts distinct DiaSources: input rows repeating a
+#   diaSourceId (the input may contain duplicates) count once, at their
+#   smallest separation. It is computed from the matches of each (orbit, visit)
 #   prediction before the nearest-object reduction.
