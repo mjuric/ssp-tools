@@ -1,6 +1,6 @@
 # Design: building and delivering the PPDB Solar System tables daily
 
-Status: **proposed**, for owner approval (2026-10-01).
+Status: **implemented** (2026-10-01): `ssp-extract-sso-inputs`, `ssp-build-sso`, `ssp-upload-sso` and `ssp-sso-daily`. A full daily run with a dry-run upload to dev works end to end; the runbook is `docs/runbooks/sso-daily.md`. Real uploads wait on the DM-55678 items listed there.
 
 ## Context
 
@@ -109,3 +109,24 @@ A convenience wrapper, `ssp-sso-daily`, runs the three stages in sequence. Each 
 - Run the three stages end to end on fresh inputs, with the upload in dry-run mode.
 - Write `docs/runbooks/sso-daily.md` and record the results here.
 - A real upload to dev comes once the service account is issued. Ask the DM-55678 owners for it, and for NearbySSO support in `dax_ppdb` and `load_sso`.
+
+## Results (2026-10-01)
+
+**Work packages,** each merged into `sso-delivery` through its own PR:
+- WP H, the delivery check (#53);
+- WP G, upload and the daily wrapper (#54), light review, two rounds;
+- WP E, extract (#55), light review, two rounds;
+- WP F, build (#56), full review, two rounds.
+
+**Findings from the reviews that changed the design:**
+- **NearbySSO is held back from uploads** (owner decision). The loader fails the entire load on an unknown table.
+- **Partial uploads** need `--allow-partial`. The loader `WRITE_TRUNCATE`s only the tables listed, so a subset would mix snapshots.
+- **`dia_sources` records the `obs_sbn` it was built from** (`obs_sbn_md5`), and every stage refuses a mismatch.
+- **`deliverable`** requires every expected check by name. The inputs are re-hashed after the build; `--from` re-hashes the tables it keeps and refuses mixed commits; an uploaded run can't be rebuilt without `--force-rebuild`.
+- **Schema change:** `current_identifications.published` is an `int` in the schema, matching the MPC's codes 0, 1, 2 and 4.
+
+**Verified:**
+- The shaped MPC tables equal the raw inputs row for row.
+- Builds from the 2026-09-30 fixture are byte-identical to the validated SSSource and SSObject references.
+- Reruns on the same inputs give md5-identical tables.
+- The reference daily run is in the runbook.
