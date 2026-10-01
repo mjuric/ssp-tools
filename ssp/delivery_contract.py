@@ -66,8 +66,14 @@ MANIFEST_FIELDS = {
     "created_utc": "ISO 8601 time the manifest was written",
     "producer": "what produced the inputs, e.g. 'ssp-extract-sso-inputs <version> (<commit>)'",
     "mpc_snapshot_utc": "ISO 8601 time of the MPC snapshot (the transaction's start)",
-    "files": "{name: {file, rows, md5, source, extracted_utc}} for every INPUT_FILES name",
+    "files": "{name: {file, rows, md5, source, extracted_utc}} for every INPUT_FILES name;"
+             " the dia_sources entry also has obs_sbn_md5",
 }
+
+#: dia_sources is derived from obs_sbn: its manifest entry records the md5 of
+#: the obs_sbn it was built from (``obs_sbn_md5``), and every stage refuses
+#: inputs where it differs from files.obs_sbn.md5.
+DERIVED_FROM = {"dia_sources": "obs_sbn"}
 
 # --------------------------------------------------------------------------
 # Stage 2 -> 3: the delivery (RUN_DIR/delivery) and the report
