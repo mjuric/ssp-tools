@@ -18,8 +18,16 @@ Subcommands (each prints a text report, optionally also to ``--out FILE``)::
   clickhouse SSSOURCE [--n 10000]
       a sample stratified by processing, re-fetched from ssp.SubmittableSources
       by (processing, id); blocks 3 and 4 compared
+  offsets SSSOURCE
+      ephOffsetAlongTrack/CrossTrack recomputed from ephOffsetRa/Dec and
+      ephRateRa/Dec by the contract's formula (also run by conformance)
   regression NEW_SSSOURCE REF_SSSOURCE
       the ephemeris/geometry columns bitwise equal to today's SSSource
+      (except the computed ellipse and along/cross-track columns)
+  ssobject-permutation SSSOURCE DIA MPCORB [--max-objects N]
+      ssp-build-ssobject, run as a black box on copies of SSSource with
+      the rows of each object permuted, must write byte-identical SSObject
+      files
   ellipse SSSOURCE NEARBYSSO --orbits-a A --orbits-b B
       the error ellipse against NearbySSO's, for rows in both whose orbit is
       identical in the two mpc_orbits snapshots
@@ -89,9 +97,26 @@ FELIS_ARROW = {
 FELIS_STRING = ("char", "string", "unicode", "text")
 
 #: Columns in the reference (today's SSSource) that must be bitwise equal:
-#: everything ephemeris and geometry except the three new ellipse columns.
+#: everything ephemeris and geometry except the ellipse and the along/cross-
+#: track offsets, which are new computations. (diaDistanceRank is no longer
+#: in SSSource; it moved to NearbySSO.)
 REGRESSION_PREFIXES = ("ecl", "gal", "topo", "helio", "eph")
-REGRESSION_EXACT = ("elongation", "phaseAngle", "diaDistanceRank")
+REGRESSION_EXACT = ("elongation", "phaseAngle")
+
+#: The along/cross-track offsets (block 6), computed per the contract.
+TRACK_COLUMNS = ("ephOffsetAlongTrack", "ephOffsetCrossTrack")
+#: ... and the columns they are computed from.
+TRACK_INPUTS = ("ephOffsetRa", "ephOffsetDec", "ephRateRa", "ephRateDec")
+REGRESSION_EXCLUDED = (*ELLIPSE_COLUMNS, *TRACK_COLUMNS)
+
+#: Tolerance of the recomputed along/cross-track offsets, in float32 epsilons
+#: times |ephOffset|: the inputs' (float32 rates) and the output's rounding.
+TRACK_EPS = 8
+#: along^2 + cross^2 vs ephOffset^2: gated on rows with ephOffset at most
+#: this [arcsec] (beyond, the tangent-plane offsets and the great-circle
+#: separation part ways), to this relative tolerance on the root.
+TRACK_SEP_GATE_ARCSEC = 60.0
+TRACK_SEP_RTOL = 1e-4
 
 #: mpc_orbits columns that must be equal for two snapshots' orbits to count
 #: as identical (the elements, their uncertainties, H/G, and the JSON that
@@ -401,6 +426,8 @@ def check_conformance(path, schema=DEFAULT_SCHEMA, rep=None):
         check_ellipse_rule(t, rep)
     if has("processing", "measuredOn", "primary", *ID_COLUMNS):
         check_primary(t, rep)
+    if has("ephRa", "ephOffset", *TRACK_INPUTS, *TRACK_COLUMNS):
+        check_offsets_table(t, rep)
 
     # Parquet layout
     comp, nodict = set(), set()
@@ -541,6 +568,113 @@ def check_ellipse_rule(t, rep):
     rep.check("ellipse sane (NULL together, errors > 0, |cov| <= raErr*decErr)", not (split or n_bad),
               f"{int(together.sum()):,} rows with an ellipse" +
               (f"; {split:,} partially NULL, {n_bad:,} not positive-definite" if (split or n_bad) else ""))
+
+
+def expected_track_offsets(off_ra, off_dec, rate_ra, rate_dec):
+    """The contract's along/cross-track offsets [arcsec], in float64, NaN
+    where ephRate = hypot(ephRateRa, ephRateDec) is 0 or an input missing:
+    along = (dRa*vRa + dDec*vDec)/|v|, cross = (-dRa*vDec + dDec*vRa)/|v|."""
+    x, y, vx, vy = (np.asarray(a, dtype=np.float64) for a in (off_ra, off_dec, rate_ra, rate_dec))
+    v = np.hypot(vx, vy)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        along = np.where(v > 0, (x * vx + y * vy) / v, np.nan)
+        cross = np.where(v > 0, (-x * vy + y * vx) / v, np.nan)
+    return along, cross
+
+
+def check_offsets_table(t, rep, eps=TRACK_EPS, sep_gate=TRACK_SEP_GATE_ARCSEC, sep_rtol=TRACK_SEP_RTOL):
+    """ephOffsetAlongTrack/CrossTrack against the contract's formula on the
+    file's own ephOffsetRa/Dec and ephRateRa/Dec; their NULL rule; and
+    along^2 + cross^2 against ephOffsetRa^2 + ephOffsetDec^2 and
+    ephOffset^2."""
+    keys = to_np(t["obsid"])[0] if "obsid" in t.column_names else np.arange(len(t))
+    ra, ra_valid, _ = to_np(t["ephRa"])
+    orbit = ra_valid & ~np.isnan(ra)
+    x, y, vx, vy = (to_np(t[c])[0].astype(np.float64) for c in TRACK_INPUTS)
+    with np.errstate(invalid="ignore"):
+        zero_rate = orbit & (np.hypot(vx, vy) == 0)
+    want_a, want_c = expected_track_offsets(x, y, vx, vy)
+    expect = orbit & np.isfinite(want_a) & np.isfinite(want_c)
+    n_inputs_missing = int(np.sum(orbit & ~zero_rate & ~expect))
+
+    got, present, nan_cells = {}, {}, 0
+    for c in TRACK_COLUMNS:
+        v, valid, _ = to_np(t[c])
+        got[c] = v.astype(np.float64)
+        present[c] = valid & ~np.isnan(v)
+        nan_cells += int(np.sum(valid & np.isnan(v)))
+
+    # the NULL rule
+    bad = []
+    for c in TRACK_COLUMNS:
+        stray = present[c] & ~expect
+        missing = expect & ~present[c]
+        for what, m in (("set without an orbit", stray & ~orbit),
+                        ("set where ephRate is 0", stray & zero_rate),
+                        ("set where an input is missing", stray & orbit & ~zero_rate),
+                        ("missing with an orbit and a rate", missing)):
+            if m.any():
+                bad.append(f"{c}: {int(m.sum()):,} {what} ({_examples(keys, m, got[c], k=3)})")
+    rep.check("along/cross-track NULL exactly where no orbit or ephRate is 0", not bad,
+              "; ".join(bad) or f"{int(expect.sum()):,} set; NULL: {int((~orbit).sum()):,} without an orbit, "
+              f"{int(zero_rate.sum()):,} with ephRate 0" +
+              (f", {n_inputs_missing:,} with an input missing" if n_inputs_missing else ""))
+    if nan_cells:
+        rep.info(f"along/cross-track missing values written as NaN, not NULL: {nan_cells:,} cells")
+
+    # the values
+    both = expect & present[TRACK_COLUMNS[0]] & present[TRACK_COLUMNS[1]]
+    off = np.hypot(x, y)
+    tol = eps * np.finfo(np.float32).eps * off
+    bad, worst = [], 0.0
+    for c, want in zip(TRACK_COLUMNS, (want_a, want_c)):
+        d = np.abs(got[c] - want)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r = np.where(both, d / np.where(off > 0, off, np.inf), 0.0)
+        worst = max(worst, float(np.nanmax(r)) if len(r) else 0.0)
+        m = both & (d > tol)
+        if m.any():
+            bad.append(f"{c}: {int(m.sum()):,} rows ({_examples(keys, m, got[c], want, k=3)})")
+    eps32 = float(np.finfo(np.float32).eps)
+    rep.check(f"along/cross-track equal the contract formula (<= {eps} float32 eps x |offset|)", not bad,
+              "; ".join(bad) or f"{int(both.sum()):,} rows; worst |d|/|offset| = {worst / eps32:.3g} eps")
+
+    # along^2 + cross^2: a rotation of (ephOffsetRa, ephOffsetDec) ...
+    h = np.hypot(got[TRACK_COLUMNS[0]], got[TRACK_COLUMNS[1]])
+    m = both & (np.abs(h - off) > 2 * tol)
+    rep.check("along^2 + cross^2 == ephOffsetRa^2 + ephOffsetDec^2", not m.any(),
+              f"{int(m.sum()):,} rows ({_examples(keys, m, h, off, k=3)})" if m.any() else
+              f"{int(both.sum()):,} rows")
+    # ... and ~ ephOffset^2 (the great-circle separation)
+    sep = to_np(t["ephOffset"])[0].astype(np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel = np.abs(h - sep) / sep
+    gated = both & np.isfinite(sep) & (sep > 0) & (sep <= sep_gate)
+    m = gated & ~(rel <= sep_rtol)
+    qs = (50, 99, 99.99, 100)
+    for name, sel in ((f"<= {sep_gate:g}\"", gated), (f"> {sep_gate:g}\"", both & (sep > sep_gate))):
+        if sel.any():
+            rep.info(f"|sqrt(along^2 + cross^2) - ephOffset| / ephOffset, ephOffset {name} "
+                     f"({int(sel.sum()):,} rows): " +
+                     "  ".join(f"p{q}={v:.3g}" for q, v in zip(qs, np.nanpercentile(rel[sel], qs))))
+    rep.check(f"along^2 + cross^2 ~ ephOffset^2 (rel. {sep_rtol:g} on the root, ephOffset <= {sep_gate:g}\")",
+              not m.any(), f"{int(m.sum()):,} of {int(gated.sum()):,} rows outside"
+              + (f" ({_examples(keys, m, h, sep, k=3)})" if m.any() else ""))
+    return rep
+
+
+def check_offsets(path, rep=None, **kw):
+    """The along/cross-track checks alone (only the columns they need)."""
+    rep = rep or Report(f"SSSource along/cross-track offsets: {path}")
+    have = pq.read_schema(path).names
+    need = ["obsid", "ephRa", "ephOffset", *TRACK_INPUTS, *TRACK_COLUMNS]
+    miss = [c for c in need if c not in have]
+    if miss:
+        rep.check("columns needed by the offsets check present", False, f"missing {miss}")
+        return rep
+    t = pq.read_table(path, columns=need)
+    rep.info(f"{len(t):,} rows")
+    return check_offsets_table(t, rep, **kw)
 
 
 def _measurement_id(t):
@@ -772,7 +906,7 @@ def check_clickhouse(sssource, n=10_000, seed=1, fetch=ch_fetch, schema=DEFAULT_
 
 def regression_columns(names):
     return [c for c in names
-            if (c.startswith(REGRESSION_PREFIXES) or c in REGRESSION_EXACT) and c not in ELLIPSE_COLUMNS]
+            if (c.startswith(REGRESSION_PREFIXES) or c in REGRESSION_EXACT) and c not in REGRESSION_EXCLUDED]
 
 
 def check_regression(new, ref, rep=None):
@@ -1022,6 +1156,180 @@ def check_counts(sssource, obs_sbn, dia_sources=None, station="X05", rep=None):
 
 
 # --------------------------------------------------------------------------
+# 7. ssobject-permutation: SSObject must not depend on SSSource's row order
+# --------------------------------------------------------------------------
+
+def default_ssobject_cmd():
+    """``ssp-build-ssobject`` next to this interpreter, else on PATH."""
+    exe = os.path.join(os.path.dirname(sys.executable), "ssp-build-ssobject")
+    return [exe] if os.path.exists(exe) else ["ssp-build-ssobject"]
+
+
+def sssource_subset(sssource, max_objects=None, seed=0):
+    """SSSource, or the rows of ``max_objects`` objects drawn at random
+    (``seed``) from those with an ssObjectId."""
+    if not max_objects:
+        return pq.read_table(sssource)
+    sid = pc.unique(pq.read_table(sssource, columns=["ssObjectId"])["ssObjectId"].drop_null()).to_numpy()
+    if max_objects < len(sid):
+        sid = np.sort(np.random.default_rng(seed).choice(sid, max_objects, replace=False))
+    return pq.read_table(sssource, filters=[("ssObjectId", "in", sid.tolist())])
+
+
+def _sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 24), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def diff_tables(a, b, key="ssObjectId"):
+    """Lines describing how two SSObject tables differ: schema, rows, and
+    per column (after aligning on ``key``, if both have it) the rows that
+    differ bitwise (floats: NaN == NULL == NaN)."""
+    out = []
+    if a.schema != b.schema:
+        out.append(f"schemas differ: {a.schema.names == b.schema.names and 'types' or 'names'}")
+    if len(a) != len(b):
+        out.append(f"rows: {len(a):,} vs {len(b):,}")
+        return out
+    if key in a.column_names and key in b.column_names:
+        ka, kb = to_np(a[key])[0], to_np(b[key])[0]
+        if not np.array_equal(ka, kb):
+            out.append(f"row order differs ({int(np.sum(ka != kb)):,} rows out of place); "
+                       f"compared after sorting by {key}")
+            a = a.take(pa.array(np.argsort(ka, kind="stable")))
+            b = b.take(pa.array(np.argsort(kb, kind="stable")))
+            if not np.array_equal(np.sort(ka), np.sort(kb)):
+                out.append(f"different {key} sets")
+                return out
+    keys = to_np(a[key])[0] if key in a.column_names else np.arange(len(a))
+    rows_any = np.zeros(len(a), dtype=bool)
+    for c in a.column_names:
+        if c not in b.column_names:
+            continue
+        try:
+            mism, _ = bitwise_mismatch(a[c], b[c])
+        except TypeError as e:
+            out.append(f"{c}: {e}")
+            continue
+        if mism.any():
+            rows_any |= mism
+            x, _, kx = to_np(a[c])
+            y, _, _ = to_np(b[c])
+            extra = ""
+            if kx == "f":
+                with np.errstate(invalid="ignore"):
+                    d = np.abs(x[mism].astype(np.float64) - y[mism])
+                    r = d / np.abs(y[mism].astype(np.float64))
+                if np.isfinite(d).any():
+                    extra = f", max |d| {np.nanmax(d):.3g}, max |d|/|x| {np.nanmax(r):.3g}"
+            out.append(f"{c}: {int(mism.sum()):,} rows{extra} (e.g. {_examples(keys, mism, x, y, k=3)})")
+    if rows_any.any():
+        out.append(f"{int(rows_any.sum()):,} of {len(a):,} objects differ in some column")
+    return out
+
+
+def permutation(sid, seed, shuffle_objects=False):
+    """Row order of a permuted SSSource copy: the rows of each object (and
+    the NULL-ssObjectId rows, as one group) shuffled among themselves, the
+    groups kept together, in their order in the file (the builder requires
+    SSSource grouped by ssObjectId) or, with ``shuffle_objects``, shuffled
+    too. ``sid``: the ssObjectId column (Arrow)."""
+    v, valid, _ = to_np(sid)
+    group = pd.factorize(pd.Series(np.where(valid, v, -1)), sort=False)[0]
+    rng = np.random.default_rng(seed)
+    if shuffle_objects:
+        group = rng.permutation(group.max() + 1)[group] if len(group) else group
+    return np.lexsort((rng.random(len(group)), group))
+
+
+def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=None, object_seed=0,
+                               workdir=None, cmd=None, extra_args=(), include_original=False,
+                               shuffle_objects=False, permute_dia=False, rep=None):
+    """Run ssp-build-ssobject (a black box, via its CLI) on permuted copies
+    of SSSource (one per seed: see ``permutation``; also the file's own
+    order with ``include_original``) and require byte-identical outputs.
+    With ``permute_dia``, the DiaSource file is also given a random row
+    order per seed (restricted to the SSSource rows' obsids)."""
+    import shlex
+    import subprocess
+    import tempfile
+
+    rep = rep or Report(f"SSObject permutation invariance: {sssource}")
+    cmd = shlex.split(cmd) if isinstance(cmd, str) else list(cmd or default_ssobject_cmd())
+    tmp = None
+    if workdir is None:
+        tmp = tempfile.TemporaryDirectory(prefix="ssobject-perm-")
+        workdir = tmp.name
+    os.makedirs(workdir, exist_ok=True)
+    try:
+        t = sssource_subset(sssource, max_objects, object_seed)
+        n_obj = len(pc.unique(t["ssObjectId"].drop_null())) if "ssObjectId" in t.column_names else 0
+        rep.info(f"SSSource: {len(t):,} rows, {n_obj:,} objects"
+                 + (f" (a random {max_objects:,}, seed {object_seed})" if max_objects else " (all)"))
+        rep.info("permutation: rows within each object" + (", and the objects' order" if shuffle_objects
+                                                            else " (objects kept in the file's order)"))
+        dia_t = None
+        if permute_dia:
+            dia_t = pq.read_table(dia)
+            if max_objects:
+                keep = pc.is_in(dia_t["obsid"], value_set=pc.unique(t["obsid"]))
+                dia_t = dia_t.filter(keep)
+            rep.info(f"DiaSource: {len(dia_t):,} rows, permuted per seed")
+        rep.info(f"builder: {shlex.join(cmd)} SSSOURCE {dia} {mpcorb} --output OUT {shlex.join(extra_args)}")
+        runs = [("original", None)] if include_original else []
+        runs += [(f"seed {s}", s) for s in seeds]
+        outs = []
+        for name, s in runs:
+            tag = "original" if s is None else f"seed{s}"
+            src = os.path.join(workdir, f"sssource.{tag}.parquet")
+            out = os.path.join(workdir, f"ssobject.{tag}.parquet")
+            perm = np.arange(len(t)) if s is None else permutation(t["ssObjectId"], s, shuffle_objects)
+            pq.write_table(t.take(pa.array(perm)), src, compression="zstd")
+            dia_src = dia
+            if dia_t is not None:
+                dia_src = os.path.join(workdir, f"dia_sources.{tag}.parquet")
+                dperm = (np.arange(len(dia_t)) if s is None
+                         else np.random.default_rng([s, 1]).permutation(len(dia_t)))
+                pq.write_table(dia_t.take(pa.array(dperm)), dia_src, compression="zstd")
+            t0 = time.time()
+            with open(os.path.join(workdir, f"ssobject.{tag}.log"), "w") as log:
+                r = subprocess.run([*cmd, src, dia_src, mpcorb, "--output", out, *extra_args],
+                                   stdout=log, stderr=subprocess.STDOUT)
+            ok = r.returncode == 0 and os.path.exists(out)
+            rep.check(f"builder succeeded ({name})", ok,
+                      f"{time.time() - t0:.1f} s" + ("" if ok else f"; exit {r.returncode}, "
+                                                     f"log {log.name}"))
+            if ok:
+                outs.append((name, out))
+                os.remove(src)
+                if dia_src != dia:
+                    os.remove(dia_src)
+        if len(outs) < 2:
+            rep.check("at least two outputs to compare", False, f"{len(outs)}")
+            return rep
+        (n0, ref), sha0 = outs[0], _sha256(outs[0][1])
+        rep.info(f"{n0}: {os.path.getsize(ref):,} bytes, sha256 {sha0[:16]}")
+        ta = None
+        for name, out in outs[1:]:
+            sha = _sha256(out)
+            same = sha == sha0
+            detail = f"{os.path.getsize(out):,} bytes, sha256 {sha[:16]}"
+            rep.check(f"SSObject byte-identical ({name} vs {n0})", same, detail)
+            if not same:
+                ta = ta if ta is not None else pq.read_table(ref)
+                diff = diff_tables(pq.read_table(out), ta)
+                rep.info("\n".join(diff) or "tables equal (only the bytes differ)")
+        return rep
+    finally:
+        if tmp is not None:
+            tmp.cleanup()
+
+
+# --------------------------------------------------------------------------
 # mock: a widened SSSource faked from today's (development)
 # --------------------------------------------------------------------------
 
@@ -1040,7 +1348,27 @@ FAULTS = {
     "status": "one status changed",
     "drop_row": "one row dropped",
     "ellipse_value": "one NearbySSO-matched ephRaErr scaled by 1.1",
+    "along_value": "one ephOffsetAlongTrack scaled by 1 + 1e-5",
+    "cross_sign": "one ephOffsetCrossTrack with its sign flipped",
+    "track_swap": "along and cross swapped on one row",
+    "track_null": "one ephOffsetAlongTrack NULL where it has a value",
+    "track_no_orbit": "an ephOffsetCrossTrack where ephRa is NULL",
+    "rate_zero": "one row's ephRateRa/Dec set to 0, along/cross kept",
 }
+
+
+def add_track_offsets(data):
+    """The along/cross-track offsets of a table (or dict of columns) with
+    TRACK_INPUTS and ephRa, per the contract: float32 Arrow arrays, NULL
+    without an orbit or where ephRate is 0."""
+    ra, rv, _ = to_np(data["ephRa"])
+    x, y, vx, vy = (to_np(data[c])[0] for c in TRACK_INPUTS)
+    along, cross = expected_track_offsets(x, y, vx, vy)
+    out = []
+    for v in (along, cross):
+        miss = ~rv | np.isnan(ra) | np.isnan(v)
+        out.append(pa.array(np.where(miss, 0, v).astype(np.float32), mask=miss))
+    return out
 
 
 def match_method_from_dia(match, obssubid):
@@ -1094,8 +1422,11 @@ def build_mock(ref, dia_sources, obs_sbn, out, nearbysso=None, faults=(), schema
     for c in b[4]:
         data[c] = dia[c]
     for c in b[6]:
-        if c not in ELLIPSE_COLUMNS:
+        if c not in ELLIPSE_COLUMNS and c not in TRACK_COLUMNS:
             data[c] = rt[c]
+    # the along/cross-track offsets, per the contract
+    along, cross = add_track_offsets(data)
+    data[TRACK_COLUMNS[0]], data[TRACK_COLUMNS[1]] = along, cross
 
     # the ellipse: NearbySSO's where it has the row, else made up;
     # NULL without an orbit
@@ -1203,6 +1534,30 @@ def apply_faults(t, faults, from_nss=None):
         t = _replace(t, "status", i, "P")
     if "drop_row" in faults:
         t = t.take(pa.array(np.r_[0:40, 41:len(t)]))
+    along = to_np(t["ephOffsetAlongTrack"])[0] if "ephOffsetAlongTrack" in t.column_names else None
+    cross = to_np(t["ephOffsetCrossTrack"])[0] if "ephOffsetCrossTrack" in t.column_names else None
+    if along is not None:
+        # rows whose offsets are well away from 0 (a fault there is visible)
+        big = np.flatnonzero((np.abs(along) > 0.01) & (np.abs(cross) > 0.01) &
+                             (np.abs(np.abs(along) - np.abs(cross)) > 0.01))
+    if "along_value" in faults:
+        i = int(big[50])
+        t = _replace(t, "ephOffsetAlongTrack", i, float(np.float32(along[i] * (1 + 1e-5))))
+    if "cross_sign" in faults:
+        i = int(big[60])
+        t = _replace(t, "ephOffsetCrossTrack", i, float(-cross[i]))
+    if "track_swap" in faults:
+        i = int(big[70])
+        t = _replace(t, "ephOffsetAlongTrack", i, float(cross[i]))
+        t = _replace(t, "ephOffsetCrossTrack", i, float(along[i]))
+    if "track_null" in faults:
+        t = _replace(t, "ephOffsetAlongTrack", int(big[80]), None)
+    if "track_no_orbit" in faults:
+        t = _replace(t, "ephOffsetCrossTrack", int(no_orbit[1]), 0.5)
+    if "rate_zero" in faults:
+        i = int(big[90])
+        t = _replace(t, "ephRateRa", i, 0.0)
+        t = _replace(t, "ephRateDec", i, 0.0)
     if "ellipse_value" in faults:
         ra_err = to_np(t["ephRaErr"])[0]
         proc = to_np(t["processing"])[0]
@@ -1244,6 +1599,12 @@ def main(argv=None):
     p.add_argument("--port", type=int, default=CH_PORT)
     p.add_argument("--user", default=None)
     p.add_argument("--schema", default=DEFAULT_SCHEMA)
+    p = add("offsets", "along/cross-track offsets against the contract's formula")
+    p.add_argument("sssource")
+    p.add_argument("--eps", type=float, default=TRACK_EPS, help="tolerance in float32 eps x |offset|")
+    p.add_argument("--sep-gate", type=float, default=TRACK_SEP_GATE_ARCSEC,
+                   help="gate along^2+cross^2 ~ ephOffset^2 on rows with ephOffset <= this [arcsec]")
+    p.add_argument("--sep-rtol", type=float, default=TRACK_SEP_RTOL)
     p = add("regression", "ephemeris/geometry bitwise equal to today's SSSource")
     p.add_argument("new")
     p.add_argument("ref")
@@ -1259,6 +1620,24 @@ def main(argv=None):
     p.add_argument("sssource")
     p.add_argument("obs_sbn")
     p.add_argument("--dia-sources", default=None)
+    p = add("ssobject-permutation", "ssp-build-ssobject on row-permuted SSSource copies: identical output")
+    p.add_argument("sssource")
+    p.add_argument("dia_sources")
+    p.add_argument("mpcorb")
+    p.add_argument("--seeds", default="1,2", help="comma-separated permutation seeds (default: %(default)s)")
+    p.add_argument("--include-original", action="store_true", help="also run on the file's own row order")
+    p.add_argument("--permute-dia", action="store_true",
+                   help="also permute the DiaSource file's rows (per seed)")
+    p.add_argument("--shuffle-objects", action="store_true",
+                   help="also shuffle the order of the objects (rows stay grouped by ssObjectId)")
+    p.add_argument("--max-objects", type=int, default=None,
+                   help="use the rows of this many random objects only (for speed)")
+    p.add_argument("--object-seed", type=int, default=0, help="seed of the --max-objects draw")
+    p.add_argument("--workdir", default=None,
+                   help="keep the outputs and logs here (default: a temp dir)")
+    p.add_argument("--builder", default=None, help="the builder command (default: ssp-build-ssobject)")
+    p.add_argument("--workers", type=int, default=None, help="passed to the builder as --workers")
+    p.add_argument("--builder-args", default="", help="more arguments for the builder (one string)")
     p = sub.add_parser("mock", help="(development) a widened SSSource faked from today's")
     p.add_argument("ref")
     p.add_argument("dia_sources")
@@ -1282,12 +1661,21 @@ def main(argv=None):
         def fetch(keys):
             return ch_fetch(keys, a.host, a.port, CH_DATABASE, a.user, a.workers)
         rep = check_clickhouse(a.sssource, a.n, a.seed, fetch, a.schema)
+    elif a.cmd == "offsets":
+        rep = check_offsets(a.sssource, eps=a.eps, sep_gate=a.sep_gate, sep_rtol=a.sep_rtol)
     elif a.cmd == "regression":
         rep = check_regression(a.new, a.ref)
     elif a.cmd == "ellipse":
         rep = check_ellipse(a.sssource, a.nearbysso, a.orbits_a, a.orbits_b, a.processing, a.rtol, a.rho_tol)
     elif a.cmd == "counts":
         rep = check_counts(a.sssource, a.obs_sbn, a.dia_sources)
+    elif a.cmd == "ssobject-permutation":
+        import shlex
+        extra = shlex.split(a.builder_args) + (["--workers", str(a.workers)] if a.workers else [])
+        seeds = [int(x) for x in a.seeds.split(",") if x.strip()]
+        rep = check_ssobject_permutation(a.sssource, a.dia_sources, a.mpcorb, seeds, a.max_objects,
+                                         a.object_seed, a.workdir, a.builder, extra, a.include_original,
+                                         a.shuffle_objects, a.permute_dia)
     elif a.cmd == "mock":
         t = build_mock(a.ref, a.dia_sources, a.obs_sbn, a.out, a.nearbysso, a.fault, a.schema)
         print(f"wrote {a.out}: {len(t):,} rows, {t.num_columns} columns; faults: {a.fault or 'none'}")

@@ -57,6 +57,20 @@ def _values():
     for c in B[6]:
         if c.startswith("eph") or c in ("phaseAngle",) or c.startswith(("topo", "helio")):
             d[c] = [v if o else None for v, o in zip(d[c], ORBIT)]
+    # the along/cross-track offsets by the contract's formula; row 3 has
+    # ephRate 0 (so NULL along/cross)
+    d["ephOffsetRa"] = [0.3, -1.2, 2.5, 0.7, None, None]
+    d["ephOffsetDec"] = [-0.4, 0.9, 0.1, -2.0, None, None]
+    d["ephRateRa"] = [0.25, -0.1, 0.0, 0.0, None, None]
+    d["ephRateDec"] = [0.05, 0.3, -1.5, 0.0, None, None]
+    d["ephOffset"] = [None if x is None else float(np.hypot(x, y))
+                      for x, y in zip(d["ephOffsetRa"], d["ephOffsetDec"])]
+    d["ephOffsetAlongTrack"], d["ephOffsetCrossTrack"] = [], []
+    for x, y, vx, vy in zip(*(d[c] for c in ("ephOffsetRa", "ephOffsetDec", "ephRateRa", "ephRateDec"))):
+        v = None if vx is None else float(np.hypot(np.float32(vx), np.float32(vy)))
+        ok = v is not None and v > 0
+        d["ephOffsetAlongTrack"].append((x * vx + y * vy) / v if ok else None)
+        d["ephOffsetCrossTrack"].append((-x * vy + y * vx) / v if ok else None)
     d["ephRaErr"] = [1e-5 if o else None for o in ORBIT]
     d["ephDecErr"] = [2e-5 if o else None for o in ORBIT]
     d["ephRa_ephDec_Cov"] = [1e-11 if o else None for o in ORBIT]
@@ -119,8 +133,8 @@ def dia_from(t):
 # --------------------------------------------------------------------------
 
 def test_blocks_match_design():
-    assert len(NAMES) == 181
-    assert [len(B[k]) for k in (1, 2, 3, 4, 6)] == [7, 2, 7, 126, 39]
+    assert len(NAMES) == 180
+    assert [len(B[k]) for k in (1, 2, 3, 4, 6)] == [7, 2, 7, 126, 38]
     assert B[4][0] == "visit" and B[4][-1] == "glint_trail"
     assert set(ELLIPSE_COLUMNS) <= set(B[6])
 
@@ -556,3 +570,219 @@ def test_apply_faults_known_names():
         V.apply_faults(table(), ["nope"])
     t = V.apply_faults(table(), ["status"])
     assert t["status"].to_pylist()[0] == "P"
+
+
+# --------------------------------------------------------------------------
+# offsets (along/cross-track)
+# --------------------------------------------------------------------------
+
+NULL_RULE = "along/cross-track NULL exactly where no orbit or ephRate is 0"
+FORMULA = "along/cross-track equal the contract formula (<= 8 float32 eps x |offset|)"
+ROTATION = "along^2 + cross^2 == ephOffsetRa^2 + ephOffsetDec^2"
+SEPARATION = "along^2 + cross^2 ~ ephOffset^2 (rel. 0.0001 on the root, ephOffset <= 60\")"
+
+
+def test_expected_track_offsets_worked_example():
+    # moving due east: along = the RA offset, cross = the Dec offset
+    a, c = V.expected_track_offsets([2.0], [1.0], [0.5], [0.0])
+    assert a[0] == 2.0 and c[0] == 1.0
+    # moving due north: along = dDec, cross = -dRa
+    a, c = V.expected_track_offsets([2.0], [1.0], [0.0], [3.0])
+    assert a[0] == 1.0 and c[0] == -2.0
+    # at 45 degrees, an offset along the motion is all along-track
+    a, c = V.expected_track_offsets([1.0], [1.0], [1.0], [1.0])
+    assert np.isclose(a[0], np.sqrt(2)) and abs(c[0]) < 1e-15
+    a, c = V.expected_track_offsets([1.0], [1.0], [0.0], [0.0])
+    assert np.isnan(a[0]) and np.isnan(c[0])
+
+
+def test_offsets_pass(good):
+    rep = V.check_offsets(good)
+    assert rep.ok, rep.text()
+    assert "1 with ephRate 0" in rep.text()
+    assert {NULL_RULE, FORMULA, ROTATION, SEPARATION} <= {n for n, _ in rep.results}
+    assert V.main(["offsets", good]) == 0
+
+
+def _off(tmp_path, **cols):
+    d = _values()
+    for c, (i, v) in cols.items():
+        d[c] = list(d[c])
+        d[c][i] = v
+    return failed(V.check_offsets(write(table(d), tmp_path / "off.parquet")))
+
+
+def test_offsets_fail_values(tmp_path):
+    d = _values()
+    assert FORMULA in _off(tmp_path, ephOffsetAlongTrack=(0, d["ephOffsetAlongTrack"][0] * (1 + 1e-5)))
+    assert FORMULA in _off(tmp_path, ephOffsetCrossTrack=(1, -d["ephOffsetCrossTrack"][1]))
+    # along and cross swapped: the formula fails, the rotation still holds
+    f = _off(tmp_path, ephOffsetAlongTrack=(2, d["ephOffsetCrossTrack"][2]),
+             ephOffsetCrossTrack=(2, d["ephOffsetAlongTrack"][2]))
+    assert FORMULA in f and ROTATION not in f
+    # ephOffset inconsistent with the components
+    assert SEPARATION in _off(tmp_path, ephOffset=(0, d["ephOffset"][0] * 1.01))
+    # the rotation broken (both scaled)
+    f = _off(tmp_path, ephOffsetAlongTrack=(0, d["ephOffsetAlongTrack"][0] * 1.1),
+             ephOffsetCrossTrack=(0, d["ephOffsetCrossTrack"][0] * 1.1))
+    assert {FORMULA, ROTATION, SEPARATION} <= f
+
+
+def test_offsets_fail_null_rule(tmp_path):
+    assert NULL_RULE in _off(tmp_path, ephOffsetAlongTrack=(0, None))       # NULL with a rate
+    assert NULL_RULE in _off(tmp_path, ephOffsetCrossTrack=(3, 0.0))        # set where ephRate is 0
+    assert NULL_RULE in _off(tmp_path, ephOffsetCrossTrack=(4, 0.5))        # set without an orbit
+    # rate set to 0 with along/cross kept
+    assert NULL_RULE in _off(tmp_path, ephRateRa=(0, 0.0), ephRateDec=(0, 0.0))
+    # a NaN where a value is due counts as missing (and is reported)
+    along = [float("nan")] + _values()["ephOffsetAlongTrack"][1:]
+    rep = V.check_offsets(write(table(_values(), ephOffsetAlongTrack=along), tmp_path / "nan.parquet"))
+    assert NULL_RULE in failed(rep)
+    assert "written as NaN, not NULL: 1 cells" in rep.text()
+
+
+def test_offsets_in_conformance(tmp_path):
+    assert NULL_RULE in _conf(tmp_path, table(ephOffsetCrossTrack=[None] * N))
+
+
+def test_offsets_missing_columns(tmp_path):
+    t = table().drop_columns(["ephOffsetAlongTrack"])
+    assert "columns needed by the offsets check present" in failed(
+        V.check_offsets(write(t, tmp_path / "x.parquet")))
+
+
+def test_regression_skips_track_and_rank(tmp_path, good):
+    # today's SSSource: zero along/cross-track and a diaDistanceRank column
+    ref = ref_from(table())
+    assert "ephOffsetAlongTrack" not in ref.column_names
+    ref = (ref.append_column("ephOffsetAlongTrack", pa.array([0.0] * N, pa.float32()))
+              .append_column("ephOffsetCrossTrack", pa.array([0.0] * N, pa.float32()))
+              .append_column("diaDistanceRank", pa.array([0] * N, pa.int16())))
+    rep = V.check_regression(good, write(ref, tmp_path / "r.parquet"))
+    assert rep.ok, rep.text()
+    assert "diaDistanceRank" not in V.REGRESSION_EXACT
+
+
+# --------------------------------------------------------------------------
+# ssobject-permutation (a fake builder, as a black box)
+# --------------------------------------------------------------------------
+
+FAKE_BUILDER = '''
+import sys
+import pyarrow as pa
+import pyarrow.parquet as pq
+args = sys.argv[1:]
+out = args[args.index("--output") + 1]
+mode = args[args.index("--mode") + 1] if "--mode" in args else "sorted"
+t = pq.read_table(args[0], columns=["ssObjectId", "midpointMjdTai", "psfFlux"]).to_pandas()
+sid = t["ssObjectId"].fillna(-1).to_numpy()
+starts = sid[1:] != sid[:-1]
+if len(set(sid[1:][starts])) != starts.sum() or (len(sid) and sid[0] in set(sid[1:][starts])):
+    sys.exit(4)               # as the real builder: SSSource must be grouped by ssObjectId
+t = t[t["ssObjectId"].notna()]
+if mode == "fail":
+    sys.exit(3)
+if mode == "sorted":          # order-independent: sort within each object first
+    t = t.sort_values(["ssObjectId", "midpointMjdTai"])
+if mode == "unsorted_rows":   # by time within each object, objects in file order
+    t = t.sort_values(["midpointMjdTai"], kind="stable")
+g = t.groupby("ssObjectId", sort=(mode != "unsorted_rows"))
+res = g.agg(first=("psfFlux", "first"), n=("psfFlux", "size")).reset_index()
+if "--dia-first" in args:     # depends on the DiaSource file's order
+    res["dia0"] = pq.read_table(args[1], columns=["obsid"])["obsid"][0].as_py()
+pq.write_table(pa.Table.from_pandas(res, preserve_index=False), out)
+'''
+
+
+@pytest.fixture
+def builder(tmp_path):
+    p = tmp_path / "fake_builder.py"
+    p.write_text(FAKE_BUILDER)
+    return f"{sys.executable} {p}"
+
+
+def _many(tmp_path, n_obj=30, per=7):
+    """A larger synthetic SSSource: n_obj objects x per rows."""
+    d = {"ssObjectId": np.repeat(np.arange(1, n_obj + 1), per),
+         "midpointMjdTai": np.tile(np.arange(per, dtype=float), n_obj) + 61000,
+         "psfFlux": np.arange(n_obj * per, dtype=np.float32) + 1.5}
+    t = pa.table(d).append_column("obsid", pa.array([f"o{k}" for k in range(n_obj * per)]))
+    return write(t, tmp_path / "many.parquet")
+
+
+def test_ssobject_permutation_pass(tmp_path, builder):
+    ss = _many(tmp_path)
+    work = tmp_path / "work"
+    rep = V.check_ssobject_permutation(ss, "dia.parquet", "mpc.parquet", seeds=(1, 2), cmd=builder,
+                                       extra_args=["--mode", "sorted"], include_original=True,
+                                       workdir=str(work))
+    assert rep.ok, rep.text()
+    assert len(list(work.glob("ssobject.*.parquet"))) == 3
+    # a subset of objects
+    rep = V.check_ssobject_permutation(ss, "d", "m", seeds=(5, 6), max_objects=4, cmd=builder,
+                                       extra_args=["--mode", "sorted"])
+    assert rep.ok, rep.text()
+    assert "28 rows, 4 objects (a random 4" in rep.text()
+
+
+def test_ssobject_permutation_fail(tmp_path, builder):
+    ss = _many(tmp_path)
+    # the first row of each object, in file order: depends on the order
+    rep = V.check_ssobject_permutation(ss, "d", "m", seeds=(1, 2), cmd=builder,
+                                       extra_args=["--mode", "first"])
+    assert "SSObject byte-identical (seed 2 vs seed 1)" in failed(rep)
+    assert "first: " in rep.text() and "objects differ in some column" in rep.text()
+    # objects in first-seen order: the same values, rows out of place
+    # (only once the objects' order is shuffled too)
+    rep = V.check_ssobject_permutation(ss, "d", "m", seeds=(1, 2), cmd=builder,
+                                       extra_args=["--mode", "unsorted_rows"])
+    assert rep.ok, rep.text()
+    rep = V.check_ssobject_permutation(ss, "d", "m", seeds=(1, 2), cmd=builder,
+                                       extra_args=["--mode", "unsorted_rows"], shuffle_objects=True)
+    assert "SSObject byte-identical (seed 2 vs seed 1)" in failed(rep)
+    assert "row order differs" in rep.text()
+    # the builder fails
+    rep = V.check_ssobject_permutation(ss, "d", "m", seeds=(1, 2), cmd=builder,
+                                       extra_args=["--mode", "fail"])
+    assert {"builder succeeded (seed 1)", "at least two outputs to compare"} <= failed(rep)
+
+
+def test_ssobject_permutation_dia(tmp_path, builder):
+    ss = _many(tmp_path)
+    dia = write(pq.read_table(ss, columns=["obsid"]), tmp_path / "dia.parquet")
+    args = ["--mode", "sorted", "--dia-first"]
+    assert V.check_ssobject_permutation(ss, dia, "m", cmd=builder, extra_args=args).ok
+    rep = V.check_ssobject_permutation(ss, dia, "m", cmd=builder, extra_args=args, permute_dia=True,
+                                       max_objects=10)
+    assert "SSObject byte-identical (seed 2 vs seed 1)" in failed(rep)
+    assert "DiaSource: 70 rows, permuted per seed" in rep.text()
+
+
+def test_ssobject_permutation_cli(tmp_path, builder):
+    ss = _many(tmp_path)
+    assert V.main(["ssobject-permutation", ss, "d", "m", "--builder", builder, "--builder-args",
+                   "--mode sorted", "--max-objects", "3"]) == 0
+    assert V.main(["ssobject-permutation", ss, "d", "m", "--builder", builder, "--builder-args",
+                   "--mode first"]) == 1
+
+
+def test_permutation():
+    sid = pa.array([1, 1, 1, 2, 2, 5, 5, 5, 5, None, None])
+    for shuffle in (False, True):
+        p = V.permutation(sid, 3, shuffle)
+        assert sorted(p) == list(range(len(sid)))
+        g = [sid[i].as_py() for i in p]
+        blocks = [k for k, prev in zip(g, [object()] + g[:-1]) if k != prev]
+        assert len(blocks) == 4                     # still grouped
+        if not shuffle:
+            assert blocks == [1, 2, 5, None]          # objects in the file's order
+    assert list(V.permutation(sid, 3)) != list(range(len(sid)))
+    assert list(V.permutation(sid, 3)) != list(V.permutation(sid, 4))
+
+
+def test_diff_tables():
+    a = pa.table({"ssObjectId": [1, 2], "H": pa.array([1.0, np.nan], pa.float32())})
+    assert V.diff_tables(a, a) == []
+    b = pa.table({"ssObjectId": [1, 2], "H": pa.array([1.0, 2.0], pa.float32())})
+    assert any(line.startswith("H: 1 rows") for line in V.diff_tables(a, b))
+    assert V.diff_tables(a, a.slice(1)) == ["rows: 2 vs 1"]
