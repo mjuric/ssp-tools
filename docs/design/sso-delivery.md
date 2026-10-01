@@ -43,7 +43,7 @@ From DM-55678 and `lsst/dax_ppdb` `bigquery/sso_uploader.py`:
 | `mpc_orbits.designation` | Added by the export: a Rubin-provided copy of `unpacked_primary_provisional_designation`, per the schema. |
 | AP-side DiaSource columns (`ssObjectId`, `ssObjectReassocTimeMjdTai`) | Not touched now. |
 | Pushing `tickets/DM-55375` | Once all schema changes are in, i.e. after Phase 0 below. |
-| NearbySSO | **Built, staged and uploaded** with the others, though the DM-55678 side doesn't accept it yet. The run report and the runbook note this. |
+| NearbySSO | **Built and staged, but not uploaded** (revised 2026-10-01). The loader (`load_sso`) fails the *entire* load if NearbySSO is in `uploaded_tables`: no BigQuery table exists for it, and promotion waits on every table. It is uploaded once `dax_ppdb`'s `SSO_TABLES` and `load_sso` add it. The upload configs list the five accepted tables. |
 | Uploader | Our own, in ssp-tools, following the `dax_ppdb` contract exactly, without the LSST-stack dependency. |
 | Environments | Config-driven. Ship the dev config, with int and prod as commented templates from `idf_deploy`. Nothing uploads until the service account exists. |
 | Driver | One run builds every table from one MPC snapshot. **Extraction is a separate stage** (`ssp-extract-sso-inputs`), decoupled from the build by a file contract, because the upstream data may later come from somewhere other than ClickHouse. |
