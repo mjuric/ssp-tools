@@ -12,7 +12,6 @@ geometry columns, computed per object with ASSIST from mpc_orbits.
 
 import argparse
 import contextlib
-import importlib
 import io
 import os
 import sys
@@ -35,6 +34,8 @@ from . import util
 from .photfit import hg_V_mag
 from .ephem_assist import MJD_J2000, compute_ephemerides_one, open_ephem
 from .nearbysso import propagate as _propagate
+# (a module attribute, so tests can substitute it)
+from . import sssource_ellipse as _ellipse
 from .sssource_contract import (
     ELLIPSE_COLUMNS, ID_SPLIT, MATCH_METHODS, SSSOURCE_DICTIONARY, SSSOURCE_NONNULL, SSSOURCE_SORT,
     VIEW_DROPPED, SSSourceDtype,
@@ -90,47 +91,6 @@ WORK_DTYPE = np.dtype([("ssObjectId", "<i8"), ("designation", SSSourceDtype["des
                       + [(c, SSSourceDtype[c]) for c in EPHEMERIS_COLUMNS])
 
 
-# --------------------------------------------------------------------------
-# The ephemeris error ellipse (ssp.sssource_ellipse, WP3)
-# --------------------------------------------------------------------------
-#
-# FIXME (integration): the ImportError fallback below is for development
-# only, until ssp.sssource_ellipse lands; then import it directly.
-
-def _ellipse_module():
-    """ssp.sssource_ellipse, or None while it doesn't exist yet."""
-    name = f"{__package__}.sssource_ellipse"
-    try:
-        return importlib.import_module(name)
-    except ModuleNotFoundError as e:
-        if e.name != name:
-            raise   # (a real import error inside the module)
-        return None
-
-
-def _load_orbit_covariances(mpc_orbits_path, designations):
-    """The orbits, with covariances, of ``designations`` (see
-    ssp.sssource_ellipse.load_orbit_covariances), or None (with one warning)
-    if that module isn't available: the ellipse columns are then NULL."""
-    mod = _ellipse_module()
-    if mod is None:
-        print("WARNING: ssp.sssource_ellipse is not available; "
-              f"{', '.join(ELLIPSE_COLUMNS)} will be NULL.", file=sys.stderr, flush=True)
-        return None
-    return mod.load_orbit_covariances(mpc_orbits_path, designations, open_ephem())
-
-
-def _ephemeris_ellipse(orbit, t_assist, obs_pos, topo_pos, ephem):
-    """(ra_err, dec_err, ra_dec_cov) [deg, deg, deg^2] of one object at its
-    K observations, via ssp.sssource_ellipse.ephemeris_ellipse; NaN if
-    there is no orbit covariance or no such module."""
-    mod = _ellipse_module() if orbit is not None else None
-    if mod is None:
-        nan = np.full(len(t_assist), np.nan)
-        return nan, nan, nan
-    return mod.ephemeris_ellipse(orbit, t_assist, obs_pos, topo_pos, ephem)
-
-
 def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None):
     """Fill the ephemeris-derived SSSource columns (EPH_FIELDS) for one
     object.
@@ -140,8 +100,8 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None):
     ``dia`` (dia_index) and the observer's barycentric state (obs_pos [AU],
     obs_vel [km/s], each of shape (3,)); ``dia`` is a structured array of
     midpointMjdTai, ra and dec. ``covs`` maps designations to their orbits
-    with covariances (from _load_orbit_covariances); objects not in it, or
-    all if it is None, get a NaN error ellipse.
+    with covariances (from ssp.sssource_ellipse.load_orbit_covariances);
+    objects not in it, or all if it is None, get a NaN error ellipse.
     """
 
     # extract only the subset of observations related to this object
@@ -218,14 +178,20 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None):
 
     sss["ephVmag"] = hg_V_mag(e.H, e.G, sss["helioRange"], sss["topoRange"], e.phase_angle)
 
-    # The predicted position's error ellipse, along the precise pass's line
-    # of sight (e.topo_pos). (ephTimes.tdb is cached by astropy, from the
-    # same conversion compute_ephemerides_one made.)
+    # The predicted position's error ellipse, at the observation times (TDB
+    # days since J2000, as compute_ephemerides_one integrates in; astropy
+    # caches ephTimes.tdb), from the same observer positions, along the
+    # precise pass's float64 line of sight (e.topo_pos, not the float32
+    # topo_x/y/z: see ssp.sssource_ellipse.ephemeris_ellipse).
     orbit = covs.get(provID) if covs is not None else None
-    t_assist = ephTimes.tdb.mjd - MJD_J2000 if orbit is not None else dia["midpointMjdTai"]
-    ellipse = _ephemeris_ellipse(orbit, t_assist, assoc["obs_pos"], e.topo_pos.T, ephem)
-    for c, v in zip(ELLIPSE_COLUMNS, ellipse):
-        sss[c] = v
+    if orbit is None:
+        for c in ELLIPSE_COLUMNS:
+            sss[c] = np.nan
+    else:
+        t_assist = ephTimes.tdb.mjd - MJD_J2000
+        ellipse = _ellipse.ephemeris_ellipse(orbit, t_assist, assoc["obs_pos"], e.topo_pos.T, ephem)
+        for c, v in zip(ELLIPSE_COLUMNS, ellipse):
+            sss[c] = v
 
     max_sep = np.max(sss["ephOffset"])
     med_sep = np.median(sss["ephOffset"])
@@ -405,15 +371,22 @@ def cast_column(name, arr):
     return arr
 
 
-def sssource_table(columns):
+def sssource_table(columns, cast=True):
     """The SSSource table from ``columns`` (name -> array, every column of
-    SSSourceDtype and nothing else), each cast and checked with
-    cast_column, in schema order."""
+    SSSourceDtype and nothing else), in schema order, each cast and checked
+    with cast_column; with ``cast=False`` the columns must already be
+    cast_column's output (their types are checked, not their values)."""
     names = set(columns)
     if names != set(_NAMES):
         raise ValueError(f"SSSource columns: missing {sorted(set(_NAMES) - names)}, "
                          f"unexpected {sorted(names - set(_NAMES))}")
-    return pa.Table.from_arrays([cast_column(n, columns[n]) for n in _NAMES], schema=sssource_schema())
+    schema = sssource_schema()
+    if not cast:
+        bad = [n for n in _NAMES if columns[n].type != schema.field(n).type]
+        if bad:
+            raise ValueError(f"SSSource columns not cast (see cast_column): {bad}")
+        return pa.Table.from_arrays([columns[n] for n in _NAMES], schema=schema)
+    return pa.Table.from_arrays([cast_column(n, columns[n]) for n in _NAMES], schema=schema)
 
 
 def sort_indices(ssObjectId, midpointMjdTai, obsid):
@@ -441,6 +414,7 @@ def _derive_match_method(match, obssubid):
     where an id match's obssubid ends in -A or -B (one of a trail pair: the
     extractor resolves an -A/-B row by id only as a pair, a lone one by
     position); else ``obssubid``. A documented fallback, for older files."""
+    obssubid = pc.utf8_trim_whitespace(obssubid)
     trail = pc.fill_null(pc.or_(pc.ends_with(obssubid, "-A"), pc.ends_with(obssubid, "-B")), False)
     is_id = pc.equal(match, "id")
     return pc.if_else(pc.equal(match, "position"), "position",
@@ -565,6 +539,10 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     # designation, and NULL orbit-derived columns. Set them aside while
     # resolving the designations of the rest.
     undesignated = assoc["mpc_provid"].isna() & assoc["mpc_permid"].isna()
+    # (status 'I', the Isolated Tracklet File, is unidentified by definition)
+    n_bad = int(((assoc["mpc_status"] == "I").fillna(False) & ~undesignated).sum())
+    if n_bad:
+        raise ValueError(f"obs_sbn: {n_bad:,} status 'I' rows have a provid or permid")
     und = assoc[undesignated].reset_index(drop=True)
     assoc = assoc[~undesignated].reset_index(drop=True)
 
@@ -712,7 +690,8 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
 
     print(f"[{time.perf_counter() - t_start:.1f} s] linked and set up", flush=True)
     # The orbits' covariances, for the error ellipse, of the objects present.
-    covs = _load_orbit_covariances(mpc_orbits_path, np.unique(sss["designation"][:n_orbit]))
+    covs = _ellipse.load_orbit_covariances(mpc_orbits_path, np.unique(sss["designation"][:n_orbit]),
+                                           open_ephem())
 
     print(f"[{time.perf_counter() - t_start:.1f} s] orbit covariances loaded", flush=True)
     # ephemerides for the objects with orbits (the first n_orbit rows);
@@ -778,7 +757,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
         columns[name] = cast_column(name, arr)
     del pending
 
-    table = sssource_table(columns)
+    table = sssource_table(columns, cast=False)   # (each was cast above)
     del columns
     print(f"[{time.perf_counter() - t_start:.1f} s] assembled", flush=True)
     n_null = table["ssObjectId"].null_count

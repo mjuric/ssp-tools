@@ -72,12 +72,20 @@ def _measurement(name, n, rng, measured_on):
     v = rng.normal(100, 30, n)
     if name in ("psfFlux", "psfFluxErr"):
         v = np.abs(v) + 1
+    elif name in NAN_COLUMNS:
+        v[NAN_ROWS] = np.nan            # (a NaN value, not a NULL: kept as is)
     # nullable columns get some NULLs; the Source-only apertures are NULL
     # on DiaSource rows
     mask = np.arange(n) % 5 == 2
     if name.startswith("ap0") or name.startswith("ap25"):
         mask = measured_on == "difference"
     return pa.array(v, mask=None if name in SSSOURCE_NONNULL else mask)
+
+
+#: Block-4 float columns with NaN values (at NAN_ROWS; their NULLs are at
+#: rows 2, 7, 12) -- a copied NaN stays NaN, a copied NULL stays NULL.
+NAN_COLUMNS = ("snr", "apFlux", "trailRa")
+NAN_ROWS = [0, 6]
 
 
 def make_inputs(path, seed=0, match_method=False, **overrides):
@@ -181,19 +189,48 @@ def _fake_observatory(obscode, obstime):
     return r * u.au, -r * 0.0172 * u.au / u.day
 
 
+#: The object whose orbit has no usable covariance (NULL ellipse).
+NO_COV = "2024 BB2"
+
+
+class _FakeEllipse:
+    """A stand-in for ssp.sssource_ellipse: a covariance for every
+    requested designation but NO_COV."""
+
+    loaded = None
+
+    def load_orbit_covariances(self, path, designations, ephem, *, verbose=True):
+        _FakeEllipse.loaded = sorted(designations)
+        return {d: {"designation": d} for d in designations if d != NO_COV}
+
+    def ephemeris_ellipse(self, orbit, t_assist, obs_pos, topo_pos, ephem):
+        r = np.linalg.norm(topo_pos, axis=1)
+        return 1e-6 * r, 2e-6 * r, 1e-13 * r
+
+
 @pytest.fixture
 def offline(monkeypatch):
     # (inherited by forked workers)
     monkeypatch.setattr(sssource, "compute_ephemerides_one", _fake_ephemerides)
     monkeypatch.setattr(sssource, "open_ephem", lambda: None)
     monkeypatch.setattr(sssource.util, "observatory_barycentric_posvel", _fake_observatory)
-    monkeypatch.setattr(sssource, "_ellipse_module", lambda: None)
+    monkeypatch.setattr(sssource, "_ellipse", _FakeEllipse())
 
 
 def _build(tmp_path, workers=1, **kw):
     dia, obs_sbn = make_inputs(tmp_path, **kw)
     build_sssource(tmp_path, tmp_path, workers=workers)
     return pq.read_table(tmp_path / "sssource.parquet"), dia, obs_sbn
+
+
+def _same(a, b):
+    """Arrays equal, NULLs in the same places, NaN equal to NaN."""
+    if a.type != b.type or not a.is_null().equals(b.is_null()):
+        return False
+    if pa.types.is_floating(a.type):
+        return np.array_equal(a.to_numpy(zero_copy_only=False), b.to_numpy(zero_copy_only=False),
+                              equal_nan=True)
+    return a.equals(b)
 
 
 def _by_obsid(table, obsid):
@@ -271,9 +308,13 @@ def test_identification(tmp_path, offline):
         for ob, v in zip(dia["obsid"].to_pylist(), col):
             if rows[ob][0] in (None, "C") and c not in sssource.MEASURED_EPH_COLUMNS:
                 assert v is None, (c, ob)
-            if c in sssource.MEASURED_EPH_COLUMNS or (rows[ob][0] not in (None, "C")
-                                                      and c not in sssource.ELLIPSE_COLUMNS):
-                assert v is not None, (c, ob)
+            if c in sssource.MEASURED_EPH_COLUMNS or rows[ob][0] not in (None, "C"):
+                if c in sssource.ELLIPSE_COLUMNS and OBJECTS[rows[ob][0]][0] == NO_COV:
+                    assert v is None, (c, ob)     # (no usable covariance)
+                else:
+                    assert v is not None, (c, ob)
+    # covariances are loaded for the objects with an orbit only
+    assert _FakeEllipse.loaded == sorted(v[0] for v in OBJECTS.values() if v[3])
 
 
 def test_id_split(tmp_path, offline):
@@ -325,11 +366,22 @@ def test_copied_columns(tmp_path, offline):
         got = s[c].combine_chunks()
         if pa.types.is_dictionary(got.type):
             got = got.cast(pa.string())
-        assert got.null_count == dia[c].null_count, c
-        assert got.equals(pc.cast(dia[c], got.type, safe=False).combine_chunks()), c
+        assert _same(got, pc.cast(dia[c], got.type, safe=False).combine_chunks()), c
     # what isn't in SSSourceDtype is dropped
     for c in sssource.DIA_DROPPED:
         assert c not in sss.column_names
+
+
+def test_copied_nan_stays_nan_and_null_stays_null(tmp_path, offline):
+    sss, dia, _ = _build(tmp_path)
+    s = _by_obsid(sss, dia["obsid"])
+    for c in NAN_COLUMNS:
+        src_nan = pc.fill_null(pc.is_nan(dia[c]), False).to_numpy(zero_copy_only=False)
+        src_null = dia[c].is_null().to_numpy(zero_copy_only=False)
+        assert src_nan.sum() == len(NAN_ROWS) and src_null.any(), c     # (both present)
+        got = s[c]
+        assert np.array_equal(got.is_null().to_numpy(zero_copy_only=False), src_null), c
+        assert np.array_equal(pc.fill_null(pc.is_nan(got), False).to_numpy(zero_copy_only=False), src_nan), c
 
 
 def test_parallel_identical(tmp_path, offline):
@@ -337,7 +389,9 @@ def test_parallel_identical(tmp_path, offline):
     (tmp_path / "b").mkdir()
     a, _, _ = _build(tmp_path / "a", workers=1)
     b, _, _ = _build(tmp_path / "b", workers=3)
-    assert a.equals(b)
+    assert a.schema.equals(b.schema)
+    for c in a.column_names:            # (Table.equals has NaN != NaN)
+        assert _same(a[c].combine_chunks(), b[c].combine_chunks()), c
 
 
 def test_non_null_failure(tmp_path, offline):
@@ -354,6 +408,40 @@ def test_overflow_failure(tmp_path, offline):
     det[5] = 40_000                                 # detector is a short
     make_inputs(tmp_path, detector=pa.array(det))
     with pytest.raises(ValueError, match="'detector'"):
+        build_sssource(tmp_path, tmp_path)
+
+
+def test_duplicate_obs_sbn_obsid_fails(tmp_path, offline):
+    _, obs_sbn = make_inputs(tmp_path)
+    pq.write_table(pa.concat_tables([obs_sbn, obs_sbn.slice(3, 1)]), tmp_path / "obs_sbn.parquet")
+    with pytest.raises(ValueError, match="obs_sbn.parquet: obsid is not unique"):
+        build_sssource(tmp_path, tmp_path)
+
+
+def test_duplicate_dia_obsid_fails(tmp_path, offline):
+    dia, _ = make_inputs(tmp_path)
+    pq.write_table(pa.concat_tables([dia, dia.slice(3, 1)]), tmp_path / "dia_sources.parquet")
+    with pytest.raises(ValueError, match="dia_sources.parquet: obsid is not unique"):
+        build_sssource(tmp_path, tmp_path)
+
+
+def test_orphan_dia_sources_row_fails(tmp_path, offline):
+    dia, obs_sbn = make_inputs(tmp_path)
+    orphan = dia["obsid"][0].as_py()
+    keep = pc.not_equal(obs_sbn["obsid"], orphan)
+    pq.write_table(obs_sbn.filter(keep), tmp_path / "obs_sbn.parquet")
+    with pytest.raises(ValueError, match="1 dia_sources.parquet rows have no obs_sbn row"):
+        build_sssource(tmp_path, tmp_path)
+
+
+def test_designated_status_i_fails(tmp_path, offline):
+    _, obs_sbn = make_inputs(tmp_path)
+    status = obs_sbn["status"].to_pylist()
+    k = obs_sbn["provid"].to_pylist().index("2025 AA1")
+    status[k] = "I"
+    obs_sbn = obs_sbn.set_column(obs_sbn.schema.get_field_index("status"), "status", pa.array(status))
+    pq.write_table(obs_sbn, tmp_path / "obs_sbn.parquet")
+    with pytest.raises(ValueError, match="status 'I' rows have a provid or permid"):
         build_sssource(tmp_path, tmp_path)
 
 
@@ -425,5 +513,8 @@ def test_derive_match_method():
     obssubid = pa.array(["LSST-DP2-DS-1", "LSST-DP2-DS-2-A", "LSST-DP2-DS-2-B", "x-A", None, "9"])
     assert sssource._derive_match_method(match, obssubid).to_pylist() == [
         "obssubid", "obssubid_trail", "obssubid_trail", "position", "position", "obssubid"]
+    # (surrounding whitespace doesn't hide the suffix)
+    assert sssource._derive_match_method(pa.array(["id"]), pa.array(["LSST-DP2-DS-2-B "])).to_pylist() == [
+        "obssubid_trail"]
     # an unknown match value gives NULL (which the non-null check then rejects)
     assert sssource._derive_match_method(pa.array(["huh"]), pa.array(["1"])).to_pylist() == [None]

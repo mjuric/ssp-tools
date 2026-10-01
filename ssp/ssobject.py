@@ -312,10 +312,13 @@ def compute_ssobject(
         dia_tmp["dia_row"] = np.arange(len(dia_tmp))
         sss = sss.merge(dia_tmp, left_on="obsid", right_on="dia_obsid", how="inner")
         del sss["dia_obsid"]
-        # The per-object fits depend, in the last bits, on the order of the
-        # object's rows: take them in DiaSource (dia_sources.parquet) order,
-        # whatever the SSSource order (the widened SSSource's is by time;
-        # the earlier one's was this one).
+        # The per-object fits depend on the order of the object's rows: on
+        # the full 2026-09-30 fixture, taking them in the widened SSSource's
+        # (time) order instead changes thousands of fits, including
+        # nObsUsed and slope_fit_failed, with HErr and G12 differing by up
+        # to 99%. Until that's decided, take them in DiaSource
+        # (dia_sources.parquet) order, which is what the earlier SSSource
+        # had, whatever the SSSource's own order.
         order = np.lexsort((sss["dia_row"].to_numpy(), sss["ssObjectId"].to_numpy()))
         sss = sss.iloc[order].reset_index(drop=True)
         del sss["dia_row"]

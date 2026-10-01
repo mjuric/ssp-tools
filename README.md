@@ -171,7 +171,7 @@ fast-export --config examples/exports.yaml --host your.host --dbname your_db --u
 
 ### Butler Catalog Extraction
 
-`extract-catalog` streams LSST Butler dataset tables into a single Parquet file (one row group per dataset, e.g. per visit). This complements `fast-export` for Postgres sources by enabling efficient extraction of Science Pipelines data products.
+`extract-catalog` streams LSST Butler dataset tables into a single Parquet file (one row group per dataset, e.g. per visit). This complements `fast-export` for Postgres sources by enabling efficient extraction of Science Pipelines data products. Its output can no longer be the input of `ssp-build-sssource`, which needs the `obs_sbn` linkage `extract-submitted-sources` adds (see below).
 
 Basic invocation (shows a progress bar by default):
 ```bash
@@ -211,8 +211,10 @@ The resulting Parquet file is optimized for downstream columnar analytics (Arrow
 
 ### Submitted-source Extraction (ClickHouse)
 
-`extract-submitted-sources` is an alternative to `extract-catalog`: it builds
-`dia_sources.parquet` for the X05 rows of an MPC `obs_sbn` dump from the
+`extract-submitted-sources` builds the `dia_sources.parquet` that
+`ssp-build-sssource` needs (an `extract-catalog` DiaSource file can't feed it
+any more: SSSource is built per `obs_sbn` row, from the columns this tool
+adds). It makes it for the X05 rows of an MPC `obs_sbn` dump from the
 ClickHouse view `ssp.SubmittableSources`, which serves the source catalogs of
 every processing Rubin has submitted from (each under a `processing` label such
 as `DP2-DS` or `AP-DS`; the view's `processingTable` names the `ssp` table a
