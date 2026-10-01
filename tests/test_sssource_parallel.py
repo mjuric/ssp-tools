@@ -9,12 +9,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ssp import schema, sssource
-from ssp.sssource import EPH_FIELDS, compute_ephemerides, compute_sssource_entry
+from ssp import sssource
+from ssp.sssource import EPH_FIELDS, WORK_DTYPE, compute_ephemerides, compute_sssource_entry
 
-# (as build_sssource makes it: SSSource plus a few object columns)
-SSS_DTYPE = np.dtype(schema.SSSourceDtype.descr
-                     + [("processing", object), ("obsid", object), ("primary", bool)])
+# (as build_sssource makes it: the object key and the ephemeris columns)
+SSS_DTYPE = WORK_DTYPE
 OBS_DTYPE = [("dia_index", np.int64), ("obs_pos", np.float64, 3), ("obs_vel", np.float64, 3)]
 
 
@@ -45,7 +44,6 @@ def _tables(n_obj=40, seed=2, epoch=60800.0):
     sss = np.zeros(n, dtype=SSS_DTYPE)
     sss["ssObjectId"] = np.repeat(oids, counts)
     sss["designation"] = [f"2025 A{o:04d}" for o in sss["ssObjectId"]]
-    sss["diaSourceId"] = 1000 + np.arange(n)
 
     dia_index = rng.permutation(n + 50)[:n]      # DiaSources in another order, with extra rows
     dia_eph = np.zeros(n + 50, dtype=[(c, np.float64) for c in ("midpointMjdTai", "ra", "dec")])
@@ -77,9 +75,10 @@ def fake_ephem(monkeypatch):
     monkeypatch.setattr(sssource, "open_ephem", lambda: None)
 
 
-def _run(workers, chunk_factor=8, **kw):
+def _run(workers, chunk_factor=8, covs=None, **kw):
     sss, obs_state, dia_eph, mpcorb = _tables(**kw)
-    compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=workers, chunk_factor=chunk_factor)
+    compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=workers, chunk_factor=chunk_factor,
+                        covs=covs)
     return sss
 
 
@@ -136,6 +135,64 @@ def test_eph_fields_are_what_compute_sssource_entry_writes(fake_ephem):
                if sss.dtype[f].kind != "O" and sss[f].tobytes() != before[f].tobytes()]
     assert sorted(changed) == sorted(EPH_FIELDS)
     assert len(set(EPH_FIELDS)) == len(EPH_FIELDS)
+
+
+class _FakeEllipse:
+    """A stand-in for ssp.sssource_ellipse (WP3): records the arguments it
+    gets, and returns values made from them."""
+
+    def __init__(self):
+        self.calls = []
+
+    def ephemeris_ellipse(self, orbit, t_assist, obs_pos, topo_pos, ephem):
+        self.calls.append((orbit, t_assist.shape, obs_pos.shape, topo_pos.shape))
+        assert obs_pos.shape == topo_pos.shape == (len(t_assist), 3)
+        rng = np.linalg.norm(topo_pos, axis=1)
+        return orbit["k"] * rng, 2 * orbit["k"] * rng, -orbit["k"] * t_assist * 1e-6
+
+
+@pytest.fixture
+def fake_ellipse(monkeypatch):
+    fake = _FakeEllipse()
+    monkeypatch.setattr(sssource, "_ellipse_module", lambda: fake)
+    return fake
+
+
+def _covs(n_obj=40, seed=2, skip=3):
+    """Fake orbit covariances for every object of _tables but every
+    ``skip``-th, keyed by designation."""
+    sss = _tables(n_obj=n_obj, seed=seed)[0]
+    desig = sorted(set(sss["designation"]))
+    return {d: {"k": 1e-5 * (j + 1)} for j, d in enumerate(desig) if j % skip}
+
+
+def test_ellipse_columns(fake_ephem, fake_ellipse):
+    covs = _covs()
+    sss = _run(workers=1, covs=covs)
+    has = np.isin(sss["designation"], list(covs))
+    assert has.any() and (~has).any()
+    for c in sssource.ELLIPSE_COLUMNS:
+        assert np.all(np.isfinite(sss[c][has])) and np.all(np.isnan(sss[c][~has])), c
+    # one call per object with a covariance, at that object's K times
+    assert len(fake_ellipse.calls) == len(set(sss["designation"][has]))
+    # the error is along the precise pass's line of sight: topoRange
+    k = np.array([covs[d]["k"] if d in covs else np.nan for d in sss["designation"]])
+    assert np.allclose(sss["ephRaErr"][has], (k * sss["topoRange"])[has], rtol=1e-6)
+
+
+def test_ellipse_parallel_identical_to_serial(fake_ephem, fake_ellipse):
+    covs = _covs()
+    _assert_identical(_run(workers=1, covs=covs), _run(workers=3, chunk_factor=4, covs=covs))
+
+
+def test_ellipse_without_module_is_nan(fake_ephem, monkeypatch, capsys):
+    # (until ssp.sssource_ellipse exists, or with no covariances)
+    monkeypatch.setattr(sssource, "_ellipse_module", lambda: None)
+    assert sssource._load_orbit_covariances("no-such-file.parquet", ["2025 A0001"]) is None
+    assert "not available" in capsys.readouterr().err
+    sss = _run(workers=2, covs=_covs())
+    for c in sssource.ELLIPSE_COLUMNS:
+        assert np.all(np.isnan(sss[c])), c
 
 
 @pytest.mark.skipif(
