@@ -9,40 +9,53 @@ extract"). The steps:
 ``mpc``
     ``obs_sbn`` (the X05 rows), ``mpc_orbits``, ``current_identifications``
     and ``numbered_identifications`` from the USDF MPC replica, in one
-    REPEATABLE READ transaction (``fast-export``'s batch mode). The
-    transaction's start is the manifest's ``mpc_snapshot_utc``.
+    REPEATABLE READ, READ ONLY transaction (``fast-export``'s batch mode).
+    The transaction's start is the manifest's ``mpc_snapshot_utc``.
 ``dia_sources``
     ``extract-submitted-sources`` on that ``obs_sbn`` (ClickHouse
     ``ssp.SubmittableSources``, at most 8 concurrent queries). It also
-    leaves ``dia_sources.unresolved.parquet``, which is not an input.
+    leaves ``dia_sources.unresolved.parquet``, which is not an input. Its
+    manifest entry carries ``obs_sbn_md5``, the md5 of the ``obs_sbn`` it
+    was built from; a manifest whose ``obs_sbn_md5`` differs from
+    ``obs_sbn``'s md5 is never written. A new ``obs_sbn`` (the ``mpc``
+    step run, or a reused one) therefore also runs ``dia_sources``, unless
+    ``dia_sources`` is itself reused.
 ``ppdb_dia_sources``
     The five ``ppdb.DiaSource`` columns NearbySSO reads, one read-only
     query.
 
-Every file is written under ``INPUTS_DIR/.partial/`` and moved into place
-when its step succeeds. The manifest is written only if every step
-succeeded; with ``--force`` an existing manifest is removed before anything
-else, so a failed rerun never leaves a manifest describing other files.
+Nothing in INPUTS_DIR changes until every step has succeeded: the steps
+write under ``INPUTS_DIR/.partial/`` (the MPC export's temporary CSVs
+too), and only then are the files moved into place, the old manifest kept
+aside as ``.manifest.previous.json`` and the new manifest written (fsynced,
+atomically). A failed or refused run leaves the previous inputs and their
+manifest as they were. A lock file (``.lock``) keeps two runs out of one
+INPUTS_DIR.
 
-``--reuse NAME=PATH`` takes an existing file instead of extracting it (it
-is hard-linked, or copied across filesystems), and the manifest records it
+An INPUTS_DIR with a manifest is complete: redoing any of it needs
+``--force``. ``--only``/``--skip`` redo parts of it: a step not run keeps
+its files, whose manifest entries are carried over (from ``manifest.json``,
+else ``.manifest.previous.json``) once their md5s are checked, before
+anything is run. ``--reuse NAME=PATH`` takes an existing file instead of
+extracting it (hard-linked, or copied across filesystems; a path that is
+already the INPUTS_DIR file is used in place), and the manifest records it
 as reused. The four MPC files are one snapshot: reuse all four or none.
-``--only``/``--skip`` redo parts of an earlier run in the same INPUTS_DIR:
-a step not run keeps its files, and its manifest entries are carried over
-from the previous manifest after checking the files still match it.
 
 Credentials: the MPC password from ``~/.pgpass`` (libpq), ClickHouse from
 ``SSP_CH_USER``/``SSP_CH_PASSWORD`` or ``~/.chpass``
 (``ssp.export.submittable.credentials``).
 """
 
+
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -92,11 +105,13 @@ STEPS = {
 assert sorted(n for ns in STEPS.values() for n in ns) == sorted(INPUT_FILES)
 
 PARTIAL = ".partial"
+LOCK_FILE = ".lock"
+PREVIOUS_MANIFEST = ".manifest.previous.json"   # stage 2 never reads it
 
 
 class ExtractError(RuntimeError):
-    """A step failed, or the inputs are inconsistent; no manifest is
-    written."""
+    """The inputs are inconsistent, or a step cannot run; INPUTS_DIR is
+    left as it was."""
 
 
 def utcnow():
@@ -173,7 +188,7 @@ def export_mpc(tmp, args):
     dsn = (f"host={args.mpc_host} port={args.mpc_port} dbname={args.mpc_dbname} user={args.mpc_user} "
            "options='-c extra_float_digits=3'")
     exports = [{"sql": sql, "out": str(tmp / INPUT_FILES[name][0])} for name, sql in MPC_SQL.items()]
-    return export_in_transaction(dsn, exports, log=lambda m: print(m, flush=True))
+    return export_in_transaction(dsn, exports, tmp_dir=tmp, log=lambda m: print(m, flush=True))
 
 
 def extract_dia_sources(obs_path, out_path, args):
@@ -216,180 +231,250 @@ def ch_source(args):
     return f"ClickHouse {args.ch_host}:{args.ch_port}"
 
 
+
 #
 # The run
 #
 
 
-def place(tmp_path, final_path):
-    os.replace(tmp_path, final_path)
+def load_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def parse_utc(value):
+    """``--mpc-snapshot-utc``: ISO 8601 with a time zone, as ``iso()``."""
+    try:
+        t = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ExtractError(f"--mpc-snapshot-utc {value!r}: not an ISO 8601 time") from None
+    if t.tzinfo is None:
+        raise ExtractError(f"--mpc-snapshot-utc {value!r}: give the time zone (e.g. a trailing Z)")
+    return iso(t)
+
+
+_OBS_MD5_RE = re.compile(r"obs_sbn \(md5 ([0-9a-f]{32})\)")
+
+
+def recorded_obs_md5(entry):
+    """The md5 of the ``obs_sbn`` a ``dia_sources`` manifest entry was built
+    from: its ``obs_sbn_md5``, else (manifests before that field) the md5
+    in its ``source``; None if unknown."""
+    if not entry:
+        return None
+    if entry.get("obs_sbn_md5"):
+        return entry["obs_sbn_md5"]
+    m = _OBS_MD5_RE.search(entry.get("source", ""))
+    return m.group(1) if m else None
+
+
+@contextlib.contextmanager
+def lock(out):
+    """An exclusive ``flock`` on ``INPUTS_DIR/.lock`` (released when the
+    process ends, however it ends)."""
+    import fcntl
+
+    fd = os.open(out / LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ExtractError(f"{out} is in use by another {PROG} (locked {out / LOCK_FILE})") from None
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        yield
+    finally:
+        os.close(fd)
 
 
 def take(src, dst):
     """Hard-link ``src`` to ``dst``, or copy it across filesystems."""
-    if dst.exists() or dst.is_symlink():
-        dst.unlink()
     try:
         os.link(src, dst)
     except OSError:
         shutil.copy2(src, dst)
 
 
-def reused_entry(name, src, dst):
-    """The manifest entry for a reused file: its extraction time from a
-    manifest beside it that describes the same file, else its mtime."""
-    md5 = md5sum(dst)
-    when, origin = None, None
-    side = Path(src).resolve().parent / MANIFEST_FILE
-    if side.exists():
-        try:
-            e = json.loads(side.read_text())["files"][name]
-            if e["md5"] == md5:
-                when, origin = e["extracted_utc"], e["source"]
-        except (KeyError, TypeError, ValueError):
-            pass
-    if when is None:
-        when = iso(datetime.datetime.fromtimestamp(Path(src).stat().st_mtime, datetime.timezone.utc))
-    source = f"reused {Path(src).resolve()}" + (f" (originally: {origin})" if origin else "")
-    entry = describe(name, dst, source, when)
-    assert entry["md5"] == md5
-    return entry
+def write_manifest(path, manifest):
+    """Atomically, and durably: write, fsync, rename, fsync the
+    directory."""
+    tmp = path.parent / f".{path.name}.tmp"
+    with open(tmp, "w") as f:
+        f.write(json.dumps(manifest, indent=2) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    dfd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
-def reused_snapshot(reuse):
-    """``mpc_snapshot_utc`` of reused MPC files, from a manifest beside
-    them, or None."""
-    times = set()
-    for name in MPC_SNAPSHOT:
-        side = Path(reuse[name]).resolve().parent / MANIFEST_FILE
-        try:
-            times.add(json.loads(side.read_text())["mpc_snapshot_utc"])
-        except (OSError, KeyError, ValueError):
-            return None
-    return times.pop() if len(times) == 1 else None
+class Reused:
+    """A ``--reuse NAME=PATH`` file, checked: its md5, and what a manifest
+    beside it says about it (when that manifest describes this very
+    file)."""
+
+    def __init__(self, name, path, dst):
+        self.name, self.path = name, Path(path).resolve()
+        if not self.path.is_file():
+            raise ExtractError(f"--reuse {name}: no such file {path}")
+        check_columns(name, self.path)
+        self.in_place = dst.exists() and os.path.samefile(self.path, dst)
+        self.md5 = md5sum(self.path)
+        side = load_json(self.path.parent / MANIFEST_FILE) or {}
+        e = (side.get("files") or {}).get(name)
+        self.side_entry = e if isinstance(e, dict) and e.get("md5") == self.md5 else None
+        self.side_snapshot = side.get("mpc_snapshot_utc") if self.side_entry else None
+
+    def entry(self):
+        e = self.side_entry
+        when = e["extracted_utc"] if e else iso(
+            datetime.datetime.fromtimestamp(self.path.stat().st_mtime, datetime.timezone.utc))
+        source = f"reused {self.path}" + (f" (originally: {e['source']})" if e else "")
+        out = {"file": INPUT_FILES[self.name][0], "rows": pq.ParquetFile(self.path).metadata.num_rows,
+               "md5": self.md5, "source": source, "extracted_utc": when}
+        return out
 
 
-def plan(args):
-    """The steps to run, from --only/--skip."""
-    steps = list(STEPS)
-    if args.only:
-        steps = [s for s in steps if s in args.only]
-    if args.skip:
-        steps = [s for s in steps if s not in args.skip]
-    return steps
-
-
-def parse_reuse(items):
+def parse_reuse(items, out):
     reuse = {}
     for item in items or []:
         name, sep, path = item.partition("=")
         if not sep or name not in INPUT_FILES:
             raise ExtractError(f"--reuse {item!r}: expected NAME=PATH with NAME one of {list(INPUT_FILES)}")
-        if not Path(path).is_file():
-            raise ExtractError(f"--reuse {name}: no such file {path}")
         reuse[name] = path
     some = [n for n in MPC_SNAPSHOT if n in reuse]
     if some and len(some) != len(MPC_SNAPSHOT):
         raise ExtractError(f"--reuse: the MPC files {list(MPC_SNAPSHOT)} are one snapshot; reuse all "
                            f"four or none (got {some})")
-    return reuse
+    return {n: Reused(n, p, out / INPUT_FILES[n][0]) for n, p in reuse.items()}
+
+
+def plan(args, reuse, carried_obs_md5):
+    """The steps to run: --only/--skip, plus ``dia_sources`` whenever the
+    ``obs_sbn`` is new (``mpc`` run, or a reused ``obs_sbn`` other than the
+    one the kept ``dia_sources`` was built from) and ``dia_sources`` is not
+    reused."""
+    steps = [s for s in STEPS if (not args.only or s in args.only) and s not in (args.skip or ())]
+    steps = [s for s in steps if not all(n in reuse for n in STEPS[s])]
+    new_obs = "mpc" in steps or ("obs_sbn" in reuse and reuse["obs_sbn"].md5 != carried_obs_md5)
+    if new_obs and "dia_sources" not in reuse and "dia_sources" not in steps:
+        if "dia_sources" in (args.skip or ()):
+            raise ExtractError("--skip dia_sources: a new obs_sbn needs a new dia_sources (or "
+                               "--reuse dia_sources=PATH built from it)")
+        print("dia_sources: also run, since obs_sbn is new", flush=True)
+        steps.append("dia_sources")
+    return [s for s in STEPS if s in steps]
 
 
 def run(args):
     """Extract into ``args.inputs_dir``; returns the manifest written."""
     out = Path(args.inputs_dir)
     out.mkdir(parents=True, exist_ok=True)
-    manifest_path = out / MANIFEST_FILE
-    reuse = parse_reuse(args.reuse)
-    steps = plan(args)
+    with lock(out):
+        return _run(args, out)
 
-    previous = None
-    if manifest_path.exists():
-        if not args.force:
-            raise ExtractError(f"{manifest_path} exists: these inputs are complete. Use a new "
-                               "INPUTS_DIR, or --force to redo them (with --only/--skip for parts)")
-        previous = json.loads(manifest_path.read_text())
-        # From here on the directory is not a valid set of inputs until a
-        # new manifest is written.
-        manifest_path.unlink()
 
+def _run(args, out):
+    manifest_path, previous_path = out / MANIFEST_FILE, out / PREVIOUS_MANIFEST
+    if manifest_path.exists() and not args.force:
+        raise ExtractError(f"{manifest_path} exists: these inputs are complete. Use a new "
+                           "INPUTS_DIR, or --force to redo them (with --only/--skip for parts)")
+    previous = load_json(manifest_path) if manifest_path.exists() else load_json(previous_path)
+    prev_files = (previous or {}).get("files") or {}
+    snapshot_arg = parse_utc(args.mpc_snapshot_utc) if args.mpc_snapshot_utc else None
+
+    # Everything is checked before anything is run or changed.
+    reuse = parse_reuse(args.reuse, out)
+    carry_dia = prev_files.get("dia_sources") if "dia_sources" not in reuse else None
+    steps = plan(args, reuse, recorded_obs_md5(carry_dia))
+
+    files, snapshot = {}, None
+    for step, names in STEPS.items():
+        for name in names:
+            if name in reuse or step in steps:
+                continue
+            path, e = out / INPUT_FILES[name][0], prev_files.get(name)
+            if e is None or not path.exists():
+                raise ExtractError(f"step {step} is not run but {name} has no previous file and "
+                                   "manifest entry; run the step or --reuse the file")
+            if md5sum(path) != e["md5"]:
+                raise ExtractError(f"{path} no longer matches the previous manifest; run step {step}")
+            check_columns(name, path)
+            files[name] = dict(e)
+    if "obs_sbn" in reuse:
+        snaps = {r.side_snapshot for r in (reuse[n] for n in MPC_SNAPSHOT)}
+        snapshot = snapshot_arg or (snaps.pop() if len(snaps) == 1 and None not in snaps else None)
+        if snapshot is None:
+            raise ExtractError("--reuse of the MPC files: give --mpc-snapshot-utc (no manifest beside "
+                               "them describes all four files with one snapshot)")
+    elif "mpc" not in steps:
+        snapshot = previous["mpc_snapshot_utc"]
+    for name, r in reuse.items():
+        files[name] = r.entry()
+    if "dia_sources" in reuse:
+        r = reuse["dia_sources"]
+        obs_md5 = recorded_obs_md5(r.side_entry)
+        if obs_md5 is None and "obs_sbn" in reuse and reuse["obs_sbn"].path.parent == r.path.parent:
+            obs_md5 = reuse["obs_sbn"].md5      # reused together, from one directory
+        if obs_md5 is None:
+            raise ExtractError(f"--reuse dia_sources={r.path}: which obs_sbn it was built from is "
+                               "unknown (no manifest beside it records it); reuse it together with "
+                               "its obs_sbn from the same directory")
+        files["dia_sources"]["obs_sbn_md5"] = obs_md5
+    elif "dia_sources" in files:
+        files["dia_sources"]["obs_sbn_md5"] = recorded_obs_md5(files["dia_sources"])
+    if "dia_sources" not in steps and "mpc" not in steps:
+        check_pairing(files, files["obs_sbn"], early=True)
+
+    # Run the steps, into .partial.
     tmp = out / PARTIAL
     if tmp.exists():
         shutil.rmtree(tmp)
     tmp.mkdir()
+    staged, timings = {}, {}      # name -> path in tmp
 
-    files, snapshot, timings = {}, None, {}
+    def path_of(name):
+        return staged.get(name, out / INPUT_FILES[name][0])
 
-    # Reused files first: the extraction may depend on them (obs_sbn).
-    for name, src in reuse.items():
-        dst = out / INPUT_FILES[name][0]
-        take(src, dst)
-        files[name] = reused_entry(name, src, dst)
-        print(f"{name}: reused {src}", flush=True)
-    if "obs_sbn" in reuse:
-        snapshot = args.mpc_snapshot_utc or reused_snapshot(reuse)
-        if snapshot is None:
-            raise ExtractError("--reuse of the MPC files: give --mpc-snapshot-utc (no manifest beside "
-                               "them gives it)")
+    for name, r in reuse.items():
+        if not r.in_place:
+            take(r.path, tmp / INPUT_FILES[name][0])
+            staged[name] = tmp / INPUT_FILES[name][0]
+        print(f"{name}: reused {r.path}" + (" (in place)" if r.in_place else ""), flush=True)
 
-    for step, names in STEPS.items():
-        todo = [n for n in names if n not in reuse]
-        if not todo:
-            continue
-        if step not in steps:
-            # Not run: carry the previous entries over, if the files match.
-            for name in todo:
-                path = out / INPUT_FILES[name][0]
-                e = (previous or {}).get("files", {}).get(name)
-                if e is None or not path.exists():
-                    raise ExtractError(f"step {step} is not run but {name} has no previous file and "
-                                       "manifest entry; run the step or --reuse the file")
-                if md5sum(path) != e["md5"]:
-                    raise ExtractError(f"{path} no longer matches the previous manifest")
-                check_columns(name, path)
-                files[name] = e
-            if step == "mpc":
-                snapshot = previous["mpc_snapshot_utc"]
-            print(f"{step}: not run; kept {', '.join(todo)}", flush=True)
-            continue
-
+    for step in steps:
         print(f"\n=== {step} ===", flush=True)
-        t0 = time.time()
-        started = utcnow()
+        t0, started = time.time(), utcnow()
         if step == "mpc":
-            snap = export_mpc(tmp, args)
-            snapshot = iso(snap)
-            for name in todo:
-                place(tmp / INPUT_FILES[name][0], out / INPUT_FILES[name][0])
-                files[name] = describe(name, out / INPUT_FILES[name][0],
-                                       f"{mpc_source(args)}: {MPC_SQL[name]}", snapshot)
+            snapshot = iso(export_mpc(tmp, args))
+            for name in MPC_SNAPSHOT:
+                staged[name] = tmp / INPUT_FILES[name][0]
+                files[name] = describe(name, staged[name], f"{mpc_source(args)}: {MPC_SQL[name]}", snapshot)
         elif step == "dia_sources":
-            obs = out / INPUT_FILES["obs_sbn"][0]
-            tmp_out = tmp / INPUT_FILES["dia_sources"][0]
-            extract_dia_sources(obs, tmp_out, args)
-            stem = tmp_out.name[:-len(".parquet")]
-            for extra in tmp.glob(f"{stem}.*.parquet"):     # the .unresolved side file
-                place(extra, out / extra.name)
-            place(tmp_out, out / tmp_out.name)
+            staged["dia_sources"] = tmp / INPUT_FILES["dia_sources"][0]
+            extract_dia_sources(path_of("obs_sbn"), staged["dia_sources"], args)
+            obs_md5 = files["obs_sbn"]["md5"]
             files["dia_sources"] = describe(
-                "dia_sources", out / tmp_out.name,
-                f"extract-submitted-sources --workers {args.workers} on obs_sbn (md5 "
-                f"{files['obs_sbn']['md5']}), against {ch_source(args)} ssp.SubmittableSources",
-                iso(started))
+                "dia_sources", staged["dia_sources"],
+                f"extract-submitted-sources --workers {args.workers} on obs_sbn (md5 {obs_md5}), "
+                f"against {ch_source(args)} ssp.SubmittableSources", iso(started))
+            files["dia_sources"]["obs_sbn_md5"] = obs_md5
         elif step == "ppdb_dia_sources":
-            tmp_out = tmp / INPUT_FILES["ppdb_dia_sources"][0]
-            export_ppdb(tmp_out, args)
-            place(tmp_out, out / tmp_out.name)
-            files["ppdb_dia_sources"] = describe(
-                "ppdb_dia_sources", out / tmp_out.name,
-                f"{ch_source(args)}: {PPDB_SQL}", iso(started))
+            staged["ppdb_dia_sources"] = tmp / INPUT_FILES["ppdb_dia_sources"][0]
+            export_ppdb(staged["ppdb_dia_sources"], args)
+            files["ppdb_dia_sources"] = describe("ppdb_dia_sources", staged["ppdb_dia_sources"],
+                                                 f"{ch_source(args)}: {PPDB_SQL}", iso(started))
         timings[step] = time.time() - t0
-        for name in todo:
-            e = files[name]
-            print(f"{name}: {e['rows']:,} rows, md5 {e['md5']}", flush=True)
+        for name in STEPS[step]:
+            print(f"{name}: {files[name]['rows']:,} rows, md5 {files[name]['md5']}", flush=True)
         print(f"{step}: {timings[step]:.1f} s", flush=True)
 
-    shutil.rmtree(tmp)
+    check_pairing(files, files["obs_sbn"])
     manifest = {
         "created_utc": iso(utcnow()),
         "producer": producer(),
@@ -397,14 +482,34 @@ def run(args):
         "files": {name: files[name] for name in INPUT_FILES},
     }
     assert list(manifest) == list(MANIFEST_FIELDS)
-    # Written last, and atomically.
-    tmp_manifest = out / f".{MANIFEST_FILE}.tmp"
-    tmp_manifest.write_text(json.dumps(manifest, indent=2) + "\n")
-    os.replace(tmp_manifest, manifest_path)
+
+    # Commit: the old manifest aside, the files into place, the new manifest.
+    if manifest_path.exists():
+        os.replace(manifest_path, previous_path)
+    for name, path in staged.items():
+        os.replace(path, out / path.name)
+    side = out / "dia_sources.unresolved.parquet"
+    if (tmp / side.name).exists():
+        os.replace(tmp / side.name, side)
+    elif "dia_sources" in staged and side.exists():
+        side.unlink()       # it belonged to the replaced dia_sources
+    write_manifest(manifest_path, manifest)
+    shutil.rmtree(tmp)
     print(f"\nwrote {manifest_path}", flush=True)
     for k, v in timings.items():
         print(f"  {k:20s} {v:8.1f} s")
     return manifest
+
+
+def check_pairing(files, obs_entry, early=False):
+    """Refuse a ``dia_sources`` not built from this ``obs_sbn``."""
+    dia = files.get("dia_sources")
+    if dia is None:
+        return
+    if dia.get("obs_sbn_md5") != obs_entry["md5"]:
+        raise ExtractError(
+            f"dia_sources was built from obs_sbn md5 {dia.get('obs_sbn_md5')}, but obs_sbn is "
+            f"{obs_entry['md5']}" + ("; run dia_sources too" if early else ""))
 
 
 def build_parser():
@@ -425,8 +530,8 @@ def build_parser():
     p.add_argument("--reuse", action="append", metavar="NAME=PATH",
                    help=f"Take PATH as input NAME instead of extracting it (repeatable); "
                         f"NAME is one of {', '.join(INPUT_FILES)}")
-    p.add_argument("--mpc-snapshot-utc", help="The snapshot time of reused MPC files, if no manifest "
-                                              "beside them gives it")
+    p.add_argument("--mpc-snapshot-utc", help="The snapshot time (ISO 8601) of reused MPC files, if "
+                                              "no manifest beside them gives it")
     p.add_argument("--force", action="store_true",
                    help="Redo inputs in a directory that already has a manifest")
     g = p.add_argument_group("MPC replica")
@@ -455,8 +560,7 @@ def main(argv=None):
     try:
         run(args)
     except ExtractError as e:
-        kept = (Path(args.inputs_dir) / MANIFEST_FILE).exists()
-        print(f"{PROG}: error: {e}" + ("" if kept else "; no manifest written"), file=sys.stderr)
+        print(f"{PROG}: error: {e}; INPUTS_DIR left as it was", file=sys.stderr)
         sys.exit(1)
     print(f"total wall time: {time.time() - t0:.1f} s")
 

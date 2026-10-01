@@ -1,6 +1,7 @@
 """Tests for ssp.sso_inputs (stage 1, extract), offline: the three sources
 (MPC replica, extract-submitted-sources, ppdb.DiaSource) are stubbed."""
 
+import collections
 import datetime
 import json
 
@@ -27,10 +28,14 @@ ROWS = {"obs_sbn": 5, "mpc_orbits": 4, "current_identifications": 3, "numbered_i
         "dia_sources": 5, "ppdb_dia_sources": 7}
 
 
+EXPORT_MPC = M.export_mpc
+
+
 @pytest.fixture
 def stubs(monkeypatch):
     """Stub the sources; returns a dict of call counts and controls."""
-    calls = {"mpc": 0, "dia_sources": 0, "ppdb_dia_sources": 0, "fail": None, "drop": {}}
+    calls = {"mpc": 0, "dia_sources": 0, "ppdb_dia_sources": 0, "fail": None, "drop": {},
+             "rows": collections.ChainMap({}, ROWS)}   # overrides over ROWS
 
     def export_mpc(tmp, args):
         calls["mpc"] += 1
@@ -38,7 +43,7 @@ def stubs(monkeypatch):
             pq.write_table(table("obs_sbn", 1), tmp / "obs_sbn.parquet")   # a partial export
             raise RuntimeError("connection lost")
         for name in MPC_SNAPSHOT:
-            pq.write_table(table(name, ROWS[name], drop=calls["drop"].get(name, ())),
+            pq.write_table(table(name, calls["rows"][name], drop=calls["drop"].get(name, ())),
                            tmp / INPUT_FILES[name][0])
         return SNAP
 
@@ -85,7 +90,8 @@ def test_full_run_manifest(tmp_path, stubs):
     out = tmp_path / "inputs"
     for name, (fname, _) in INPUT_FILES.items():
         e = m["files"][name]
-        assert set(e) == {"file", "rows", "md5", "source", "extracted_utc"}
+        assert set(e) == {"file", "rows", "md5", "source", "extracted_utc"} | (
+            {"obs_sbn_md5"} if name == "dia_sources" else set())
         assert e["file"] == fname
         assert e["rows"] == ROWS[name]
         assert e["md5"] == M.md5sum(out / fname)
@@ -96,6 +102,7 @@ def test_full_run_manifest(tmp_path, stubs):
         assert "mpcorb-db.slac.stanford.edu" in m["files"][name]["source"]
     assert "WHERE stn='X05'" in m["files"]["obs_sbn"]["source"]
     assert m["files"]["obs_sbn"]["md5"] in m["files"]["dia_sources"]["source"]
+    assert m["files"]["dia_sources"]["obs_sbn_md5"] == m["files"]["obs_sbn"]["md5"]
     assert "ppdb.DiaSource" in m["files"]["ppdb_dia_sources"]["source"]
     assert stubs["workers"] == 8
     # the side file is kept; nothing partial is left behind
@@ -123,12 +130,25 @@ def test_failure_writes_no_manifest(tmp_path, stubs, step):
     assert not (tmp_path / "inputs" / MANIFEST_FILE).exists()
 
 
-def test_failed_force_rerun_removes_old_manifest(tmp_path, stubs):
-    run(tmp_path)
-    stubs["fail"] = "ppdb_dia_sources"
+def assert_valid(tmp_path, m, d="inputs"):
+    """INPUTS_DIR's files match manifest ``m``, which is its manifest."""
+    assert manifest(tmp_path, d) == m
+    for e in m["files"].values():
+        assert M.md5sum(tmp_path / d / e["file"]) == e["md5"]
+
+
+@pytest.mark.parametrize("step", ["mpc", "dia_sources", "ppdb_dia_sources"])
+def test_failed_force_rerun_keeps_old_inputs(tmp_path, stubs, step):
+    first = run(tmp_path)
+    stubs["fail"] = step
+    stubs["rows"]["obs_sbn"] = 6      # so a new obs_sbn would differ
     with pytest.raises(RuntimeError):
         run(tmp_path, "--force")
-    assert not (tmp_path / "inputs" / MANIFEST_FILE).exists()
+    assert_valid(tmp_path, first)
+    # ... and can be redone
+    stubs["fail"] = None
+    m = run(tmp_path, "--force", "--only", step)
+    assert_valid(tmp_path, m)
 
 
 def test_failed_mpc_leaves_no_partial_file_in_place(tmp_path, stubs):
@@ -146,14 +166,22 @@ def test_missing_required_column_fails(tmp_path, stubs):
 
 
 def test_reuse_dia_sources(tmp_path, stubs):
-    src = tmp_path / "elsewhere" / "my_dia.parquet"
-    src.parent.mkdir()
+    """A fixture directory without a manifest: obs_sbn and dia_sources
+    reused together from it are taken to belong together."""
+    fx = tmp_path / "fixture"
+    fx.mkdir()
+    for n in MPC_SNAPSHOT:
+        pq.write_table(table(n, ROWS[n]), fx / INPUT_FILES[n][0])
+    src = fx / "dia_sources.parquet"
     pq.write_table(table("dia_sources", 11), src)
-    m = run(tmp_path, "--reuse", f"dia_sources={src}")
-    assert stubs["dia_sources"] == 0 and stubs["mpc"] == 1
+    reuse = [a for n in MPC_SNAPSHOT + ("dia_sources",)
+             for a in ("--reuse", f"{n}={fx / INPUT_FILES[n][0]}")]
+    m = run(tmp_path, *reuse, "--mpc-snapshot-utc", "2026-10-01T06:25:00Z")
+    assert (stubs["dia_sources"], stubs["mpc"], stubs["ppdb_dia_sources"]) == (0, 0, 1)
     e = m["files"]["dia_sources"]
     assert e["rows"] == 11
     assert e["source"].startswith(f"reused {src}")
+    assert e["obs_sbn_md5"] == m["files"]["obs_sbn"]["md5"]
     assert e["md5"] == M.md5sum(src) == M.md5sum(tmp_path / "inputs" / "dia_sources.parquet")
 
 
@@ -207,6 +235,140 @@ def test_reuse_missing_column_fails(tmp_path, stubs):
     assert not (tmp_path / "inputs" / MANIFEST_FILE).exists()
 
 
+def test_reuse_own_path(tmp_path, stubs):
+    first = run(tmp_path)
+    p = tmp_path / "inputs" / "ppdb_dia_sources.parquet"
+    m = run(tmp_path, "--force", "--reuse", f"ppdb_dia_sources={p}")
+    assert stubs["ppdb_dia_sources"] == 1
+    assert m["files"]["ppdb_dia_sources"]["md5"] == first["files"]["ppdb_dia_sources"]["md5"]
+    assert "originally" in m["files"]["ppdb_dia_sources"]["source"]
+    assert_valid(tmp_path, m)
+
+
+def test_only_mpc_also_runs_dia_sources(tmp_path, stubs):
+    run(tmp_path)
+    stubs["rows"]["obs_sbn"] = 6      # the MPC moved on
+    m = run(tmp_path, "--force", "--only", "mpc")
+    assert (stubs["mpc"], stubs["dia_sources"], stubs["ppdb_dia_sources"]) == (2, 2, 1)
+    assert m["files"]["dia_sources"]["rows"] == 6
+    assert m["files"]["dia_sources"]["obs_sbn_md5"] == m["files"]["obs_sbn"]["md5"]
+    assert_valid(tmp_path, m)
+
+
+def test_skip_dia_sources_with_new_obs_refused(tmp_path, stubs):
+    first = run(tmp_path)
+    with pytest.raises(M.ExtractError, match="new obs_sbn"):
+        run(tmp_path, "--force", "--skip", "dia_sources")
+    assert stubs["mpc"] == 1
+    assert_valid(tmp_path, first)
+
+
+def test_reuse_dia_sources_with_fresh_mpc(tmp_path, stubs):
+    # no record of the obs_sbn it was built from: refused before anything runs
+    src = tmp_path / "my_dia.parquet"
+    pq.write_table(table("dia_sources", 11), src)
+    with pytest.raises(M.ExtractError, match="which obs_sbn"):
+        run(tmp_path, "--reuse", f"dia_sources={src}")
+    assert stubs["mpc"] == 0
+    # from a run whose obs_sbn the fresh export reproduces: accepted
+    old = run(tmp_path, d="old")
+    old_dia = tmp_path / "old" / "dia_sources.parquet"
+    m = run(tmp_path, "--reuse", f"dia_sources={old_dia}")
+    assert m["files"]["dia_sources"]["obs_sbn_md5"] == old["files"]["obs_sbn"]["md5"]
+    assert stubs["dia_sources"] == 1
+    # ... but not once the MPC has moved on
+    stubs["rows"]["obs_sbn"] = 6
+    with pytest.raises(M.ExtractError, match="built from obs_sbn md5"):
+        run(tmp_path, "--force", "--reuse", f"dia_sources={old_dia}")
+    assert_valid(tmp_path, m)
+
+
+def test_carried_dia_sources_must_match_obs(tmp_path, stubs):
+    first = run(tmp_path)
+    mf = tmp_path / "inputs" / MANIFEST_FILE
+    bad = json.loads(mf.read_text())
+    bad["files"]["dia_sources"]["obs_sbn_md5"] = "0" * 32
+    mf.write_text(json.dumps(bad))
+    with pytest.raises(M.ExtractError, match="built from obs_sbn md5"):
+        run(tmp_path, "--force", "--only", "ppdb_dia_sources")
+    assert stubs["ppdb_dia_sources"] == 1
+    # an older manifest without the field: the md5 in its source is used
+    del bad["files"]["dia_sources"]["obs_sbn_md5"]
+    mf.write_text(json.dumps(bad))
+    m = run(tmp_path, "--force", "--only", "ppdb_dia_sources")
+    assert m["files"]["dia_sources"]["obs_sbn_md5"] == first["files"]["obs_sbn"]["md5"]
+
+
+def test_previous_manifest_kept_aside_and_used(tmp_path, stubs):
+    first = run(tmp_path)
+    m = run(tmp_path, "--force", "--only", "ppdb_dia_sources")
+    prev = tmp_path / "inputs" / M.PREVIOUS_MANIFEST
+    assert json.loads(prev.read_text()) == first
+    # without manifest.json (a crash while committing), the carry-overs
+    # come from the previous manifest
+    (tmp_path / "inputs" / MANIFEST_FILE).unlink()
+    m2 = run(tmp_path, "--only", "ppdb_dia_sources")
+    for n in MPC_SNAPSHOT + ("dia_sources",):
+        assert m2["files"][n] == m["files"][n]
+
+
+def test_mpc_snapshot_utc_validated(tmp_path, stubs):
+    with pytest.raises(M.ExtractError, match="ISO 8601"):
+        run(tmp_path, "--mpc-snapshot-utc", "yesterday")
+    with pytest.raises(M.ExtractError, match="time zone"):
+        run(tmp_path, "--mpc-snapshot-utc", "2026-10-01T06:25:00")
+    assert M.parse_utc("2026-10-01T08:25:00+02:00") == "2026-10-01T06:25:00Z"
+
+
+def test_reused_snapshot_needs_matching_side_manifest(tmp_path, stubs):
+    run(tmp_path, d="old")
+    old = tmp_path / "old"
+    pq.write_table(table("mpc_orbits", 9), old / "mpc_orbits.parquet")   # no longer what it describes
+    reuse = [a for n in MPC_SNAPSHOT for a in ("--reuse", f"{n}={old / INPUT_FILES[n][0]}")]
+    with pytest.raises(M.ExtractError, match="--mpc-snapshot-utc"):
+        run(tmp_path, *reuse)
+
+
+def test_lock(tmp_path, stubs):
+    import fcntl
+    d = tmp_path / "inputs"
+    d.mkdir()
+    with open(d / M.LOCK_FILE, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        with pytest.raises(M.ExtractError, match="in use"):
+            run(tmp_path)
+    run(tmp_path)
+
+
+def test_export_mpc_one_transaction(tmp_path, stubs, monkeypatch):
+    """export_mpc: one export_in_transaction call, with the four exports in
+    MPC_SNAPSHOT order, and the CSVs in INPUTS_DIR/.partial."""
+    from ssp.export import postgres as P
+
+    seen = []
+
+    def fake(dsn, exports, tmp_dir=None, **kw):
+        seen.append((dsn, exports, tmp_dir))
+        for e in exports:
+            name = next(n for n, (f, _) in INPUT_FILES.items() if e["out"].endswith("/" + f))
+            pq.write_table(table(name, ROWS[name]), e["out"])
+        return SNAP
+
+    monkeypatch.setattr(P, "export_in_transaction", fake)
+    monkeypatch.setattr(M, "export_mpc", EXPORT_MPC)
+    m = run(tmp_path)
+    assert len(seen) == 1
+    dsn, exports, tmp_dir = seen[0]
+    assert "host=mpcorb-db.slac.stanford.edu" in dsn and "dbname=mpc_sbn" in dsn and "user=rubin" in dsn
+    assert [e["sql"] for e in exports] == [
+        "SELECT * FROM obs_sbn WHERE stn='X05'", "SELECT * FROM mpc_orbits",
+        "SELECT * FROM current_identifications", "SELECT * FROM numbered_identifications"]
+    assert [e["out"] for e in exports] == [str(tmp_path / "inputs" / M.PARTIAL / INPUT_FILES[n][0])
+                                           for n in MPC_SNAPSHOT]
+    assert tmp_dir == tmp_path / "inputs" / M.PARTIAL
+    assert m["mpc_snapshot_utc"] == "2026-10-01T06:25:03Z"
+
+
 def test_only_redoes_one_step(tmp_path, stubs):
     first = run(tmp_path)
     m = run(tmp_path, "--force", "--only", "ppdb_dia_sources")
@@ -240,31 +402,46 @@ def test_workers_capped(tmp_path, stubs):
         M.main([str(tmp_path / "inputs"), "--workers", "9"])
 
 
+class FakeCursor:
+    """Enough of a psycopg2 cursor: one int column ``x``; COPY writes
+    ``csv`` (then raises, if ``fail``)."""
+
+    def __init__(self, log, csv="1\n2\n", fail=False):
+        self.log, self.csv, self.fail = log, csv, fail
+
+    def execute(self, sql):
+        self.log.append(("execute", sql))
+        self.description = [type("D", (), {"name": "x", "type_code": 23})()]
+
+    def fetchone(self):
+        return (SNAP,)
+
+    def copy_expert(self, sql, f):
+        self.log.append(("copy", f.name))
+        f.write(self.csv.encode())
+        f.flush()
+        if self.fail:
+            raise RuntimeError("connection lost")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
 def test_export_in_transaction(tmp_path, monkeypatch):
-    """One REPEATABLE READ transaction; its first statement's now() is the
-    snapshot time; every export runs on the same cursor; then commit."""
+    """One REPEATABLE READ, READ ONLY transaction; its first statement's
+    now() is the snapshot time; every export runs on the same cursor, with
+    its CSV in tmp_dir; then commit and close."""
     from ssp.export import postgres as P
 
     log = []
-
-    class Cur:
-        def execute(self, sql):
-            log.append(("execute", sql))
-
-        def fetchone(self):
-            return (SNAP,)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    cur = Cur()
+    cur = FakeCursor(log)
 
     class Conn:
-        def set_isolation_level(self, level):
-            log.append(("isolation", level))
+        def set_session(self, **kw):
+            log.append(("session", kw))
 
         def cursor(self):
             return cur
@@ -272,19 +449,34 @@ def test_export_in_transaction(tmp_path, monkeypatch):
         def commit(self):
             log.append(("commit",))
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
+        def close(self):
+            log.append(("close",))
 
     monkeypatch.setattr(P.psycopg2, "connect", lambda dsn: (log.append(("connect", dsn)), Conn())[1])
     monkeypatch.setattr(P, "export_query_to_parquet",
-                        lambda cur, sql, parquet_out, **kw: log.append(("export", id(cur), sql)))
+                        lambda cur, sql, parquet_out, tmp_dir=None, **kw:
+                        log.append(("export", id(cur), sql, tmp_dir)))
     exports = [{"sql": "SELECT 1", "out": "a"}, {"sql": "SELECT 2", "out": "b"}]
-    assert P.export_in_transaction("dsn", exports, log=lambda m: None) == SNAP
+    assert P.export_in_transaction("dsn", exports, tmp_dir="T", log=lambda m: None) == SNAP
+    rr = P.psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ
     assert log == [("connect", "dsn"),
-                   ("isolation", P.psycopg2.extensions.ISOLATION_LEVEL_REPEATABLE_READ),
+                   ("session", {"isolation_level": rr, "readonly": True}),
                    ("execute", "SELECT now()"),
-                   ("export", id(cur), "SELECT 1"), ("export", id(cur), "SELECT 2"),
-                   ("commit",)]
+                   ("export", id(cur), "SELECT 1", "T"), ("export", id(cur), "SELECT 2", "T"),
+                   ("commit",), ("close",)]
+
+
+def test_export_query_tmp_csv(tmp_path):
+    """The CSV goes to tmp_dir and is removed, also when the COPY fails."""
+    from ssp.export import postgres as P
+
+    tmpd = tmp_path / "tmp"
+    tmpd.mkdir()
+    log = []
+    P.export_query_to_parquet(FakeCursor(log), "SELECT x", str(tmp_path / "x.parquet"), tmp_dir=tmpd)
+    assert pq.read_table(tmp_path / "x.parquet")["x"].to_pylist() == [1, 2]
+    assert log[-1][1].startswith(str(tmpd)) and not list(tmpd.iterdir())
+    with pytest.raises(RuntimeError):
+        P.export_query_to_parquet(FakeCursor(log, fail=True), "SELECT x", str(tmp_path / "y.parquet"),
+                                  tmp_dir=tmpd)
+    assert not list(tmpd.iterdir())
