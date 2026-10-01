@@ -15,7 +15,7 @@ In this repo, that record is already what `extract-submitted-sources` reads:
 - `ssp.SubmittableSources`, a ClickHouse view over every DiaSource **and** Source table we submit from: DP2-DS, pDP2-DS, AP-DS, prompt, DP1, NV, daytime, and so on;
 - joined to the X05 rows of the MPC's `obs_sbn`.
 
-`extract-submitted-sources` writes `dia_sources.parquet`, one row per resolved `obs_sbn` row. `python -m ssp.sssource` then adds the ephemeris and geometry columns.
+`extract-submitted-sources` writes `dia_sources.parquet`, one row per resolved `obs_sbn` row. `python -m ssp.sssource` then adds the ephemeris and geometry columns. It has no console script yet; this work adds `ssp-build-sssource`.
 
 **The widened SSSource is those two put together:** one table, one row per `obs_sbn` row, with the measurement columns of `SubmittableSources` and the ephemeris columns of today's SSSource.
 
@@ -73,10 +73,12 @@ Each `*Mag`/`*MagErr` follows its own `*FluxErr`. The Source-only `ap03`/`ap06`/
 - Rows are sorted by (`ssObjectId`, `midpointMjdTai`), with the unidentified rows last.
 - The NumPy dtype comes from the Felis schema (`ssp/schema_ppdb.py`, generated). The writer **fails** if a non-null column has a null, or if a narrowing cast overflows. Narrowing float64 to float32 is expected and not an error.
 
-**`matchMethod` values:**
-- `obssubid`: matched by the `obsSubID` id;
-- `obssubid_trail`: an `-A`/`-B` endpoint pair matched to one trailed source;
-- `position`: the position + time fallback.
+**`matchMethod` values:** how `extract-submitted-sources` found the measurement each `obs_sbn` row was submitted from.
+- `obssubid`: the `obsSubID` (`LSST-<processing>-<id>`, or a bare id) parsed, looked up in the view, and verified by position and time.
+- `obssubid_trail`: a trailed source submitted as two `obs_sbn` rows, `…-A` and `…-B`, one per trail end. They are paired, and their averaged position and time are verified against the single measurement. Both rows point at it; the `-A` row is `primary`.
+- `position`: the position + time search, for rows whose `obsSubID` doesn't parse or verify, including an `-A`/`-B` row without its partner.
+
+Today the extractor's `match` column has only `id`/`position`.
 
 The extractor's other diagnostics (`sep_mas`, `dt_ms`, `dmag`, `band_ok`, `n_pass`, `ambiguous`) stay in `dia_sources.parquet` and the extractor's report.
 
@@ -89,7 +91,7 @@ All regenerated daily:
 
 ## How it is built
 
-The pipeline is unchanged, `extract-submitted-sources` → `ssp.sssource` → `ssp-build-ssobject`, with these changes:
+The pipeline is `extract-submitted-sources` → **`ssp-build-sssource`** (new console script, replacing `python -m ssp.sssource`) → `ssp-build-ssobject`, with these changes:
 
 1. **Extractor:** emits `matchMethod`. Nothing else changes: it already writes every view column, renaming `id` to `diaSourceId`, plus `obsid`, `primary`, `submission_id`, `trksub` and `trkid`.
 2. **SSSource:** writes the widened table.
@@ -148,7 +150,7 @@ The same pattern as NearbySSO: parallel subagents, each in its own worktree; the
 | WP | builds | depends on | independent review |
 |---|---|---|---|
 | **WP1 Extractor** | `matchMethod` (categorical) in `dia_sources.parquet`. Tests: each category, and the trail pair. | contract | no (small) |
-| **WP2 Widened SSSource writer** | In `ssp.sssource`: assembling the six blocks; casts to the contract dtypes, with overflow and nullability checks; the id split by `measuredOn`; `status` from `obs_sbn`; `ssObjectId` NULL rules; the Parquet writer (dictionary encoding, sort order). SSObject reads only what it needs and handles a NULL `ssObjectId`. Tests: conformance on the fixture subset; the #7 and `I` rows; Source and DiaSource rows. | contract, fixtures | **yes:** casts and narrowing, null handling, row identity (`obsid`), the id split, SSObject compatibility |
+| **WP2 Widened SSSource writer** | The `ssp-build-sssource` console script (`ssp.sssource:main`, registered in `pyproject.toml`; README updated). In `ssp.sssource`: assembling the six blocks; casts to the contract dtypes, with overflow and nullability checks; the id split by `measuredOn`; `status` from `obs_sbn`; `ssObjectId` NULL rules; the Parquet writer (dictionary encoding, sort order). SSObject reads only what it needs and handles a NULL `ssObjectId`. Tests: conformance on the fixture subset; the #7 and `I` rows; Source and DiaSource rows. | contract, fixtures | **yes:** casts and narrowing, null handling, row identity (`obsid`), the id split, SSObject compatibility |
 | **WP3 Ephemeris ellipse** | Loading the covariances for the objects present (`load_orbits(with_filter=False)`); `coarse` at each object's observation times plus `ellipse_at(topo_pos)`, inside the existing parallel per-object pass; NULL where there is no covariance. Tests: against `coarse` directly, and against NearbySSO's ellipse for shared rows. | contract | **yes (light):** it reuses reviewed numerics, so the focus is the integration: times, frames, `topo_pos`, parallel determinism |
 | **WP4 Validation harness** | `bench/sssource_validate.py`, black-box: the conformance check from YAML, ClickHouse value spot-checks (read-only, ≤ 8 concurrent queries), the ephemeris regression, the NearbySSO ellipse cross-check. | contract, fixtures | no; it is the independent check of WP1–3 |
 
