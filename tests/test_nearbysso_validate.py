@@ -691,3 +691,178 @@ def test_read_sss_old_layout(tmp_path):
     sss = V._read_sss(tmp_path / "o.parquet")
     assert sss["diaSourceId"].dtype == np.int64 and sss["diaSourceId"].tolist() == [big + 1, big + 2]
     assert list(sss.columns) == ["diaSourceId", "designation", "ssObjectId"] + V.EPH_COMPARED + ["ephOffset"]
+
+
+# --------------------------------------------------------------------------
+# rank: diaDistanceRank by brute force
+# --------------------------------------------------------------------------
+
+AS = 1 / 3600.0
+RANK_GATE = ("diaDistanceRank == 1 + the DiaSources of the visit nearer the prediction "
+             "(ties: lower diaSourceId)")
+RANK1_GATE = "rank-1 rows: no DiaSource of the visit is nearer the prediction"
+ORDER_GATE = "within each (object, visit), ranks distinct and increasing with (separation, diaSourceId)"
+TYPE_GATE = "diaDistanceRank is int16 (short), non-null, >= 1"
+
+
+def _rank_case():
+    """Visit 1: A predicted at (10, 0); DiaSources 101 (+1" Dec) and 102
+    (-1" Dec) tie for A; C, predicted 1.3" north, takes 101; B, 3.2" east,
+    takes 103; 104 is 7" west, near nobody. So A's row for 102 has rank 2
+    (101, nearer another object, still counts, and wins the tie by id).
+    Visit 2: A's two DiaSources 201 (0.5") and 202 (2"), ranks 1 and 2.
+    Hand-made ranks (not from the code under test)."""
+    dia = pd.DataFrame({
+        "diaSourceId": [101, 102, 103, 104, 105, 201, 202, 203],
+        "visit": [1, 1, 1, 1, 1, 2, 2, 2],
+        "midpointMjdTai": [61000.1] * 5 + [61001.1] * 3,
+        "ra": [10.0, 10.0, 10.0 + 3 * AS, 10.0 - 7 * AS, 50.0, 20.0, 20.0 + 2 * AS, 21.0],
+        "dec": [AS, -AS, 0.0, 0.0, 5.0, -10.0 + 0.5 * AS, -10.0, -10.0],
+    })
+    pred = {"A1": (10.0, 0.0), "B1": (10.0 + 3.2 * AS, 0.0), "C1": (10.0, 1.3 * AS), "A2": (20.0, -10.0)}
+    rows = [(101, "C", "C1", 1), (102, "A", "A1", 2), (103, "B", "B1", 1), (201, "A", "A2", 1),
+            (202, "A", "A2", 2)]
+    d = dia.set_index("diaSourceId")
+    nss = pd.DataFrame({
+        "diaSourceId": [r[0] for r in rows], "ssObjectId": [1] * len(rows),
+        "designation": [r[1] for r in rows],
+        "ephRa": [pred[r[2]][0] for r in rows], "ephDec": [pred[r[2]][1] for r in rows],
+    })
+    at = d.loc[nss["diaSourceId"]]
+    sep = util.sky_separation_arcsec(nss["ephRa"].to_numpy(), nss["ephDec"].to_numpy(),
+                                     at["ra"].to_numpy(), at["dec"].to_numpy())
+    nss["ephOffset"] = sep.astype(np.float32)
+    nss["diaDistanceRank"] = np.array([r[3] for r in rows], dtype=np.int16)
+    return nss, dia
+
+
+def _rank_files(tmp_path, nss=None, dia=None):
+    n0, d0 = _rank_case()
+    nss = n0 if nss is None else nss
+    dia = d0 if dia is None else dia
+    dia.sample(frac=1, random_state=1).to_parquet(tmp_path / "dia.parquet", row_group_size=3)
+    nss.to_parquet(tmp_path / "nss.parquet")
+    return str(tmp_path / "nss.parquet"), str(tmp_path / "dia.parquet")
+
+
+def _rank_failed(tmp_path, nss=None, **kw):
+    verdict, rep, s = V.check_rank(*_rank_files(tmp_path, nss), **kw)
+    return {name for name, ok in rep.gates if not ok}, verdict, rep, s
+
+
+def test_brute_force_ranks():
+    nss, dia = _rank_case()
+    dia = dia.sort_values(["visit", "diaSourceId"]).reset_index(drop=True)
+    bf = V.brute_force_ranks(dia.set_index("diaSourceId").loc[nss["diaSourceId"], "visit"],
+                             nss["ephRa"], nss["ephDec"], nss["diaSourceId"], dia)
+    assert (bf["n_closer"] + 1).tolist() == nss["diaDistanceRank"].tolist()
+    assert bf["n_within"].tolist() == [3, 3, 3, 2, 2]     # A1: 101, 102, 103 (3"); 104 at 7" out
+    assert bf["nearest_id"].tolist() == [101, 101, 103, 201, 201]
+    # a DiaSource not in that visit
+    bf = V.brute_force_ranks([2], [10.0], [0.0], [101], dia)
+    assert np.isnan(bf["own_sep"][0]) and bf["n_closer"][0] == -1
+
+
+def test_rank_pass(tmp_path):
+    failed, verdict, rep, s = _rank_failed(tmp_path)
+    assert verdict == "PASS", "\n".join(rep.lines)
+    assert not failed
+    assert "ranks in the file: 1: 3, 2: 2" in "\n".join(rep.lines)
+    assert len(s) == 5 and (s["expected_rank"] == s["diaDistanceRank"]).all()
+    # a sample, and the CLI
+    assert V.check_rank(*_rank_files(tmp_path), n=2)[0] == "PASS"
+    nss, dia = _rank_files(tmp_path)
+    assert V.main(["rank", "--nearbysso", nss, "--dia", dia, "--out", str(tmp_path / "r")]) == 0
+    assert "GATE (every rank check): PASS" in (tmp_path / "r" / "rank.txt").read_text()
+
+
+def test_rank_fail_value(tmp_path):
+    nss, _ = _rank_case()
+    nss.loc[2, "diaDistanceRank"] = 2                 # B's 103: nothing nearer B's prediction
+    failed, verdict, _, _ = _rank_failed(tmp_path, nss)
+    assert verdict == "FAIL" and failed == {RANK_GATE}
+
+
+def test_rank_fail_tie_and_rank1(tmp_path):
+    nss, _ = _rank_case()
+    nss.loc[1, "diaDistanceRank"] = 1                 # the tie broken the wrong way (102 > 101)
+    failed, _, _, _ = _rank_failed(tmp_path, nss)
+    assert failed == {RANK_GATE, RANK1_GATE}
+
+
+def test_rank_fail_order_within_object_visit(tmp_path):
+    nss, _ = _rank_case()
+    nss.loc[[3, 4], "diaDistanceRank"] = np.array([2, 1], np.int16)       # A's ranks in visit 2 swapped
+    failed, _, _, _ = _rank_failed(tmp_path, nss)
+    assert {RANK_GATE, RANK1_GATE, ORDER_GATE} <= failed
+    nss.loc[[3, 4], "diaDistanceRank"] = np.array([1, 1], np.int16)       # repeated
+    failed, _, _, _ = _rank_failed(tmp_path, nss)
+    assert ORDER_GATE in failed
+
+
+def test_rank_fail_type_and_missing(tmp_path):
+    nss, _ = _rank_case()
+    failed, _, _, _ = _rank_failed(tmp_path, nss.assign(diaDistanceRank=nss["diaDistanceRank"].astype("i4")))
+    assert failed == {TYPE_GATE}
+    nss0 = nss.copy()
+    nss0.loc[0, "diaDistanceRank"] = 0
+    assert TYPE_GATE in _rank_failed(tmp_path, nss0)[0]
+    failed, verdict, _, s = _rank_failed(tmp_path, nss.drop(columns="diaDistanceRank"))
+    assert failed == {"diaDistanceRank column present"} and s is None
+
+
+def test_rank_fail_prediction_and_dia(tmp_path):
+    nss, _ = _rank_case()
+    nss.loc[2, "ephOffset"] = np.float32(nss.loc[2, "ephOffset"] * 1.01)
+    assert _rank_failed(tmp_path, nss)[0] == {"ephOffset == its separation (rel. 1e-06)"}
+    nss, _ = _rank_case()
+    nss.loc[2, "ephRa"] += 6 * AS                     # 103 now > 5" from the prediction
+    assert "the row's DiaSource is within 5\" of ephRa/ephDec" in _rank_failed(tmp_path, nss)[0]
+    nss, _ = _rank_case()
+    nss.loc[0, "diaSourceId"] = 999
+    assert "every row's DiaSource is in the DiaSource file" in _rank_failed(tmp_path, nss)[0]
+
+
+def test_mock_rank_and_faults(tmp_path):
+    nss, dia = _rank_case()
+    n_path, d_path = _rank_files(tmp_path, nss.drop(columns="diaDistanceRank"))
+    out = str(tmp_path / "m.parquet")
+    assert V.main(["mock-rank", "--nearbysso", n_path, "--dia", d_path, "--output", out]) == 0
+    m = pd.read_parquet(out)
+    assert m["diaDistanceRank"].tolist() == nss["diaDistanceRank"].tolist()
+    names = list(m.columns)
+    assert names.index("diaDistanceRank") == names.index("ephOffset") + 1
+    assert V.check_rank(out, d_path)[0] == "PASS"
+    for fault in V.RANK_FAULTS:
+        V.add_ranks(n_path, d_path, out, [fault], seed=3)
+        assert V.check_rank(out, d_path)[0] == "FAIL", fault
+    with pytest.raises(ValueError):
+        V.add_ranks(n_path, d_path, out, ["nope"])
+
+
+def test_rank_repeated_dia_ids(tmp_path):
+    """DiaSource rows repeating a diaSourceId (PPDB has some) are one
+    DiaSource, at its smallest separation (the contract)."""
+    nss, dia = _rank_case()
+    twin = dia[dia["diaSourceId"] == 101]                                  # an exact repeat
+    moved = dia[dia["diaSourceId"] == 203].assign(ra=20.0 + 0.2 * AS, dec=-10.0)   # 203 again, 0.2" from A2
+    dia2 = pd.concat([dia, twin, moved], ignore_index=True)
+    # 101 counts once for A's 102 (rank 2, not 3); 203, at its nearest row,
+    # is now A2's nearest DiaSource: 201 and 202 become ranks 2 and 3
+    nss.loc[[3, 4], "diaDistanceRank"] = np.array([2, 3], np.int16)
+    verdict, rep, s = V.check_rank(*_rank_files(tmp_path, nss, dia2))
+    text = "\n".join(rep.lines)
+    assert verdict == "PASS", text
+    assert "DiaSource rows repeating a diaSourceId: 2 ids (1 rows exact repeats)" in text
+    assert "sampled rows whose rank involves a repeated diaSourceId: 4" in text
+    bf = s.set_index("diaSourceId")
+    assert bf.loc[201, "nearest_id"] == 203
+    assert np.isclose(bf.loc[201, "nearest_sep"], 0.2 * np.cos(np.radians(10)))
+    # a builder counting the twin twice
+    nss.loc[1, "diaDistanceRank"] = 3
+    failed = {n for n, ok in V.check_rank(*_rank_files(tmp_path, nss, dia2))[1].gates if not ok}
+    assert failed == {RANK_GATE}
+    # the mock agrees
+    n_path, d_path = _rank_files(tmp_path, nss.drop(columns="diaDistanceRank"), dia2)
+    V.add_ranks(n_path, d_path, str(tmp_path / "m.parquet"))
+    assert pd.read_parquet(tmp_path / "m.parquet")["diaDistanceRank"].tolist() == [1, 2, 1, 2, 3]

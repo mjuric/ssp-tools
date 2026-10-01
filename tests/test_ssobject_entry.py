@@ -7,6 +7,8 @@ import pandas as pd
 
 from ssp.ssobject import compute_ssobject
 
+from test_ssobject_parallel import widen
+
 
 def _read_back(df, tmp_path, name):
     """Round-trip through Parquet, as ssp-build-ssobject reads its inputs."""
@@ -37,19 +39,19 @@ def _tables(tmp_path, n_obj=5, n=9):
         ra=10.0, dec=1.0, extendedness=pd.array(ext, dtype="Float64"),  # NaN -> null
         band=np.where(k % 2 == 0, "r", "g"), psfFlux=flux, psfFluxErr=30.0, obsid=obsid,
     ))
-    return _read_back(sss, tmp_path, "sss"), _read_back(dia, tmp_path, "dia"), ext, dia
+    return _read_back(widen(sss, dia), tmp_path, "sss"), ext, dia
 
 
 def test_nulls_and_statistics(tmp_path):
-    sss, dia, ext, dia_np = _tables(tmp_path)
-    assert dia["extendedness"].isna().sum() == 3 + 9        # the nulls survived the round trip
-    obj = compute_ssobject(sss, dia, None)
+    sss, ext, dia_np = _tables(tmp_path)
+    assert sss["extendedness"].isna().sum() == 3 + 9        # the nulls survived the round trip
+    obj = compute_ssobject(sss, None)
     assert len(obj) == 5
 
     for j, oid in enumerate(range(1, 6)):
         m = (dia_np["obsid"].str[1:].astype(int) // 9) == j
         t = dia_np["midpointMjdTai"][m].to_numpy()
-        e = ext[m.to_numpy()]
+        e = ext[m.to_numpy()].astype(np.float32).astype(float)   # (SSSource is float32)
         e = e[~np.isnan(e)]
         assert obj["ssObjectId"][j] == oid
         assert obj["nObs"][j] == 9
@@ -69,7 +71,7 @@ def test_nulls_and_statistics(tmp_path):
 
 
 def test_serial_equals_parallel_on_pyarrow_inputs(tmp_path):
-    sss, dia, _, _ = _tables(tmp_path)
-    a = compute_ssobject(sss, dia, None, workers=1)
-    b = compute_ssobject(sss, dia, None, workers=3)
+    sss, _, _ = _tables(tmp_path)
+    a = compute_ssobject(sss, None, workers=1)
+    b = compute_ssobject(sss, None, workers=3)
     assert a.tobytes() == b.tobytes()

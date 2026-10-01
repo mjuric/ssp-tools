@@ -1,6 +1,14 @@
+"""Build the SSObject table from the (widened) SSSource and mpc_orbits.
+
+Per object and band, an H/G12 fit of SSSource's photometry (``fit_band``):
+a band's slope fit fails (``{band}_slope_fit_failed``) when the free G12
+ends at a bound, the fit isn't invertible, it uses fewer than 3 points, or
+its points span less than 2 deg in phase angle; H is then refit at a
+fiducial G12 (0.5). See ``compute_ssobject`` for the details. Every value
+is a function of the set of an object's SSSource rows, whatever their order.
+"""
 import pandas as pd
 import numpy as np
-import pyarrow.parquet as pq
 from functools import partial
 from . import photfit
 from . import util
@@ -9,15 +17,6 @@ from .moid import MOIDSolver, earth_orbit
 import argparse
 import os
 import sys
-
-# The only columns we need from DiaSource.
-# TODO DM-53699: These column names should be taken from and/or checked to
-# match the DiaSource table definition in sdm_schemas
-DIA_COLUMNS = [
-    "diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness",
-    "band", "psfFlux", "psfFluxErr"
-]
-DIA_DTYPES = [int, float, float, float, float, str, float, float]
 
 def nJy_to_mag(f_njy):
     """
@@ -53,48 +52,163 @@ def nJy_err_to_mag_err(f_njy, f_err_njy):
     """
     return 1.085736 * (f_err_njy / f_njy)
 
-FIT_COLUMNS = ["dia_psfMag", "dia_psfMagErr", "phaseAngle", "topoRange", "helioRange"]
+FIT_COLUMNS = ["psfMag", "psfMagErr", "phaseAngle", "topoRange", "helioRange"]
 
-# The only SSSource columns compute_ssobject uses (obsid and primary from
-# extract-submitted-sources-based SSSource; diaSourceId to join DiaSource
-# where there is no obsid). The measurement itself still comes from
-# DiaSource (dia_sources.parquet), in its original (double) precision.
-SSS_COLUMNS = ["ssObjectId", "designation", "obsid", "primary", "diaSourceId",
-               "phaseAngle", "topoRange", "helioRange", "ephRa"]
+# The only SSSource (widened, ssp.schema_ppdb.SSSourceDtype) columns
+# compute_ssobject uses. The photometry is SSSource's own: band, and the
+# float32 psfFlux and psfFluxErr, converted to magnitudes in float64.
+SSS_COLUMNS = ["ssObjectId", "designation", "primary", "ephRa",
+               "midpointMjdTai", "band", "psfFlux", "psfFluxErr", "extendedness",
+               "phaseAngle", "topoRange", "helioRange"]
 
 
 def _entry_columns(sss):
-    """The columns of the joined SSSource/DiaSource frame that
-    compute_ssobject_entry reads, as numpy arrays, converted once for the
-    whole table rather than per object (slicing and reducing the
-    pyarrow-backed frame per object cost about a third of the per-object
-    time). The conversions are the ones previously applied per object, so
-    the values are identical."""
-    cols = {c: np.asarray(sss[c]) for c in ["dia_band"] + FIT_COLUMNS}
+    """The SSSource columns that compute_ssobject_entry reads, as numpy
+    arrays, converted once for the whole table rather than per object
+    (slicing and reducing the pyarrow-backed frame per object cost about a
+    third of the per-object time). The magnitudes are computed in float64
+    from SSSource's float32 fluxes."""
+    flux = sss["psfFlux"].to_numpy(dtype=np.float64, na_value=np.nan)
+    flux_err = sss["psfFluxErr"].to_numpy(dtype=np.float64, na_value=np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cols = {"psfMag": nJy_to_mag(flux), "psfMagErr": nJy_err_to_mag_err(flux, flux_err)}
+    for c in ("phaseAngle", "topoRange", "helioRange"):
+        cols[c] = np.asarray(sss[c])
+    cols["band"] = np.asarray(sss["band"].astype(str))
     cols["ssObjectId"] = sss["ssObjectId"].to_numpy()
     cols["designation"] = sss["designation"].to_numpy()
-    cols["dia_midpointMjdTai"] = sss["dia_midpointMjdTai"].to_numpy(dtype=float, na_value=np.nan)
-    cols["dia_extendedness"] = sss["dia_extendedness"].to_numpy(dtype=float, na_value=np.nan)
+    cols["midpointMjdTai"] = sss["midpointMjdTai"].to_numpy(dtype=float, na_value=np.nan)
+    cols["extendedness"] = sss["extendedness"].to_numpy(dtype=float, na_value=np.nan)
     return cols
+
+
+# The slope (G12) fit of a band fails (``{band}_slope_fit_failed``) when
+# any of these holds; fit_band returns them as a bit mask.
+FAIL_BOUND = 1        # the free G12 ends at a bound (within G12_BOUND_TOL of 0 or 1)
+FAIL_SINGULAR = 2     # J^T J singular: no finite result (other than FAIL_FEW), or a
+                      # non-finite G12Err with G12 inside (0, 1)
+FAIL_FEW = 4          # fewer than MIN_SLOPE_OBS usable points, or used (after clipping)
+FAIL_SPAN = 8         # the points used span less than minPhaseSpan in phase angle
+FAILURES = {"bound": FAIL_BOUND, "singular": FAIL_SINGULAR, "few": FAIL_FEW, "span": FAIL_SPAN}
+
+#: A free G12 this close to 0 or 1 is at the bound: ~10x the bounded
+#: search's tolerance (its minima at a bound land within ~1e-6 of it).
+G12_BOUND_TOL = 1e-5
+#: The fewest points (after clipping) a slope fit may use.
+MIN_SLOPE_OBS = 3
+#: Fits clip outliers only if more than this many usable points are left
+#: (the free fit's condition; the fiducial-G12 fallback uses it too).
+CLIP_MIN_OBS = 3
+#: The fiducial G12 of a failed slope fit (DP2's fixed value).
+FIDUCIAL_G12 = 0.5
+#: The smallest phase-angle span [deg] of the points a slope fit uses.
+MIN_PHASE_SPAN = 2.0
+
+
+def fit_band(
+    mag, magSigma, phaseAngle, tdist, rdist, fixedG12=None,
+    magSigmaFloor=0.0, nSigmaClip=None, fiducialG12=None,
+    minPhaseSpan=MIN_PHASE_SPAN,
+):
+    """The H/G12 fit of one band, as the SSObject columns (without the
+    band prefix; "Cov" is the H-G12 covariance), plus ``failures``, the
+    FAIL_* mask.
+
+    With a free G12 (``fixedG12`` None), the slope fit fails when any
+    FAIL_* rule holds. A band with fewer than MIN_SLOPE_OBS observations
+    gets no free fit at all (it would fail FAIL_FEW). On failure, H is
+    refit with G12 fixed at ``fiducialG12`` (default FIDUCIAL_G12),
+    with the same error floor and clipping (clipping only with more than
+    CLIP_MIN_OBS usable points, as the free fit); G12 is stored as that
+    value, G12Err and Cov are NaN, and HErr, nObsUsed and Chi2 are the
+    fixed-G12 fit's. If clipping leaves one point, H, HErr come from it
+    (nObsUsed 1, Chi2 NaN). Only if no point is usable or none survives
+    clipping are H, HErr and G12 NaN (nObsUsed 0). slope_fit_failed is
+    set in either case. (NaN is how SSObject stores NULL.)
+
+    With ``fixedG12`` set, G12 isn't fit and these rules don't apply:
+    the fit is the fixed-G12 one, and slope_fit_failed is set only if
+    it fails.
+
+    Every input is taken as a set (photfit.fitHG12 orders them
+    canonically; the phase span is max - min), so the result doesn't
+    depend on their order.
+    """
+    if fiducialG12 is None:
+        fiducialG12 = FIDUCIAL_G12 if fixedG12 is None else fixedG12
+    kw = dict(magSigmaFloor=magSigmaFloor, nSigmaClip=nSigmaClip)
+    phaseAngle = np.asarray(phaseAngle)
+    failures = 0
+    if fixedG12 is None:
+        res = None
+        if len(mag) >= MIN_SLOPE_OBS:
+            det = {}
+            res = photfit.fitHG12(mag, magSigma, phaseAngle, tdist, rdist, _details=det, **kw)
+        if res is None:
+            failures = FAIL_FEW
+        elif not (np.isfinite(res.H) and np.isfinite(res.G12) and np.isfinite(res.H_err)
+                  and (np.isfinite(res.G12_err) or res.G12 in (0., 1.))):
+            # (fewer than MIN_SLOPE_OBS usable points, or clipped to fewer:
+            # fitHG12 returns no result, and that is FAIL_FEW. A G12_err
+            # is NaN by design only at a bound.)
+            few = (det["nusable"] < MIN_SLOPE_OBS
+                   or ("keep" in det and det["keep"].sum() < MIN_SLOPE_OBS))
+            failures = FAIL_FEW if few else FAIL_SINGULAR
+        else:
+            if min(res.G12, 1. - res.G12) <= G12_BOUND_TOL:
+                failures |= FAIL_BOUND
+            if res.nobs < MIN_SLOPE_OBS:
+                failures |= FAIL_FEW
+            pa = phaseAngle[det["used"]]
+            if np.nanmax(pa) - np.nanmin(pa) < minPhaseSpan:
+                failures |= FAIL_SPAN
+        G = fiducialG12
+    else:
+        G = fixedG12
+
+    if fixedG12 is not None or failures:
+        # (clipped under the same condition as the free fit, more than 3
+        # usable points, so it never uses fewer points than that would)
+        res = photfit.fitHG12(mag, magSigma, phaseAngle, tdist, rdist, fixedG12=G,
+                              clipMinObs=CLIP_MIN_OBS if fixedG12 is None else None, **kw)
+        nDof = res.nobs - 1
+        failed = bool(failures) or not np.isfinite(res.H)
+        out = dict(H=res.H, HErr=res.H_err, G12=G if np.isfinite(res.H) else np.nan,
+                   G12Err=np.nan, Cov=np.nan)
+    else:
+        nDof = res.nobs - 2
+        failed = False
+        out = dict(H=res.H, HErr=res.H_err, G12=res.G12, G12Err=res.G12_err, Cov=res.HG_cov)
+    if res.nobs == 0:
+        out["H"] = out["HErr"] = np.nan
+    # chi2dof is per degree of freedom of the points the fit used (after
+    # clipping), so scale back by those, not by all of the band's points.
+    with np.errstate(invalid="ignore"):
+        out.update(Chi2=res.chi2dof * nDof, nObsUsed=res.nobs, slope_fit_failed=failed,
+                   failures=failures)
+    return out
 
 
 def compute_ssobject_entry(
     row, sss, fixedG12=None, magSigmaFloor=0.0, nSigmaClip=None,
+    fiducialG12=None, minPhaseSpan=MIN_PHASE_SPAN,
 ):
     """Fill the SSObject ``row`` of one object. ``sss`` maps each column of
-    ``_entry_columns`` to that object's rows (numpy arrays)."""
+    ``_entry_columns`` to that object's rows (numpy arrays), in any order:
+    every value computed here is a function of the set of rows, bitwise
+    (``photfit.fitHG12`` sorts its inputs canonically)."""
     # just verify we didn't screw up something
     assert np.all(sss["ssObjectId"] == sss["ssObjectId"][0])
 
     # Metadata columns
     row["ssObjectId"] = sss["ssObjectId"][0]
-    row["firstObservationMjdTai"] = np.nanmin(sss["dia_midpointMjdTai"])
+    row["firstObservationMjdTai"] = np.nanmin(sss["midpointMjdTai"])
 
     if "discoverySubmissionDate" in row.dtype.names: # DP2 does not have this field
         # FIXME: here I arbitrarily guess we discover everything 7 days
         # after first obsv. we should really pull this out of the obs_sbn tbl.
         row["discoverySubmissionDate"] = row["firstObservationMjdTai"] + 7.
-    row["arc"] = np.ptp(sss["dia_midpointMjdTai"])
+    row["arc"] = np.ptp(sss["midpointMjdTai"])
     row["designation"] = sss["designation"][0]
 
     # observation counts
@@ -102,7 +216,7 @@ def compute_ssobject_entry(
 
     # (selecting bands on numpy arrays is much cheaper than filtering the
     # pyarrow-backed frame six times per object)
-    bandCol = sss["dia_band"]
+    bandCol = sss["band"]
     fitCols = {col: sss[col] for col in FIT_COLUMNS}
 
     # per band entries
@@ -129,39 +243,19 @@ def compute_ssobject_entry(
             row[f"{band}_phaseAngleMin"] = paMin
             row[f"{band}_phaseAngleMax"] = paMax
 
-            if nBandObs > 1:
-                # do the absmag/slope fits, if there are at least two
-                # data points
-                H, G12, sigmaH, sigmaG12, covHG12, chi2dof, nobsv = photfit.fitHG12(
-                    df["dia_psfMag"], df["dia_psfMagErr"],
-                    df["phaseAngle"], df["topoRange"], df["helioRange"],
-                    fixedG12=fixedG12, magSigmaFloor=magSigmaFloor,
-                    nSigmaClip=nSigmaClip,
-                )
-                # chi2dof is per degree of freedom of the points the fit
-                # used (after clipping), so scale back by those, not by all
-                # of the band's observations.
-                nDof = nobsv - (1 if fixedG12 is not None else 2)
-                # print(provID, band, H, G12, sigmaH, sigmaG12, covHG12,
-                #       chi2dof, nobsv)
-
-                # mark if the fit failed
-                if np.isnan(G12):
-                    row[f'{band}_slope_fit_failed'] = True
-                    # FIXME: if fitting fails, we should revert to simple
-                    # estimation of H using a fiducial G12 value, storing
-                    # that G12 as well.
-
-                row[f'{band}_Chi2'] = chi2dof * nDof
-                row[f'{band}_G12'] = G12
-                row[f'{band}_G12Err'] = sigmaG12
-                row[f'{band}_H'] = H
-                row[f'{band}_H_{band}_G12_Cov'] = covHG12
-                row[f'{band}_HErr'] = sigmaH
-                row[f'{band}_nObsUsed'] = nobsv
+            fit = fit_band(
+                df["psfMag"], df["psfMagErr"],
+                df["phaseAngle"], df["topoRange"], df["helioRange"],
+                fixedG12=fixedG12, magSigmaFloor=magSigmaFloor,
+                nSigmaClip=nSigmaClip, fiducialG12=fiducialG12,
+                minPhaseSpan=minPhaseSpan,
+            )
+            for col, val in fit.items():
+                if col != "failures":
+                    row[f"{band}_{col}" if col != "Cov" else f"{band}_H_{band}_G12_Cov"] = val
 
     # Extendedness (null for DiaSources that lack it -> NaN)
-    ext = sss["dia_extendedness"]
+    ext = sss["extendedness"]
     ext = ext[~np.isnan(ext)]
     row["extendednessMin"] = ext.min() if len(ext) else np.nan
     row["extendednessMax"] = ext.max() if len(ext) else np.nan
@@ -211,32 +305,54 @@ def _moid_chunk(j0, j1):
     return res
 
 def compute_ssobject(
-    sss, dia, mpcorb, fixedG12=None, magSigmaFloor=0.05,
+    sss, mpcorb, fixedG12=None, magSigmaFloor=0.05,
     nSigmaClip=10.0, workers=1, chunk_factor=8,
+    fiducialG12=None, minPhaseSpan=MIN_PHASE_SPAN,
 ):
     """
-    Compute solar system object properties by joining and processing
-    SSSource, DiaSource, and MPC orbit data.
+    Compute solar system object properties from SSSource and MPC orbit
+    data.
 
-    This function takes a pre-grouped SSSource table, joins it with
-    DiaSource data, computes per-object quantities, and calculates
-    additional orbital parameters like Tisserand J and Minimum Orbit
-    Intersection Distance (MOID) with Earth for matching objects.
+    This function takes a pre-grouped (widened) SSSource table, computes
+    per-object quantities from its photometry and geometry, and
+    calculates additional orbital parameters like Tisserand J and Minimum
+    Orbit Intersection Distance (MOID) with Earth for matching objects.
 
     Parameters
     ----------
     sss : pandas.DataFrame
-        SSSource table, pre-grouped by 'ssObjectId'. Must be sorted by
-        'ssObjectId' for correct grouping. Contains columns like
-        'ssObjectId', 'diaSourceId', etc.
-    dia : pandas.DataFrame
-        DiaSource table with columns prefixed as 'dia_' in the join.
-        Must include 'dia_diaSourceId', 'dia_psfFlux', 'dia_psfFluxErr',
-        etc.
+        SSSource table, pre-grouped by 'ssObjectId' (the order of each
+        object's rows doesn't matter). Must have the ``SSS_COLUMNS``.
     mpcorb : pandas.DataFrame
         MPC orbit data with columns like
         'unpacked_primary_provisional_designation', 'q', 'e', 'i',
         'node', 'argperi'.
+    fixedG12, magSigmaFloor, nSigmaClip, fiducialG12, minPhaseSpan
+        The per-band H/G12 fits, as ``fit_band``. A band's slope fit
+        fails (``{band}_slope_fit_failed``, "G12 fit failed in {band}
+        band. G12 contains a fiducial value used to fit H.") when:
+
+        1. the free G12 ends at a bound, within G12_BOUND_TOL (1e-5) of
+           0 or 1;
+        2. the fit isn't invertible (J^T J singular): no finite result,
+           or no finite G12Err with G12 inside (0, 1);
+        3. fewer than MIN_SLOPE_OBS (3) points are usable, or used after
+           clipping;
+        4. the points it uses span less than ``minPhaseSpan`` (default
+           2 deg) in phase angle.
+
+        H is then refit with G12 fixed at ``fiducialG12`` (default
+        ``fixedG12`` if set, else 0.5), clipping as the free fit does
+        (only with more than 3 usable points); G12 is stored as that value,
+        G12Err and the H-G12 covariance are NaN, and HErr, nObsUsed and
+        Chi2 come from the fixed-G12 fit; one point left after clipping
+        gives H from that point (nObsUsed 1, Chi2 NaN). Only if no point
+        is usable, or none survives clipping, are H, HErr and G12 NaN
+        (nObsUsed 0); the flag is set either way. (SSObject stores NULL
+        as NaN.) With
+        ``fixedG12`` set G12 isn't fit, and the flag means the fixed fit
+        failed. Each fit is a function of the set of its band's points,
+        whatever their order.
     workers : int
         Number of worker processes for the per-object and MOID stages.
         1 (the default) runs everything serially in this process. More
@@ -257,8 +373,7 @@ def compute_ssobject(
     Raises
     ------
     AssertionError
-        If 'sss' is not pre-grouped by 'ssObjectId', or if DiaSources
-        are missing after join.
+        If 'sss' is not pre-grouped by 'ssObjectId'.
 
     Notes
     -----
@@ -268,6 +383,10 @@ def compute_ssobject(
       designations in 'mpcorb'.
     - MOID computation uses a MOIDSolver for each matched object.
     """
+
+    missing = [c for c in SSS_COLUMNS if c not in sss.columns]
+    if missing:
+        raise ValueError(f"SSSource lacks the columns {missing} (SSObject needs the widened SSSource)")
 
     # Sources without an orbit get no SSObject: unmatched ones (a NULL
     # ssObjectId in the widened SSSource; 0 in older files), and any other
@@ -283,8 +402,7 @@ def compute_ssobject(
 
     # A source claimed by several obs_sbn rows (both endpoints of a trail,
     # repeated submissions) has several SSSource rows; count it once.
-    if "primary" in sss.columns:
-        sss = sss[sss["primary"].to_numpy(dtype=bool)]
+    sss = sss[sss["primary"].to_numpy(dtype=bool)]
 
     # assert that sss is pre-grouped by ssObjectId
     assert util.values_grouped(sss["ssObjectId"]), (
@@ -294,52 +412,15 @@ def compute_ssobject(
         "typically large and we want to avoid copies, it's not done internally."
     )
 
-    # Join the DiaSource parts we're interested in to our SSSource table.
-    # DiaSources from extract-submitted-sources have one row per obs_sbn
-    # row and come from several processings, so neither diaSourceId nor
-    # (processing, diaSourceId) is unique; join on their key, obsid.
-    num = len(sss)
-    by_obsid = "obsid" in dia.columns and "obsid" in sss.columns and sss["obsid"].notna().all()
-    dia_cols = DIA_COLUMNS + (["obsid"] if by_obsid else [])
-    dia_tmp = dia[dia_cols].add_prefix("dia_")  # FIXME: does this cause unnececessary copy?
-    # FIXME: The diaSourceId should really be uint64. But Felis doesn't speak
-    # uint64, but only knows about int64. Yet the pipeline produces uint64
-    # diaSourceId in the dia_source dataset. So we have to cast here to int64
-    # to make the join work (otherwise pyarrow tries to cast to float64, and
-    # the whole thing gloriously explodes).
-    dia_tmp["dia_diaSourceId"] = dia_tmp["dia_diaSourceId"].astype("int64[pyarrow]")
-    if by_obsid:
-        dia_tmp["dia_row"] = np.arange(len(dia_tmp))
-        sss = sss.merge(dia_tmp, left_on="obsid", right_on="dia_obsid", how="inner")
-        del sss["dia_obsid"]
-        # The per-object fits depend on the order of the object's rows: on
-        # the full 2026-09-30 fixture, taking them in the widened SSSource's
-        # (time) order instead changes thousands of fits, including
-        # nObsUsed and slope_fit_failed, with HErr and G12 differing by up
-        # to 99%. Until that's decided, take them in DiaSource
-        # (dia_sources.parquet) order, which is what the earlier SSSource
-        # had, whatever the SSSource's own order.
-        order = np.lexsort((sss["dia_row"].to_numpy(), sss["ssObjectId"].to_numpy()))
-        sss = sss.iloc[order].reset_index(drop=True)
-        del sss["dia_row"]
-    else:
-        sss = sss.merge(dia_tmp, left_on="diaSourceId", right_on="dia_diaSourceId", how="inner")
-    assert num == len(sss), f"{num - len(sss)} DiaSources found missing (or duplicated)."
-    del sss["dia_diaSourceId"]
-    del dia_tmp
-
-    # add magnitude columns
-    sss["dia_psfMag"] = nJy_to_mag(sss["dia_psfFlux"])
-    sss["dia_psfMagErr"] = nJy_err_to_mag_err(sss["dia_psfFlux"], sss["dia_psfFluxErr"])
-
     # Pre-create the empty array
-    totalNumObjects = np.unique(sss["ssObjectId"]).size
+    totalNumObjects = np.unique(sss["ssObjectId"].to_numpy()).size
     obj = np.zeros(totalNumObjects, dtype=schema.SSObjectDtype)
 
     # compute per-object quantities
     callback = partial(
         compute_ssobject_entry, fixedG12=fixedG12,
         magSigmaFloor=magSigmaFloor, nSigmaClip=nSigmaClip,
+        fiducialG12=fiducialG12, minPhaseSpan=minPhaseSpan,
     )
     parallel = workers > 1 and util.fork_context() is not None
     cols = _entry_columns(sss)
@@ -428,25 +509,25 @@ def main():
     DiaSource, and MPC orbit data.
     """
     parser = argparse.ArgumentParser(
-        description="Build SSObject table from SSSource, DiaSource, and MPC orbit Parquet files",
+        description="Build SSObject table from SSSource and MPC orbit Parquet files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  ssp-build-ssobject sssource.parquet dia_sources.parquet mpc_orbits.parquet --output ssobject.parquet
+  ssp-build-ssobject sssource.parquet mpc_orbits.parquet --output ssobject.parquet
+
+The photometry comes from SSSource. The older form, with dia_sources.parquet
+between the two, is still accepted; that file is not read.
         """
     )
 
     parser.add_argument(
         "sssource_parquet",
-        help="Path to SSSource Parquet file"
+        help="Path to the (widened) SSSource Parquet file"
     )
     parser.add_argument(
-        "diasource_parquet",
-        help="Path to DiaSource Parquet file"
-    )
-    parser.add_argument(
-        "mpcorb_parquet",
-        help="Path to MPC orbits Parquet file"
+        "inputs", nargs="+", metavar="mpcorb_parquet",
+        help="Path to MPC orbits Parquet file (an extra dia_sources.parquet "
+             "before it, as in the older form, is ignored)"
     )
     parser.add_argument(
         "--output", "-o",
@@ -489,6 +570,25 @@ Examples:
     )
 
     parser.add_argument(
+        "--hg12FiducialG12",
+        type=float,
+        default=None,
+        help=(
+            "G12 of the fixed-G12 refit of H where a band's slope fit "
+            "fails (default: --hg12FixedG12 if set, else 0.5, as in DP2)."
+        ),
+    )
+    parser.add_argument(
+        "--hg12MinPhaseSpan",
+        type=float,
+        default=MIN_PHASE_SPAN,
+        help=(
+            "A slope fit whose points span less than this phase angle "
+            f"(deg) fails (default: {MIN_PHASE_SPAN})."
+        ),
+    )
+
+    parser.add_argument(
         "--workers",
         type=int,
         default=min(64, os.cpu_count() or 1),
@@ -510,6 +610,11 @@ Examples:
     )
 
     args = parser.parse_args()
+    if len(args.inputs) > 2:
+        parser.error("expected: sssource_parquet [diasource_parquet] mpcorb_parquet")
+    if len(args.inputs) == 2:
+        print(f"Note: {args.inputs[0]} is not read; the photometry comes from SSSource.")
+    args.mpcorb_parquet = args.inputs[-1]
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     if args.chunk_factor < 1:
@@ -519,29 +624,10 @@ Examples:
         # Load SSSource: only the columns compute_ssobject uses (the
         # widened SSSource has ~180)
         print(f"Loading SSSource from {args.sssource_parquet}...")
-        present = set(pq.read_schema(args.sssource_parquet).names)
         sss = pd.read_parquet(args.sssource_parquet, engine="pyarrow", dtype_backend="pyarrow",
-                              columns=[c for c in SSS_COLUMNS if c in present]).reset_index(drop=True)
+                              columns=SSS_COLUMNS).reset_index(drop=True)
         num = len(sss)
         print(f"Loaded {num:,} SSSource rows")
-
-        # Load DiaSource with required columns (and the obsid, for
-        # DiaSources from extract-submitted-sources)
-        dia_columns = [
-            "diaSourceId", "midpointMjdTai", "ra", "dec", "extendedness",
-            "band", "psfFlux", "psfFluxErr"
-        ]
-        if "obsid" in pq.read_schema(args.diasource_parquet).names:
-            dia_columns.append("obsid")
-        print(f"Loading DiaSource from {args.diasource_parquet}...")
-        dia = pd.read_parquet(args.diasource_parquet, engine="pyarrow",
-                              dtype_backend="pyarrow", columns=dia_columns
-                              ).reset_index(drop=True)
-        print(f"Loaded {len(dia):,} DiaSource rows")
-
-        # Ensure diaSourceId is uint64
-        assert np.all(dia["diaSourceId"] >= 0)
-        dia["diaSourceId"] = dia["diaSourceId"].astype("uint64[pyarrow]")
 
         # Load MPC orbits
         mpcorb_columns = [
@@ -557,10 +643,12 @@ Examples:
         # Compute SSObject
         print("Computing SSObject data...")
         obj = compute_ssobject(
-            sss, dia, mpcorb,
+            sss, mpcorb,
             fixedG12=args.hg12FixedG12,
             magSigmaFloor=args.hg12MagSigmaFloor,
             nSigmaClip=args.hg12NSigmaClip,
+            fiducialG12=args.hg12FiducialG12,
+            minPhaseSpan=args.hg12MinPhaseSpan,
             workers=args.workers,
             chunk_factor=args.chunk_factor,
         )
@@ -586,23 +674,10 @@ if __name__ == "__main__":
     # Loads
     #
 
-    # load SSObject
-    present = set(pq.read_schema(f'{output_dir}/sssource.parquet').names)
+    # load SSSource
     sss = pd.read_parquet(f'{output_dir}/sssource.parquet',
                           engine="pyarrow", dtype_backend="pyarrow",
-                          columns=[c for c in SSS_COLUMNS if c in present]
-                          ).reset_index(drop=True)
-    num = len(sss)
-
-    # load corresponding DiaSource
-    dia = pd.read_parquet(f'{input_dir}/dia_sources.parquet',
-                          engine="pyarrow", dtype_backend="pyarrow",
-                          columns=DIA_COLUMNS).reset_index(drop=True)
-
-    # FIXME: I'm not sure why the datatype is int and not uint here.
-    # Investigate upstream...
-    assert np.all(dia["diaSourceId"] >= 0)
-    dia["diaSourceId"] = dia["diaSourceId"].astype("uint64[pyarrow]")
+                          columns=SSS_COLUMNS).reset_index(drop=True)
 
     # Load mpcorb
     mpcorb = pd.read_parquet(f'{input_dir}/mpc_orbits.parquet',
@@ -616,7 +691,7 @@ if __name__ == "__main__":
     #
     # Business logic
     #
-    obj = compute_ssobject(sss, dia, mpcorb)
+    obj = compute_ssobject(sss, mpcorb)
 
     #
     # Save

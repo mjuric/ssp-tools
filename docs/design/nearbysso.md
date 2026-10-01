@@ -39,16 +39,17 @@ One row per DiaSource that has an eligible known object's prediction within 5″
 | `diaSourceId` | int64 | the input DiaSource (primary key) |
 | `ssObjectId` | int64, nullable | the object's SSObject id, **only if** it has an `SSObject` row ("if any", per the draft) |
 | `designation` | char(16) | primary provisional designation, unpacked (the `mpc_orbits` key) |
-| `ephRa`, `ephDec` | double, deg | predicted topocentric ICRS position at the DiaSource's `midpointMjdTai`, light-time corrected |
+| `ephRa`, `ephRaErr`, `ephDec`, `ephDecErr`, `ephRa_ephDec_Cov` | double / float, deg, deg² | predicted topocentric ICRS position at the DiaSource's `midpointMjdTai` (light-time corrected) and its 1σ error ellipse (RA error includes cos δ; DiaSource's `raErr`/`decErr`/`ra_dec_Cov` convention) |
 | `ephOffset` | float, arcsec | DiaSource ↔ prediction separation (the "distance"), with SSSource's formula |
+| `diaDistanceRank` | short | rank of this DiaSource by separation among **all** of the visit's distinct DiaSources within 5″ of the object's (eligible) prediction: 1 = nearest; ties to the lower `diaSourceId` (added 2026-10-01) |
 | `ephVmag` | float, mag | predicted V from `mpc_orbits` H, G (as SSSource) |
 | `ephRateRa`, `ephRateDec` | float, deg/d | predicted on-sky rates (RA includes cos δ) |
-| **`ephRaErr`, `ephDecErr`** | float, deg | **new:** 1σ prediction uncertainty in RA (with cos δ) and Dec |
-| **`ephRa_ephDec_Cov`** | float, deg² | **new:** their covariance; with the two above, the full error ellipse (the same convention as DiaSource's `raErr`/`decErr`/`ra_dec_Cov`) |
+
+The columns are written in this, the schema's, order (sdm_schemas `tickets/DM-55375`, `sso_base.yaml` NearbySSO). On the PPDB build: rank 1 on 1,289,874 rows, 2 on 892, 3 on 5, 4 on 1; `bench/nearbysso_validate rank` agrees on a 200,000-row brute-force sample.
 
 - Ties for nearest are broken by `designation`, so the output is deterministic.
 - About 32 bytes per row before compression, against ~20 in the RFC's estimate.
-- The three new columns need a matching change to the draft schema.
+- The schema change is on `sdm_schemas` `tickets/DM-55375` (local, awaiting the owner's go-ahead).
 
 ## Inputs (read-only, all regenerated daily)
 

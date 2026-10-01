@@ -17,8 +17,12 @@ Subcommands (each writes ``<out>/<name>.txt`` and ``<out>/<name>.parquet``)::
   horizons-positions   stratified Horizons spot check, < 1 mas RMS gate
   horizons-sigma       our ellipse (SBDB orbit+covariance) vs Horizons 3-sigma
   brute-force          coarse-pass safety: all orbits, exact ephemerides
+  rank                 diaDistanceRank recomputed by brute force from the
+                       DiaSources of each sampled row's visit
   mock-nearbysso       (development) a NearbySSO file faked from SSSource,
                        with injected faults, to exercise the checks
+  mock-rank            (development) a NearbySSO file with diaDistanceRank
+                       added by brute force, optionally with faults
 
 Exit status: 0 pass (or report-only), 1 a gate failed, 3 incomplete (e.g.
 sigma unknown because propagate.coarse isn't implemented yet).
@@ -1718,6 +1722,323 @@ def cmd_brute_force(args):
 
 
 # ---------------------------------------------------------------------------
+# 7. diaDistanceRank by brute force
+# ---------------------------------------------------------------------------
+
+RANK = "diaDistanceRank"
+RANK_FAULTS = {
+    "plus1": "one row's rank increased by 1",
+    "swap": "the ranks of two rows of one (object, visit) swapped",
+    "rank1": "a rank-2 row set to rank 1",
+    "zero": "one rank set to 0",
+}
+
+
+def read_dia_all(path, columns=("diaSourceId", "visit", "ra", "dec")):
+    """Every DiaSource row (only ``columns``), sorted by (visit,
+    diaSourceId). Rows repeating a diaSourceId (PPDB has some) are kept;
+    `brute_force_ranks` counts each id once, at its smallest separation.
+    ``attrs``: ``dup_ids`` (the ids on several rows) and ``n_exact_dup``
+    (rows identical to an earlier one), for the report."""
+    t = pq.read_table(path, columns=list(columns))
+    d = pd.DataFrame({c: t[c].to_numpy() for c in columns})
+    ids = d["diaSourceId"].to_numpy()
+    dup_ids = np.unique(ids[pd.Series(ids).duplicated().to_numpy()])
+    n_exact = int(d.duplicated().sum())
+    d = d.sort_values(["visit", "diaSourceId"], kind="stable").reset_index(drop=True)
+    d.attrs.update(n_exact_dup=n_exact, dup_ids=dup_ids)
+    return d
+
+
+def brute_force_ranks(visit, pred_ra, pred_dec, own_id, dia, radius=RADIUS, chunk=512):
+    """For predictions (visit[k], pred_ra[k], pred_dec[k]) and the DiaSource
+    each names (own_id[k]): the separation of EVERY DiaSource of that visit
+    (``dia``: from `read_dia_all`, sorted by (visit, diaSourceId)), by
+    ssp.util.sky_separation_arcsec. A diaSourceId on several rows is one
+    DiaSource, at its smallest separation (the contract). Returns a
+    DataFrame with, per k:
+
+    - ``own_sep`` [arcsec]: of the named DiaSource (NaN: not in that visit);
+    - ``n_closer``: the visit's DiaSources nearer than it, or as near with a
+      lower diaSourceId, so its rank is ``n_closer + 1``;
+    - ``n_within``: the visit's DiaSources within ``radius``;
+    - ``nearest_id``, ``nearest_sep``: the visit's nearest DiaSource (ties:
+      the lower diaSourceId);
+    - ``near_dup``: the named DiaSource, or one at most as far, is on
+      several rows (so the dedup matters).
+    """
+    visit = np.asarray(visit, dtype=np.int64)
+    pred_ra, pred_dec = np.asarray(pred_ra, np.float64), np.asarray(pred_dec, np.float64)
+    own_id = np.asarray(own_id, dtype=np.int64)
+    n = len(visit)
+    out = {"own_sep": np.full(n, np.nan), "n_closer": np.full(n, -1, np.int64),
+           "n_within": np.zeros(n, np.int64), "nearest_id": np.full(n, -1, np.int64),
+           "nearest_sep": np.full(n, np.nan), "near_dup": np.zeros(n, bool)}
+    dv = dia["visit"].to_numpy(np.int64)
+    ids_all = dia["diaSourceId"].to_numpy(np.int64)
+    ra_all, dec_all = dia["ra"].to_numpy(np.float64), dia["dec"].to_numpy(np.float64)
+    order = np.argsort(visit, kind="stable")
+    uv, start = np.unique(visit[order], return_index=True)
+    end = np.append(start[1:], n)
+    lo, hi = np.searchsorted(dv, uv, "left"), np.searchsorted(dv, uv, "right")
+    for v_lo, v_hi, s, e in zip(lo, hi, start, end):
+        if v_hi == v_lo:
+            continue
+        ids_rows, ra, dec = ids_all[v_lo:v_hi], ra_all[v_lo:v_hi], dec_all[v_lo:v_hi]
+        ids, first, mult = np.unique(ids_rows, return_index=True, return_counts=True)   # ids_rows sorted
+        dup = mult > 1
+        for c0 in range(s, e, chunk):
+            k = order[c0:min(e, c0 + chunk)]
+            S = util.sky_separation_arcsec(pred_ra[k][:, None], pred_dec[k][:, None],
+                                           ra[None, :], dec[None, :])
+            if dup.any():
+                S = np.minimum.reduceat(S, first, axis=1)       # one column per distinct id
+            pos = np.minimum(np.searchsorted(ids, own_id[k]), len(ids) - 1)
+            found = ids[pos] == own_id[k]
+            own = np.where(found, S[np.arange(len(k)), pos], np.nan)
+            closer = (S < own[:, None]) | ((S == own[:, None]) & (ids[None, :] < own_id[k][:, None]))
+            out["own_sep"][k] = own
+            out["n_closer"][k] = np.where(found, closer.sum(axis=1), -1)
+            out["n_within"][k] = (S <= radius).sum(axis=1)
+            out["near_dup"][k] = ((S <= own[:, None]) & dup[None, :]).any(axis=1)
+            j = np.argmin(S, axis=1)      # the first minimum: the lowest id (ids ascending)
+            out["nearest_id"][k] = ids[j]
+            out["nearest_sep"][k] = S[np.arange(len(k)), j]
+    return pd.DataFrame(out)
+
+
+def rank_order_violations(designation, visit, sep, did, rank):
+    """Within each (object, visit), ranks must be distinct and increasing in
+    (sep, diaSourceId). Returns a boolean mask of the rows of violating
+    groups."""
+    df = pd.DataFrame({"des": designation, "visit": visit, "sep": sep, "id": did, "rank": rank})
+    df = df.sort_values(["des", "visit", "sep", "id"], kind="stable")
+    same = (df["des"].to_numpy() == np.roll(df["des"].to_numpy(), 1)) & \
+           (df["visit"].to_numpy() == np.roll(df["visit"].to_numpy(), 1))
+    if len(same):
+        same[0] = False
+    r = df["rank"].to_numpy()
+    bad_row = same & (r <= np.roll(r, 1))
+    g = df.groupby(["des", "visit"], sort=False).ngroup().to_numpy()
+    bad_groups = np.unique(g[bad_row])
+    mask = np.zeros(len(df), bool)
+    mask[df.index.to_numpy()[np.isin(g, bad_groups)]] = True
+    return mask
+
+
+def _nss_with_visits(path, dia):
+    """NearbySSO rows (with the rank, if present) and each row's visit and
+    DiaSource position, from the DiaSource table ``dia``."""
+    present = pq.read_schema(path).names
+    cols = [c for c in ("diaSourceId", "designation", "ephRa", "ephDec", "ephOffset", RANK) if c in present]
+    t = pq.read_table(path, columns=cols)
+    nss = pd.DataFrame({c: t[c].to_numpy(zero_copy_only=False) for c in cols if c != RANK})
+    rank_type = t.schema.field(RANK).type if RANK in cols else None
+    if rank_type is not None:
+        r = t[RANK]
+        nss[RANK] = pc.fill_null(r, -1).to_numpy()
+        nss["rank_null"] = r.is_null().to_numpy(zero_copy_only=False)
+    # every DiaSource row of each NearbySSO row's id; the separation is the
+    # smallest over them (an id on several rows is one DiaSource)
+    ids = dia["diaSourceId"].to_numpy()
+    q = nss["diaSourceId"].to_numpy()
+    by_id = np.argsort(ids, kind="stable")
+    ids_sorted = ids[by_id]
+    lo, hi = np.searchsorted(ids_sorted, q, "left"), np.searchsorted(ids_sorted, q, "right")
+    cnt = hi - lo
+    nss["n_dia_rows"] = cnt
+    ok = cnt > 0
+    row = np.repeat(np.arange(len(nss)), cnt)
+    offs = np.arange(len(row)) - np.repeat(np.cumsum(cnt) - cnt, cnt)
+    drow = by_id[lo[row] + offs]
+    sep_rows = util.sky_separation_arcsec(nss["ephRa"].to_numpy()[row], nss["ephDec"].to_numpy()[row],
+                                          dia["ra"].to_numpy()[drow], dia["dec"].to_numpy()[drow])
+    sep = np.full(len(nss), np.inf)
+    np.minimum.at(sep, row, sep_rows)
+    nss["sep"] = np.where(ok, sep, np.nan)
+    visit = np.full(len(nss), -1, np.int64)
+    visit[row] = dia["visit"].to_numpy()[drow]
+    nss["visit"] = visit
+    nss["dia_row"] = np.where(ok, 0, -1)
+    return nss, rank_type
+
+
+def _hist(values, top=12):
+    vc = pd.Series(values).value_counts().sort_index()
+    head = vc.iloc[:top]
+    s = ", ".join(f"{k}: {v:,}" for k, v in head.items())
+    if len(vc) > top:
+        s += f", ... ({int(vc.iloc[top:].sum()):,} more, max {vc.index.max()})"
+    return s
+
+
+def check_rank(nss_path, dia_path, orbits_path=None, n=100_000, seed=42, rep=None, sep_rtol=1e-6):
+    """The rank checks (see the `rank` subcommand). Returns (verdict, the
+    Report, the sampled rows with their brute-force values, or None); the
+    Report's ``gates`` lists (name, passed)."""
+    rep = rep or Report("rank", None)
+    gates = rep.gates = []
+
+    def gate(name, ok, detail=""):
+        gates.append((name, bool(ok)))
+        rep(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f": {detail}" if detail else ""))
+
+    rep("# NearbySSO diaDistanceRank by brute force against the DiaSources")
+    rep(f"nearbysso={nss_path}\ndia={dia_path}" + (f"\norbits={orbits_path}" if orbits_path else ""))
+    dia = read_dia_all(dia_path)
+    nss, rank_type = _nss_with_visits(nss_path, dia)
+    rep(f"NearbySSO: {len(nss):,} rows; DiaSources: {len(dia):,} in {dia['visit'].nunique():,} visits")
+    dup_ids = dia.attrs["dup_ids"]
+    if len(dup_ids):
+        rep(f"DiaSource rows repeating a diaSourceId: {len(dup_ids):,} ids "
+            f"({dia.attrs['n_exact_dup']:,} rows exact repeats); {int((nss['n_dia_rows'] > 1).sum()):,} "
+            f"NearbySSO rows name one. Each id counts once, at its smallest separation.")
+    if rank_type is None:
+        gate(f"{RANK} column present", False, "missing")
+        return "FAIL", rep, None
+    r = nss[RANK].to_numpy()
+    gate(f"{RANK} is int16 (short), non-null, >= 1",
+         rank_type == pa.int16() and not nss["rank_null"].any() and (r[~nss["rank_null"]] >= 1).all(),
+         f"type {rank_type}, {int(nss['rank_null'].sum()):,} NULL, "
+         f"{int(np.sum((r < 1) & ~nss['rank_null'].to_numpy())):,} < 1")
+    rep(f"ranks in the file: {_hist(r)}")
+    found = nss["dia_row"].to_numpy() >= 0
+    gate("every row's DiaSource is in the DiaSource file", found.all(), f"{int((~found).sum()):,} missing")
+
+    # every row: in each (object, visit), distinct ranks in (sep, id) order
+    f = nss[found]
+    viol = rank_order_violations(f["designation"].to_numpy(), f["visit"].to_numpy(), f["sep"].to_numpy(),
+                                 f["diaSourceId"].to_numpy(), f[RANK].to_numpy())
+    n_groups = f.groupby(["designation", "visit"]).ngroups
+    multi = int((f.groupby(["designation", "visit"]).size() > 1).sum())
+    gate("within each (object, visit), ranks distinct and increasing with (separation, diaSourceId)",
+         not viol.any(), f"{n_groups:,} (object, visit) groups, {multi:,} with several rows; "
+         f"{int(viol.sum()):,} rows in violating groups"
+         + (f" (e.g. {f['diaSourceId'].to_numpy()[viol][:3].tolist()})" if viol.any() else ""))
+
+    # the brute-force sample
+    rng = np.random.default_rng(seed)
+    cand = np.flatnonzero(found)
+    pick = np.sort(cand if not n or n >= len(cand) else rng.choice(cand, n, replace=False))
+    s = nss.iloc[pick].reset_index(drop=True)
+    rep(f"sample: {len(s):,} rows (seed {seed}) in {s['visit'].nunique():,} visits")
+    t0 = time.time()
+    bf = brute_force_ranks(s["visit"], s["ephRa"], s["ephDec"], s["diaSourceId"], dia)
+    rep(f"brute force: every DiaSource of each sampled row's visit, {time.time() - t0:.1f} s")
+    s = pd.concat([s, bf], axis=1)
+    s["expected_rank"] = s["n_closer"] + 1
+    nd = s["near_dup"].to_numpy()
+    if nd.any():
+        rep(f"sampled rows whose rank involves a repeated diaSourceId: {int(nd.sum()):,} "
+            f"(rank as brute force: {int((s[RANK][nd] == s['expected_rank'][nd]).sum()):,})")
+
+    within = s["own_sep"].to_numpy() <= RADIUS
+    eo = s["ephOffset"].to_numpy(np.float64)
+    with np.errstate(invalid="ignore"):
+        eo_ok = np.abs(eo - s["own_sep"].to_numpy()) <= sep_rtol * np.maximum(s["own_sep"].to_numpy(), 1e-3)
+    gate(f"the row's DiaSource is within {RADIUS:g}\" of ephRa/ephDec", within.all(),
+         f"{int((~within).sum()):,} not" + (f" (e.g. {s['diaSourceId'][~within].head(3).tolist()})"
+                                            if not within.all() else ""))
+    ex = list(zip(s["diaSourceId"][~eo_ok].head(3), eo[~eo_ok][:3], s["own_sep"][~eo_ok].head(3)))
+    gate(f"ephOffset == its separation (rel. {sep_rtol:g})", eo_ok.all(),
+         f"{int((~eo_ok).sum()):,} differ" + (f" (e.g. {ex})" if ex else ""))
+
+    got, want = s[RANK].to_numpy(), s["expected_rank"].to_numpy()
+    bad = got != want
+    detail = f"{len(s):,} rows; {int(bad.sum()):,} differ"
+    if bad.any():
+        b = s[bad].head(5)
+        detail += " (diaSourceId designation: file vs brute force) " + "; ".join(
+            f"{r.diaSourceId} {r.designation}: {r[RANK]} vs {r.expected_rank}" for _, r in b.iterrows())
+    gate(f"{RANK} == 1 + the DiaSources of the visit nearer the prediction (ties: lower diaSourceId)",
+         not bad.any(), detail)
+    one = got == 1
+    not_nearest = one & ((s["nearest_id"].to_numpy() != s["diaSourceId"].to_numpy()))
+    gate("rank-1 rows: no DiaSource of the visit is nearer the prediction", not not_nearest.any(),
+         f"{int(one.sum()):,} rank-1 rows sampled; {int(not_nearest.sum()):,} with a nearer one"
+         + (f" (e.g. {s['diaSourceId'][not_nearest].head(3).tolist()})" if not_nearest.any() else ""))
+    rep(f"brute-force ranks (sample): {_hist(want)}")
+    rep(f"DiaSources within {RADIUS:g}\" of the prediction (sample): {_hist(s['n_within'])}")
+    rep(f"rows whose rank > 1 (their object has a nearer DiaSource, named by another row or not "
+        f"in NearbySSO): {int(np.sum(want > 1)):,} of {len(s):,} ({100 * np.mean(want > 1):.2f}%)")
+
+    if orbits_path:
+        orbits = read_orbits(orbits_path, designations=set(s["designation"]))
+        reasons = reasons_for(s["designation"].to_numpy(), reason_lookup(orbits))
+        rep(f"sampled rows' objects by orbit-filter reason ('' kept): "
+            f"{pd.Series(reasons).value_counts().to_dict()}")
+
+    ok = all(g for _, g in gates)
+    rep(f"GATE (every rank check): {'PASS' if ok else 'FAIL'} "
+        f"({sum(not g for _, g in gates)} of {len(gates)} failed)")
+    return ("PASS" if ok else "FAIL"), rep, s
+
+
+def cmd_rank(args):
+    rep = Report("rank", args.out)
+    verdict, rep, s = check_rank(args.nearbysso, args.dia, args.orbits, args.n, args.seed, rep)
+    if s is not None:
+        rep.write(s.drop(columns=["dia_row", "rank_null"], errors="ignore"))
+    else:
+        rep.write()
+    return 0 if verdict == "PASS" else 1
+
+
+def add_ranks(nss_path, dia_path, out_path, faults=(), seed=42):
+    """(development) The NearbySSO file with diaDistanceRank computed by
+    brute force (`brute_force_ranks`), in the schema's column order, with
+    optional injected RANK_FAULTS. Returns (table, faults DataFrame)."""
+    for f in faults:
+        if f not in RANK_FAULTS:
+            raise ValueError(f"unknown fault {f}; known: {sorted(RANK_FAULTS)}")
+    dia = read_dia_all(dia_path)
+    t = pq.read_table(nss_path)
+    nss, _ = _nss_with_visits(nss_path, dia)
+    if (nss["dia_row"] < 0).any():
+        raise ValueError("NearbySSO rows whose DiaSource is not in the DiaSource file")
+    bf = brute_force_ranks(nss["visit"], nss["ephRa"], nss["ephDec"], nss["diaSourceId"], dia)
+    rank = (bf["n_closer"].to_numpy() + 1).astype(np.int16)
+    ok = np.ones(len(rank), bool)
+    rng = np.random.default_rng(seed)
+    injected = []
+    if "plus1" in faults:
+        i = int(rng.choice(np.flatnonzero(ok)))
+        rank[i] += 1
+        injected.append(("plus1", i))
+    if "rank1" in faults:
+        i = int(rng.choice(np.flatnonzero(ok & (rank == 2))))
+        rank[i] = 1
+        injected.append(("rank1", i))
+    if "zero" in faults:
+        i = int(rng.choice(np.flatnonzero(ok)))
+        rank[i] = 0
+        injected.append(("zero", i))
+    if "swap" in faults:
+        g = nss.assign(r=rank).groupby(["designation", "visit"])
+        groups = [ix for ix in g.indices.values() if len(ix) > 1 and ok[ix].all()]
+        ix = groups[int(rng.integers(len(groups)))]
+        a, b = int(ix[0]), int(ix[1])
+        rank[a], rank[b] = rank[b], rank[a]
+        injected += [("swap", a), ("swap", b)]
+    if RANK in t.column_names:
+        t = t.drop_columns([RANK])
+    t = t.append_column(pa.field(RANK, pa.int16(), nullable=False), pa.array(rank, pa.int16()))
+    t = t.select([c for c in NSS_COLUMNS if c in t.column_names]
+                 + [c for c in t.column_names if c not in NSS_COLUMNS])
+    pq.write_table(t, out_path, compression="zstd")
+    fl = pd.DataFrame([(f, int(nss["diaSourceId"].iloc[i])) for f, i in injected],
+                      columns=["fault", "diaSourceId"])
+    return t, fl
+
+
+def cmd_mock_rank(args):
+    t, faults = add_ranks(args.nearbysso, args.dia, args.output, args.fault, args.seed)
+    faults.to_parquet(args.output + ".faults.parquet", index=False)
+    print(f"wrote {len(t):,} rows to {args.output}; faults: {faults.to_dict('records') or 'none'}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Development: a NearbySSO faked from SSSource, with injected faults
 # ---------------------------------------------------------------------------
 
@@ -1840,6 +2161,21 @@ def main(argv=None):
     p.add_argument("--calibrate", type=int, default=2000, help="orbits used to calibrate the prefilter")
     p.add_argument("--workers", type=int, default=8)
     p.set_defaults(func=cmd_brute_force)
+
+    p = sub.add_parser("rank", help="diaDistanceRank by brute force against the DiaSources")
+    common(p, orbits=False)
+    p.add_argument("--orbits", default=None,
+                   help="mpc_orbits Parquet (optional: reports the sampled objects' filter reasons)")
+    p.add_argument("--n", type=int, default=100_000, help="rows sampled (0: all)")
+    p.set_defaults(func=cmd_rank)
+
+    p = sub.add_parser("mock-rank", help="(development) add diaDistanceRank by brute force")
+    p.add_argument("--nearbysso", required=True)
+    p.add_argument("--dia", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--fault", action="append", default=[], choices=sorted(RANK_FAULTS))
+    p.add_argument("--seed", type=int, default=42)
+    p.set_defaults(func=cmd_mock_rank)
 
     p = sub.add_parser("mock-nearbysso", help="(development) fake NearbySSO from SSSource")
     p.add_argument("--sssource", required=True)

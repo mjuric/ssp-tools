@@ -18,8 +18,10 @@ sliced:
 3. **Matching** (``read_workers`` processes, one slice each; the
    predictions shared through fork): read the slice again, index it
    (``DiaIndex``), match the slice's predictions (a contiguous range of the
-   visit-sorted ones) and keep the nearest per DiaSource (ties by
-   designation). A slice owns its DiaSources, so that is exact.
+   visit-sorted ones), rank each prediction's matches by separation
+   (``diaDistanceRank``, ties by diaSourceId) and keep the nearest per
+   DiaSource (ties by designation). A slice owns its DiaSources, and so
+   every DiaSource of a visit, so both are exact.
 
 The parent then attaches ``ssObjectId`` from an SSObject table, writes the
 Parquet file (sorted by diaSourceId) and a JSON run report next to it.
@@ -404,9 +406,9 @@ def sort_predictions(chunks, nvisits):
 
 def _match_slice(s0, s1):
     """Slices [s0, s1): per slice, the nearest match of each of its
-    DiaSources, as (diaSourceId, prediction index, separation), plus the
-    number of matches before that reduction; then (seconds reading,
-    indexing, matching) and the peak RSS."""
+    DiaSources, as (diaSourceId, prediction index, separation,
+    diaDistanceRank), plus the number of matches before that reduction;
+    then (seconds reading, indexing, matching) and the peak RSS."""
     w = _W
     preds, vstart, poff = w["preds"], w["vstart"], w["poff"]
     out, tim = [], np.zeros(3)
@@ -434,9 +436,18 @@ def _match_slice(s0, s1):
         row = np.concatenate(row_all) if row_all else np.zeros(0, np.int64)
         sep = np.concatenate(sep_all) if sep_all else np.zeros(0)
         n_match = int(k.size)
-        # (prediction order is (visit, orbit), so k breaks ties by designation)
+        # (every match of a prediction is here: a slice holds whole visits)
+        rank = distance_rank(k, ids[row], sep)
+        # (prediction order is (visit, orbit), so k breaks ties by designation.
+        # Rows are unique here, so a repeated diaSourceId keeps one match per
+        # row; the parent's nearest() then picks among them by (sep, k), and
+        # for exact twins, which give identical output rows, the stable
+        # lexsort keeps the first: DiaIndex.match returns matches sorted by
+        # (pred, dia_row), nearest() returns them by row, and read_dia's
+        # stable (visit, diaSourceId) sort keeps the input order of twins,
+        # so the lower row wins, deterministically.)
         sel = nearest(row, sep, k)
-        out.append((ids[row[sel]], k[sel], sep[sel], n_match))
+        out.append((ids[row[sel]], k[sel], sep[sel], rank[sel], n_match))
         tim += (t1 - t0, t2 - t1, time.perf_counter() - t2)
     return out, tim, _peak_rss_gb()
 
@@ -445,12 +456,45 @@ def _match_slice(s0, s1):
 # Reduce and write
 # --------------------------------------------------------------------------
 
+def distance_rank(pred, dia_id, sep):
+    """``diaDistanceRank`` of each match (int16): the 1-based rank of its
+    DiaSource by ``sep`` among the distinct DiaSources matching its
+    prediction ``pred``, ties going to the lower ``dia_id``. Rows repeating
+    a ``dia_id`` (the input may have duplicates) count once, at their
+    smallest separation, and every copy gets that DiaSource's rank."""
+    n = len(pred)
+    if not n:
+        return np.zeros(0, np.int16)
+    # one representative per (pred, dia_id): its smallest sep. (Which copy
+    # represents exact twins doesn't matter: only (pred, dia_id, sep) enter
+    # the rank. lexsort is stable, so it is the first, i.e. the lower row.)
+    o = np.lexsort((sep, dia_id, pred))
+    po, io = pred[o], dia_id[o]
+    new = np.r_[True, (po[1:] != po[:-1]) | (io[1:] != io[:-1])]
+    grp = np.cumsum(new) - 1                 # (pred, dia_id) group of o[j]
+    best = o[new]
+    # rank the representatives within each prediction
+    order = np.lexsort((dia_id[best], sep[best], pred[best]))
+    ps = pred[best][order]
+    idx = np.arange(best.size)
+    first = np.maximum.accumulate(np.where(np.r_[True, ps[1:] != ps[:-1]], idx, 0))
+    r = idx - first + 1
+    if r.max() > np.iinfo(np.int16).max:
+        raise OverflowError("diaDistanceRank: more matches of one prediction than int16 holds")
+    rbest = np.empty(best.size, np.int16)
+    rbest[order] = r
+    rank = np.empty(n, np.int16)
+    rank[o] = rbest[grp]
+    return rank
+
+
 def nearest(dia_id, sep, orbit):
     """Indices of the nearest match per diaSourceId (ties broken by
     ``orbit``, i.e. by designation, since orbits are designation-sorted),
     sorted by diaSourceId."""
     if not len(dia_id):
         return np.zeros(0, np.int64)
+    # (lexsort is stable: of full ties, the earliest index wins)
     order = np.lexsort((orbit, sep, dia_id))
     d = dia_id[order]
     first = np.r_[True, d[1:] != d[:-1]]
@@ -658,11 +702,12 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     peak["pass3_worker"] = max((r[2] for r in res), default=0.0)
     del res
     for st, r in zip(rep["slices"], per_slice):
-        st.update(matches=r[3], nearest=int(r[0].size))
+        st.update(matches=r[4], nearest=int(r[0].size))
     ids = np.concatenate([r[0] for r in per_slice]) if per_slice else np.zeros(0, np.int64)
     k = np.concatenate([r[1] for r in per_slice]) if per_slice else np.zeros(0, np.int64)
     sep = np.concatenate([r[2] for r in per_slice]) if per_slice else np.zeros(0)
-    n_matches = int(sum(r[3] for r in per_slice))
+    rank = np.concatenate([r[3] for r in per_slice]) if per_slice else np.zeros(0, np.int16)
+    n_matches = int(sum(r[4] for r in per_slice))
     del per_slice
     tim["pass3_matching"] = time.perf_counter() - t
     tim["pass3_cpu"] = dict(read=float(t3[0]), dia_index=float(t3[1]), match=float(t3[2]))
@@ -670,7 +715,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     # Reduce (a diaSourceId is in one slice, unless the input repeats it) --
     t = time.perf_counter()
     sel = nearest(ids, sep, k)
-    ids, k, sep = ids[sel], k[sel], sep[sel]
+    ids, k, sep, rank = ids[sel], k[sel], sep[sel], rank[sel]
     p = preds[k]
     rows = np.zeros(k.size, dtype=NEARBYSSO_DTYPE)
     rows["diaSourceId"] = ids
@@ -678,6 +723,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     rows["ephRa"] = p["ra"]
     rows["ephDec"] = p["dec"]
     rows["ephOffset"] = sep
+    rows["diaDistanceRank"] = rank
     rows["ephVmag"] = p["vmag"]
     rows["ephRateRa"] = p["rate_ra"]
     rows["ephRateDec"] = p["rate_dec"]

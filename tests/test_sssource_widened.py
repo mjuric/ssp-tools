@@ -14,8 +14,8 @@ import pytest
 
 from ssp import sssource
 from ssp.sssource import (
-    EPHEMERIS_COLUMNS, MEASUREMENT_COLUMNS, build_sssource, cast_column, sort_indices, sssource_schema,
-    sssource_table,
+    EPHEMERIS_COLUMNS, MEASUREMENT_COLUMNS, along_cross_track, build_sssource, cast_column, sort_indices,
+    sssource_schema, sssource_table,
 )
 from ssp.sssource_contract import (
     ID_SPLIT, MATCH_METHODS, SSSOURCE_DICTIONARY, SSSOURCE_NONNULL, SSSourceDtype,
@@ -299,11 +299,9 @@ def test_identification(tmp_path, offline):
             expect = int(np.frombuffer(packed[obj].rjust(8).encode(), dtype="<u8")[0])
             assert r["ssObjectId"] == expect and r["designation"] == OBJECTS[obj][0]
     # no orbit: NULL orbit-derived columns, but the measured ones are filled
-    # (and diaDistanceRank, never computed, is today's 0)
-    assert set(s["diaDistanceRank"].to_pylist()) == {0}
+    # (SSSource no longer has diaDistanceRank; it is on NearbySSO)
+    assert "diaDistanceRank" not in sss.column_names
     for c in EPHEMERIS_COLUMNS:
-        if c == "diaDistanceRank":
-            continue
         col = s[c].to_pylist()
         for ob, v in zip(dia["obsid"].to_pylist(), col):
             if rows[ob][0] in (None, "C") and c not in sssource.MEASURED_EPH_COLUMNS:
@@ -315,6 +313,101 @@ def test_identification(tmp_path, offline):
                     assert v is not None, (c, ob)
     # covariances are loaded for the objects with an orbit only
     assert _FakeEllipse.loaded == sorted(v[0] for v in OBJECTS.values() if v[3])
+
+
+# --------------------------------------------------------------------------
+# Along/cross-track offsets (ssp.sssource_contract, block 6)
+# --------------------------------------------------------------------------
+
+#: pipe_tasks' worked example, 2003 YF26 (tests/test_ssoAssociation.py,
+#: lsst/pipe_tasks tickets/DM-54843; verified there against JPL Horizons):
+#: offsets [arcsec], rates [deg/d].
+YF26 = dict(
+    ephRate=0.13175297987940152,
+    ephRateRa=-0.1242177608944433,
+    ephRateDec=-0.0439180553471223,
+    ephOffsetRa=-0.08092633090227584,
+    ephOffsetDec=-0.06292996923882299,
+    ephOffset=0.10251464315747216,
+    ephOffsetAlongTrack=0.09727483587724564,
+    ephOffsetCrossTrack=0.03235519072357292,
+)
+
+
+def test_along_cross_track_yf26():
+    y = YF26
+    along, cross = along_cross_track(y["ephOffsetRa"], y["ephOffsetDec"], y["ephRateRa"], y["ephRateDec"])
+    # (pipe_tasks' tolerance: assertAlmostEqual(places=10))
+    assert abs(along - y["ephOffsetAlongTrack"]) < 0.5e-10
+    assert abs(cross - y["ephOffsetCrossTrack"]) < 0.5e-10
+    assert abs(np.hypot(y["ephRateRa"], y["ephRateDec"]) - y["ephRate"]) < 0.5e-10
+    # stored as float32
+    assert np.float32(along) == np.float32(y["ephOffsetAlongTrack"])
+    assert np.float32(cross) == np.float32(y["ephOffsetCrossTrack"])
+
+
+def test_along_cross_track_orthogonality():
+    rng = np.random.default_rng(7)
+    n = 10_000
+    off_ra, off_dec = rng.normal(0, 1, n), rng.normal(0, 1, n)
+    rate_ra, rate_dec = rng.normal(0, 0.3, n), rng.normal(0, 0.3, n)
+    along, cross = along_cross_track(off_ra, off_dec, rate_ra, rate_dec)
+    np.testing.assert_allclose(along**2 + cross**2, off_ra**2 + off_dec**2, rtol=1e-12, atol=1e-15)
+    # (independent of the rate's magnitude)
+    a2, c2 = along_cross_track(off_ra, off_dec, 1e3 * rate_ra, 1e3 * rate_dec)
+    np.testing.assert_allclose(a2, along, rtol=1e-12, atol=1e-15)
+    np.testing.assert_allclose(c2, cross, rtol=1e-12, atol=1e-15)
+    y = YF26
+    assert abs(y["ephOffsetAlongTrack"]**2 + y["ephOffsetCrossTrack"]**2 - y["ephOffset"]**2) < 0.5e-10
+
+
+@pytest.mark.parametrize("rate_ra, rate_dec, along, cross", [
+    (0.15, 0.0, 0.1, 0.05),      # +RA: along = +off_ra, cross = +off_dec
+    (-0.15, 0.0, -0.1, -0.05),   # -RA: both flip
+    (0.0, 0.2, 0.05, -0.1),      # +Dec: along = +off_dec, cross = -off_ra
+    (0.0, -0.2, -0.05, 0.1),     # -Dec
+])
+def test_along_cross_track_signs(rate_ra, rate_dec, along, cross):
+    a, c = along_cross_track(0.1, 0.05, rate_ra, rate_dec)
+    assert a == pytest.approx(along, abs=1e-15) and c == pytest.approx(cross, abs=1e-15)
+
+
+def test_along_cross_track_null():
+    nan = np.nan
+    a, c = along_cross_track([0.1, 0.1, nan, 0.1, 0.1], [0.05, 0.05, nan, 0.05, 0.05],
+                             [0.0, -0.0, nan, nan, 0.1], [0.0, 0.0, nan, nan, 0.0])
+    assert np.isnan(a[:4]).all() and np.isnan(c[:4]).all()     # rate 0, or no orbit
+    assert a[4] == pytest.approx(0.1) and c[4] == pytest.approx(0.05)
+
+
+def test_along_cross_track_in_sssource(tmp_path, offline):
+    sss, _, _ = _build(tmp_path)
+    for c in ("ephOffsetAlongTrack", "ephOffsetCrossTrack"):
+        assert sss.schema.field(c).type == pa.float32()
+    has = sss["ephRa"].is_valid()
+    for c in ("ephOffsetAlongTrack", "ephOffsetCrossTrack"):
+        assert sss[c].is_valid().equals(has), c                # NULL exactly without an orbit
+    t = sss.filter(has)
+    along, cross = along_cross_track(*(t[c].to_numpy() for c in
+                                       ("ephOffsetRa", "ephOffsetDec", "ephRateRa", "ephRateDec")))
+    # (from the float64 rates, so to the float32 rates' precision)
+    np.testing.assert_allclose(t["ephOffsetAlongTrack"].to_numpy(), along, rtol=1e-6, atol=1e-9)
+    np.testing.assert_allclose(t["ephOffsetCrossTrack"].to_numpy(), cross, rtol=1e-6, atol=1e-9)
+    off2 = t["ephOffsetRa"].to_numpy()**2 + t["ephOffsetDec"].to_numpy()**2
+    np.testing.assert_allclose(along**2 + cross**2, off2, rtol=1e-12)
+
+
+def test_along_cross_track_zero_rate(tmp_path, offline, monkeypatch):
+    def still(*args, **kw):
+        e = _fake_ephemerides(*args, **kw)
+        e.mu_lon, e.mu_lat, e.mu_total = (np.zeros_like(e.mu_lon) for _ in range(3))
+        return e
+    monkeypatch.setattr(sssource, "compute_ephemerides_one", still)
+    sss, _, _ = _build(tmp_path)
+    has = sss["ephRa"].is_valid()
+    assert pc.any(has).as_py()
+    for c in ("ephOffsetAlongTrack", "ephOffsetCrossTrack"):
+        assert sss[c].null_count == sss.num_rows, c
 
 
 def test_id_split(tmp_path, offline):

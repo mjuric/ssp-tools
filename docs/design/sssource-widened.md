@@ -164,12 +164,8 @@ Further results:
 1. **The linear error ellipse understates the uncertainty of poorly constrained short arcs observed far from their epoch.**
    - The WP3 review's Monte Carlo of the full chain gave spreads 30–700× the linear ellipse in such cases. For example, 2025 NT344 observed about 300 days before its epoch: 58″ linear, against about 10° in the Monte Carlo.
    - NearbySSO has the same limitation, but its σ ≤ 10″ cut excludes those cases. SSSource publishes the ellipse as is.
-2. **SSObject depends on row order.** Its HG12 fits depend strongly on input row order: in another order, thousands of fits differ, `nObsUsed` and `slope_fit_failed` change, and HErr and G12 differ by up to 99%.
-   - It restores `dia_sources`' row order, which keeps its output identical to today's.
-   - It reads photometry from `dia_sources` (float64), not SSSource's float32 copies. So the published SSObject can't be reproduced exactly from the published SSSource.
-   - **Owner decision:** keep this, or switch SSObject once to SSSource's own order and columns.
-3. **Placeholder columns.** `diaDistanceRank` is 0 on every row, and `ephOffsetAlongTrack`/`ephOffsetCrossTrack` are 0.0 wherever there is an orbit. Neither is computed, today or now; they're kept as today so the regression can be bitwise.
-   - **Owner decision:** make them NULL, or compute them.
+2. **SSObject row-order dependence: resolved (2026-10-01; "Follow-ups").** The fits now take their observations in a canonical order, so SSObject is a function of the set of observations; it reads its photometry from SSSource, so it is reproducible from the published SSSource.
+3. **Placeholder columns: resolved (2026-10-01).** `ephOffsetAlongTrack`/`CrossTrack` are computed; `diaDistanceRank` moved to NearbySSO, where it is computed.
 4. **The Butler input path to `ssp.sssource` is gone.** The widened table needs the `obs_sbn` linkage, which only `extract-submitted-sources` output carries.
 5. **Pushing the schema.** `tickets/DM-55375` (sso_base.yaml and ppdb.yaml) is committed locally and awaits the owner's go-ahead to push and open the `sdm_schemas` PR. The version is left at 10.0.0 (see "Phase 0 results").
 
@@ -231,3 +227,62 @@ When the owner approves, push `tickets/DM-55375` and open the `sdm_schemas` PR f
 - Incremental updates; the table is regenerated in full daily.
 - Changing `ssp.SubmittableSources` itself.
 - A widened SSObject.
+
+## Follow-ups (2026-10-01; implemented)
+
+### Owner decisions
+
+| item | decision |
+|---|---|
+| `diaDistanceRank` | **Removed** from SSSource. |
+| `ephOffsetAlongTrack`, `ephOffsetCrossTrack` | **Computed**, ported from pipe_tasks (`ssoAssociation.py`, upstream main), which ssp-tools never had. `along = (ephOffsetRa, ephOffsetDec) · (ephRateRa, ephRateDec)/ephRate` and `cross = (ephOffsetRa, ephOffsetDec) · (−ephRateDec, ephRateRa)/ephRate`, in arcsec. NULL where there is no orbit or `ephRate` is 0. |
+| `NearbySSO.diaDistanceRank` | **Added** (named as in the old SSSource, now on NearbySSO where it belongs): the 1-based rank of the row's DiaSource by separation from its object's prediction in that visit. It ranks **all** of that visit's DiaSources within the 5″ radius of that prediction that pass the σ cut, whichever object each one's NearbySSO row names. Ties go to the lower `diaSourceId`. NearbySSO gets no along/cross-track columns. |
+| SSObject's row-order dependence | **Find the root cause and make the fits order-independent**, rather than matching today's values by sorting. SSObject then reads its photometry from **SSSource** (the published float32 columns), so the published SSObject is reproducible from the published SSSource. Its values change for the objects whose fits were order-sensitive. |
+
+### Plan
+
+The same pattern as before: the integrator owns the contract, reviews and integrates; parallel subagents build the work packages; independent reviews where marked.
+
+**Phase 0 (integrator):**
+- `sdm_schemas` `tickets/DM-55375` (local): drop `SSSource.diaDistanceRank`; add `NearbySSO.diaDistanceRank` (short, non-null) after `ephOffset`.
+- Re-vendor `sso_base.yaml`, regenerate `ssp/schema_ppdb.py`.
+- `ssp/sssource_contract.py`: the along/cross formula and its NULL rules.
+- `ssp/nearbysso/_contract.py`: add the rank to `NEARBYSSO_DTYPE`, and put the output columns in the schema's order (the ellipse columns next to `ephRa`/`ephDec`).
+
+**Phase 1 (parallel):**
+
+| WP | builds | independent review |
+|---|---|---|
+| **A SSSource** | Compute along/cross-track per the contract; drop `diaDistanceRank`; tests including pipe_tasks' worked example. | no (small; WP D checks it) |
+| **B NearbySSO** | `diaDistanceRank` in pass 3, from every match within the radius of each (orbit, visit) prediction, ranked before the nearest-object reduction; output in schema order; tests. | light |
+| **C SSObject** | Root-cause every source of row-order dependence in the photometric fits (`ssp/photfit.py`, `ssp/ssobject.py`) and why its effect is large. Fix it so the fits are mathematically order-independent. Read photometry from SSSource. Tests: random within-object permutations give the same SSObject (bitwise where order-insensitive arithmetic allows, else to a stated tolerance). Report how many objects change, and by how much, relative to today. | **yes** |
+| **D Validation** | `bench/sssource_validate`: an independent along/cross check; regression without `diaDistanceRank` and the along/cross columns; an SSObject permutation-invariance check. `bench/nearbysso_validate`: a brute-force rank check against the DiaSources. | no (it is the check) |
+
+**Phase 2 (integrator):** rerun the full chain on the 2026-09-30 fixture and NearbySSO on PPDB, run every check, and record the results here and in `nearbysso.md`.
+
+### Further owner decisions (2026-10-01, during WP C)
+
+| item | decision |
+|---|---|
+| `{band}_slope_fit_failed` | Implements the schema's meaning ("G12 fit failed; G12 contains a fiducial value used to fit H"). A band's slope fit fails when G12 ends at a bound (within 1e-5 of 0 or 1), the fit isn't invertible (including a non-finite G12Err at an interior G12), fewer than 3 points are used, or the phase span of the points used is below 2° (`--hg12MinPhaseSpan`). |
+| Fallback | H is refit with G12 fixed at 0.5 (`--hg12FiducialG12`; DP2's value), clipping under the same condition as the free fit (more than 3 points). G12 = 0.5, G12Err and Cov NULL (stored as NaN, the SSObject convention), flag set. One surviving point still gives H; H is NULL only if no point survives. |
+| Bands with 1–2 observations | Get H at the fiducial G12, flagged. |
+
+### Results (2026-10-01)
+
+**Root cause of the order dependence** (WP C, confirmed by its independent review). The fits' reductions (weighted means, IRLS sums, costs, JᵀJ) round differently, by an ulp, in another row order. In well-posed fits that moves G12 within the bounded search's tolerance (≤ 2e-5). In degenerate fits (2 points for 2 parameters, or a single phase angle) the cost is flat to rounding and JᵀJ is singular to about 1e16, so the rounding decided G12, whether it ended at a bound (which switches the HErr formula: 8e5 against 0.057), and whether the fit failed. With the canonical order, and the failure rules routing every degenerate fit to the fallback, no residual order effect remains beyond ~1e-6 (and none at all bitwise). Degenerate free fits are still decided by rounding for a given set of observations, so they may differ across platforms; the rules send them to the fallback.
+
+**Integrated rerun** on the 2026-09-30 fixture (`sssource-followups` a9d3385, 32 workers; `/sdf/data/rubin/user/mjuric/sssource-widened/integration/2026-09-30-r2/`; the extract reused from the first run):
+
+| stage | wall | peak RSS | output |
+|---|---|---|---|
+| `ssp-build-sssource` | 3:11 | 13.2 GB | 8,070,610 rows × 180 columns |
+| `ssp-build-ssobject` (now `SSSOURCE MPCORB`) | 1:17 | 3.0 GB | 297,762 objects |
+
+Every check passes: conformance (23), offsets (4: along/cross recomputed independently, NULL rules, rotation, separation), copied (5), clickhouse (6), regression (8; the 33 unchanged ephemeris and geometry columns bitwise equal), counts (4), ellipse (3), ssobject-permutation (5: byte-identical SSObject from permuted SSSource).
+
+**SSObject against the previous build** (297,762 objects): 296,022 change.
+- The order fix and float32 photometry alone change 112,071, mostly by ≤ 1e-4 relative; the large differences are all degenerate fits.
+- The failure rules flag 852,924 of 1,091,782 band fits (78%; 67.6% of bands with ≥ 3 observations): G12 at a bound 458,829, fewer than 3 points 358,593, phase span < 2° 231,608, singular 3 (overlapping).
+- 174,550 bands gain an H and none loses one; 6 bands end with no H (clipping keeps no point; bad photometry or linkage).
+- The refit H moves by a median of 0.074 mag (p90 0.19, p99 0.26).
