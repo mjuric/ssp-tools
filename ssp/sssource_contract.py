@@ -90,8 +90,9 @@ ELLIPSE_COLUMNS = ("ephRaErr", "ephDecErr", "ephRa_ephDec_Cov")
 #     cross = (-ephOffsetRa * ephRateDec + ephOffsetDec * ephRateRa) / ephRate
 #   (ephOffsetRa includes cos(dec); ephRate = hypot(ephRateRa, ephRateDec)),
 #   NULL where there is no orbit or ephRate is 0. (SSSource no longer has
-#   diaDistanceRank; it is on NearbySSO.) NULL (NaN) for rows without an orbit; the ellipse
-#   is also NULL where the orbit has no usable covariance.
+#   diaDistanceRank; it is on NearbySSO.) Every block-6 column is NULL for
+#   rows without an orbit; the ellipse is also NULL where the orbit has no
+#   usable covariance.
 
 # --------------------------------------------------------------------------
 # WP1: extract-submitted-sources
