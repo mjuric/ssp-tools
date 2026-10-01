@@ -1,0 +1,22 @@
+# ssp-upload-sso config: the PPDB prod environment -- a TEMPLATE, commented out.
+#
+# Source: lsst/idf_deploy @ 9f810ac (2026-10-01), environment/deployments/ppdb/.
+# There is no prod deployment there yet: .github/workflows/ppdb-prod-*-tf.yaml
+# refer to env/prod-services.tfvars, which doesn't exist. By the same
+# services/gcs.tf and pubsub.tf the names would be:
+#
+# bucket_name: ppdb-prod-sso-ingest     # TODO: confirm once prod is deployed
+# topic: load-sso-topic
+# project: TODO                         # the prod ppdb project id (random-suffixed,
+#                                       # like ppdb-dev-5c07 and ppdb-int-6c62)
+#
+# The complete set: the five tables the loader (dax_ppdb SSO_TABLES, load_sso)
+# accepts. NearbySSO is built and staged, but not uploaded until DM-55678's
+# dax_ppdb SSO_TABLES and load_sso add it; sending it today fails the entire
+# load. Uploading a subset of these needs --allow-partial.
+# tables:
+#   - SSSource
+#   - SSObject
+#   - numbered_identifications
+#   - current_identifications
+#   - mpc_orbits
