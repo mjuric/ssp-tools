@@ -64,6 +64,29 @@ def test_load_orbit_covariances_subset(tmp_path, row_group_size):
     assert se.load_orbit_covariances(path, [], ephem, verbose=False) == {}
 
 
+def test_load_orbit_covariances_duplicates_across_row_groups(tmp_path):
+    """A designation on rows in several row groups: the last row, as
+    load_orbits on the whole file plus a dict gives, whatever the threads'
+    timing."""
+    import pyarrow as pa
+    table, _, _ = _synthetic_table(np.random.default_rng(1))
+    n = table.num_rows
+    dup = table.slice(0, 1)                                 # "2000 AA", other elements
+    dup = dup.set_column(dup.schema.get_field_index("i"), "i", pa.array([77.0]))
+    table = pa.concat_tables([table, table.slice(5, n - 5), dup])
+    path = tmp_path / "mpc_orbits.parquet"
+    pq.write_table(table, path, row_group_size=4)
+    assert pq.ParquetFile(path).num_row_groups > 4
+    ephem = FakeEphem()
+    rows = O.load_orbits(path, with_filter=False, ephem=ephem, verbose=False)
+    full = {str(r["designation"]): r for r in rows}
+    for _ in range(5):
+        got = se.load_orbit_covariances(path, ["2000 AA", "2002 CC", "1994 UU"], ephem, verbose=False)
+        assert got["2000 AA"]["i"] == 77.0
+        for d, r in got.items():
+            _rows_equal(r, full[d])
+
+
 def test_load_orbit_covariances_prints_summary(tmp_path, capsys):
     table, _, _ = _synthetic_table(np.random.default_rng(1))
     path = tmp_path / "mpc_orbits.parquet"
@@ -76,11 +99,18 @@ def test_load_orbit_covariances_prints_summary(tmp_path, capsys):
 # ephemeris_ellipse: no ASSIST needed
 # ---------------------------------------------------------------------------
 
-def _fake_track(t, cov):
+#: A placeholder ephemeris for the tests that replace propagate.coarse.
+EPHEM = object()
+
+
+def _fake_track(t, cov, ra=np.nan, dec=np.nan):
+    """A track with covariances ``cov`` and (by default) no direction, which
+    skips the topo_pos direction check."""
     K = len(t)
     z = np.zeros(K)
-    return CoarseTrack(t=np.asarray(t, float), ra=z, dec=z, rate_ra=z, rate_dec=z, ra_err=z, dec_err=z,
-                       ra_dec_cov=z, sigma_major=z, ok=np.ones(K, bool), delta=np.ones(K), cov=cov)
+    return CoarseTrack(t=np.asarray(t, float), ra=np.full(K, ra), dec=np.full(K, dec), rate_ra=z,
+                       rate_dec=z, ra_err=z, dec_err=z, ra_dec_cov=z, sigma_major=z,
+                       ok=np.ones(K, bool), delta=np.ones(K), cov=cov)
 
 
 def _orbit(has_cov=True):
@@ -102,7 +132,7 @@ def test_convention_ra_err_includes_cos_dec(monkeypatch):
     dec = np.radians([0.0, 60.0, -80.0])
     ra = np.radians([10.0, 200.0, 330.0])
     topo = d * np.stack([np.cos(dec) * np.cos(ra), np.cos(dec) * np.sin(ra), np.sin(dec)], axis=1)
-    ra_err, dec_err, c = se.ephemeris_ellipse(_orbit(), t, np.zeros((3, 3)), topo, None)
+    ra_err, dec_err, c = se.ephemeris_ellipse(_orbit(), t, np.zeros((3, 3)), topo, EPHEM)
     want = np.degrees(sigma / d)
     np.testing.assert_allclose(ra_err, want, rtol=1e-12)
     np.testing.assert_allclose(dec_err, want, rtol=1e-12)
@@ -113,7 +143,7 @@ def test_convention_ra_err_includes_cos_dec(monkeypatch):
     C = np.diag([1.0, 4.0, 9.0]) * sigma ** 2
     C[0, 2] = C[2, 0] = 2.0 * sigma ** 2
     cov[:, :3, :3] = C
-    ra_err, dec_err, c = se.ephemeris_ellipse(_orbit(), t, np.zeros((3, 3)), topo, None)
+    ra_err, dec_err, c = se.ephemeris_ellipse(_orbit(), t, np.zeros((3, 3)), topo, EPHEM)
     e_ra, e_dec = propagate._tangent_basis(topo / d)
     for k in range(3):
         J = np.degrees(np.stack([e_ra[k], e_dec[k]]) / d)
@@ -125,10 +155,10 @@ def test_convention_ra_err_includes_cos_dec(monkeypatch):
 def test_no_covariance_is_nan(monkeypatch):
     called = []
     monkeypatch.setattr(propagate, "coarse", lambda *a, **k: called.append(1))
-    out = se.ephemeris_ellipse(_orbit(has_cov=False), np.arange(4.0), np.ones((4, 3)), np.ones((4, 3)), None)
+    out = se.ephemeris_ellipse(_orbit(has_cov=False), np.arange(4.0), np.ones((4, 3)), np.ones((4, 3)), EPHEM)
     assert all(np.isnan(x).all() and x.shape == (4,) for x in out)
     assert not called                   # not even propagated
-    out = se.ephemeris_ellipse(_orbit(), np.zeros(0), np.zeros((0, 3)), np.zeros((0, 3)), None)
+    out = se.ephemeris_ellipse(_orbit(), np.zeros(0), np.zeros((0, 3)), np.zeros((0, 3)), EPHEM)
     assert all(x.shape == (0,) for x in out)
 
 
@@ -136,15 +166,56 @@ def test_exception_is_nan(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("ASSIST blew up")
     monkeypatch.setattr(propagate, "coarse", boom)
-    out = se.ephemeris_ellipse(_orbit(), np.arange(3.0), np.ones((3, 3)), np.ones((3, 3)), None)
+    out = se.ephemeris_ellipse(_orbit(), np.arange(3.0), np.ones((3, 3)), np.ones((3, 3)), EPHEM)
     assert all(np.isnan(x).all() for x in out)
+
+
+def test_caller_errors_raise(monkeypatch):
+    """Not an ORBIT_DTYPE row, no ephemeris, bad shapes: ValueError, not a
+    silent NaN."""
+    import pandas as pd
+    monkeypatch.setattr(propagate, "coarse",
+                        lambda orbit, t, obs_pos, ephem: _fake_track(t, np.zeros((len(t), 6, 6))))
+    args = (np.arange(3.0), np.ones((3, 3)), np.ones((3, 3)))
+    o = _orbit()
+    for bad in (dict(has_cov=True), pd.Series({"has_cov": True, "q": 1.0}), np.zeros(1, dtype=ORBIT_DTYPE),
+                np.zeros((), dtype=[("has_cov", "?")])[()], None):
+        with pytest.raises(ValueError, match="ORBIT_DTYPE"):
+            se.ephemeris_ellipse(bad, *args, EPHEM)
+    with pytest.raises(ValueError, match="ephem"):
+        se.ephemeris_ellipse(o, *args, None)
+    with pytest.raises(ValueError):
+        se.ephemeris_ellipse(o, np.zeros((3, 1)), *args[1:], EPHEM)
+    # a 0-d array and a void row are both fine
+    se.ephemeris_ellipse(o, *args, EPHEM)
+    se.ephemeris_ellipse(np.zeros(2, dtype=ORBIT_DTYPE)[1], *args, EPHEM)
+
+
+def test_topo_direction_check(monkeypatch):
+    """topo_pos pointing away from the orbit's own direction raises; within
+    the tolerance it doesn't."""
+    cov = np.zeros((3, 6, 6))
+    cov[:, :3, :3] = 1e-12 * np.eye(3)
+    monkeypatch.setattr(propagate, "coarse",
+                        lambda orbit, t, obs_pos, ephem: _fake_track(t, cov[:len(t)], ra=0.0, dec=0.0))
+    t, obs = np.arange(3.0), np.zeros((3, 3))
+    ok = np.tile([2.0, 0.1, -0.1], (3, 1))                  # ~4 deg off: fine
+    assert np.isfinite(se.ephemeris_ellipse(_orbit(), t, obs, ok, EPHEM)[0]).all()
+    bad = ok.copy()
+    bad[1] = [0.0, 2.0, 0.0]                                # 90 deg off
+    with pytest.raises(ValueError, match="topo_pos"):
+        se.ephemeris_ellipse(_orbit(), t, obs, bad, EPHEM)
+    nan = ok.copy()
+    nan[1] = np.nan                                         # non-finite: NaN, no error
+    r = se.ephemeris_ellipse(_orbit(), t, obs, nan, EPHEM)[0]
+    assert np.isnan(r[1]) and np.isfinite(r[[0, 2]]).all()
 
 
 def test_shape_mismatch_raises():
     with pytest.raises(ValueError):
-        se.ephemeris_ellipse(_orbit(), np.arange(3.0), np.ones((2, 3)), np.ones((3, 3)), None)
+        se.ephemeris_ellipse(_orbit(), np.arange(3.0), np.ones((2, 3)), np.ones((3, 3)), EPHEM)
     with pytest.raises(ValueError):
-        se.ephemeris_ellipse(_orbit(), np.arange(3.0), np.ones((3, 3)), np.ones((3,)), None)
+        se.ephemeris_ellipse(_orbit(), np.arange(3.0), np.ones((3, 3)), np.ones((3,)), EPHEM)
 
 
 def test_samples_distinct_sorted_times(monkeypatch):
@@ -163,7 +234,7 @@ def test_samples_distinct_sorted_times(monkeypatch):
     obs = np.tile([1.0, 0.0, 0.0], (7, 1))
     obs[6] = np.nan
     topo = np.tile([0.0, 1.0, 0.0], (7, 1))
-    a, b, c = se.ephemeris_ellipse(_orbit(), t, obs, topo, None)
+    a, b, c = se.ephemeris_ellipse(_orbit(), t, obs, topo, EPHEM)
     np.testing.assert_array_equal(seen["t"], [1.0, 2.0, 3.0])
     assert np.isnan(a[[3, 6]]).all() and np.isfinite(a[[0, 1, 2, 4, 5]]).all()
     assert a[0] == a[2] and a[1] == a[5]
@@ -318,3 +389,20 @@ def test_bad_orbits_do_not_raise(ephem, orbits):
     op = np.tile(obs_pos[:1], (3, 1))
     ra_err, _, _ = se.ephemeris_ellipse(o, tt, op, np.tile(topo[:1], (3, 1)), ephem)
     assert np.isfinite(ra_err[:2]).all() and np.isnan(ra_err[2])
+
+
+@needs_assist
+def test_transposed_topo_raises(ephem, orbits):
+    """K = 3 with topo_pos passed as (3, K): the shape can't tell, the
+    direction check does. So does the wrong sign (observer - object)."""
+    orbit = orbits[MB_LONG]
+    t = _obs_times(60990, 60993, per_night=1)
+    assert t.size == 3
+    obs_pos, topo = _precise_topo(orbit, t, ephem)
+    assert np.isfinite(se.ephemeris_ellipse(orbit, t, obs_pos, topo, ephem)[0]).all()
+    u = topo / np.linalg.norm(topo, axis=1)[:, None]
+    assert np.min(np.sum(u * (topo.T / np.linalg.norm(topo.T, axis=1)[:, None]), axis=1)) < 0.9
+    with pytest.raises(ValueError, match="topo_pos"):
+        se.ephemeris_ellipse(orbit, t, obs_pos, topo.T.copy(), ephem)
+    with pytest.raises(ValueError, match="topo_pos"):
+        se.ephemeris_ellipse(orbit, t, obs_pos, -topo, ephem)
