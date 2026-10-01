@@ -438,7 +438,14 @@ def _match_slice(s0, s1):
         n_match = int(k.size)
         # (every match of a prediction is here: a slice holds whole visits)
         rank = distance_rank(k, ids[row], sep)
-        # (prediction order is (visit, orbit), so k breaks ties by designation)
+        # (prediction order is (visit, orbit), so k breaks ties by designation.
+        # Rows are unique here, so a repeated diaSourceId keeps one match per
+        # row; the parent's nearest() then picks among them by (sep, k), and
+        # for exact twins, which give identical output rows, the stable
+        # lexsort keeps the first: DiaIndex.match returns matches sorted by
+        # (pred, dia_row), nearest() returns them by row, and read_dia's
+        # stable (visit, diaSourceId) sort keeps the input order of twins,
+        # so the lower row wins, deterministically.)
         sel = nearest(row, sep, k)
         out.append((ids[row[sel]], k[sel], sep[sel], rank[sel], n_match))
         tim += (t1 - t0, t2 - t1, time.perf_counter() - t2)
@@ -451,20 +458,33 @@ def _match_slice(s0, s1):
 
 def distance_rank(pred, dia_id, sep):
     """``diaDistanceRank`` of each match (int16): the 1-based rank of its
-    DiaSource by ``sep`` among all the matches of its prediction ``pred``,
-    ties going to the lower ``dia_id``."""
+    DiaSource by ``sep`` among the distinct DiaSources matching its
+    prediction ``pred``, ties going to the lower ``dia_id``. Rows repeating
+    a ``dia_id`` (the input may have duplicates) count once, at their
+    smallest separation, and every copy gets that DiaSource's rank."""
     n = len(pred)
     if not n:
         return np.zeros(0, np.int16)
-    order = np.lexsort((dia_id, sep, pred))
-    ps = pred[order]
-    idx = np.arange(n)
+    # one representative per (pred, dia_id): its smallest sep. (Which copy
+    # represents exact twins doesn't matter: only (pred, dia_id, sep) enter
+    # the rank. lexsort is stable, so it is the first, i.e. the lower row.)
+    o = np.lexsort((sep, dia_id, pred))
+    po, io = pred[o], dia_id[o]
+    new = np.r_[True, (po[1:] != po[:-1]) | (io[1:] != io[:-1])]
+    grp = np.cumsum(new) - 1                 # (pred, dia_id) group of o[j]
+    best = o[new]
+    # rank the representatives within each prediction
+    order = np.lexsort((dia_id[best], sep[best], pred[best]))
+    ps = pred[best][order]
+    idx = np.arange(best.size)
     first = np.maximum.accumulate(np.where(np.r_[True, ps[1:] != ps[:-1]], idx, 0))
     r = idx - first + 1
     if r.max() > np.iinfo(np.int16).max:
         raise OverflowError("diaDistanceRank: more matches of one prediction than int16 holds")
+    rbest = np.empty(best.size, np.int16)
+    rbest[order] = r
     rank = np.empty(n, np.int16)
-    rank[order] = r
+    rank[o] = rbest[grp]
     return rank
 
 
@@ -474,6 +494,7 @@ def nearest(dia_id, sep, orbit):
     sorted by diaSourceId."""
     if not len(dia_id):
         return np.zeros(0, np.int64)
+    # (lexsort is stable: of full ties, the earliest index wins)
     order = np.lexsort((orbit, sep, dia_id))
     d = dia_id[order]
     first = np.r_[True, d[1:] != d[:-1]]

@@ -137,6 +137,13 @@ def test_distance_rank():
     perm = np.random.default_rng(5).permutation(pred.size)
     np.testing.assert_array_equal(B.distance_rank(pred[perm], dia_id[perm], sep[perm]), r[perm])
     assert B.distance_rank(np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0)).dtype == np.int16
+    # repeated diaSourceIds count once, at their smallest separation: A at
+    # 1", its exact twin, B at 2" (rank 2, not 3); A again at 3" and C at
+    # 2.5"; every copy of A gets A's rank
+    pred = np.array([0, 0, 0, 0, 0])
+    dia_id = np.array([7, 7, 3, 7, 5])     # A=7, B=3, C=5
+    sep = np.array([1.0, 1.0, 2.0, 3.0, 2.5])
+    assert B.distance_rank(pred, dia_id, sep).tolist() == [1, 1, 2, 1, 3]
 
 
 def _east(ra, dec, arcsec):
@@ -147,7 +154,9 @@ def _rank_synth(tmp_path):
     """Two nights. Night 1, one visit: P0 (orbit 0) and P1 (orbit 1, 3"
     east of P0), and DiaSources around both, some nearer to P1. Night 2,
     one visit, one prediction (orbit 2): two DiaSources at the same place
-    (a tie), one nearer, one farther, one outside the radius. Returns the
+    (a tie), one nearer, one farther, one outside the radius, and repeated
+    diaSourceIds (an exact twin of the nearest, a farther copy of one of
+    the tie), which count once. Returns the
     path, the predictions and the expected (diaSourceId -> (orbit, rank))."""
     ra0, dec0 = 10.0, 20.0
     v1, v2 = 2025093000001, 2025100100001
@@ -160,6 +169,8 @@ def _rank_synth(tmp_path):
            (106, v1, 9.0),     # out of both
            (300, v2, 2.0), (200, v2, 2.0),   # a tie: 200 ranks 2, 300 ranks 3
            (250, v2, -1.0),    # rank 1
+           (250, v2, -1.0),    #   its exact twin: counted once
+           (200, v2, 4.8),     #   a farther copy of 200: counted once, at 2.0
            (150, v2, 4.5),     # rank 4
            (151, v2, 5.5)]     # out
     p = np.zeros(3, dtype=B.PRED_DTYPE)
@@ -478,7 +489,8 @@ def test_end_to_end(tmp_path, synth, orbits, ephem, expected):
         np.testing.assert_allclose(res[col], exp[e].astype(np.float32), rtol=1e-5, err_msg=col)
     # diaDistanceRank, by brute force: every DiaSource of the visit within
     # the radius of the row's prediction (ties to the lower diaSourceId),
-    # in the input as read (with the repeated diaSourceId)
+    # in the input as read (with the repeated diaSourceId), counting each
+    # distinct diaSourceId once, at its smallest separation
     from ssp.util import sky_separation_arcsec
     assert res["diaDistanceRank"].dtype == np.int16
     full = pq.read_table(path).to_pandas()
@@ -488,9 +500,14 @@ def test_end_to_end(tmp_path, synth, orbits, ephem, expected):
         s = sky_separation_arcsec(r["ephRa"], r["ephDec"], same["ra"].to_numpy(), same["dec"].to_numpy())
         near = s <= 5.0
         nid, ns = same["diaSourceId"].to_numpy()[near], s[near]
-        ranked = nid[np.lexsort((nid, ns))]
-        assert r["diaDistanceRank"] == 1 + np.flatnonzero(ranked == i)[0], (i, v)
-    assert set(res["diaDistanceRank"]) == {1, 2, 3}  # hits, decoys, a decoy behind the repeat
+        best = {}
+        for j, x in zip(nid.tolist(), ns.tolist()):
+            best[j] = min(x, best.get(j, np.inf))
+        ranked = sorted(best, key=lambda j: (best[j], j))
+        assert r["diaDistanceRank"] == 1 + ranked.index(i), (i, v)
+    # hits, decoys, and a decoy behind the repeated diaSourceId (a distinct
+    # DiaSource of that visit, as its other copy is in another night)
+    assert set(res["diaDistanceRank"]) == {1, 2, 3}
     hits = truth.loc[res.index, "kind"] == "hit"
     np.testing.assert_allclose(res.loc[hits, "ephOffset"], 0.8, atol=1e-3)
     np.testing.assert_allclose(res.loc[~hits, "ephOffset"], 2.5, atol=1e-3)
