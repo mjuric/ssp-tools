@@ -24,10 +24,11 @@ Subcommands (each prints a text report, optionally also to ``--out FILE``)::
   regression NEW_SSSOURCE REF_SSSOURCE
       the ephemeris/geometry columns bitwise equal to today's SSSource
       (except the computed ellipse and along/cross-track columns)
-  ssobject-permutation SSSOURCE DIA MPCORB [--max-objects N]
+  ssobject-permutation SSSOURCE [DIA] MPCORB [--max-objects N]
       ssp-build-ssobject, run as a black box on copies of SSSource with
       the rows of each object permuted, must write byte-identical SSObject
-      files
+      files. SSObject reads its photometry from SSSource; DIA (passed on to
+      the builder, which ignores it) is needed only for --permute-dia
   ellipse SSSOURCE NEARBYSSO --orbits-a A --orbits-b B
       the error ellipse against NearbySSO's, for rows in both whose orbit is
       identical in the two mpc_orbits snapshots
@@ -1252,13 +1253,17 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
     """Run ssp-build-ssobject (a black box, via its CLI) on permuted copies
     of SSSource (one per seed: see ``permutation``; also the file's own
     order with ``include_original``) and require byte-identical outputs.
-    With ``permute_dia``, the DiaSource file is also given a random row
-    order per seed (restricted to the SSSource rows' obsids)."""
+    ``dia`` (None for none) is passed to the builder between SSSource and
+    the orbits, as its older 3-argument form had it; today's builder
+    ignores it. With ``permute_dia``, the DiaSource file is also given a
+    random row order per seed (restricted to the SSSource rows' obsids)."""
     import shlex
     import subprocess
     import tempfile
 
     rep = rep or Report(f"SSObject permutation invariance: {sssource}")
+    if permute_dia and dia is None:
+        raise ValueError("--permute-dia needs a DiaSource file")
     cmd = shlex.split(cmd) if isinstance(cmd, str) else list(cmd or default_ssobject_cmd())
     tmp = None
     if workdir is None:
@@ -1279,7 +1284,8 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
                 keep = pc.is_in(dia_t["obsid"], value_set=pc.unique(t["obsid"]))
                 dia_t = dia_t.filter(keep)
             rep.info(f"DiaSource: {len(dia_t):,} rows, permuted per seed")
-        rep.info(f"builder: {shlex.join(cmd)} SSSOURCE {dia} {mpcorb} --output OUT {shlex.join(extra_args)}")
+        rep.info(f"builder: {shlex.join(cmd)} SSSOURCE {dia + ' ' if dia else ''}{mpcorb} --output OUT "
+                 f"{shlex.join(extra_args)}")
         runs = [("original", None)] if include_original else []
         runs += [(f"seed {s}", s) for s in seeds]
         outs = []
@@ -1297,7 +1303,8 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
                 pq.write_table(dia_t.take(pa.array(dperm)), dia_src, compression="zstd")
             t0 = time.time()
             with open(os.path.join(workdir, f"ssobject.{tag}.log"), "w") as log:
-                r = subprocess.run([*cmd, src, dia_src, mpcorb, "--output", out, *extra_args],
+                r = subprocess.run([*cmd, src, *([dia_src] if dia_src else []), mpcorb, "--output", out,
+                                    *extra_args],
                                    stdout=log, stderr=subprocess.STDOUT)
             ok = r.returncode == 0 and os.path.exists(out)
             rep.check(f"builder succeeded ({name})", ok,
@@ -1306,7 +1313,7 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
             if ok:
                 outs.append((name, out))
                 os.remove(src)
-                if dia_src != dia:
+                if dia_src and dia_src != dia:
                     os.remove(dia_src)
         if len(outs) < 2:
             rep.check("at least two outputs to compare", False, f"{len(outs)}")
@@ -1622,8 +1629,9 @@ def main(argv=None):
     p.add_argument("--dia-sources", default=None)
     p = add("ssobject-permutation", "ssp-build-ssobject on row-permuted SSSource copies: identical output")
     p.add_argument("sssource")
-    p.add_argument("dia_sources")
-    p.add_argument("mpcorb")
+    p.add_argument("inputs", nargs="+", metavar="[DIA] MPCORB",
+                   help="the MPC orbits; optionally a DiaSource file before them (passed to the builder, "
+                        "which ignores it; needed for --permute-dia)")
     p.add_argument("--seeds", default="1,2", help="comma-separated permutation seeds (default: %(default)s)")
     p.add_argument("--include-original", action="store_true", help="also run on the file's own row order")
     p.add_argument("--permute-dia", action="store_true",
@@ -1673,7 +1681,10 @@ def main(argv=None):
         import shlex
         extra = shlex.split(a.builder_args) + (["--workers", str(a.workers)] if a.workers else [])
         seeds = [int(x) for x in a.seeds.split(",") if x.strip()]
-        rep = check_ssobject_permutation(a.sssource, a.dia_sources, a.mpcorb, seeds, a.max_objects,
+        if len(a.inputs) > 2:
+            ap.error("ssobject-permutation: expected SSSOURCE [DIA] MPCORB")
+        dia, mpcorb = (a.inputs if len(a.inputs) == 2 else (None, a.inputs[0]))
+        rep = check_ssobject_permutation(a.sssource, dia, mpcorb, seeds, a.max_objects,
                                          a.object_seed, a.workdir, a.builder, extra, a.include_original,
                                          a.shuffle_objects, a.permute_dia)
     elif a.cmd == "mock":

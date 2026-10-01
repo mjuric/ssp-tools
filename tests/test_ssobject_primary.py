@@ -6,6 +6,8 @@ import pandas as pd
 
 from ssp.ssobject import compute_ssobject
 
+from test_ssobject_parallel import widen
+
 
 def _tables(n=8):
     rng = np.random.default_rng(1)
@@ -26,7 +28,7 @@ def _tables(n=8):
 
 def test_nonprimary_and_undesignated_rows_do_not_count():
     sss, dia = _tables()
-    ref = compute_ssobject(sss, dia, None)
+    ref = compute_ssobject(widen(sss, dia), None)
 
     # a second submission of source 103 (same diaSourceId, new obsid) and an
     # undesignated detection
@@ -35,7 +37,7 @@ def test_nonprimary_and_undesignated_rows_do_not_count():
     sss2 = pd.concat([und, sss.iloc[:4], dup, sss.iloc[4:]], ignore_index=True)
     dia2 = pd.concat([dia, dia.iloc[[3]].assign(obsid="o3-again"),
                       dia.iloc[[0]].assign(obsid="u0", diaSourceId=999)], ignore_index=True)
-    obj = compute_ssobject(sss2, dia2, None)
+    obj = compute_ssobject(widen(sss2, dia2), None)
 
     assert len(obj) == len(ref) == 1
     for c in ("nObs", "r_nObs", "arc", "firstObservationMjdTai", "r_H", "r_G12", "r_nObsUsed"):

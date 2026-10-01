@@ -764,6 +764,22 @@ def test_ssobject_permutation_cli(tmp_path, builder):
                    "--mode sorted", "--max-objects", "3"]) == 0
     assert V.main(["ssobject-permutation", ss, "d", "m", "--builder", builder, "--builder-args",
                    "--mode first"]) == 1
+    # without the (ignored) DiaSource file: the builder gets SSSOURCE MPCORB
+    work = tmp_path / "nodia"
+    assert V.main(["ssobject-permutation", ss, "m", "--builder", builder, "--builder-args",
+                   "--mode sorted", "--workdir", str(work)]) == 0
+    with pytest.raises(ValueError, match="permute-dia"):
+        V.check_ssobject_permutation(ss, None, "m", cmd=builder, permute_dia=True)
+
+
+def test_ssobject_permutation_without_dia_passes_two_inputs(tmp_path):
+    ss = _many(tmp_path)
+    spy = tmp_path / "spy.py"
+    spy.write_text("import sys, shutil\nargs = sys.argv[1:]\nopen(args[args.index('--output') + 1], 'w')"
+                   ".write(repr(args[:args.index('--output')]).replace(args[0], 'SSS'))\n")
+    rep = V.check_ssobject_permutation(ss, None, "mpc.parquet", seeds=(1, 2), cmd=f"{sys.executable} {spy}")
+    assert rep.ok, rep.text()
+    assert "SSSOURCE mpc.parquet --output OUT" in rep.text()
 
 
 def test_permutation():

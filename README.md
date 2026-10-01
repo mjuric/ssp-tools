@@ -338,22 +338,26 @@ An end-to-end run is extraction, SSSource, then SSObject:
 ```bash
 extract-submitted-sources analysis/inputs/obs_sbn.parquet analysis/inputs/dia_sources.parquet
 ssp-build-sssource
-ssp-build-ssobject analysis/outputs/sssource.parquet analysis/inputs/dia_sources.parquet \
-  analysis/inputs/mpc_orbits.parquet --output analysis/outputs/ssobject.parquet
+ssp-build-ssobject analysis/outputs/sssource.parquet analysis/inputs/mpc_orbits.parquet \
+  --output analysis/outputs/ssobject.parquet
 ```
 
 ### SSObject Table Construction
 
-`ssp-build-ssobject` constructs SSObject tables from SSSource, DiaSource, and MPC orbit data. This tool processes photometric and orbital data to create comprehensive solar system object catalogs with fitted parameters.
+`ssp-build-ssobject` constructs SSObject tables from SSSource and MPC orbit data. This tool processes photometric and orbital data to create comprehensive solar system object catalogs with fitted parameters.
 
 Basic usage:
 ```bash
-ssp-build-ssobject sssource.parquet dia_sources.parquet mpc_orbits.parquet --output ssobject.parquet
+ssp-build-ssobject sssource.parquet mpc_orbits.parquet --output ssobject.parquet
 ```
 
+(The older form, `sssource.parquet dia_sources.parquet mpc_orbits.parquet`, is
+still accepted; the DiaSource file is not read.)
+
 Arguments:
-- `sssource.parquet` – SSSource Parquet file (from `ssp-build-sssource`; only the columns used are read)
-- `dia_sources.parquet` – DiaSource Parquet file with photometric measurements
+- `sssource.parquet` – SSSource Parquet file (from `ssp-build-sssource`; only the columns used are read).
+  The photometry is SSSource's own: `band`, and the float32 `psfFlux` and `psfFluxErr`, so SSObject
+  can be reproduced from the published SSSource.
 - `mpc_orbits.parquet` – MPC orbit Parquet file with orbital elements
 - `--output ssobject.parquet` – Output SSObject Parquet file
 - `--workers N` – Number of worker processes for the per-object fits and the MOIDs (default: `min(64, CPUs)`).
@@ -361,15 +365,41 @@ Arguments:
 - `--hg12MagSigmaFloor` – error floor (mag) added in quadrature to the magnitude errors before the H/G12 fits (default 0.05; 0 for none)
 - `--hg12NSigmaClip` – reject points beyond this many sigma of an initial robust fit (default 10; `inf` to keep every point)
 - `--hg12FixedG12` – fix G12 to this value and fit only H (default: unset, G12 is fit)
+- `--hg12FiducialG12` – the G12 of the fixed-G12 refit where a band's slope fit fails (default: `--hg12FixedG12` if set, else 0.5, as in DP2)
+- `--hg12MinPhaseSpan` – a slope fit whose points span less than this phase angle (deg) fails (default 2)
 
 The tool performs:
 - Photometric fitting (H/G12 parameters) for each band (ugrizy). By default
   each band's fit follows DP2's robust recipe: a 0.05 mag error floor, a
   robust (`soft_l1`) fit, rejection of points beyond 10σ, and a final
   least-squares fit of the rest. Unlike DP2, which fixed G12 at 0.5 (use
-  `--hg12FixedG12 0.5` for that), G12 is fit, bounded to [0, 1]. A G12 that
-  ends at a bound has no `G12Err` or H–G12 covariance (both NaN), and its
-  `HErr` is that of the fixed-G12 fit.
+  `--hg12FixedG12 0.5` for that), G12 is fit, bounded to [0, 1].
+- **Failed slope fits** (`{band}_slope_fit_failed`: "G12 fit failed in {band}
+  band. G12 contains a fiducial value used to fit H."). A band's G12 fit fails
+  when any of these holds:
+  1. the free G12 ends at a bound, within 1e-5 of 0 or 1;
+  2. the fit isn't invertible (JᵀJ singular): no finite result, or no
+     finite `G12Err` with G12 inside (0, 1);
+  3. fewer than 3 points are usable, or used after clipping (a band with
+     fewer than 3 observations gets no free fit);
+  4. the points it uses span less than `--hg12MinPhaseSpan` (2°) in phase
+     angle.
+
+  H is then refit with G12 fixed at the fiducial value (`--hg12FiducialG12`,
+  0.5), with the same error floor and clipping, which, as for the free fit,
+  applies only with more than 3 usable points. G12 holds that value,
+  `G12Err` and the H–G12 covariance are NULL, and `HErr`, `nObsUsed` and
+  `Chi2` are the fixed-G12 fit's. If clipping leaves a single point, H and
+  `HErr` come from that point (`nObsUsed` 1, `Chi2` NULL). Only if no point is
+  usable (every flux ≤ 0) or none survives clipping are H, `HErr` and G12
+  NULL (`nObsUsed` 0); the flag is set in every case. (As elsewhere in
+  SSObject, NULL is stored as NaN in the Parquet file.) With
+  `--hg12FixedG12`, G12 isn't fit, and the flag means the fixed fit failed.
+  Every band with at least one observation is fit (one point gives H at the
+  fiducial G12). The fits don't depend on the order of
+  the rows: each takes its observations in a canonical order (by phase angle,
+  magnitude, error, distances), so any permutation gives bitwise identical
+  results.
 - Orbital analysis including Tisserand parameter and MOID calculations
 - Quality metrics and observation statistics per object
 
