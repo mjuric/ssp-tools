@@ -124,6 +124,123 @@ def test_nearest_tie_break():
     assert B.nearest(np.zeros(0, np.int64), np.zeros(0), np.zeros(0, np.int64)).size == 0
 
 
+def test_distance_rank():
+    """1-based per prediction, by separation, ties to the lower
+    diaSourceId; in the input's order."""
+    pred = np.array([4, 4, 4, 4, 1, 1, 9])
+    dia_id = np.array([50, 20, 30, 10, 20, 10, 7])
+    sep = np.array([1.0, 0.5, 0.5, 3.0, 2.0, 2.0, 4.9])
+    r = B.distance_rank(pred, dia_id, sep)
+    assert r.dtype == np.int16
+    assert r.tolist() == [3, 1, 2, 4, 2, 1, 1]
+    # independent of the order of the matches
+    perm = np.random.default_rng(5).permutation(pred.size)
+    np.testing.assert_array_equal(B.distance_rank(pred[perm], dia_id[perm], sep[perm]), r[perm])
+    assert B.distance_rank(np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0)).dtype == np.int16
+    # repeated diaSourceIds count once, at their smallest separation: A at
+    # 1", its exact twin, B at 2" (rank 2, not 3); A again at 3" and C at
+    # 2.5"; every copy of A gets A's rank
+    pred = np.array([0, 0, 0, 0, 0])
+    dia_id = np.array([7, 7, 3, 7, 5])     # A=7, B=3, C=5
+    sep = np.array([1.0, 1.0, 2.0, 3.0, 2.5])
+    assert B.distance_rank(pred, dia_id, sep).tolist() == [1, 1, 2, 1, 3]
+
+
+def _east(ra, dec, arcsec):
+    return ra + arcsec / 3600.0 / np.cos(np.radians(dec)), dec
+
+
+def _rank_synth(tmp_path):
+    """Two nights. Night 1, one visit: P0 (orbit 0) and P1 (orbit 1, 3"
+    east of P0), and DiaSources around both, some nearer to P1. Night 2,
+    one visit, one prediction (orbit 2): two DiaSources at the same place
+    (a tie), one nearer, one farther, one outside the radius, and repeated
+    diaSourceIds (an exact twin of the nearest, a farther copy of one of
+    the tie), which count once. Returns the
+    path, the predictions and the expected (diaSourceId -> (orbit, rank))."""
+    ra0, dec0 = 10.0, 20.0
+    v1, v2 = 2025093000001, 2025100100001
+    # (diaSourceId, visit, offset east of P0 ["]; night 2: of P2)
+    src = [(105, v1, 1.0),     # P0 1.0 (rank 2), P1 2.0 (rank 2): P0's
+           (101, v1, 2.6),     # P0 2.6 (rank 3), P1 0.4 (rank 1): P1's
+           (104, v1, -0.5),    # P0 0.5 (rank 1), P1 3.5 (rank 4): P0's
+           (102, v1, -4.0),    # P0 4.0 (rank 4), P1 7.0 (out): P0's
+           (103, v1, 6.0),     # P0 6.0 (out), P1 3.0 (rank 3): P1's
+           (106, v1, 9.0),     # out of both
+           (300, v2, 2.0), (200, v2, 2.0),   # a tie: 200 ranks 2, 300 ranks 3
+           (250, v2, -1.0),    # rank 1
+           (250, v2, -1.0),    #   its exact twin: counted once
+           (200, v2, 4.8),     #   a farther copy of 200: counted once, at 2.0
+           (150, v2, 4.5),     # rank 4
+           (151, v2, 5.5)]     # out
+    p = np.zeros(3, dtype=B.PRED_DTYPE)
+    p["visit"] = [0, 0, 1]
+    p["orbit"] = [0, 1, 2]
+    p["ra"][0], p["dec"][0] = ra0, dec0
+    p["ra"][1], p["dec"][1] = _east(ra0, dec0, 3.0)
+    p["ra"][2], p["dec"][2] = 200.0, -30.0
+    rows = []
+    for sid, v, off in src:
+        k = 0 if v == v1 else 2
+        ra, dec = _east(p["ra"][k], p["dec"][k], off)
+        rows.append((sid, v, 60949.1 if v == v1 else 60950.2, ra, dec))
+    sid, visit, t, ra, dec = map(np.array, zip(*rows))
+    _write_dia(tmp_path / "rank.parquet", visit, t, ra, dec, sid)
+    want = {105: (0, 2), 101: (1, 1), 104: (0, 1), 102: (0, 4), 103: (1, 3),
+            300: (2, 3), 200: (2, 2), 250: (2, 1), 150: (2, 4)}
+    return tmp_path / "rank.parquet", p, want
+
+
+def _pass3(path, preds, slice_days, read_workers):
+    """Pass 3 and the parent's reduction, as ``build`` runs them, for
+    given predictions (the visits indexed over all nights in order)."""
+    nights, tmin, tmax, nsrc = B.night_ranges(path)
+    slices = B.plan_slices(nights, tmin, tmax, slice_days, nsrc)
+    vis_parts = []
+    for sl in slices:
+        dia = B._read_slice(path, sl)
+        u, start = np.unique(dia["visit"], return_index=True)
+        v = np.zeros(u.size, dtype=VISIT_DTYPE)
+        v["visit"], v["night"] = u, u // 100000
+        v["dia_start"], v["dia_end"] = start, np.r_[start[1:], dia["visit"].size]
+        vis_parts.append(v)
+    visits = np.concatenate(vis_parts)
+    vstart = np.r_[0, np.cumsum([v.size for v in vis_parts])].astype(np.int64)
+    p, poff = B.sort_predictions([preds.copy()], visits.size)
+    B._W.update(dia_path=path, slices=slices, threads=1, visits=visits, vstart=vstart, preds=p, poff=poff)
+    try:
+        res = B._map(B._match_slice, [(s, s + 1) for s in range(len(slices))], read_workers, "test",
+                     unit="slices")
+    finally:
+        B._W.clear()
+    per = [r for chunk, _, _ in res for r in chunk]
+    ids, k, sep, rank = (np.concatenate([r[j] for r in per]) for j in range(4))
+    sel = B.nearest(ids, sep, k)
+    return ids[sel], p["orbit"][k[sel]], rank[sel], len(slices)
+
+
+def test_rank_around_predictions(tmp_path, monkeypatch):
+    """diaDistanceRank counts every DiaSource within the radius of the
+    row's object's prediction, including those whose nearest object is
+    another; it is the same for any slicing, workers and match batches."""
+    path, preds, want = _rank_synth(tmp_path)
+    ids, orbit, rank, ns = _pass3(path, preds, 30, 1)
+    assert ns == 1
+    assert rank.dtype == np.int16
+    assert {int(i): (int(o), int(r)) for i, o, r in zip(ids, orbit, rank)} == want
+    assert ids.tolist() == sorted(want)
+    for days, rw in ((1, 1), (1, 2)):
+        i2, o2, r2, ns = _pass3(path, preds, days, rw)
+        assert ns == 2
+        np.testing.assert_array_equal(i2, ids)
+        np.testing.assert_array_equal(o2, orbit)
+        np.testing.assert_array_equal(r2, rank)
+    monkeypatch.setattr(B, "_MATCH_BATCH", 1)
+    i3, o3, r3, _ = _pass3(path, preds, 30, 1)
+    np.testing.assert_array_equal(i3, ids)
+    np.testing.assert_array_equal(r3, rank)
+
+
 def test_write_parquet_null_ssobjectid(tmp_path):
     rows = np.zeros(3, dtype=NEARBYSSO_DTYPE)
     rows["diaSourceId"] = [1, 2, 3]
@@ -133,6 +250,10 @@ def test_write_parquet_null_ssobjectid(tmp_path):
     B.write_parquet(rows, has, tmp_path / "n.parquet")
     t = pq.read_table(tmp_path / "n.parquet")
     assert t.column_names == list(NEARBYSSO_DTYPE.names)
+    from ssp.schema_ppdb import NearbySSODtype
+    assert t.column_names == list(NearbySSODtype.names)          # the schema's order
+    assert t.schema.field("diaDistanceRank").type == pa.int16()
+    assert not t.schema.field("diaDistanceRank").nullable
     assert t["ssObjectId"].to_pylist() == [11, None, 33]
     assert t.schema.field("ssObjectId").type == pa.int64()
     assert t.schema.field("designation").type == pa.string()
@@ -366,6 +487,27 @@ def test_end_to_end(tmp_path, synth, orbits, ephem, expected):
     assert DUP not in set(res["designation"])
     for col, e in (("ephRaErr", "ra_err"), ("ephDecErr", "dec_err"), ("ephRa_ephDec_Cov", "cov")):
         np.testing.assert_allclose(res[col], exp[e].astype(np.float32), rtol=1e-5, err_msg=col)
+    # diaDistanceRank, by brute force: every DiaSource of the visit within
+    # the radius of the row's prediction (ties to the lower diaSourceId),
+    # in the input as read (with the repeated diaSourceId), counting each
+    # distinct diaSourceId once, at its smallest separation
+    from ssp.util import sky_separation_arcsec
+    assert res["diaDistanceRank"].dtype == np.int16
+    full = pq.read_table(path).to_pandas()
+    for i, r in res.iterrows():
+        v = truth.loc[i, "visit"]
+        same = full[full["visit"] == v]
+        s = sky_separation_arcsec(r["ephRa"], r["ephDec"], same["ra"].to_numpy(), same["dec"].to_numpy())
+        near = s <= 5.0
+        nid, ns = same["diaSourceId"].to_numpy()[near], s[near]
+        best = {}
+        for j, x in zip(nid.tolist(), ns.tolist()):
+            best[j] = min(x, best.get(j, np.inf))
+        ranked = sorted(best, key=lambda j: (best[j], j))
+        assert r["diaDistanceRank"] == 1 + ranked.index(i), (i, v)
+    # hits, decoys, and a decoy behind the repeated diaSourceId (a distinct
+    # DiaSource of that visit, as its other copy is in another night)
+    assert set(res["diaDistanceRank"]) == {1, 2, 3}
     hits = truth.loc[res.index, "kind"] == "hit"
     np.testing.assert_allclose(res.loc[hits, "ephOffset"], 0.8, atol=1e-3)
     np.testing.assert_allclose(res.loc[~hits, "ephOffset"], 2.5, atol=1e-3)
