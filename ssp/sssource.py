@@ -75,6 +75,7 @@ DIA_DROPPED = VIEW_DROPPED + ("parentId", "obssubid", "match",
 EPH_FIELDS = [
     "ephRateRa", "ephRateDec", "ephRate",
     "ephRa", "ephDec", "ephOffsetDec", "ephOffsetRa", "ephOffset",
+    "ephOffsetAlongTrack", "ephOffsetCrossTrack",
     "helio_x", "helio_y", "helio_z", "helioRange",
     "helio_vx", "helio_vy", "helio_vz", "helio_vtot", "helioRangeRate",
     "topo_x", "topo_y", "topo_z", "topoRange",
@@ -89,6 +90,31 @@ EPH_FIELDS = [
 #: same).
 WORK_DTYPE = np.dtype([("ssObjectId", "<i8"), ("designation", SSSourceDtype["designation"])]
                       + [(c, SSSourceDtype[c]) for c in EPHEMERIS_COLUMNS])
+
+
+def along_cross_track(off_ra, off_dec, rate_ra, rate_dec):
+    """The offset (``off_ra``, which includes cos(dec), and ``off_dec``)
+    resolved along and across the predicted direction of motion (the rates
+    ``rate_ra``, which includes cos(dec), and ``rate_dec``), as pipe_tasks'
+    ssoAssociation computes them (see ssp.sssource_contract, block 6)::
+
+        along = (off_ra * rate_ra + off_dec * rate_dec) / rate
+        cross = (-off_ra * rate_dec + off_dec * rate_ra) / rate
+
+    with rate = hypot(rate_ra, rate_dec). The result is in the offsets'
+    units (independent of the rates'). Positive ``along`` is ahead of the
+    prediction; positive ``cross`` is to the left of the motion (the
+    motion rotated by +90 degrees, i.e. from +RA towards +Dec). Both are
+    NaN where the rate is 0 or not finite (no orbit). Computed in float64.
+    """
+    off_ra, off_dec, rate_ra, rate_dec = (np.asarray(x, dtype=np.float64)
+                                          for x in (off_ra, off_dec, rate_ra, rate_dec))
+    rate = np.hypot(rate_ra, rate_dec)
+    ok = np.isfinite(rate) & (rate > 0)
+    safe = np.where(ok, rate, 1.0)
+    along = np.where(ok, (off_ra * rate_ra + off_dec * rate_dec) / safe, np.nan)
+    cross = np.where(ok, (-off_ra * rate_dec + off_dec * rate_ra) / safe, np.nan)
+    return along, cross
 
 
 def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None):
@@ -137,6 +163,10 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None):
     sss["ephOffsetDec"] = (dia["dec"] - sss["ephDec"]) * 3600
     sss["ephOffsetRa"] = (dia["ra"] - sss["ephRa"]) * np.cos(np.deg2rad(sss["ephDec"])) * 3600
     sss["ephOffset"] = util.sky_separation_arcsec(sss["ephRa"], sss["ephDec"], dia["ra"], dia["dec"])
+    # along/cross-track [arcsec]: from the float64 offsets and rates (not
+    # the float32-stored rates); NaN (NULL) where the rate is 0
+    sss["ephOffsetAlongTrack"], sss["ephOffsetCrossTrack"] = along_cross_track(
+        sss["ephOffsetRa"], sss["ephOffsetDec"], e.mu_lon, e.mu_lat)
 
     # Compute heliocentric position components
     sss["helio_x"] = e.helio_pos[0]
@@ -724,9 +754,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     del assoc, designation
 
     # Block 6: NaN is NULL (a computed column with no value). The rest is
-    # as today's SSSource, bitwise, including the never-computed
-    # placeholders: diaDistanceRank (0) and, where there is an orbit,
-    # ephOffsetAlongTrack/ephOffsetCrossTrack (0.0).
+    # as today's SSSource, bitwise.
     for name in EPHEMERIS_COLUMNS:
         v = sss[name]
         mask = np.isnan(v) if v.dtype.kind == "f" else None
