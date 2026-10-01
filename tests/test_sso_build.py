@@ -10,6 +10,8 @@ columns, which must deliver the same tables.
 import datetime
 import json
 import os
+import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -317,9 +319,9 @@ print("fake step writing", out)
 if fail:
     sys.exit("fake failure")
 if out.endswith(".json"):
-    json.dump({"delivery:fake": {"status": "PASS" if n else "FAIL", "report": "checks/fake.txt"}},
-              open(out, "w"))
-    sys.exit(0 if n else 1)
+    checks = json.loads(sys.argv[4])
+    json.dump({k: {"status": v, "report": "checks/fake.txt"} for k, v in checks.items()}, open(out, "w"))
+    sys.exit(int(sys.argv[5]))
 pq.write_table(pa.table({"x": list(range(n))}), out)
 """
 
@@ -327,8 +329,11 @@ pq.write_table(pa.table({"x": list(range(n))}), out)
 @pytest.fixture
 def fake_steps(monkeypatch):
     """Replace the builder and check steps with stand-ins; the mpc step is
-    real. ``fails`` lists the steps that fail; ``rows`` the rows written."""
-    state = dict(fails=set(), rows=3, calls=[])
+    real. ``fails`` lists the steps that fail; ``rows`` the rows written;
+    ``checks`` the check results the fake check step writes, and
+    ``check_exit`` its exit code."""
+    state = dict(fails=set(), rows=3, calls=[], checks={c: "PASS" for c in B.EXPECTED_CHECKS},
+                 check_exit=0)
     real = B.step_command
 
     def step_command(step, inputs_dir, run_dir, manifest, workers):
@@ -340,7 +345,8 @@ def fake_steps(monkeypatch):
         if step == "check":
             (Path(run_dir) / "checks").mkdir(exist_ok=True)
             out = Path(run_dir).resolve() / "checks" / "results.json"
-            return [sys.executable, "-c", FAKE, str(out), fail, str(state["rows"])], {}
+            return [sys.executable, "-c", FAKE, str(out), fail, str(state["rows"]),
+                    json.dumps(state["checks"]), str(state["check_exit"])], {}
         table = B.STEP_TABLES[step][0]
         out = work / f"{table}.parquet"
         return ([sys.executable, "-c", FAKE, str(out), fail, str(state["rows"])],
@@ -371,7 +377,9 @@ def test_report_all_ok(tmp_path, fake_steps):
         assert e["file"] == f"delivery/{t}.parquet"
         assert e["md5"] == B._md5(p) and e["bytes"] == p.stat().st_size
     assert rep["tables"]["mpc_orbits"]["rows"] == 4 and rep["tables"]["SSSource"]["rows"] == 3
-    assert rep["checks"] == {"delivery:fake": {"status": "PASS", "report": "checks/fake.txt"}}
+    assert rep["checks"] == {c: {"status": "PASS", "report": "checks/fake.txt"} for c in B.EXPECTED_CHECKS}
+    assert rep["input_paths"]["obs_sbn"] == str((tmp_path / "in" / "obs_sbn.parquet").resolve())
+    assert all(rep["steps"][s]["ssp_tools_commit"] == rep["ssp_tools_commit"] for s in BUILD_STEPS)
     assert rep["inputs"] == B.read_manifest(tmp_path / "in")
     assert json.loads((tmp_path / "run" / "report.json").read_text()) == rep
     delivered = sorted(os.listdir(tmp_path / "run" / "delivery"))
@@ -380,11 +388,49 @@ def test_report_all_ok(tmp_path, fake_steps):
 
 def test_failed_check_not_deliverable(tmp_path, fake_steps):
     write_inputs(tmp_path / "in")
-    fake_steps["rows"] = 0             # (the fake check FAILs)
+    fake_steps["checks"]["delivery:SSObject"] = "FAIL"
+    fake_steps["check_exit"] = 1
     rep = B.build(tmp_path / "in", tmp_path / "run", log=_quiet)
     assert rep["steps"]["check"]["status"] == "failed"
-    assert rep["checks"]["delivery:fake"]["status"] == "FAIL"
+    assert rep["checks"]["delivery:SSObject"]["status"] == "FAIL"
     assert rep["deliverable"] is False
+
+
+@pytest.mark.parametrize("checks", [
+    "one FAIL",                 # (M3: the check results, not just the step's exit code)
+    "sssource missing",         # (an expected check that never ran)
+    "extra FAIL",
+])
+def test_deliverable_needs_every_check(tmp_path, fake_steps, checks):
+    """A check step that exits 0 is not enough: every expected check, by
+    name, must PASS."""
+    write_inputs(tmp_path / "in")
+    if checks == "one FAIL":
+        fake_steps["checks"]["delivery:NearbySSO"] = "FAIL"
+    elif checks == "sssource missing":
+        for c in ("sssource:conformance", "sssource:offsets"):
+            del fake_steps["checks"][c]
+    else:
+        fake_steps["checks"]["something:else"] = "FAIL"
+    rep = B.build(tmp_path / "in", tmp_path / "run", log=_quiet)
+    assert rep["steps"]["check"]["status"] == "ok"
+    assert rep["deliverable"] is False
+
+
+def test_deliverable_rules():
+    """_deliverable on hand-made reports (M3, M19)."""
+    ok = dict(steps={s: dict(status="ok") for s in BUILD_STEPS},
+              checks={c: dict(status="PASS") for c in B.EXPECTED_CHECKS},
+              tables={t: {} for t in DELIVERY_TABLES})
+    assert B._deliverable(ok) is True
+    for edit in (lambda r: r["tables"].pop("NearbySSO"),
+                 lambda r: r["checks"]["delivery:SSSource"].update(status="FAIL"),
+                 lambda r: r["checks"].pop("sssource:offsets"),
+                 lambda r: r.update(checks={}),
+                 lambda r: r["steps"]["ssobject"].update(status="skipped")):
+        r = json.loads(json.dumps(ok))
+        edit(r)
+        assert B._deliverable(r) is False
 
 
 def test_failed_step_then_from(tmp_path, fake_steps):
@@ -462,8 +508,25 @@ def test_check_real_delivery_check_fails(tmp_path, monkeypatch):
     (tmp_path / "delivery").mkdir()
     assert B.step_check(tmp_path, log=_quiet) is False
     res = json.loads((tmp_path / "checks" / "results.json").read_text())
-    assert set(res) == {f"delivery:{t}" for t in DELIVERY_TABLES}
+    assert set(res) == set(B.EXPECTED_CHECKS)
     assert all(v["status"] == "FAIL" for v in res.values())
+    assert "run from a source checkout" in (tmp_path / "checks" / "sssource-offsets.txt").read_text()
+
+
+def test_check_without_bench_fails(tmp_path, monkeypatch):
+    """Without bench/, the SSSource checks FAIL as not available, so the
+    delivery is not deliverable even if the delivery check passes."""
+    from collections import namedtuple
+    R = namedtuple("CheckResult", "name ok detail")
+    monkeypatch.setattr(B, "check_delivery",
+                        lambda d, **k: {t: [R("x", True, "ok")] for t in DELIVERY_TABLES})
+    monkeypatch.setattr(B, "have_sssource_validate", lambda: False)
+    (tmp_path / "delivery").mkdir()
+    assert B.step_check(tmp_path, log=_quiet) is False
+    res = json.loads((tmp_path / "checks" / "results.json").read_text())
+    assert set(res) == set(B.EXPECTED_CHECKS)
+    failed = [k for k, v in res.items() if v["status"] == "FAIL"]
+    assert failed == ["sssource:conformance", "sssource:offsets"]
 
 
 def test_check_delivery_results(tmp_path, monkeypatch):
@@ -479,9 +542,176 @@ def test_check_delivery_results(tmp_path, monkeypatch):
     (tmp_path / "delivery").mkdir()
     assert B.step_check(tmp_path, log=_quiet) is False
     res = json.loads((tmp_path / "checks" / "results.json").read_text())
-    assert set(res) == {f"delivery:{t}" for t in DELIVERY_TABLES}
+    assert set(res) == set(B.EXPECTED_CHECKS)
     assert [t for t in DELIVERY_TABLES if res[f"delivery:{t}"]["status"] == "FAIL"] == ["SSObject"]
     assert "FAIL  pk            dup" in (tmp_path / "checks" / "delivery-SSObject.txt").read_text()
+
+
+def test_from_refuses_missing_kept_table(tmp_path, fake_steps):
+    """(M9)"""
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    B.build(tmp_path / "in", run, log=_quiet)
+    (run / "delivery" / "SSSource.parquet").unlink()
+    with pytest.raises(ValueError, match="SSSource, from step sssource, is missing"):
+        B.build(tmp_path / "in", run, from_step="ssobject", log=_quiet)
+
+
+def test_from_refuses_changed_kept_table(tmp_path, fake_steps):
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    B.build(tmp_path / "in", run, log=_quiet)
+    pq.write_table(pa.table({"x": [9, 9, 9, 9]}), run / "delivery" / "SSSource.parquet")
+    with pytest.raises(ValueError, match="SSSource.parquet has changed since step sssource"):
+        B.build(tmp_path / "in", run, from_step="check", log=_quiet)
+
+
+def test_from_mixed_commits(tmp_path, fake_steps, monkeypatch):
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    monkeypatch.setattr(B, "ssp_tools_commit", lambda: "OLD")
+    B.build(tmp_path / "in", run, log=_quiet)
+    monkeypatch.setattr(B, "ssp_tools_commit", lambda: "NEW")
+    with pytest.raises(ValueError, match="built by other code"):
+        B.build(tmp_path / "in", run, from_step="nearbysso", log=_quiet)
+    rep = B.build(tmp_path / "in", run, from_step="nearbysso", allow_mixed_commits=True, log=_quiet)
+    assert rep["deliverable"] is True and rep["ssp_tools_commit"] == "NEW"
+    assert rep["mixed_commits"] == dict(mpc="OLD", sssource="OLD", ssobject="OLD", nearbysso="NEW",
+                                        check="NEW")
+    assert rep["steps"]["sssource"]["ssp_tools_commit"] == "OLD"
+    assert rep["steps"]["check"]["ssp_tools_commit"] == "NEW"
+
+
+def test_inputs_changed_during_build(tmp_path, fake_steps, monkeypatch):
+    """An input replaced after validation fails the check step."""
+    write_inputs(tmp_path / "in")
+    write_inputs(tmp_path / "other", n=7)
+    inner = B.step_command
+
+    def sc(step, *a, **k):
+        if step == "sssource":
+            shutil.copy(tmp_path / "other" / "dia_sources.parquet", tmp_path / "in" / "dia_sources.parquet")
+        return inner(step, *a, **k)
+
+    monkeypatch.setattr(B, "step_command", sc)
+    rep = B.build(tmp_path / "in", tmp_path / "run", log=_quiet)
+    assert rep["steps"]["nearbysso"]["status"] == "ok"
+    assert rep["steps"]["check"]["status"] == "failed"
+    assert "inputs changed during the build: ['dia_sources']" in rep["steps"]["check"]["error"]
+    assert rep["checks"] == {} and rep["deliverable"] is False
+
+
+def _uploaded(run, dry_run=False):
+    r = json.loads((run / "report.json").read_text())
+    r["upload"] = {"dry_run": dry_run, "object_prefix": "20261001T000000000", "message_id": "1"}
+    r["uploads"] = [dict(r["upload"])]
+    (run / "report.json").write_text(json.dumps(r))
+    return r
+
+
+@pytest.mark.parametrize("from_step", [None, "check"])
+def test_uploaded_run_dir_refused(tmp_path, fake_steps, from_step):
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    B.build(tmp_path / "in", run, log=_quiet)
+    before = _uploaded(run)
+    with pytest.raises(ValueError, match="was uploaded"):
+        B.build(tmp_path / "in", run, from_step=from_step, log=_quiet)
+    assert json.loads((run / "report.json").read_text()) == before
+    assert B.main([str(tmp_path / "in"), str(run)]) == 2
+    rep = B.build(tmp_path / "in", run, from_step=from_step, force_rebuild=True, log=_quiet)
+    assert rep["deliverable"] is True
+    assert rep["upload"] == before["upload"] and rep["uploads"] == before["uploads"]
+
+
+def test_dry_run_upload_not_refused(tmp_path, fake_steps):
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    B.build(tmp_path / "in", run, log=_quiet)
+    before = _uploaded(run, dry_run=True)
+    rep = B.build(tmp_path / "in", run, log=_quiet)
+    assert rep["deliverable"] is True and rep["uploads"] == before["uploads"]
+
+
+def test_stray_delivery_files_removed(tmp_path, fake_steps):
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    (run / "delivery" / "junk").mkdir(parents=True)
+    (run / "delivery" / "Extra.parquet").write_text("x")
+    msgs = []
+    rep = B.build(tmp_path / "in", run, log=msgs.append)
+    assert rep["deliverable"] is True
+    assert sorted(os.listdir(run / "delivery")) == sorted(f"{t}.parquet" for t in DELIVERY_TABLES)
+    assert sum("WARNING: removing" in m for m in msgs) == 2
+
+
+@pytest.mark.parametrize("edit, match", [
+    (lambda m: m["files"]["obs_sbn"].update(rows="4"), "rows '4' is not a row count"),
+    (lambda m: m["files"]["obs_sbn"].update(md5=None), "md5 None is not an md5"),
+    (lambda m: m["files"]["obs_sbn"].update(file=7), "file 7 is not a path"),
+    (lambda m: m["files"]["obs_sbn"].update(file="."), "is not a readable Parquet file|does not exist"),
+])
+def test_malformed_manifest_replaces_stale_report(tmp_path, edit, match):
+    write_inputs(tmp_path / "in")
+    _edit_manifest(tmp_path / "in", edit)
+    (tmp_path / "run").mkdir()
+    (tmp_path / "run" / "report.json").write_text(json.dumps({"deliverable": True, "old": 1}))
+    assert B.main([str(tmp_path / "in"), str(tmp_path / "run")]) == 1
+    rep = json.loads((tmp_path / "run" / "report.json").read_text())
+    assert rep["deliverable"] is False and "old" not in rep
+    assert re.search(match, rep["error"])
+
+
+def test_hashing_oserror_is_a_manifest_error(tmp_path, monkeypatch):
+    write_inputs(tmp_path / "in")
+
+    def boom(path, blocksize=0):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(B, "_md5", boom)
+    rep = B.build(tmp_path / "in", tmp_path / "run", log=_quiet)
+    assert rep["deliverable"] is False and "PermissionError" in rep["error"]
+
+
+@pytest.mark.parametrize("edit, match", [
+    (lambda m: m["files"]["mpc_orbits"].update(extracted_utc="2020-01-01T00:00:00Z"),
+     "mpc_orbits: extracted_utc"),
+    (lambda m: m.update(mpc_snapshot_utc="2020-01-01T00:00:00Z"), "must come from one snapshot"),
+    (lambda m: m.update(mpc_snapshot_utc="yesterday"), "not an ISO 8601 time"),
+])
+def test_manifest_one_mpc_snapshot(tmp_path, edit, match):
+    write_inputs(tmp_path)
+    _edit_manifest(tmp_path, edit)
+    with pytest.raises(B.ManifestError, match=match):
+        B.validate_manifest(tmp_path)
+
+
+def test_manifest_snapshot_z_and_offset_equal(tmp_path):
+    m = write_inputs(tmp_path)
+    t = B._parse_utc(m["mpc_snapshot_utc"])
+    _edit_manifest(tmp_path, lambda m: m.update(mpc_snapshot_utc=t.strftime("%Y-%m-%dT%H:%M:%SZ")))
+    B.validate_manifest(tmp_path)
+
+
+def test_recorded_md5_rules():
+    a, b, c = "a" * 32, "b" * 32, "c" * 32
+    e = {"source": f"rebuilt; old_obs_sbn (md5 {a}) replaced by obs_sbn (md5 {b})"}
+    assert B.recorded_parent_md5(e, "obs_sbn") == b
+    assert B.recorded_parent_md5({"obs_sbn_md5": "", "source": f"x obs_sbn (md5 {c})"}, "obs_sbn") == ""
+
+
+def test_manifest_empty_obs_sbn_md5_refused(tmp_path):
+    m = write_inputs(tmp_path)
+    md5 = m["files"]["obs_sbn"]["md5"]
+    _edit_manifest(tmp_path, lambda m: m["files"]["dia_sources"].update(
+        obs_sbn_md5="", source=f"on obs_sbn (md5 {md5})"))
+    with pytest.raises(B.ManifestError, match="out of step"):
+        B.validate_manifest(tmp_path)
+
+
+def test_json_nan_rejected():
+    assert B._check_json(['{"a": 1}', None, '{"a": NaN}'], 10) == (12, "invalid JSON: NaN is not JSON")
+    assert B._check_json(['{"a": -Infinity}'], 0)[1] == "invalid JSON: -Infinity is not JSON"
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +786,14 @@ def test_e2e_subset(e2e):
         assert s.names == [c["name"] for c in SCHEMA[t]], t
     orb = pq.read_table(d / "run" / "delivery" / "mpc_orbits.parquet")
     assert orb["designation"].equals(orb["unpacked_primary_provisional_designation"])
+    # NearbySSO's ssObjectId is SSObject's, by designation (M13: --ssobject)
+    sso = pq.read_table(d / "run" / "delivery" / "SSObject.parquet", columns=["designation", "ssObjectId"])
+    ids = dict(zip(sso["designation"].to_pylist(), sso["ssObjectId"].to_pylist()))
+    nss = pq.read_table(d / "run" / "delivery" / "NearbySSO.parquet", columns=["designation", "ssObjectId"])
+    pairs = list(zip(nss["designation"].to_pylist(), nss["ssObjectId"].to_pylist()))
+    assert sum(des in ids for des, _ in pairs) > 0
+    for des, sid in pairs:
+        assert sid == ids.get(des), (des, sid)
     assert (d / "run" / "work" / "sssource" / "in" / "obs_sbn.parquet").is_symlink()
 
 

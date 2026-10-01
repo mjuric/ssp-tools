@@ -55,6 +55,7 @@ from .delivery_contract import (
     DELIVERY_TABLES,
     DERIVED_FROM,
     INPUT_FILES,
+    MPC_SNAPSHOT,
     MANIFEST_FIELDS,
     MANIFEST_FILE,
     REPORT_FILE,
@@ -93,6 +94,10 @@ CHECK_RESULTS = "results.json"
 #: The SSSource content checks of bench/sssource_validate.py run by ``check``.
 SSSOURCE_CHECKS = ("conformance", "offsets")
 
+#: The checks a deliverable run must have passed, by name.
+EXPECTED_CHECKS = (tuple(f"delivery:{t}" for t in DELIVERY_TABLES)
+                   + tuple(f"sssource:{c}" for c in SSSOURCE_CHECKS))
+
 MPC_BATCH_ROWS = 131_072
 
 
@@ -129,13 +134,17 @@ def _write_json(obj, path):
 
 
 def ssp_tools_commit():
-    """The git commit of this code (``-dirty`` if the tree has changes), or
-    None outside a git checkout."""
+    """The git commit of this code, with ``-dirty`` if the checkout has
+    uncommitted changes, or untracked files under ssp/ or bench/ (code that
+    may run); None outside a git checkout."""
+    git = ["git", "-C", str(REPO_ROOT)]
     try:
-        sha = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], capture_output=True,
+        sha = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True,
                              text=True, check=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", str(REPO_ROOT), "status", "--porcelain", "--untracked-files=no"],
+        dirty = subprocess.run([*git, "status", "--porcelain", "--untracked-files=no"],
                                capture_output=True, text=True, check=True).stdout.strip()
+        dirty += subprocess.run([*git, "ls-files", "--others", "--exclude-standard", "--", "ssp", "bench"],
+                                capture_output=True, text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return None
     return sha + ("-dirty" if dirty else "")
@@ -164,11 +173,43 @@ def read_manifest(inputs_dir):
     return manifest
 
 
+_MD5_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _parse_utc(value):
+    """An ISO 8601 time (``Z`` allowed) as an aware datetime, or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo is not None else None
+
+
+def input_md5s(inputs_dir, manifest, workers=8):
+    """{name: md5} of every input file, hashed now (in threads)."""
+    names = list(INPUT_FILES)
+    with ThreadPoolExecutor(max(1, min(workers, len(names)))) as pool:
+        md5s = list(pool.map(lambda n: _md5(input_path(inputs_dir, manifest, n)), names))
+    return dict(zip(names, md5s))
+
+
 def validate_manifest(inputs_dir, workers=8):
     """Read and check ``INPUTS_DIR/manifest.json`` against the files; return
-    it. Raises ManifestError listing every problem: a missing manifest
-    field, a missing input (INPUT_FILES) or file, a row count or md5 that
-    does not match, or a missing REQUIRED_INPUT_COLUMNS column."""
+    it. Raises ManifestError listing every problem: a missing or malformed
+    manifest field, a missing input (INPUT_FILES) or file, a row count or
+    md5 that does not match, a missing REQUIRED_INPUT_COLUMNS column, a
+    DERIVED_FROM input built from another parent, or MPC_SNAPSHOT inputs
+    not all extracted at ``mpc_snapshot_utc``. An OSError reading a file is
+    a ManifestError too."""
+    try:
+        return _validate_manifest(inputs_dir, workers)
+    except OSError as e:
+        raise ManifestError(f"invalid inputs: {type(e).__name__}: {e}") from e
+
+
+def _validate_manifest(inputs_dir, workers):
     manifest = read_manifest(inputs_dir)
     problems = [f"manifest lacks {k!r}" for k in MANIFEST_FIELDS if k not in manifest]
     files = manifest.get("files")
@@ -184,6 +225,16 @@ def validate_manifest(inputs_dir, workers=8):
         missing = [k for k in ("file", "rows", "md5") if k not in entry]
         if missing:
             problems.append(f"{name}: manifest entry lacks {missing}")
+            continue
+        bad = []
+        if not isinstance(entry["file"], str) or not entry["file"]:
+            bad.append(f"file {entry['file']!r} is not a path")
+        if not isinstance(entry["rows"], int) or isinstance(entry["rows"], bool) or entry["rows"] < 0:
+            bad.append(f"rows {entry['rows']!r} is not a row count")
+        if not isinstance(entry["md5"], str) or not _MD5_RE.fullmatch(entry["md5"]):
+            bad.append(f"md5 {entry['md5']!r} is not an md5")
+        if bad:
+            problems.append(f"{name}: malformed manifest entry: {'; '.join(bad)}")
             continue
         path = input_path(inputs_dir, manifest, name)
         if not path.is_file():
@@ -209,7 +260,7 @@ def validate_manifest(inputs_dir, workers=8):
             problems.append(f"{name}: md5 of {path} is {got}, the manifest says {want}")
 
     for name, parent in DERIVED_FROM.items():
-        if name not in files or parent not in files:
+        if not isinstance(files.get(name), dict) or not isinstance(files.get(parent), dict):
             continue
         recorded = recorded_parent_md5(files[name], parent)
         if recorded is None:
@@ -218,6 +269,21 @@ def validate_manifest(inputs_dir, workers=8):
         elif recorded != files[parent].get("md5"):
             problems.append(f"{name} was built from a {parent} of md5 {recorded}, not this one "
                             f"({files[parent].get('md5')}): the two are out of step")
+
+    # one MPC snapshot: every MPC_SNAPSHOT input extracted at mpc_snapshot_utc
+    snap = _parse_utc(manifest.get("mpc_snapshot_utc"))
+    if "mpc_snapshot_utc" in manifest and snap is None:
+        problems.append(f"mpc_snapshot_utc {manifest['mpc_snapshot_utc']!r} is not an ISO 8601 time "
+                        "with a time zone")
+    elif snap is not None:
+        for name in MPC_SNAPSHOT:
+            entry = files.get(name)
+            if not isinstance(entry, dict):
+                continue
+            if _parse_utc(entry.get("extracted_utc")) != snap:
+                problems.append(f"{name}: extracted_utc {entry.get('extracted_utc')!r} is not the MPC "
+                                f"snapshot's ({manifest['mpc_snapshot_utc']}): the MPC inputs must come "
+                                "from one snapshot")
 
     if problems:
         raise ManifestError("invalid inputs: " + "; ".join(problems))
@@ -228,10 +294,13 @@ def recorded_parent_md5(entry, parent):
     """The md5 of the ``parent`` input a derived input's manifest ``entry``
     was built from (DERIVED_FROM): its ``<parent>_md5``, else (manifests
     before that field) the ``<parent> (md5 ...)`` in its ``source``, as
-    ssp-extract-sso-inputs writes it; None if neither is there."""
-    if entry.get(f"{parent}_md5"):
-        return entry[f"{parent}_md5"]
-    m = re.search(rf"{re.escape(parent)} \(md5 ([0-9a-f]{{32}})\)", str(entry.get("source", "")))
+    ssp-extract-sso-inputs writes it; None if neither is there. A
+    ``<parent>_md5`` that is present is returned as is, even if empty
+    (and then refused), never replaced by the fallback."""
+    key = f"{parent}_md5"
+    if key in entry:
+        return entry[key]
+    m = re.search(rf"\b{re.escape(parent)} \(md5 ([0-9a-f]{{32}})\)", str(entry.get("source", "")))
     return m.group(1) if m else None
 
 
@@ -242,15 +311,17 @@ def write_manifest(inputs_dir, files, producer="hand-made", mpc_snapshot_utc=Non
     ``<name>_<parent>_md5=``). For tests and for inputs from other sources;
     stage 1 writes its own."""
     now = _utcnow()
+    snapshot = mpc_snapshot_utc or now
     entries = {}
     for name, file in files.items():
         path = Path(inputs_dir) / file
         entries[name] = dict(file=str(file), rows=pq.ParquetFile(path).metadata.num_rows, md5=_md5(path),
-                             source=extra.pop(f"{name}_source", "file"), extracted_utc=now)
+                             source=extra.pop(f"{name}_source", "file"),
+                             extracted_utc=snapshot if name in MPC_SNAPSHOT else now)
     for name, parent in DERIVED_FROM.items():
         if name in entries and parent in entries:
             entries[name][f"{parent}_md5"] = extra.pop(f"{name}_{parent}_md5", entries[parent]["md5"])
-    manifest = dict(created_utc=now, producer=producer, mpc_snapshot_utc=mpc_snapshot_utc or now,
+    manifest = dict(created_utc=now, producer=producer, mpc_snapshot_utc=snapshot,
                     files=entries, **extra)
     _write_json(manifest, Path(inputs_dir) / MANIFEST_FILE)
     return manifest
@@ -359,14 +430,19 @@ def cast_column(where, arr, col):
     return out
 
 
+def _no_constant(name):
+    raise ValueError(f"{name} is not JSON")
+
+
 def _check_json(values, offset):
     """(row, error) of the first value of ``values`` (strings or None) that
-    is not a JSON object, or None."""
+    is not a JSON object (NaN and Infinity, which Python's json accepts,
+    are not JSON), or None."""
     for i, s in enumerate(values):
         if s is None:
             continue
         try:
-            v = json.loads(s)
+            v = json.loads(s, parse_constant=_no_constant)
         except ValueError as e:
             return offset + i, f"invalid JSON: {e}"
         if not isinstance(v, dict):
@@ -419,7 +495,8 @@ def shape_mpc_table(table, src, dst, schema=None, workers=1, batch_rows=MPC_BATC
 
     tmp = f"{dst}.tmp"
     n = 0
-    pool = (ProcessPoolExecutor(workers, mp_context=get_context("fork"))
+    # (forkserver: forking this process, with Arrow threads, is unsafe)
+    pool = (ProcessPoolExecutor(workers, mp_context=get_context("forkserver"))
             if json_cols and workers > 1 else None)
     pending = []
 
@@ -487,7 +564,9 @@ def have_sssource_validate():
 def step_check(run_dir, log=_log):
     """The delivery check of every delivered table, and SSSource's content
     checks; writes ``RUN_DIR/checks/<check>.txt`` and ``results.json``
-    ({check: {status, report}}). Returns True if every check passed."""
+    ({check: {status, report}}). Returns True if every check passed. The
+    SSSource checks need bench/ (a source checkout): without it they FAIL,
+    as not available."""
     run_dir = Path(run_dir)
     delivery = run_dir / DELIVERY_DIR
     checks = run_dir / CHECKS_DIR
@@ -512,8 +591,11 @@ def step_check(run_dir, log=_log):
                 rep.write_text(f"{' '.join(cmd)} exited {r.returncode} without a report\n")
             record(f"sssource:{name}", r.returncode == 0, rep)
     else:
-        log(f"WARNING: {REPO_ROOT / 'bench' / 'sssource_validate.py'} not found: "
-            f"SSSource checks {SSSOURCE_CHECKS} not run")
+        for name in SSSOURCE_CHECKS:
+            rep = checks / f"sssource-{name}.txt"
+            rep.write_text(f"FAIL: not available: {REPO_ROOT / 'bench' / 'sssource_validate.py'} not "
+                           "found; run from a source checkout\n")
+            record(f"sssource:{name}", False, rep)
 
     # The delivery check (ssp.delivery_check, WP H)
     per_table = check_delivery(delivery)
@@ -610,7 +692,9 @@ sys.exit(code if code >= 0 else 128 - code)
 
 def run_logged(cmd, log_path, env=None):
     """Run ``cmd`` with its stdout and stderr to ``log_path``; return
-    (exit code, wall s, peak RSS GB of it and its descendants)."""
+    (exit code, wall s, max RSS GB). The max RSS is the peak RSS of the
+    largest single process (``cmd`` or one of its descendants, e.g. a pool
+    worker), not the step's total: the report's ``max_rss_gb``."""
     env = dict(os.environ if env is None else env)
     env.setdefault("OMP_NUM_THREADS", "1")
     rusage = f"{log_path}.rusage.json"
@@ -646,9 +730,12 @@ def table_entry(run_dir, table):
 
 
 def _deliverable(report):
+    """Every step ok, every EXPECTED_CHECKS check (and any other) PASS, and
+    every delivered table present."""
+    checks = report.get("checks") or {}
     return (all(report["steps"].get(s, {}).get("status") == "ok" for s in BUILD_STEPS)
-            and bool(report["checks"])
-            and all(c["status"] == "PASS" for c in report["checks"].values())
+            and all(checks.get(c, {}).get("status") == "PASS" for c in EXPECTED_CHECKS)
+            and all(c.get("status") == "PASS" for c in checks.values())
             and all(t in report["tables"] for t in DELIVERY_TABLES))
 
 
@@ -667,28 +754,72 @@ def _clear_step_outputs(run_dir, steps):
             log.unlink()
 
 
-def build(inputs_dir, run_dir, from_step=None, workers=1, log=_log):
+def _remove_strays(run_dir, log):
+    """Remove anything in RUN_DIR/delivery other than the delivered tables."""
+    d = Path(run_dir) / DELIVERY_DIR
+    if not d.is_dir():
+        return
+    keep = {f"{t}.parquet" for t in DELIVERY_TABLES}
+    for p in sorted(d.iterdir()):
+        if p.name not in keep:
+            log(f"WARNING: removing {p}, which is not a delivered table")
+            shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+
+
+#: The report fields stage 3 writes, carried over by a rebuild.
+UPLOAD_FIELDS = ("upload", "uploads")
+
+
+def real_uploads(report):
+    """The upload records of ``report`` that are not dry runs."""
+    recs = [report.get("upload")] + list(report.get("uploads") or [])
+    return [r for r in recs if isinstance(r, dict) and r.get("dry_run") is not True]
+
+
+def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, allow_mixed_commits=False,
+          log=_log):
     """Run stage 2 (see the module docstring); return the report. A failed
     step or invalid inputs do not raise: see the report's ``deliverable``
-    (and, for the inputs, ``error``). Raises ValueError if ``from_step``
-    cannot rerun this RUN_DIR (no earlier report, other inputs, an earlier
-    step that failed or whose output is missing)."""
+    (and, for the inputs, ``error``).
+
+    Raises ValueError, changing nothing, if RUN_DIR was uploaded (a real
+    upload in its report) and not ``force_rebuild`` (which keeps the upload
+    history); or if ``from_step`` cannot rerun this RUN_DIR: no earlier
+    report, other inputs, an earlier step that failed, a kept table missing
+    or changed since, or kept steps built by another commit (unless
+    ``allow_mixed_commits``, recorded in the report as ``mixed_commits``).
+    """
     inputs_dir, run_dir = Path(inputs_dir), Path(run_dir)
     if from_step is not None and from_step not in BUILD_STEPS:
         raise ValueError(f"--from: unknown step {from_step!r} (one of {', '.join(BUILD_STEPS)})")
-    run_dir.mkdir(parents=True, exist_ok=True)
     report_path = run_dir / REPORT_FILE
     start = BUILD_STEPS.index(from_step) if from_step else 0
     previous = None
-    if start > 0:
-        if not report_path.exists():
-            raise ValueError(f"--from {from_step}: no {report_path} of an earlier run")
-        with open(report_path) as f:
-            previous = json.load(f)
+    if report_path.exists():
+        try:
+            with open(report_path) as f:
+                previous = json.load(f)
+            if not isinstance(previous, dict):
+                raise ValueError("not a JSON object")
+        except ValueError as e:
+            if start > 0 or not force_rebuild:
+                raise ValueError(f"cannot read {report_path} ({e}): it may record an upload; "
+                                 "use --force-rebuild to build over it anyway") from e
+            previous = None
+    if start > 0 and previous is None:
+        raise ValueError(f"--from {from_step}: no {report_path} of an earlier run")
+    if previous is not None and real_uploads(previous) and not force_rebuild:
+        raise ValueError(f"{run_dir} was uploaded (see {report_path}): a rebuild would replace the "
+                         "uploaded delivery; build into a new RUN_DIR, or use --force-rebuild")
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    report = dict(inputs=None, ssp_tools_commit=ssp_tools_commit(),
+    commit = ssp_tools_commit()
+    report = dict(inputs=None, ssp_tools_commit=commit,
                   steps={s: dict(status="skipped") for s in BUILD_STEPS}, tables={}, checks={},
                   deliverable=False)
+    for k in UPLOAD_FIELDS:            # (stage 3's history survives a rebuild)
+        if previous is not None and k in previous:
+            report[k] = previous[k]
 
     def save():
         report["deliverable"] = _deliverable(report)
@@ -698,28 +829,15 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, log=_log):
         report["inputs"] = read_manifest(inputs_dir)
         manifest = validate_manifest(inputs_dir, workers=workers)
         report["inputs"] = manifest
-    except ManifestError as e:
+        report["input_paths"] = {n: str(input_path(inputs_dir, manifest, n).resolve()) for n in INPUT_FILES}
+    except (ManifestError, OSError) as e:
         report["error"] = str(e)
         log(f"ERROR: {e}")
         save()
         return report
 
-    if previous is not None:
-        err = None
-        old = (previous.get("inputs") or {}).get("files") or {}
-        if {k: v.get("md5") for k, v in old.items()} != {k: v["md5"] for k, v in manifest["files"].items()}:
-            err = f"--from {from_step}: the inputs differ from those of the run in {run_dir}"
-        else:
-            for s in BUILD_STEPS[:start]:
-                if previous["steps"].get(s, {}).get("status") != "ok":
-                    err = f"--from {from_step}: step {s} did not succeed in the earlier run"
-                    break
-                for t in STEP_TABLES[s]:
-                    if not (run_dir / DELIVERY_DIR / f"{t}.parquet").exists():
-                        err = f"--from {from_step}: {t}, from step {s}, is missing"
-                        break
-        if err:
-            raise ValueError(err)
+    if start > 0:
+        _check_from(previous, manifest, run_dir, from_step, commit, allow_mixed_commits, report)
         for s in BUILD_STEPS[:start]:
             report["steps"][s] = previous["steps"][s]
             for t in STEP_TABLES[s]:
@@ -727,6 +845,7 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, log=_log):
     else:
         _clear_step_outputs(run_dir, BUILD_STEPS)
     _clear_step_outputs(run_dir, BUILD_STEPS[start:])
+    _remove_strays(run_dir, log)
     for d in (DELIVERY_DIR, LOGS_DIR, WORK_DIR):
         (run_dir / d).mkdir(parents=True, exist_ok=True)
     save()
@@ -734,24 +853,27 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, log=_log):
     for step in BUILD_STEPS[start:]:
         log_path = run_dir / LOGS_DIR / f"{step}.log"
         entry = dict(status="running", started_utc=_utcnow(), wall_s=None, max_rss_gb=None,
-                     log=str(log_path.relative_to(run_dir)))
+                     log=str(log_path.relative_to(run_dir)), ssp_tools_commit=commit)
         report["steps"][step] = entry
         save()
         (run_dir / WORK_DIR / step).mkdir(parents=True, exist_ok=True)
         log(f"[{step}] started {entry['started_utc']}; log {log_path}")
         error = None
         try:
-            cmd, moves = step_command(step, inputs_dir, run_dir, manifest, workers)
-            code, wall, rss = run_logged(cmd, log_path)
-            entry.update(wall_s=round(wall, 1), max_rss_gb=None if rss is None else round(rss, 3))
-            if code != 0:
-                error = f"exited {code}; see {log_path}"
-            else:
-                for src, dst in moves.items():
-                    if not src.exists():
-                        error = f"did not write {src}"
-                        break
-                    os.replace(src, dst)
+            if step == "check":
+                error = _inputs_changed(inputs_dir, manifest, workers)
+            if error is None:
+                cmd, moves = step_command(step, inputs_dir, run_dir, manifest, workers)
+                code, wall, rss = run_logged(cmd, log_path)
+                entry.update(wall_s=round(wall, 1), max_rss_gb=None if rss is None else round(rss, 3))
+                if code != 0:
+                    error = f"exited {code}; see {log_path}"
+                else:
+                    for src, dst in moves.items():
+                        if not src.exists():
+                            error = f"did not write {src}"
+                            break
+                        os.replace(src, dst)
             if error is None:
                 for t in STEP_TABLES[step]:
                     report["tables"][t] = table_entry(run_dir, t)
@@ -759,7 +881,7 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, log=_log):
             error = f"{type(e).__name__}: {e}"
         if step == "check":
             res = run_dir / CHECKS_DIR / CHECK_RESULTS
-            if res.exists():
+            if res.exists():        # (not when the inputs changed: the checks did not run)
                 with open(res) as f:
                     report["checks"] = json.load(f)
         entry["status"] = "failed" if error else "ok"
@@ -777,6 +899,46 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, log=_log):
             break
     log(f"deliverable: {report['deliverable']}; report {report_path}")
     return report
+
+
+def _inputs_changed(inputs_dir, manifest, workers):
+    """None if every input still has its manifest md5 (hashed again, after
+    the builders, so the check covers what they read), else the error."""
+    now = input_md5s(inputs_dir, manifest, workers)
+    changed = [n for n, md5 in now.items() if md5 != manifest["files"][n]["md5"]]
+    if changed:
+        return f"inputs changed during the build: {changed} no longer match the manifest's md5"
+    return None
+
+
+def _check_from(previous, manifest, run_dir, from_step, commit, allow_mixed_commits, report):
+    """Refuse (ValueError) a --from rerun that would keep outputs it cannot
+    trust; see build."""
+    start = BUILD_STEPS.index(from_step)
+    old = (previous.get("inputs") or {}).get("files") or {}
+    if {k: v.get("md5") for k, v in old.items()} != {k: v["md5"] for k, v in manifest["files"].items()}:
+        raise ValueError(f"--from {from_step}: the inputs differ from those of the run in {run_dir}")
+    mixed = {}
+    for s in BUILD_STEPS[:start]:
+        entry = previous.get("steps", {}).get(s, {})
+        if entry.get("status") != "ok":
+            raise ValueError(f"--from {from_step}: step {s} did not succeed in the earlier run")
+        for t in STEP_TABLES[s]:
+            path = run_dir / DELIVERY_DIR / f"{t}.parquet"
+            if not path.exists():
+                raise ValueError(f"--from {from_step}: {t}, from step {s}, is missing")
+            want = (previous.get("tables") or {}).get(t, {}).get("md5")
+            if _md5(path) != want:
+                raise ValueError(f"--from {from_step}: {path} has changed since step {s} wrote it "
+                                 f"(md5 {want} in the report)")
+        built_by = entry.get("ssp_tools_commit", previous.get("ssp_tools_commit"))
+        if built_by != commit:
+            mixed[s] = built_by
+    if mixed:
+        if not allow_mixed_commits:
+            raise ValueError(f"--from {from_step}: the kept steps were built by other code ({mixed}; this is "
+                             f"{commit}); rerun them, or use --allow-mixed-commits")
+        report["mixed_commits"] = dict(mixed, **{s: commit for s in BUILD_STEPS[start:]})
 
 
 def _default_workers():
@@ -800,6 +962,11 @@ def main(argv=None):
                         help="Rerun from this step, keeping the earlier steps' outputs")
     parser.add_argument("--workers", type=int, default=_default_workers(),
                         help="Worker processes for each step (default: min(32, usable CPUs))")
+    parser.add_argument("--force-rebuild", action="store_true",
+                        help="Build into a RUN_DIR that stage 3 has uploaded (its upload history is kept)")
+    parser.add_argument("--allow-mixed-commits", action="store_true",
+                        help="With --from, keep steps built by another ssp-tools commit (recorded in "
+                             "the report as mixed_commits)")
     parser.add_argument("--run-step", choices=("mpc", "check"), default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.workers < 1:
@@ -812,7 +979,8 @@ def main(argv=None):
         return 0 if step_check(args.run_dir) else 1
 
     try:
-        report = build(args.inputs_dir, args.run_dir, from_step=args.from_step, workers=args.workers)
+        report = build(args.inputs_dir, args.run_dir, from_step=args.from_step, workers=args.workers,
+                       force_rebuild=args.force_rebuild, allow_mixed_commits=args.allow_mixed_commits)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
