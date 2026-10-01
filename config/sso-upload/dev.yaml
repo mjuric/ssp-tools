@@ -1,0 +1,11 @@
+# ssp-upload-sso config: the PPDB dev environment (DM-55678).
+# From DM-55678 and lsst/idf_deploy environment/deployments/ppdb/services/
+# (gcs.tf: bucket "ppdb-${environment}-sso-ingest"; pubsub.tf: topic
+# "load-sso-topic"; the project is the ppdb project_factory's project_id).
+# Credentials: Google application-default credentials, intended to be the
+# sso-uploader service account (idf_deploy services/sso-uploader.tf:
+# roles/storage.objectUser on the bucket, roles/pubsub.publisher on the topic).
+bucket_name: ppdb-dev-sso-ingest
+topic: load-sso-topic
+project: ppdb-dev-5c07          # the Pub/Sub topic's project
+# tables: [...]                 # optional; default: every DELIVERY_TABLES table

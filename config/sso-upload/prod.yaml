@@ -1,0 +1,11 @@
+# ssp-upload-sso config: the PPDB prod environment -- a TEMPLATE, commented out.
+#
+# Source: lsst/idf_deploy @ 9f810ac (2026-10-01), environment/deployments/ppdb/.
+# There is no prod deployment there yet: .github/workflows/ppdb-prod-*-tf.yaml
+# refer to env/prod-services.tfvars, which doesn't exist. By the same
+# services/gcs.tf and pubsub.tf the names would be:
+#
+# bucket_name: ppdb-prod-sso-ingest     # TODO: confirm once prod is deployed
+# topic: load-sso-topic
+# project: TODO                         # the prod ppdb project id (random-suffixed,
+#                                       # like ppdb-dev-5c07 and ppdb-int-6c62)

@@ -35,9 +35,15 @@ assist = [
   "assist",
   "rebound",
 ]
+upload = [
+  "google-cloud-storage>=2.10",
+  "google-cloud-pubsub>=2.18",
+]
 all = [
   "assist",
   "rebound",
+  "google-cloud-storage>=2.10",
+  "google-cloud-pubsub>=2.18",
 ]
 
 [project.scripts]
@@ -48,6 +54,8 @@ ssp-build-sssource = "ssp.sssource:main"
 ssp-build-ssobject = "ssp.ssobject:main"
 ssp-build-nearbysso = "ssp.nearbysso.build:main"
 ssp-generate-dtypes = "ssp.felis:main"
+ssp-upload-sso = "ssp.sso_upload:main"
+ssp-sso-daily = "ssp.sso_daily:main"
 
 [tool.pytest.ini_options]
 addopts = "-q"
