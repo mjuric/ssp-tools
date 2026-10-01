@@ -1,6 +1,6 @@
 # Design: the widened SSSource table (RFC-1188)
 
-Status: **approved** (2026-09-30); Phase 0 done (see "Phase 0 results"), Phase 1 in progress.
+Status: **implemented and validated** (2026-10-01) on the full 2026-09-30 fixture; see "Results". The schema change is committed locally on `sdm_schemas` `tickets/DM-55375` (a8615ae), not yet pushed.
 
 ## Context
 
@@ -128,6 +128,50 @@ The local branch is created from main 016e612.
 3. **Regression:** on the same inputs, every ephemeris column of the widened table is bitwise equal to today's SSSource.
 4. **The ellipse against NearbySSO:** for the AP-DS rows present in both (PPDB `DiaSource` = AP-DS), the two tables' ellipses must agree, since they use the same machinery and orbits.
 5. **End to end** on a fresh `obs_sbn` dump: extract → SSSource → SSObject. Row counts against `obs_sbn`, the `I` rows and the #7 rows reported, timings and memory recorded here.
+
+## Results (2026-10-01)
+
+**The integrated chain on the full fixture.** `extract-submitted-sources` → `ssp-build-sssource` → `ssp-build-ssobject`, using the `obs_sbn` X05 dump of 2026-10-01 06:25 UTC with same-transaction MPC tables, at `sssource-widened` f02875f and 32 workers on sdfiana031. The runbook is `/sdf/data/rubin/user/mjuric/sssource-widened/integration/RUNBOOK.md`.
+
+| stage | wall | peak RSS | output |
+|---|---|---|---|
+| `extract-submitted-sources` (8 ClickHouse queries at a time) | 27:00 (12:03 on an idle server; sdfiana035 was at load ~90) | 27 GB | `dia_sources.parquet`, 8,070,610 rows |
+| `ssp-build-sssource` | 3:10 | 13.4 GB | `sssource.parquet`, 8,070,610 rows × 181 columns, 3.06 GB |
+| `ssp-build-ssobject` | 1:21 | 5.7 GB | `ssobject.parquet`, 297,762 objects |
+
+Today's SSSource build on the same inputs takes 1:42 and peaks at 15.6 GB. Most of the difference is the error ellipse:
+- the ephemerides plus ellipse take 80 s, against about 45 s without the ellipse;
+- assembling and writing the 181 columns takes about 55 s.
+
+**Validation** (`bench/sssource_validate`): every check passes.
+
+| check | result |
+|---|---|
+| `conformance` (19 checks) | schema names, order, types and nullability; `obsid` unique; sort order; id split; `ssObjectId` rules; ellipse sanity; one `primary` row per measurement (22 non-primary rows); zstd; dictionary columns |
+| `copied` (5) | blocks 1, 3 and 4 equal `dia_sources.parquet` (126 block-4 columns × 8,070,610 rows; float64 → float32 after the cast) |
+| `clickhouse` (6) | 10,000 rows stratified by `processing`, re-fetched from `ssp.SubmittableSources`: block 3, block 4 and the id split all equal |
+| `regression` (8) | all 36 ephemeris and geometry columns bitwise equal to today's SSSource; `ssObjectId` NULL on exactly the 63,850 status-`I` rows and the 18 #7 rows |
+| `counts` (4) | rows equal the 8,070,610 resolved X05 `obs_sbn` rows; `status` agrees |
+| `ellipse` (3) | against NearbySSO (PPDB build, 2026-09-28 orbits), 214,882 AP-DS rows of 787 objects with identical orbits: \|ΔraErr\|/raErr median 1.7e-6, p99 4.8e-4, max 2.5e-3; \|Δρ\| max 1.9e-3. The residual is NearbySSO's interpolation between its samples; SSSource is evaluated at each exact time. |
+
+Further results:
+- **SSObject** from the widened SSSource is **byte-identical** to today's SSObject (md5 `645ccf34…`).
+- The error ellipse is NULL on 71 of the 8,006,742 rows with an orbit, all of one object whose covariance is not positive semi-definite. No propagation hit the step cap.
+- Rows by `matchMethod`: `obssubid` 8,070,562, `obssubid_trail` 40, `position` 8.
+
+## Known limitations and open owner decisions
+
+1. **The linear error ellipse understates the uncertainty of poorly constrained short arcs observed far from their epoch.**
+   - The WP3 review's Monte Carlo of the full chain gave spreads 30–700× the linear ellipse in such cases. For example, 2025 NT344 observed about 300 days before its epoch: 58″ linear, against about 10° in the Monte Carlo.
+   - NearbySSO has the same limitation, but its σ ≤ 10″ cut excludes those cases. SSSource publishes the ellipse as is.
+2. **SSObject depends on row order.** Its HG12 fits depend strongly on input row order: in another order, thousands of fits differ, `nObsUsed` and `slope_fit_failed` change, and HErr and G12 differ by up to 99%.
+   - It restores `dia_sources`' row order, which keeps its output identical to today's.
+   - It reads photometry from `dia_sources` (float64), not SSSource's float32 copies. So the published SSObject can't be reproduced exactly from the published SSSource.
+   - **Owner decision:** keep this, or switch SSObject once to SSSource's own order and columns.
+3. **Placeholder columns.** `diaDistanceRank` is 0 on every row, and `ephOffsetAlongTrack`/`ephOffsetCrossTrack` are 0.0 wherever there is an orbit. Neither is computed, today or now; they're kept as today so the regression can be bitwise.
+   - **Owner decision:** make them NULL, or compute them.
+4. **The Butler input path to `ssp.sssource` is gone.** The widened table needs the `obs_sbn` linkage, which only `extract-submitted-sources` output carries.
+5. **Pushing the schema.** `tickets/DM-55375` (sso_base.yaml and ppdb.yaml) is committed locally and awaits the owner's go-ahead to push and open the `sdm_schemas` PR. The version is left at 10.0.0 (see "Phase 0 results").
 
 ## Implementation plan
 
