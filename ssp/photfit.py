@@ -533,7 +533,8 @@ def fitHG12(
         ``nobs``
             Number of observations used (after clipping).
 
-        If ``_details`` is a dict, it gets ``used``, a mask of the input
+        If ``_details`` is a dict, it gets ``nusable``, the number of
+        finite, positive-error observations, ``used``, a mask of the input
         observations the final fit used (set unless the fit failed), and
         with clipping ``robust`` (H, G12) and ``keep`` (the clipping mask
         of the finite, positive-error observations, in input order).
@@ -541,6 +542,8 @@ def fitHG12(
         On failure, all float fields are NaN and ``nobs`` is 0.
     """
     prep = _prepare_hg12_inputs(mag, magSigma, phaseAngle, tdist, rdist, magSigmaFloor)
+    if _details is not None:
+        _details.update(nusable=0 if prep is None else len(prep[0]))
     if prep is None:
         return _FAILED
     mag, magSigma, phase_rad, idx, sel = prep
@@ -586,7 +589,9 @@ def fitHG12(
             phase_rad = phase_rad[keep]
             nobsv = len(mag)
 
-            if nobsv <= nparams:
+            # A free fit needs a degree of freedom left; a fixed-G12 fit
+            # (H alone) can be made from one point.
+            if nobsv < (1 if fixedG12 is not None else nparams + 1):
                 return _FAILED
 
             basis = _HG1G2_basis(phase_rad)

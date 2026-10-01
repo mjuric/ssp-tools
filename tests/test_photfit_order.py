@@ -150,3 +150,20 @@ def test_permutations_give_identical_fits(fn, kw, n, single_phase):
                 ref_keep[np.asarray(ref_order)[good[ref_order]]] = ref_det["keep"]
                 assert np.array_equal(keep, ref_keep)
 
+
+
+def test_ties_on_phase_and_mag_are_ordered_by_the_rest():
+    """Rows equal in phase angle and magnitude but not in error or
+    distance: the canonical order must still be total."""
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        k = 4
+        phase = np.repeat([3.0, 9.0, 17.0, 26.0], k)
+        mag = np.repeat(rng.uniform(19, 21, 4), k)
+        sig = rng.uniform(0.01, 0.3, 4 * k)
+        tdist = rng.uniform(0.8, 2.5, 4 * k)
+        rdist = rng.uniform(1.5, 3.5, 4 * k)
+        data = (mag, sig, phase, tdist, rdist)
+        ref = _bits(_fit(data, np.arange(4 * k)))
+        for order in _orders(4 * k, seed, k=10):
+            assert _bits(_fit(data, order)) == ref, seed

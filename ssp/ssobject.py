@@ -85,8 +85,9 @@ def _entry_columns(sss):
 # The slope (G12) fit of a band fails (``{band}_slope_fit_failed``) when
 # any of these holds; fit_band returns them as a bit mask.
 FAIL_BOUND = 1        # the free G12 ends at a bound (within G12_BOUND_TOL of 0 or 1)
-FAIL_SINGULAR = 2     # the fit failed: J^T J singular, or no finite result (other than FAIL_FEW)
-FAIL_FEW = 4          # fewer than MIN_SLOPE_OBS points used (after clipping)
+FAIL_SINGULAR = 2     # J^T J singular: no finite result (other than FAIL_FEW), or a
+                      # non-finite G12Err with G12 inside (0, 1)
+FAIL_FEW = 4          # fewer than MIN_SLOPE_OBS usable points, or used (after clipping)
 FAIL_SPAN = 8         # the points used span less than minPhaseSpan in phase angle
 FAILURES = {"bound": FAIL_BOUND, "singular": FAIL_SINGULAR, "few": FAIL_FEW, "span": FAIL_SPAN}
 
@@ -120,8 +121,10 @@ def fit_band(
     with the same error floor and clipping (clipping only with more than
     CLIP_MIN_OBS usable points, as the free fit); G12 is stored as that
     value, G12Err and Cov are NaN, and HErr, nObsUsed and Chi2 are the
-    fixed-G12 fit's. If that fit fails too (no usable point), H is NaN.
-    slope_fit_failed is set in either case.
+    fixed-G12 fit's. If clipping leaves one point, H, HErr come from it
+    (nObsUsed 1, Chi2 NaN). Only if no point is usable or none survives
+    clipping are H, HErr and G12 NaN (nObsUsed 0). slope_fit_failed is
+    set in either case. (NaN is how SSObject stores NULL.)
 
     With ``fixedG12`` set, G12 isn't fit and these rules don't apply:
     the fit is the fixed-G12 one, and slope_fit_failed is set only if
@@ -143,10 +146,13 @@ def fit_band(
             res = photfit.fitHG12(mag, magSigma, phaseAngle, tdist, rdist, _details=det, **kw)
         if res is None:
             failures = FAIL_FEW
-        elif not (np.isfinite(res.H) and np.isfinite(res.G12) and np.isfinite(res.H_err)):
-            # (clipped to fewer than MIN_SLOPE_OBS points, fitHG12 returns
-            # no result: that is FAIL_FEW)
-            few = "keep" in det and det["keep"].sum() < MIN_SLOPE_OBS
+        elif not (np.isfinite(res.H) and np.isfinite(res.G12) and np.isfinite(res.H_err)
+                  and (np.isfinite(res.G12_err) or res.G12 in (0., 1.))):
+            # (fewer than MIN_SLOPE_OBS usable points, or clipped to fewer:
+            # fitHG12 returns no result, and that is FAIL_FEW. A G12_err
+            # is NaN by design only at a bound.)
+            few = (det["nusable"] < MIN_SLOPE_OBS
+                   or ("keep" in det and det["keep"].sum() < MIN_SLOPE_OBS))
             failures = FAIL_FEW if few else FAIL_SINGULAR
         else:
             if min(res.G12, 1. - res.G12) <= G12_BOUND_TOL:
@@ -328,9 +334,10 @@ def compute_ssobject(
 
         1. the free G12 ends at a bound, within G12_BOUND_TOL (1e-5) of
            0 or 1;
-        2. the fit isn't invertible (J^T J singular) or has no finite
-           result;
-        3. it uses fewer than MIN_SLOPE_OBS (3) points, after clipping;
+        2. the fit isn't invertible (J^T J singular): no finite result,
+           or no finite G12Err with G12 inside (0, 1);
+        3. fewer than MIN_SLOPE_OBS (3) points are usable, or used after
+           clipping;
         4. the points it uses span less than ``minPhaseSpan`` (default
            2 deg) in phase angle.
 
@@ -338,8 +345,11 @@ def compute_ssobject(
         ``fixedG12`` if set, else 0.5), clipping as the free fit does
         (only with more than 3 usable points); G12 is stored as that value,
         G12Err and the H-G12 covariance are NaN, and HErr, nObsUsed and
-        Chi2 come from the fixed-G12 fit. If that fit is impossible too
-        (no usable point), H is NaN; the flag is set either way. With
+        Chi2 come from the fixed-G12 fit; one point left after clipping
+        gives H from that point (nObsUsed 1, Chi2 NaN). Only if no point
+        is usable, or none survives clipping, are H, HErr and G12 NaN
+        (nObsUsed 0); the flag is set either way. (SSObject stores NULL
+        as NaN.) With
         ``fixedG12`` set G12 isn't fit, and the flag means the fixed fit
         failed. Each fit is a function of the set of its band's points,
         whatever their order.

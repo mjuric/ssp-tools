@@ -75,7 +75,8 @@ def test_singular(monkeypatch):
     real = photfit.fitHG12
     # the free fit failing as for a singular J^T J (photfit returns _FAILED)
     monkeypatch.setattr(photfit, "fitHG12",
-                        lambda *a, **kw: photfit._FAILED if kw.get("fixedG12") is None else real(*a, **kw))
+                        lambda *a, **kw: (real(*a, **kw), photfit._FAILED)[1] if kw.get("fixedG12") is None
+                        else real(*a, **kw))
     out = fit_band(*data, **KW)
     assert out["failures"] == FAIL_SINGULAR
     _assert_fallback(out, data)
@@ -121,7 +122,7 @@ def test_few_after_clipping(monkeypatch):
     def clipped(*a, _details=None, **kw):
         if kw.get("fixedG12") is not None:
             return real(*a, **kw)
-        _details.update(keep=np.array([True, False, True, False]))
+        _details.update(nusable=4, keep=np.array([True, False, True, False]))
         return photfit._FAILED
     monkeypatch.setattr(photfit, "fitHG12", clipped)
     out = fit_band(*data, **KW)
@@ -210,3 +211,85 @@ def test_ssobject_columns():
         ok = ~failed & (nobs > 0)
         assert np.all((G[ok] > 0) & (G[ok] < 1)) and np.all(np.isfinite(Gerr[ok]))
     assert obj["g_slope_fit_failed"].any() and (~obj["g_slope_fit_failed"] & (obj["g_nObs"] > 0)).any()
+
+
+def test_one_point_left_after_clipping():
+    # 5 usable points, 4 of them far off and mutually inconsistent: the
+    # fallback's clipping leaves one, which gives H at the fiducial G12
+    mag, sig, phase, tdist, rdist = _band(n=5, lo=5.0, hi=6.0, noise=0.001)
+    mag += np.array([0.0, 1.0, 2.0, 3.0, 4.0])
+    data = (mag, sig, phase, tdist, rdist)
+    det = {}
+    ref = photfit.fitHG12(*data, fixedG12=0.5, clipMinObs=3, _details=det, **KW)
+    assert det["keep"].sum() == 1 and ref.nobs == 1
+    out = fit_band(*data, **KW)
+    assert out["failures"] & FAIL_FEW and out["slope_fit_failed"]
+    _assert_fallback(out, data)
+    k = np.flatnonzero(det["keep"])[0]
+    assert out["nObsUsed"] == 1 and np.isnan(out["Chi2"])
+    assert out["HErr"] == np.sqrt(sig[k]**2 + 0.05**2)
+    one = fit_band(*(a[[k]] for a in data), **KW)
+    assert out["H"] == one["H"] and out["G12"] == 0.5
+
+
+def test_few_usable_is_few_not_singular():
+    # >= 3 rows, at most two usable (non-positive fluxes give NaN mags)
+    for n_usable in (0, 1, 2):
+        mag, sig, phase, tdist, rdist = _band(n=4)
+        mag[n_usable:] = np.nan
+        out = fit_band(mag, sig, phase, tdist, rdist, **KW)
+        assert out["failures"] == FAIL_FEW, n_usable
+        assert out["nObsUsed"] == n_usable and np.isfinite(out["H"]) == (n_usable > 0)
+
+
+def test_nonfinite_G12err_inside_is_singular(monkeypatch):
+    data = _band()
+    real = photfit.fitHG12
+
+    def fit(*a, **kw):
+        r = real(*a, **kw)
+        return r._replace(G12_err=np.nan) if kw.get("fixedG12") is None else r
+    monkeypatch.setattr(photfit, "fitHG12", fit)
+    out = fit_band(*data, **KW)
+    assert out["failures"] == FAIL_SINGULAR
+    monkeypatch.undo()
+    _assert_fallback(out, data)
+
+
+def test_span_is_of_the_points_used():
+    # all points span 4 deg, the used ones (an outlier clipped) 1.5 deg
+    mag, sig, phase, tdist, rdist = _band(n=15, lo=10.0, hi=11.5)
+    extra = (mag[0] + 5, 0.01, 14.0, 1.5, 2.5)
+    data = tuple(np.append(a, v) for a, v in zip((mag, sig, phase, tdist, rdist), extra))
+    det = {}
+    photfit.fitHG12(*data, _details=det, **KW)
+    assert det["used"].sum() == 15 and not det["used"][-1]
+    out = fit_band(*data, **KW)
+    assert out["failures"] & FAIL_SPAN
+    _assert_fallback(out, data)
+
+
+def test_span_limit_is_strict():
+    # points spanning exactly the limit pass; just under it, they fail
+    data = _band(n=20, lo=10.0, hi=12.0, noise=1e-4)
+    out = fit_band(*data, **KW)
+    assert out["failures"] == 0, out["failures"]
+    assert fit_band(*data, minPhaseSpan=np.nextafter(2.0, 3.0), **KW)["failures"] & FAIL_SPAN
+
+
+def test_magnitudes_are_float64_from_float32_flux():
+    import pandas as pd
+    flux = np.array([1234.567, 98765.4, 17.25], np.float32)
+    err = np.array([12.5, 33.3, 4.1], np.float32)
+    sss = pd.DataFrame(dict(
+        ssObjectId=1, designation="x", primary=True, ephRa=1.0, midpointMjdTai=60000.0, band="r",
+        psfFlux=flux, psfFluxErr=err, extendedness=np.float32(0.5),
+        phaseAngle=np.float32(5.0), topoRange=np.float32(1.0), helioRange=np.float32(2.0)))
+    cols = ssobject._entry_columns(sss)
+    f64, e64 = flux.astype(np.float64), err.astype(np.float64)
+    assert cols["psfMag"].dtype == np.float64 and cols["psfMagErr"].dtype == np.float64
+    assert np.array_equal(cols["psfMag"], 31.4 - 2.5 * np.log10(f64))
+    assert np.array_equal(cols["psfMagErr"], 1.085736 * (e64 / f64))
+    # (a float32 conversion would differ)
+    f32 = (np.float32(31.4) - np.float32(2.5) * np.log10(flux)).astype(float)
+    assert not np.array_equal(cols["psfMag"], f32)

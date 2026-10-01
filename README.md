@@ -378,9 +378,10 @@ The tool performs:
   band. G12 contains a fiducial value used to fit H."). A band's G12 fit fails
   when any of these holds:
   1. the free G12 ends at a bound, within 1e-5 of 0 or 1;
-  2. the fit isn't invertible (JᵀJ singular) or has no finite result;
-  3. it uses fewer than 3 points, after clipping (a band with fewer than 3
-     observations gets no free fit);
+  2. the fit isn't invertible (JᵀJ singular): no finite result, or no
+     finite `G12Err` with G12 inside (0, 1);
+  3. fewer than 3 points are usable, or used after clipping (a band with
+     fewer than 3 observations gets no free fit);
   4. the points it uses span less than `--hg12MinPhaseSpan` (2°) in phase
      angle.
 
@@ -388,8 +389,11 @@ The tool performs:
   0.5), with the same error floor and clipping, which, as for the free fit,
   applies only with more than 3 usable points. G12 holds that value,
   `G12Err` and the H–G12 covariance are NULL, and `HErr`, `nObsUsed` and
-  `Chi2` are the fixed-G12 fit's. If no fixed-G12 fit is possible either (no
-  usable point left), H is NULL; the flag is set in both cases. With
+  `Chi2` are the fixed-G12 fit's. If clipping leaves a single point, H and
+  `HErr` come from that point (`nObsUsed` 1, `Chi2` NULL). Only if no point is
+  usable (every flux ≤ 0) or none survives clipping are H, `HErr` and G12
+  NULL (`nObsUsed` 0); the flag is set in every case. (As elsewhere in
+  SSObject, NULL is stored as NaN in the Parquet file.) With
   `--hg12FixedG12`, G12 isn't fit, and the flag means the fixed fit failed.
   Every band with at least one observation is fit (one point gives H at the
   fiducial G12). The fits don't depend on the order of
