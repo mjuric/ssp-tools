@@ -25,7 +25,7 @@ SSSOURCE_NONNULL = frozenset({
 
 #: Low-cardinality string columns, written dictionary-encoded.
 SSSOURCE_DICTIONARY = ("status", "matchMethod", "measuredOn", "processing", "processingTable",
-                       "band", "trailAlgorithm", "reliabilityVersion")
+                       "band", "reliabilityVersion")
 
 #: Row order of sssource.parquet (ascending; NULL ssObjectId rows last).
 SSSOURCE_SORT = ("ssObjectId", "midpointMjdTai", "obsid")
@@ -62,13 +62,24 @@ ELLIPSE_COLUMNS = ("ephRaErr", "ephDecErr", "ephRa_ephDec_Cov")
 # Rules for specific columns
 # --------------------------------------------------------------------------
 #
+# NULL and NaN:
+#   - Copied columns (blocks 1, 3 and 4, from dia_sources.parquet and
+#     obs_sbn) keep their value as is: a NULL stays NULL and a NaN stays NaN.
+#   - Computed columns (block 6) are NULL, not NaN, where there is no value.
+#   - String columns are NULL where there is no value, never ''.
+# Arrow field nullability: declared non-nullable exactly for
+#   SSSOURCE_NONNULL, nullable otherwise.
+# "No orbit" means ephRa/ephDec are NULL; the columns computed from the
+#   observed position alone (ecl*, gal*, elongation) are still filled.
+#
 # Block 1 (obs_sbn): obsid, trksub, trkid, submission_id and primary from
 #   dia_sources.parquet (the extractor's own); status from obs_sbn, joined
 #   on obsid. matchMethod from dia_sources.parquet (WP1).
 # Block 2: ssObjectId is NULL unless the row's object has an SSObject row,
 #   i.e. NULL for status-'I' rows (no designation) and for designated objects
 #   missing from mpc_orbits (issue #7). designation is the MPC's primary
-#   provisional designation whenever there is one (also for #7 rows).
+#   provisional designation whenever there is one (also for #7 rows), and
+#   NULL otherwise (status-'I' rows).
 # Block 3 and 4: copied from dia_sources.parquet, cast to SSSourceDtype; a
 #   narrowing cast must not overflow (fail if it would), float64 -> float32
 #   rounding is expected.
