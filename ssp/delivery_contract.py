@@ -137,3 +137,22 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
     if missing:
         raise ValueError(f"ppdb.yaml lacks delivery tables {sorted(missing)}")
     return out
+
+# --------------------------------------------------------------------------
+# The delivery check (WP H: ssp/delivery_check.py; called by build step
+# "check")
+# --------------------------------------------------------------------------
+#
+# check_table(table, parquet_path, schema_dir=SCHEMA_DIR)
+#     -> list[CheckResult]
+#   Every column of delivery_schema()[table], in order, with a compatible
+#   Arrow type (char/string -> string or dictionary<string>, long -> int64,
+#   int -> int32, short -> int16, float -> float32, double -> float64,
+#   boolean -> bool, timestamp -> timestamp) and no extra columns; no NULLs
+#   in nullable: false columns; the primary key unique and non-NULL.
+# check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES)
+#     -> dict[table, list[CheckResult]]
+#   Fails (a FAIL result) for a missing file.
+# CheckResult: a NamedTuple (name: str, ok: bool, detail: str).
+# CLI: python -m ssp.delivery_check DELIVERY_DIR [--tables ...]
+#   (exit 0 if every result is ok).
