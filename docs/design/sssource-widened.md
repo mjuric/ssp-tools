@@ -69,7 +69,7 @@ Each `*Mag`/`*MagErr` follows its own `*FluxErr`. The Source-only `ap03`/`ap06`/
 - **Block 6:** as in today's SSSource; the three ellipse columns are float, as in NearbySSO.
 
 **Writing the file:**
-- One Parquet file, zstd. The low-cardinality strings (`status`, `matchMethod`, `measuredOn`, `processing`, `processingTable`, `band`, `trailAlgorithm`, `reliabilityVersion`) are dictionary-encoded.
+- One Parquet file, zstd. The low-cardinality strings (`status`, `matchMethod`, `measuredOn`, `processing`, `processingTable`, `band`, `reliabilityVersion`) are dictionary-encoded.
 - Rows are sorted by (`ssObjectId`, `midpointMjdTai`), with the unidentified rows last.
 - The NumPy dtype comes from the Felis schema (`ssp/schema_ppdb.py`, generated). The writer **fails** if a non-null column has a null, or if a narrowing cast overflows. Narrowing float64 to float32 is expected and not an error.
 
