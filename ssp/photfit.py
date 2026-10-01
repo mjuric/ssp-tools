@@ -462,7 +462,7 @@ def _hg12_result(basis, mag, magSigma, H, G12, fixedG12, chi2_total):
 def fitHG12(
     mag, magSigma, phaseAngle, tdist, rdist,
     fixedG12=None, magSigmaFloor=0.0, nSigmaClip=None,
-    _details=None,
+    clipMinObs=None, _details=None,
 ):
     """Fit the HG12 phase curve model (Muinonen et al. 2010).
 
@@ -504,6 +504,10 @@ def fitHG12(
         (soft_l1 loss) followed by sigma clipping at this
         threshold, then a final linear least-squares refit on the
         clipped data. If None (default), no clipping is performed.
+    clipMinObs : int or None, optional
+        Clip only if more than this many usable observations are left
+        (default: the number of fitted parameters + 1, i.e. 3 for a
+        free G12 and 2 for a fixed one).
 
     Returns
     -------
@@ -556,7 +560,9 @@ def fitHG12(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
 
-        if nSigmaClip is not None and nobsv > nparams + 1:
+        if clipMinObs is None:
+            clipMinObs = nparams + 1
+        if nSigmaClip is not None and nobsv > clipMinObs:
             # Stage 1: robust fit with soft_l1 loss
             if fixedG12 is not None:
                 c, H_r = prof.robust(fixedG12)

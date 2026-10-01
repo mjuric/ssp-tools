@@ -385,7 +385,8 @@ The tool performs:
      angle.
 
   H is then refit with G12 fixed at the fiducial value (`--hg12FiducialG12`,
-  0.5), with the same error floor and clipping. G12 holds that value,
+  0.5), with the same error floor and clipping, which, as for the free fit,
+  applies only with more than 3 usable points. G12 holds that value,
   `G12Err` and the H–G12 covariance are NULL, and `HErr`, `nObsUsed` and
   `Chi2` are the fixed-G12 fit's. If no fixed-G12 fit is possible either (no
   usable point left), H is NULL; the flag is set in both cases. With

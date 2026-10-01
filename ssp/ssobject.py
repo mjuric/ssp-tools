@@ -95,6 +95,9 @@ FAILURES = {"bound": FAIL_BOUND, "singular": FAIL_SINGULAR, "few": FAIL_FEW, "sp
 G12_BOUND_TOL = 1e-5
 #: The fewest points (after clipping) a slope fit may use.
 MIN_SLOPE_OBS = 3
+#: Fits clip outliers only if more than this many usable points are left
+#: (the free fit's condition; the fiducial-G12 fallback uses it too).
+CLIP_MIN_OBS = 3
 #: The fiducial G12 of a failed slope fit (DP2's fixed value).
 FIDUCIAL_G12 = 0.5
 #: The smallest phase-angle span [deg] of the points a slope fit uses.
@@ -114,7 +117,8 @@ def fit_band(
     FAIL_* rule holds. A band with fewer than MIN_SLOPE_OBS observations
     gets no free fit at all (it would fail FAIL_FEW). On failure, H is
     refit with G12 fixed at ``fiducialG12`` (default FIDUCIAL_G12),
-    with the same error floor and clipping; G12 is stored as that
+    with the same error floor and clipping (clipping only with more than
+    CLIP_MIN_OBS usable points, as the free fit); G12 is stored as that
     value, G12Err and Cov are NaN, and HErr, nObsUsed and Chi2 are the
     fixed-G12 fit's. If that fit fails too (no usable point), H is NaN.
     slope_fit_failed is set in either case.
@@ -157,7 +161,10 @@ def fit_band(
         G = fixedG12
 
     if fixedG12 is not None or failures:
-        res = photfit.fitHG12(mag, magSigma, phaseAngle, tdist, rdist, fixedG12=G, **kw)
+        # (clipped under the same condition as the free fit, more than 3
+        # usable points, so it never uses fewer points than that would)
+        res = photfit.fitHG12(mag, magSigma, phaseAngle, tdist, rdist, fixedG12=G,
+                              clipMinObs=CLIP_MIN_OBS if fixedG12 is None else None, **kw)
         nDof = res.nobs - 1
         failed = bool(failures) or not np.isfinite(res.H)
         out = dict(H=res.H, HErr=res.H_err, G12=G if np.isfinite(res.H) else np.nan,
@@ -328,7 +335,8 @@ def compute_ssobject(
            2 deg) in phase angle.
 
         H is then refit with G12 fixed at ``fiducialG12`` (default
-        ``fixedG12`` if set, else 0.5); G12 is stored as that value,
+        ``fixedG12`` if set, else 0.5), clipping as the free fit does
+        (only with more than 3 usable points); G12 is stored as that value,
         G12Err and the H-G12 covariance are NaN, and HErr, nObsUsed and
         Chi2 come from the fixed-G12 fit. If that fit is impossible too
         (no usable point), H is NaN; the flag is set either way. With

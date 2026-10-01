@@ -25,7 +25,8 @@ def _band(n=20, G12=0.5, lo=2.0, hi=25.0, seed=1, steep=0.0, noise=0.01):
 
 
 def _fixed(data, G=0.5, **kw):
-    return photfit.fitHG12(*data, fixedG12=G, **(KW | kw))
+    # (clipping as the free fit: only with more than 3 usable points)
+    return photfit.fitHG12(*data, fixedG12=G, clipMinObs=3, **(KW | kw))
 
 
 def _assert_fallback(out, data, G=0.5):
@@ -127,6 +128,24 @@ def test_few_after_clipping(monkeypatch):
     assert out["failures"] == FAIL_FEW
     monkeypatch.undo()
     _assert_fallback(out, data)
+
+
+def test_fallback_clips_as_the_free_fit():
+    # 3 points, one far off: a fixed-G12 fit with its own clipping condition
+    # (more than 2 points) would clip; the fallback keeps all 3, as the free
+    # fit (which never clips 3 points) would have
+    mag, sig, phase, tdist, rdist = _band(n=3, lo=5.0, hi=6.0, noise=0.001)
+    mag[1] += 2.0
+    data = (mag, sig, phase, tdist, rdist)
+    assert photfit.fitHG12(*data, fixedG12=0.5, **KW).nobs < 3
+    out = fit_band(*data, **KW)
+    assert out["failures"] & FAIL_SPAN and out["nObsUsed"] == 3 and np.isfinite(out["H"])
+    _assert_fallback(out, data)
+    # with 4 points it clips, as the free fit would
+    mag, sig, phase, tdist, rdist = _band(n=4, lo=5.0, hi=6.0, noise=0.001)
+    mag[1] += 2.0
+    out = fit_band(mag, sig, phase, tdist, rdist, **KW)
+    assert out["nObsUsed"] == 3
 
 
 def test_span():
