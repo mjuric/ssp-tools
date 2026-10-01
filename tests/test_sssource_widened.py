@@ -262,7 +262,11 @@ def test_identification(tmp_path, offline):
             expect = int(np.frombuffer(packed[obj].rjust(8).encode(), dtype="<u8")[0])
             assert r["ssObjectId"] == expect and r["designation"] == OBJECTS[obj][0]
     # no orbit: NULL orbit-derived columns, but the measured ones are filled
+    # (and diaDistanceRank, never computed, is today's 0)
+    assert set(s["diaDistanceRank"].to_pylist()) == {0}
     for c in EPHEMERIS_COLUMNS:
+        if c == "diaDistanceRank":
+            continue
         col = s[c].to_pylist()
         for ob, v in zip(dia["obsid"].to_pylist(), col):
             if rows[ob][0] in (None, "C") and c not in sssource.MEASURED_EPH_COLUMNS:

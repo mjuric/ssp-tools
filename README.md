@@ -296,7 +296,9 @@ of `ssp.schema_ppdb.SSSourceDtype` (generated from `sdm_schemas`'
    The geometry follows JPL Horizons conventions (see `ssp/ephem_assist.py`),
    and `bench/ephem_bench.py` checks it against Horizons. They are NULL for
    rows without an orbit, except the measured `elongation`, `eclLambda`,
-   `eclBeta`, `galLon` and `galLat`.
+   `eclBeta`, `galLon` and `galLat`. (`diaDistanceRank`,
+   `ephOffsetAlongTrack` and `ephOffsetCrossTrack` aren't computed yet: they
+   are 0 as before, the last two NULL without an orbit.)
 
 The file is zstd-compressed, with the low-cardinality string columns
 dictionary-encoded, sorted by (`ssObjectId`, `midpointMjdTai`, `obsid`), the

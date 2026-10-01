@@ -744,11 +744,14 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     }
     del assoc, designation
 
-    # Block 6: NaN is NULL, as are the integer columns without an orbit
+    # Block 6: NaN is NULL (a computed column with no value). The rest is
+    # as today's SSSource, bitwise, including the never-computed
+    # placeholders: diaDistanceRank (0) and, where there is an orbit,
+    # ephOffsetAlongTrack/ephOffsetCrossTrack (0.0).
     for name in EPHEMERIS_COLUMNS:
         v = sss[name]
-        mask = np.isnan(v) if v.dtype.kind == "f" else no_orbit
-        columns[name] = cast_column(name, pa.array(v, mask=mask if mask.any() else None))
+        mask = np.isnan(v) if v.dtype.kind == "f" else None
+        columns[name] = cast_column(name, pa.array(v, mask=mask if mask is not None and mask.any() else None))
     del sss
 
     # Blocks 1, 3 and 4, copied from dia_sources.parquet (a few columns at
