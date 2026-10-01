@@ -1,0 +1,27 @@
+# ssp-upload-sso config: the PPDB int environment -- a TEMPLATE, commented out
+# until int is meant to receive SSO deliveries (and a service account exists).
+#
+# Source: lsst/idf_deploy @ 9f810ac (2026-10-01), environment/deployments/ppdb/:
+#   services/gcs.tf      bucket "ppdb-${var.environment}-sso-ingest", with
+#                        env/int-services.tfvars environment = "int"
+#   services/pubsub.tf   topic "load-sso-topic"
+#   project              ppdb-int-6c62, as named in cloudsql/README.md (the
+#                        project_factory's id is random-suffixed; check it with
+#                        `gcloud projects list --filter=name:ppdb-int`)
+# Whether the bucket, topic and sso-uploader service account are applied in
+# int is to be confirmed with the DM-55678 owners.
+#
+# bucket_name: ppdb-int-sso-ingest
+# topic: load-sso-topic
+# project: ppdb-int-6c62
+#
+# The complete set: the five tables the loader (dax_ppdb SSO_TABLES, load_sso)
+# accepts. NearbySSO is built and staged, but not uploaded until DM-55678's
+# dax_ppdb SSO_TABLES and load_sso add it; sending it today fails the entire
+# load. Uploading a subset of these needs --allow-partial.
+# tables:
+#   - SSSource
+#   - SSObject
+#   - numbered_identifications
+#   - current_identifications
+#   - mpc_orbits

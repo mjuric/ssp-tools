@@ -1,0 +1,20 @@
+# ssp-upload-sso config: the PPDB dev environment (DM-55678).
+# From DM-55678 and lsst/idf_deploy environment/deployments/ppdb/services/
+# (gcs.tf: bucket "ppdb-${environment}-sso-ingest"; pubsub.tf: topic
+# "load-sso-topic"; the project is the ppdb project_factory's project_id).
+# Credentials: Google application-default credentials, intended to be the
+# sso-uploader service account (idf_deploy services/sso-uploader.tf:
+# roles/storage.objectUser on the bucket, roles/pubsub.publisher on the topic).
+bucket_name: ppdb-dev-sso-ingest
+topic: load-sso-topic
+project: ppdb-dev-5c07          # the Pub/Sub topic's project
+# The complete set: the five tables the loader (dax_ppdb SSO_TABLES, load_sso)
+# accepts. NearbySSO is built and staged, but not uploaded until DM-55678's
+# dax_ppdb SSO_TABLES and load_sso add it; sending it today fails the entire
+# load. Uploading a subset of these needs --allow-partial.
+tables:
+  - SSSource
+  - SSObject
+  - numbered_identifications
+  - current_identifications
+  - mpc_orbits
