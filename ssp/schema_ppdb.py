@@ -337,8 +337,6 @@ SSSourceDtype = np.dtype([
     ('topo_vz', '<f4'),             # [km/s] Cartesian topocentric Z velocity at light-emission time (ICRS).
     ('topo_vtot', '<f4'),           # [km/s] The magnitude of the topocentric velocity vector, sqrt(vx*vx +
                                     # vy*vy + vz*vz).
-    ('diaDistanceRank', '<i2'),     # The rank of the diaSourceId-identified source in terms of its closeness
-                                    # to the predicted SSO position. If diaSourceId is the nearest DiaSour...
 ])
 
 # NearbySSO: For each DiaSource, the nearest known Solar System object whose predicted position (from
@@ -358,6 +356,8 @@ NearbySSODtype = np.dtype([
     ('ephRa_ephDec_Cov', '<f4'),    # [deg**2] Covariance between ephRa (on the sky) and ephDec; with
                                     # ephRaErr and ephDecErr, the predicted position's error ellipse, in t...
     ('ephOffset', '<f4'),           # [arcsec] Total observed versus predicted angular separation on the sky.
+    ('diaDistanceRank', '<i2'),     # Rank of this DiaSource by its separation from the object's predicted
+                                    # position, among all DiaSources of the same visit within the matching...
     ('ephVmag', '<f4'),             # [mag] Predicted magnitude in V band, computed from mpc_orbits data
                                     # including the mpc_orbits-provided (H, G) estimates.
     ('ephRateRa', '<f4'),           # [deg/d] Predicted on-sky angular rate in the R.A. direction (includes

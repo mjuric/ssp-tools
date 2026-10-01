@@ -215,17 +215,26 @@ class CoarseTrack(NamedTuple):
 #: One row per DiaSource with an eligible prediction within the radius,
 #: nearest only. The draft NearbySSO schema (sdm_schemas
 #: u/mjuric/ppdb-sso-ng) plus the error ellipse.
-NEARBYSSO_DTYPE = np.dtype([
+NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
     ("diaSourceId", "i8"),
     ("ssObjectId", "i8"),        # written null where the object has no SSObject row
     ("designation", "U16"),
     ("ephRa", "f8"),
-    ("ephDec", "f8"),
+    ("ephRaErr", "f4"),          # [deg] the error ellipse, next to the position
+    ("ephDec", "f8"),            #   as DiaSource's ra/raErr/dec/decErr/ra_dec_Cov
+    ("ephDecErr", "f4"),
+    ("ephRa_ephDec_Cov", "f4"),  # [deg^2]
     ("ephOffset", "f4"),         # [arcsec]
+    ("diaDistanceRank", "i2"),   # see below
     ("ephVmag", "f4"),
     ("ephRateRa", "f4"),         # [deg/day]
     ("ephRateDec", "f4"),
-    ("ephRaErr", "f4"),          # [deg]
-    ("ephDecErr", "f4"),
-    ("ephRa_ephDec_Cov", "f4"),  # [deg^2]
 ])
+
+# diaDistanceRank: the 1-based rank of the row's DiaSource by its separation
+#   from the row's object's prediction in that visit, among ALL of that
+#   visit's DiaSources within MATCH_RADIUS_ARCSEC of that prediction (an
+#   eligible one, i.e. past the sigma cut), whichever object each of those
+#   DiaSources' own NearbySSO row ends up naming. Ties: the lower diaSourceId
+#   ranks first. It is computed from the matches of each (orbit, visit)
+#   prediction before the nearest-object reduction.

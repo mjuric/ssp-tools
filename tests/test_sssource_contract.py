@@ -15,7 +15,7 @@ def _table(name):
 def test_sssource_columns_match_schema():
     cols = _table("SSSource")["columns"]
     assert list(C.SSSourceDtype.names) == [c["name"] for c in cols]
-    assert len(cols) == 181
+    assert len(cols) == 180
     assert {c["name"] for c in cols if c.get("nullable") is False} == C.SSSOURCE_NONNULL
     assert _table("SSSource")["primaryKey"] == "#SSSource.obsid"
 
@@ -36,3 +36,8 @@ def test_named_columns_exist():
 
 def test_nearbysso_columns_match_schema():
     assert list(C.NearbySSODtype.names) == [c["name"] for c in _table("NearbySSO")["columns"]]
+
+
+def test_nearbysso_contract_dtype_is_schema_order():
+    from ssp.nearbysso._contract import NEARBYSSO_DTYPE
+    assert NEARBYSSO_DTYPE.names == C.NearbySSODtype.names

@@ -84,7 +84,13 @@ ELLIPSE_COLUMNS = ("ephRaErr", "ephDecErr", "ephRa_ephDec_Cov")
 #   narrowing cast must not overflow (fail if it would), float64 -> float32
 #   rounding is expected.
 # Block 6: as today's SSSource (ssp.sssource.compute_sssource_entry), plus
-#   ELLIPSE_COLUMNS (WP3). NULL (NaN) for rows without an orbit; the ellipse
+#   ELLIPSE_COLUMNS (WP3), and the along/cross-track offsets, as pipe_tasks'
+#   ssoAssociation computes them [arcsec]:
+#     along = (ephOffsetRa * ephRateRa + ephOffsetDec * ephRateDec) / ephRate
+#     cross = (-ephOffsetRa * ephRateDec + ephOffsetDec * ephRateRa) / ephRate
+#   (ephOffsetRa includes cos(dec); ephRate = hypot(ephRateRa, ephRateDec)),
+#   NULL where there is no orbit or ephRate is 0. (SSSource no longer has
+#   diaDistanceRank; it is on NearbySSO.) NULL (NaN) for rows without an orbit; the ellipse
 #   is also NULL where the orbit has no usable covariance.
 
 # --------------------------------------------------------------------------
