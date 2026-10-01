@@ -146,7 +146,7 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 # check_table(table, parquet_path, schema_dir=SCHEMA_DIR)
 #     -> list[CheckResult]
 #   Every column of delivery_schema()[table], in order, with a compatible
-#   Arrow type (char/string -> string or dictionary<string>, long -> int64,
+#   Arrow type (char/string/text -> string or dictionary<string>, long -> int64,
 #   int -> int32, short -> int16, float -> float32, double -> float64,
 #   boolean -> bool, timestamp -> timestamp) and no extra columns; no NULLs
 #   in nullable: false columns; the primary key unique and non-NULL.
