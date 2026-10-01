@@ -138,6 +138,35 @@ def test_manifest_every_problem_listed(tmp_path):
     assert "obs_sbn" in str(e.value) and "mpc_orbits" in str(e.value)
 
 
+def test_manifest_dia_sources_out_of_step(tmp_path):
+    """dia_sources built from another obs_sbn: refused."""
+    write_inputs(tmp_path)
+    _edit_manifest(tmp_path, lambda m: m["files"]["dia_sources"].update(obs_sbn_md5="f" * 32))
+    with pytest.raises(B.ManifestError, match="dia_sources was built from a obs_sbn of md5 f{32}, not this"):
+        B.validate_manifest(tmp_path)
+
+
+def test_manifest_dia_sources_md5_from_source(tmp_path):
+    """Manifests before obs_sbn_md5: the md5 in the source string."""
+    m = write_inputs(tmp_path)
+    obs = m["files"]["obs_sbn"]["md5"]
+
+    def old_style(md5):
+        def edit(m):
+            m["files"]["dia_sources"].pop("obs_sbn_md5", None)
+            m["files"]["dia_sources"]["source"] = f"extract-submitted-sources on obs_sbn (md5 {md5})"
+        return edit
+
+    _edit_manifest(tmp_path, old_style(obs))
+    B.validate_manifest(tmp_path)
+    _edit_manifest(tmp_path, old_style("0" * 32))
+    with pytest.raises(B.ManifestError, match="out of step"):
+        B.validate_manifest(tmp_path)
+    _edit_manifest(tmp_path, lambda m: m["files"]["dia_sources"].update(source="somewhere"))
+    with pytest.raises(B.ManifestError, match="does not record the md5 of the obs_sbn"):
+        B.validate_manifest(tmp_path)
+
+
 def test_manifest_any_file_names(tmp_path):
     """The manifest's 'file' may be any path under INPUTS_DIR."""
     m = write_inputs(tmp_path, files={"obs_sbn": "mpc/X05-observations.parquet"})
@@ -426,15 +455,15 @@ def test_fresh_run_clears_old_outputs(tmp_path, fake_steps):
     assert os.listdir(run / "delivery") == []
 
 
-def test_check_stub_fails(tmp_path, monkeypatch):
-    """Until ssp.delivery_check (WP H) lands, the check step fails."""
-    monkeypatch.setattr(B, "load_check_delivery", lambda: B._check_delivery_stub)
+def test_check_real_delivery_check_fails(tmp_path, monkeypatch):
+    """The check step runs ssp.delivery_check: an empty delivery fails
+    every table."""
     monkeypatch.setattr(B, "have_sssource_validate", lambda: False)
     (tmp_path / "delivery").mkdir()
     assert B.step_check(tmp_path, log=_quiet) is False
     res = json.loads((tmp_path / "checks" / "results.json").read_text())
-    assert res == {"delivery": {"status": "FAIL", "report": "checks/delivery.txt"}}
-    assert "has not landed" in (tmp_path / "checks" / "delivery.txt").read_text()
+    assert set(res) == {f"delivery:{t}" for t in DELIVERY_TABLES}
+    assert all(v["status"] == "FAIL" for v in res.values())
 
 
 def test_check_delivery_results(tmp_path, monkeypatch):
@@ -445,14 +474,14 @@ def test_check_delivery_results(tmp_path, monkeypatch):
     def check_delivery(delivery_dir, schema_dir=None, tables=DELIVERY_TABLES):
         return {t: [R("columns", True, "ok"), R("pk", t != "SSObject", "dup")] for t in tables}
 
-    monkeypatch.setattr(B, "load_check_delivery", lambda: check_delivery)
+    monkeypatch.setattr(B, "check_delivery", check_delivery)
     monkeypatch.setattr(B, "have_sssource_validate", lambda: False)
     (tmp_path / "delivery").mkdir()
     assert B.step_check(tmp_path, log=_quiet) is False
     res = json.loads((tmp_path / "checks" / "results.json").read_text())
     assert set(res) == {f"delivery:{t}" for t in DELIVERY_TABLES}
     assert [t for t in DELIVERY_TABLES if res[f"delivery:{t}"]["status"] == "FAIL"] == ["SSObject"]
-    assert "FAIL  pk: dup" in (tmp_path / "checks" / "delivery-SSObject.txt").read_text()
+    assert "FAIL  pk            dup" in (tmp_path / "checks" / "delivery-SSObject.txt").read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -504,17 +533,12 @@ def e2e(tmp_path_factory):
 
 
 def _expect_checks(rep):
-    """The check step's results: SSSource's checks pass; the delivery check
-    passes once ssp.delivery_check exists (else the FIXME stub fails)."""
+    """The check step's results: every check passes."""
     ch = rep["checks"]
     assert ch["sssource:conformance"]["status"] == "PASS"
     assert ch["sssource:offsets"]["status"] == "PASS"
-    if B.load_check_delivery() is B._check_delivery_stub:
-        assert ch["delivery"]["status"] == "FAIL"
-        assert rep["steps"]["check"]["status"] == "failed" and rep["deliverable"] is False
-    else:
-        assert all(ch[f"delivery:{t}"]["status"] == "PASS" for t in DELIVERY_TABLES), ch
-        assert rep["steps"]["check"]["status"] == "ok" and rep["deliverable"] is True
+    assert all(ch[f"delivery:{t}"]["status"] == "PASS" for t in DELIVERY_TABLES), ch
+    assert rep["steps"]["check"]["status"] == "ok" and rep["deliverable"] is True
 
 
 @needs_fixture

@@ -35,6 +35,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,16 +48,17 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from .delivery_check import check_delivery, format_report
 from .delivery_contract import (
     BUILD_STEPS,
     DELIVERY_DIR,
     DELIVERY_TABLES,
+    DERIVED_FROM,
     INPUT_FILES,
     MANIFEST_FIELDS,
     MANIFEST_FILE,
     REPORT_FILE,
     REQUIRED_INPUT_COLUMNS,
-    SCHEMA_DIR,
     delivery_schema,
 )
 
@@ -206,21 +208,48 @@ def validate_manifest(inputs_dir, workers=8):
         if got != want:
             problems.append(f"{name}: md5 of {path} is {got}, the manifest says {want}")
 
+    for name, parent in DERIVED_FROM.items():
+        if name not in files or parent not in files:
+            continue
+        recorded = recorded_parent_md5(files[name], parent)
+        if recorded is None:
+            problems.append(f"{name}: the manifest does not record the md5 of the {parent} it was built "
+                            f"from ({parent}_md5)")
+        elif recorded != files[parent].get("md5"):
+            problems.append(f"{name} was built from a {parent} of md5 {recorded}, not this one "
+                            f"({files[parent].get('md5')}): the two are out of step")
+
     if problems:
         raise ManifestError("invalid inputs: " + "; ".join(problems))
     return manifest
 
 
+def recorded_parent_md5(entry, parent):
+    """The md5 of the ``parent`` input a derived input's manifest ``entry``
+    was built from (DERIVED_FROM): its ``<parent>_md5``, else (manifests
+    before that field) the ``<parent> (md5 ...)`` in its ``source``, as
+    ssp-extract-sso-inputs writes it; None if neither is there."""
+    if entry.get(f"{parent}_md5"):
+        return entry[f"{parent}_md5"]
+    m = re.search(rf"{re.escape(parent)} \(md5 ([0-9a-f]{{32}})\)", str(entry.get("source", "")))
+    return m.group(1) if m else None
+
+
 def write_manifest(inputs_dir, files, producer="hand-made", mpc_snapshot_utc=None, **extra):
     """Write ``INPUTS_DIR/manifest.json`` for ``files`` ({name: file,
-    relative to INPUTS_DIR}), with each file's rows and md5. For tests and
-    for inputs from other sources; stage 1 writes its own."""
+    relative to INPUTS_DIR}), with each file's rows and md5, and each
+    DERIVED_FROM input recorded as built from the given parent (or from
+    ``<name>_<parent>_md5=``). For tests and for inputs from other sources;
+    stage 1 writes its own."""
     now = _utcnow()
     entries = {}
     for name, file in files.items():
         path = Path(inputs_dir) / file
         entries[name] = dict(file=str(file), rows=pq.ParquetFile(path).metadata.num_rows, md5=_md5(path),
                              source=extra.pop(f"{name}_source", "file"), extracted_utc=now)
+    for name, parent in DERIVED_FROM.items():
+        if name in entries and parent in entries:
+            entries[name][f"{parent}_md5"] = extra.pop(f"{name}_{parent}_md5", entries[parent]["md5"])
     manifest = dict(created_utc=now, producer=producer, mpc_snapshot_utc=mpc_snapshot_utc or now,
                     files=entries, **extra)
     _write_json(manifest, Path(inputs_dir) / MANIFEST_FILE)
@@ -451,24 +480,6 @@ def step_mpc(inputs_dir, run_dir, workers=1):
 # Step check
 # --------------------------------------------------------------------------
 
-def _check_delivery_stub(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES):
-    # FIXME(WP H): a stand-in until ssp.delivery_check lands; it fails the
-    # check step, so nothing is deliverable without the real check.
-    raise NotImplementedError("ssp.delivery_check (WP H) has not landed: the delivery is unchecked")
-
-
-def load_check_delivery():
-    """ssp.delivery_check.check_delivery, or the FIXME stub if that module
-    does not exist yet."""
-    try:
-        from ssp.delivery_check import check_delivery
-    except ModuleNotFoundError as e:
-        if e.name != "ssp.delivery_check":
-            raise
-        return _check_delivery_stub
-    return check_delivery
-
-
 def have_sssource_validate():
     return (REPO_ROOT / "bench" / "sssource_validate.py").is_file()
 
@@ -505,25 +516,17 @@ def step_check(run_dir, log=_log):
             f"SSSource checks {SSSOURCE_CHECKS} not run")
 
     # The delivery check (ssp.delivery_check, WP H)
-    check_delivery = load_check_delivery()
-    try:
-        per_table = check_delivery(delivery)
-    except NotImplementedError as e:
-        rep = checks / "delivery.txt"
-        rep.write_text(f"FAIL: {e}\n")
-        record("delivery", False, rep)
-    else:
-        for table in DELIVERY_TABLES:
-            res = per_table.get(table)
-            rep = checks / f"delivery-{table}.txt"
-            if not res:
-                rep.write_text(f"FAIL: no results for {table}\n")
-                record(f"delivery:{table}", False, rep)
-                continue
-            lines = [f"{'PASS' if r.ok else 'FAIL'}  {r.name}: {r.detail}" for r in res]
-            ok = all(r.ok for r in res)
-            rep.write_text("\n".join(lines + [f"{table}: {'PASS' if ok else 'FAIL'}"]) + "\n")
-            record(f"delivery:{table}", ok, rep)
+    per_table = check_delivery(delivery)
+    for table in DELIVERY_TABLES:
+        res = per_table.get(table)
+        rep = checks / f"delivery-{table}.txt"
+        if not res:
+            rep.write_text(f"FAIL: no results for {table}\n")
+            record(f"delivery:{table}", False, rep)
+            continue
+        ok = all(r.ok for r in res)
+        rep.write_text(format_report({table: res}) + "\n")
+        record(f"delivery:{table}", ok, rep)
     _write_json(results, checks / CHECK_RESULTS)
     return all(v["status"] == "PASS" for v in results.values())
 
