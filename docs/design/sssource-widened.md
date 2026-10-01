@@ -231,3 +231,35 @@ When the owner approves, push `tickets/DM-55375` and open the `sdm_schemas` PR f
 - Incremental updates; the table is regenerated in full daily.
 - Changing `ssp.SubmittableSources` itself.
 - A widened SSObject.
+
+## Follow-ups (proposed 2026-10-01)
+
+### Owner decisions
+
+| item | decision |
+|---|---|
+| `diaDistanceRank` | **Removed** from SSSource. |
+| `ephOffsetAlongTrack`, `ephOffsetCrossTrack` | **Computed**, ported from pipe_tasks (`ssoAssociation.py`, upstream main), which ssp-tools never had. `along = (ephOffsetRa, ephOffsetDec) · (ephRateRa, ephRateDec)/ephRate` and `cross = (ephOffsetRa, ephOffsetDec) · (−ephRateDec, ephRateRa)/ephRate`, in arcsec. NULL where there is no orbit or `ephRate` is 0. |
+| `NearbySSO.diaSourceDistanceRank` | **Added:** the 1-based rank of the row's DiaSource by separation from its object's prediction in that visit. It ranks **all** of that visit's DiaSources within the 5″ radius of that prediction that pass the σ cut, whichever object each one's NearbySSO row names. Ties go to the lower `diaSourceId`. NearbySSO gets no along/cross-track columns. |
+| SSObject's row-order dependence | **Find the root cause and make the fits order-independent**, rather than matching today's values by sorting. SSObject then reads its photometry from **SSSource** (the published float32 columns), so the published SSObject is reproducible from the published SSSource. Its values change for the objects whose fits were order-sensitive. |
+
+### Plan
+
+The same pattern as before: the integrator owns the contract, reviews and integrates; parallel subagents build the work packages; independent reviews where marked.
+
+**Phase 0 (integrator):**
+- `sdm_schemas` `tickets/DM-55375` (local): drop `SSSource.diaDistanceRank`; add `NearbySSO.diaSourceDistanceRank` (short, non-null) after `ephOffset`.
+- Re-vendor `sso_base.yaml`, regenerate `ssp/schema_ppdb.py`.
+- `ssp/sssource_contract.py`: the along/cross formula and its NULL rules.
+- `ssp/nearbysso/_contract.py`: add the rank to `NEARBYSSO_DTYPE`, and put the output columns in the schema's order (the ellipse columns next to `ephRa`/`ephDec`).
+
+**Phase 1 (parallel):**
+
+| WP | builds | independent review |
+|---|---|---|
+| **A SSSource** | Compute along/cross-track per the contract; drop `diaDistanceRank`; tests including pipe_tasks' worked example. | no (small; WP D checks it) |
+| **B NearbySSO** | `diaSourceDistanceRank` in pass 3, from every match within the radius of each (orbit, visit) prediction, ranked before the nearest-object reduction; output in schema order; tests. | light |
+| **C SSObject** | Root-cause every source of row-order dependence in the photometric fits (`ssp/photfit.py`, `ssp/ssobject.py`) and why its effect is large. Fix it so the fits are mathematically order-independent. Read photometry from SSSource. Tests: random within-object permutations give the same SSObject (bitwise where order-insensitive arithmetic allows, else to a stated tolerance). Report how many objects change, and by how much, relative to today. | **yes** |
+| **D Validation** | `bench/sssource_validate`: an independent along/cross check; regression without `diaDistanceRank` and the along/cross columns; an SSObject permutation-invariance check. `bench/nearbysso_validate`: a brute-force rank check against the DiaSources. | no (it is the check) |
+
+**Phase 2 (integrator):** rerun the full chain on the 2026-09-30 fixture and NearbySSO on PPDB, run every check, and record the results here and in `nearbysso.md`.
