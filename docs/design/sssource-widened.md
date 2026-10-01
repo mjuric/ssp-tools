@@ -1,6 +1,6 @@
 # Design: the widened SSSource table (RFC-1188)
 
-Status: **proposed**, for owner review. Nothing implemented yet.
+Status: **approved** (2026-09-30); Phase 0 done (see "Phase 0 results"), Phase 1 in progress.
 
 ## Context
 
@@ -144,6 +144,24 @@ The same pattern as NearbySSO: parallel subagents, each in its own worktree; the
    - a full `dia_sources.parquet` made from them with current master;
    - a small subset of a few hundred objects, covering every `processing` value, `-A`/`-B` pairs, position-fallback rows, `I` rows and the #7 rows;
    - today's SSSource on that subset, the reference for the regression check.
+
+### Phase 0 results (2026-10-01)
+
+- **Schema:** committed as `a8615ae` on `sdm_schemas` `tickets/DM-55375` (local only, not pushed). It covers `sso_base.yaml` (SSSource rewritten, 181 columns; NearbySSO added, 12 columns), `ppdb.yaml` (their `columnRefs`), and news fragments `DM-55375.ap.md` and `DM-55375.ssp.md`.
+  - `felis validate` passes on both files, and `sdm_schemas`' tests pass.
+  - The version stays 10.0.0: DM-55374 kept `ppdb.yaml` and `sso_base.yaml` matching the APDB version. This is to raise in the PR.
+  - The table definitions come from `gen_sso_yaml.py` and `apply_schema.py` in `/sdf/data/rubin/user/mjuric/sssource-widened/work/`, driven by the fixture's column statistics (`stats.json`).
+- **Nullability:** a column is non-null when every branch of the view populates it **by construction**, not merely in today's data. The non-null columns are `visit`, `detector`, `midpointMjdTai`, `ra`, `dec`, `band`, `psfFlux`, `psfFluxErr`, plus `obsid`, `status`, `primary`, `matchMethod`, `measuredOn`, `processing`, `processingTable` and today's non-null `eclLambda`, `eclBeta`, `galLon`, `galLat`.
+  - `psfMag`, `exposureTime`, `trksub` and `trkid` have no NULLs today but can be NULL by definition (`psfFlux` ≤ 0, no ConsDB value), so they stay nullable.
+- **Contract:**
+  - `ssp/schema_ppdb.py`: generated from a copy of that `sso_base.yaml` in `tests/data/sdm_schemas/`;
+  - `ssp/sssource_contract.py`: the rules and the WP1/WP2/WP3 interfaces;
+  - `tests/test_sssource_contract.py`: checks the two agree with the YAML.
+- **Fixtures:** `/sdf/data/rubin/user/mjuric/sssource-widened/fixtures/2026-09-30/`, read-only, with a README.
+  - `obs_sbn` X05: 8,070,610 rows, with same-transaction MPC tables.
+  - `dia_sources.parquet`: 8,070,610 rows, 12 min to extract; **542,796 of them Source-based**: NV-S, AP-S, DP2-S.
+  - Today's SSSource on the full fixture: 1 min 42 s on 32 workers.
+  - A 225-object subset covering every processing value, the trail pairs, position matches, the #7 rows, unidentified rows, repeat submissions and comets, with its own reference SSSource, bitwise equal to the full one.
 
 ### Phase 1: work packages in parallel
 
