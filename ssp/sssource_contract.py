@@ -114,7 +114,12 @@ ELLIPSE_COLUMNS = ("ephRaErr", "ephDecErr", "ephRa_ephDec_Cov")
 #   Returns float64 arrays in deg, deg and deg^2: ssp.nearbysso.propagate.
 #   coarse sampled so that every time is bracketed, then ellipse_at(...,
 #   topo_pos=topo_pos). NaN where the orbit has no usable covariance or the
-#   propagation failed. Never raises for one bad orbit.
+#   propagation failed. Never raises for one bad orbit; raises ValueError for
+#   caller errors (``orbit`` not an ORBIT_DTYPE row, ``ephem`` None, shapes
+#   not (K,), (K, 3), (K, 3)).
+#   ssp.nearbysso.propagate.STEP_CAP_STOPS counts the simulations the step cap
+#   stopped, per process: in a forked pool, reset it per chunk and return it
+#   to the parent for the run report (as ssp/nearbysso/build.py does).
 
 # --------------------------------------------------------------------------
 # WP2: the writer (ssp.sssource; console script ssp-build-sssource)
