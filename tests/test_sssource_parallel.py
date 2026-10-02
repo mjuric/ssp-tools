@@ -17,7 +17,7 @@ SSS_DTYPE = WORK_DTYPE
 OBS_DTYPE = [("dia_index", np.int64), ("obs_pos", np.float64, 3), ("obs_vel", np.float64, 3)]
 
 
-def _fake_ephemerides(provID, ephTimes, mpcorb, ephem, row=None, obs_pos=None, obs_vel=None):
+def _fake_ephemerides(provID, ephTimes, mpcorb, ephem, row=None, obs_pos=None, obs_vel=None, nongrav=None):
     """A deterministic stand-in for compute_ephemerides_one (no ASSIST)."""
     t = ephTimes.tai.mjd - 60800.0
     k = float(row["q"])
@@ -168,7 +168,7 @@ def recorded_ephem(monkeypatch):
     got (obs_pos) and returned (topo_pos)."""
     rec = {}
 
-    def fake(provID, ephTimes, mpcorb, ephem, row=None, obs_pos=None, obs_vel=None):
+    def fake(provID, ephTimes, mpcorb, ephem, row=None, obs_pos=None, obs_vel=None, nongrav=None):
         e = _fake_ephemerides(provID, ephTimes, mpcorb, ephem, row=row, obs_pos=obs_pos, obs_vel=obs_vel)
         rec[provID] = dict(obs_pos=np.array(obs_pos), topo_pos=np.array(e.topo_pos))
         return e

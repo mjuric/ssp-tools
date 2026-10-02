@@ -166,7 +166,7 @@ def make_inputs(path, seed=0, match_method=False, **overrides):
     return pq.read_table(path / "dia_sources.parquet"), obs_sbn
 
 
-def _fake_ephemerides(provID, ephTimes, mpcorb, ephem, row=None, obs_pos=None, obs_vel=None):
+def _fake_ephemerides(provID, ephTimes, mpcorb, ephem, row=None, obs_pos=None, obs_vel=None, nongrav=None):
     """A deterministic stand-in for compute_ephemerides_one (no ASSIST)."""
     t = ephTimes.tai.mjd - 60800.0
     k = float(row["q"])
