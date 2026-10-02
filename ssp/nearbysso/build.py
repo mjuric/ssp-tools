@@ -64,6 +64,7 @@ from astropy.time import Time
 import astropy.units as u
 
 from .. import util
+from .. import nongrav as _nongrav
 from ..ephem_assist import MJD_J2000, compute_ephemerides_one, open_ephem
 from ..photfit import hg_V_mag
 from . import orbits as _orbits
@@ -277,7 +278,8 @@ def process_orbit(i, w, ephem, stage_t):
 
     v = w["visits"][cand]
     e = compute_ephemerides_one(str(orbit["designation"]), w["times"][cand], None, ephem, row=orbit,
-                                obs_pos=v["obs_pos"].T, obs_vel=v["obs_vel"].T)
+                                obs_pos=v["obs_pos"].T, obs_vel=v["obs_vel"].T,
+                                nongrav=_nongrav.from_orbit(orbit))
     t3 = time.perf_counter()
     stage_t["precise"] += t3 - t2
 

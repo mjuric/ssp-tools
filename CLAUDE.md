@@ -50,9 +50,8 @@ The rules here are for development in ssp-tools, by Claude sessions and their su
 **6. Merge.**
 - Each WP merges into the feature branch **through its own PR, as a merge commit, never a squash.** Rebase it onto the feature branch and run the full test suite first.
 - After integration, the feature branch merges to master through its PR.
-- **Approvals:** the owner gives blanket approval for WP merges into the feature branch. Merge each one
-  once it has passed its review and the full test suite, without asking. The owner reviews and
-  approves only the final merge of the feature branch to master: ask before that one.
+- **Approvals:** the owner gives blanket approval for WP merges into the feature branch. Merge each one once it has passed its review and the full test suite, without asking.
+- The owner reviews and approves only the final merge of the feature branch to master: ask before that one.
 
 **7. Integrate and record.**
 - Run the integrated result end to end on real data, with every check.

@@ -108,6 +108,18 @@ class TestCometary(unittest.TestCase):
             residual = e * np.sinh(H) - H - M
             self.assertLess(np.max(np.abs(residual)), 1e-10)
 
+    def test_hyperbolic_solver_near_parabolic(self):
+        """e -> 1 at small |M|, where the arcsinh(M / e) start diverges
+        (e - 1 = 1e-6, q = 0.005 AU, 80 years from perihelion): the
+        fallback converges."""
+        e = 1.0 + 1e-6
+        a = 0.005 / (e - 1.0)
+        for days in (80 * 365.25, -80 * 365.25, 3.0):
+            M = np.sqrt(GM_SUN / a ** 3) * days
+            H = solve_kepler_hyperbolic(np.array([M]), e)
+            self.assertTrue(np.all(np.isfinite(H)))
+            self.assertLess(abs(float(e * np.sinh(H[0]) - H[0] - M)), 1e-12 * max(1.0, abs(M)))
+
     def test_matches_classical_elements(self):
         """For elliptic orbits, (q, e, t - tp) must reproduce the (a, e, M)
         conversion."""

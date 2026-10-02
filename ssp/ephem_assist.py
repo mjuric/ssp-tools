@@ -208,17 +208,35 @@ def ecliptic_to_equatorial(v: np.ndarray) -> np.ndarray:
 
 
 def solve_kepler_hyperbolic(M: np.ndarray, e: float, tol: float = 1e-14, max_iter: int = 100) -> np.ndarray:
-    """Solve the hyperbolic Kepler equation e sinh H - H = M for e > 1."""
+    """Solve the hyperbolic Kepler equation e sinh H - H = M for e > 1.
+
+    Newton from arcsinh(M / e). That start fails for e -> 1 at small |M|
+    (e cosh H - 1 ~ e - 1, so the first step overflows): then it restarts
+    from sign(M) ln(2 |M| / e + 1.8) (Danby's start, from which Newton
+    converges monotonically), and returns NaN if that fails too. Results
+    that converge from the first start are unchanged (the same fallback as
+    ssp.nearbysso.orbits._solve_kepler_hyperbolic_vec)."""
     M = np.atleast_1d(np.asarray(M, dtype=np.float64))
-    H = np.arcsinh(M / e)  # good initial guess for all M
-    for _ in range(max_iter):
-        f = e * np.sinh(H) - H - M
-        fp = e * np.cosh(H) - 1.0
-        dH = -f / fp
-        H = H + dH
-        if np.all(np.abs(dH) < tol * np.maximum(1.0, np.abs(H))):
-            break
+    H, ok = _newton_hyperbolic(np.arcsinh(M / e), M, e, tol, max_iter)
+    if not ok:
+        H, ok = _newton_hyperbolic(np.sign(M) * np.log(2.0 * np.abs(M) / e + 1.8), M, e, tol, max_iter)
+        if not ok:
+            H = np.full_like(M, np.nan)
     return H
+
+
+def _newton_hyperbolic(H, M, e, tol, max_iter):
+    """Newton iterations for solve_kepler_hyperbolic: (H, converged)."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        for _ in range(max_iter):
+            f = e * np.sinh(H) - H - M
+            fp = e * np.cosh(H) - 1.0
+            dH = -f / fp
+            H = H + dH
+            if np.all(np.abs(dH) < tol * np.maximum(1.0, np.abs(H))):
+                return H, True
+        # (steps between tol and 1e-10 are rounding cycles: converged)
+        return H, bool(np.all(np.abs(dH) < 1e-10 * np.maximum(1.0, np.abs(H))))
 
 
 def cometary_to_helio_ecliptic(
