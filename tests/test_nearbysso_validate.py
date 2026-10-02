@@ -29,13 +29,19 @@ def _orbits(**cols):
 
 
 def test_filter_reason():
-    df = _orbits(designation=["2020 AB", "P/2019 A1", "2020 AC", "2020 AD", "2020 AE", "2020 AF"],
-                 packed=["K20A00B", "PK19A010", "_K20A00C", "K20A00D", "K20A00E", "K20A00F"],
-                 q=[2.0, 2.0, 2.0, np.nan, 2.0, 2.0],
-                 arc_text=["3 days", "2014-2024", "2014-2024", "2014-2024", "2 days", None])
+    df = _orbits(designation=["2020 AB", "S/2004 S 46", "2020 AC", "2020 AD", "2020 AE", "2020 AF",
+                              "P/2019 A1", "C/2025 N1", "A/2024 U2", "C/2002 VQ94"],
+                 packed=["K20A00B", "SK04S460", "_K20A00C", "K20A00D", "K20A00E", "K20A00F",
+                         "PK19A010", "CK25N010", "AK24U020", "CK02V94Q"],
+                 q=[2.0, 2.0, 2.0, np.nan, 2.0, 2.0, 2.0, 1.35, 8.2, np.nan],
+                 arc_text=["3 days", "2014-2024", "2014-2024", "2014-2024", "2 days", None,
+                           "2014-2024", "2014-2024", "2014-2024", "2014-2024"])
     r = V.filter_reason(df)
-    # "_K20A00C" (extended packed format) is an asteroid, not a comet
-    assert list(r) == ["", "comet", "", "missing_elements", "short_arc", "null_arc"]
+    # "_K20A00C" (extended packed format) is an asteroid; comets (P/, C/)
+    # and A/ objects are kept, natural satellites (S/) and element-less
+    # placeholders are not
+    assert list(r) == ["", "satellite", "", "missing_elements", "short_arc", "null_arc", "", "", "",
+                       "missing_elements"]
     for arc, expect in (("0 days", "short_arc"), ("1 days", "short_arc"), ("0", ""), ("30 days", "")):
         assert V.filter_reason(df.iloc[:1].assign(arc_text=[arc]))[0] == expect
     lk = V.reason_lookup(df)
@@ -69,8 +75,8 @@ def test_null_arc_excluded():
     df = _orbits().iloc[[0] * 5].reset_index(drop=True).drop(columns="arc_text").assign(mpc_orb_jsonb=texts)
     assert list(V.filter_reason(df)) == ["null_arc"] * 4 + [""]
     # the earlier reasons take precedence
-    comet = _orbits(designation=["P/2019 A1"], packed=["PK19A010"], arc_text=[None])
-    assert list(V.filter_reason(comet)) == ["comet"]
+    sat = _orbits(designation=["S/2004 S 46"], packed=["SK04S460"], arc_text=[None])
+    assert list(V.filter_reason(sat)) == ["satellite"]
 
 
 def test_arc_days():
@@ -95,7 +101,7 @@ def _case():
     rows = [
         (1, "A", 1.0, "same"),            # match
         (2, "B", 1.0, "same_bad"),        # value_mismatch
-        (3, "P/C", 1.0, None),            # filtered:comet
+        (3, "S/C", 1.0, None),            # filtered:satellite
         (4, "D", 6.0, None),              # separation
         (5, "E", 3.0, "nearer"),          # nearer_object
         (6, "F", 1.0, None),              # sigma (F has sigma 20)
@@ -125,7 +131,7 @@ def _case():
         nss.append(r)
     nss = pd.DataFrame(nss)
     lookup = {d: "" for d in "ABDEFGHIYZ"}
-    lookup["P/C"] = "comet"
+    lookup["S/C"] = "satellite"
     sig = {"F": 20.0, "I": np.nan}
 
     def sigma_fn(des, t):
@@ -137,7 +143,7 @@ def test_compare_to_sssource_statuses():
     nss, sss, dia, lookup, sigma_fn = _case()
     rows, summ = V.compare_to_sssource(nss, sss, dia, lookup, sigma_fn)
     st = dict(zip(rows["diaSourceId"], rows["status"]))
-    assert st == {1: "match", 2: "value_mismatch", 3: "filtered:comet", 4: "separation",
+    assert st == {1: "match", 2: "value_mismatch", 3: "filtered:satellite", 4: "separation",
                   5: "nearer_object", 6: "sigma", 7: "unexplained", 8: "wrong_nearest",
                   9: "sigma_unknown"}
     assert summ["n_fail"] == 3 and summ["n_unknown"] == 1
@@ -585,7 +591,7 @@ def test_cli_same_orbits(tmp_path):
     assert rc == 1
     rows = pd.read_parquet(tmp_path / "r" / "same-orbits.parquet")
     st = dict(zip(rows["diaSourceId"], rows["status"]))
-    assert st[1] == "match" and st[3] == "filtered:comet" and st[6] == "sigma_unknown"
+    assert st[1] == "match" and st[3] == "filtered:satellite" and st[6] == "sigma_unknown"
     disc = pd.read_parquet(tmp_path / "r" / "same-orbits.discrepancies.parquet")
     assert set(disc["diaSourceId"]) == {2}          # 7 and 8 are sigma_unknown without sigma
     assert "GATE" in (tmp_path / "r" / "same-orbits.txt").read_text()
@@ -613,7 +619,7 @@ def test_cli_dp2_intersection(tmp_path):
     assert rc == 0                                   # reported, never gated
     rows = pd.read_parquet(tmp_path / "r" / "dp2-intersection.parquet")
     st = dict(zip(rows["diaSourceId"], rows["status"]))
-    assert 3 not in st                               # the comet: not kept by us
+    assert 3 not in st                               # the satellite: not kept by us
     assert st[1] == "match" and st[2] == "value_mismatch"
 
 

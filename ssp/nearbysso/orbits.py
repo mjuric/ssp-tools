@@ -103,17 +103,52 @@ def _solve_kepler_vec(M, e, tol=1e-14, max_iter=50):
     return E
 
 
-def _solve_kepler_hyperbolic_vec(M, e, tol=1e-14, max_iter=100):
-    """``ea.solve_kepler_hyperbolic`` for arrays of M and e."""
-    H = np.arcsinh(M / e)
+def _newton_hyperbolic(H, M, e, tol, max_iter):
+    """Newton iterations on e sinh H - H = M from ``H`` (in place), each
+    element stopped when its own step is below ``tol`` (relative to
+    max(1, |H|)). Returns the indices that failed: non-finite, or still
+    taking steps above ``_HYP_FAIL`` (relative) after ``max_iter``. (Steps
+    between ``tol`` and that are rounding cycles: converged.)"""
     act = np.arange(len(M))
-    for _ in range(max_iter):
-        Ha, ea_, Ma = H[act], e[act], M[act]
-        dH = -(ea_ * np.sinh(Ha) - Ha - Ma) / (ea_ * np.cosh(Ha) - 1.0)
-        H[act] = Ha + dH
-        act = act[np.abs(dH) >= tol * np.maximum(1.0, np.abs(H[act]))]
-        if len(act) == 0:
-            break
+    dH = np.zeros(0)
+    with np.errstate(over="ignore", invalid="ignore"):
+        for _ in range(max_iter):
+            Ha, ea_, Ma = H[act], e[act], M[act]
+            dH = -(ea_ * np.sinh(Ha) - Ha - Ma) / (ea_ * np.cosh(Ha) - 1.0)
+            H[act] = Ha + dH
+            # (a non-finite step fails the test, and stays active)
+            moving = ~(np.abs(dH) < tol * np.maximum(1.0, np.abs(H[act])))
+            act, dH = act[moving], dH[moving]
+            if len(act) == 0:
+                break
+        failed = ~(np.abs(dH) < _HYP_FAIL * np.maximum(1.0, np.abs(H[act])))
+    return act[failed]
+
+
+# Newton steps still above this (relative) after max_iter: not converged.
+_HYP_FAIL = 1e-10
+
+
+def _solve_kepler_hyperbolic_vec(M, e, tol=1e-14, max_iter=100):
+    """``ea.solve_kepler_hyperbolic`` for arrays of M and e, with a fallback.
+
+    The elements that converge from ``ea.solve_kepler_hyperbolic``'s start,
+    arcsinh(M / e), get its result. That start fails for e -> 1 at small
+    |M| (e.g. e - 1 = 1e-6, q = 0.005 AU, 80 years from perihelion): there
+    e cosh H - 1 ~ e - 1, and the first Newton step overflows. Those
+    elements restart from sign(M) ln(2 |M| / e + 1.8) (Danby's start; on
+    the convex branch, Newton then converges monotonically), and any that
+    still don't converge are NaN. (No orbit of the 2026-10-01 catalog needs
+    the fallback.)
+    """
+    H = np.arcsinh(M / e)
+    bad = _newton_hyperbolic(H, M, e, tol, max_iter)
+    if len(bad):
+        Mb, eb = M[bad], e[bad]
+        Hb = np.sign(Mb) * np.log(2.0 * np.abs(Mb) / eb + 1.8)
+        still = _newton_hyperbolic(Hb, Mb, eb, tol, max_iter)
+        Hb[still] = np.nan
+        H[bad] = Hb
     return H
 
 
@@ -468,7 +503,7 @@ def filter_masks(designation, packed, elements, arc):
     ``elements`` is a dict of the ``ELEMENTS`` arrays (NaN where missing) and
     ``arc`` the JSON ``orbit_fit_statistics.arc_length_total`` values as
     text (None or "null" when absent), a sequence or Arrow array. Returns
-    (not_comet, has_elements, long_arc).
+    (not_satellite, has_elements, long_arc).
 
     The arc rule is get-mpcorb.py's SQL, exactly: ``mpc_orb_jsonb->
     'orbit_fit_statistics'->>'arc_length_total' NOT IN ('0 days', '1 days',
@@ -485,17 +520,25 @@ def filter_masks(designation, packed, elements, arc):
     the JSON text, strings still quoted (as ``_parse_car_chunk`` returns
     them).
 
-    Comets are the designations containing "/" (C/, P/, D/, and also A/
-    and S/, which are dropped with them). A packed designation starting
-    with "_" is *not* a comet. It is the MPC's extended packed format for
-    asteroid provisional designations with a cycle count above 619 (e.g.
-    ``_FB0088`` = 2015 BE640, ``_PO001I`` = 2025 OF623). Rejecting those
-    removed 6,140 asteroids from the 2026-09-29 catalog, and no comet's
-    packed designation starts with "_". ``packed`` is kept in the
-    signature for callers.
+    Comets are kept (since 2026-10-01, docs/design/nongrav.md): C/, P/,
+    D/ and I/ designations, and A/ (asteroids on cometary orbits: inactive,
+    but with ordinary orbits, often near-parabolic). Their unpacked primary
+    provisional designation is always the provisional one ("P/1991 T1",
+    not "145P"), and the element-less placeholders (in the 2026-10-01
+    catalog all 18 D/, 2,499 C/, 9 P/ and A/2017 U1) are dropped by
+    ``has_elements``; 1,942 comets are kept (1,188 C/, 728 P/, 26 A/).
+    Natural satellites, the designations starting "S/" ("S/2004 S 46"),
+    are dropped: their elements are heliocentric two-body fits, which
+    can't follow the motion about the planet.
+
+    A packed designation starting with "_" is the MPC's extended packed
+    format for asteroid provisional designations with a cycle count above
+    619 (e.g. ``_FB0088`` = 2015 BE640, ``_PO001I`` = 2025 OF623); no
+    comet's or satellite's packed designation starts with "_" (2026-10-01
+    catalog). ``packed`` is kept in the signature for callers.
     """
     designation = np.asarray(designation, dtype=str)
-    not_comet = ~(np.char.find(designation, "/") >= 0)
+    not_satellite = ~np.char.startswith(designation, "S/")
     has_elements = np.ones(len(designation), dtype=bool)
     for k in ELEMENTS:
         has_elements &= np.isfinite(np.asarray(elements[k], dtype=np.float64))
@@ -503,7 +546,7 @@ def filter_masks(designation, packed, elements, arc):
         arc = pa.array(list(arc), type=pa.string())
     short = pc.or_kleene(pc.is_in(arc, value_set=pa.array(_SHORT_ARCS + ["null"])), pc.is_null(arc))
     long_arc = ~pc.fill_null(short, True).to_numpy(zero_copy_only=False)
-    return not_comet, has_elements, long_arc
+    return not_satellite, has_elements, long_arc
 
 
 def _col(table, name):
@@ -539,16 +582,16 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True, s
         raise RuntimeError(f"{path}: {len(arc)} JSON rows parsed, {n_read} expected")
     t_parse = time.perf_counter() - t0
 
-    not_comet, has_el, long_arc = filter_masks(desig, packed, elements, arc)
+    not_sat, has_el, long_arc = filter_masks(desig, packed, elements, arc)
     has_el &= np.isfinite(num["epoch_mjd"])
     if with_filter:
-        keep = not_comet & has_el & long_arc
+        keep = not_sat & has_el & long_arc
     else:
         keep = np.ones(n_read, dtype=bool)
     counts = dict(
-        comet=int((~not_comet).sum()),
-        elements=int((not_comet & ~has_el).sum()),
-        arc=int((not_comet & has_el & ~long_arc).sum()),
+        satellite=int((~not_sat).sum()),
+        elements=int((not_sat & ~has_el).sum()),
+        arc=int((not_sat & has_el & ~long_arc).sum()),
     )
 
     idx = np.flatnonzero(keep)
@@ -588,8 +631,9 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True, s
                      normalized_rms=dict(p5=float(pct[0]), p50=float(pct[1]), p95=float(pct[2]),
                                          p99=float(pct[3]), n=int(len(rms)), n_zero=n_zero))
     if verbose:
-        removed = (f"removed {counts['comet']:,} comets, {counts['elements']:,} missing elements, "
-                   f"{counts['arc']:,} arcs <= 2 d" if with_filter else "no filter")
+        removed = (f"removed {counts['satellite']:,} natural satellites, "
+                   f"{counts['elements']:,} missing elements, {counts['arc']:,} arcs <= 2 d"
+                   if with_filter else "no filter")
         print(f"load_orbits: {n_read:,} rows read, {removed}; {len(out):,} kept; "
               f"has_cov false {int((~pd_ok).sum()):,} ({int(missing.sum()):,} missing, "
               f"{int((~missing & ~pd_ok).sum()):,} not PSD), {int(clipped.sum()):,} clipped to PSD; "
