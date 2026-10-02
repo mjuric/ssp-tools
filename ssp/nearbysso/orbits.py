@@ -36,6 +36,7 @@ the expected layout fall back to ``json.loads``.
 from __future__ import annotations
 
 import json
+import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -371,26 +372,41 @@ def _parse_car_chunk(arr):
     return cov, state, arc
 
 
-#: Rows whose JSON contains this have coefficient names after ``vz`` (a
-#: non-gravitational fit, ~640 of the 1.5M orbits); only those are parsed by
-#: ``ssp.nongrav.nongrav_params``, which makes the final decision.
-_NG_MARK = '"vz", "'
+#: The mpc_orb_jsonb of an orbit with a non-gravitational fit: its
+#: ``non_grav_booleans.non_gravs`` flag, or CAR coefficient names going on
+#: past ``vz`` (~640 of the 1.5M orbits). Either selects the row for
+#: ``ssp.nongrav.nongrav_params``, which makes the final decision. Both are
+#: regular expressions, so that they don't depend on the JSON's whitespace
+#: (PostgreSQL's jsonb text has ", " and ": ", but a compact or indented
+#: serialization must not make every orbit silently gravity-only).
+NON_GRAVS_TRUE_RE = r'"non_gravs"\s*:\s*true'
+CAR_BEYOND_VZ_RE = r'"vz"\s*,\s*"'
+
+
+def nongrav_marks(arr):
+    """(flag, coef): boolean numpy arrays, for an Arrow string array of
+    mpc_orb_jsonb, of the rows matching ``NON_GRAVS_TRUE_RE`` and
+    ``CAR_BEYOND_VZ_RE`` (null rows are False)."""
+    def m(rx):
+        return pc.fill_null(pc.match_substring_regex(arr, rx), False).to_numpy(zero_copy_only=False)
+    return m(NON_GRAVS_TRUE_RE), m(CAR_BEYOND_VZ_RE)
 
 
 def _nongrav_chunk(arr):
-    """{row in arr: NonGrav, or the ValueError the parser raised} for the
-    rows of an Arrow string array of mpc_orb_jsonb that have a
-    non-gravitational fit."""
-    cand = pc.fill_null(pc.match_substring(arr, _NG_MARK), False).to_numpy(zero_copy_only=False)
+    """{row in arr: (result, flag, coef)} for the rows of an Arrow string
+    array of mpc_orb_jsonb that ``nongrav_marks`` selects (either mark).
+    ``result`` is the row's ssp.nongrav.NonGrav (``NONE`` if it has no
+    fit after all), or the ValueError the parser raised; ``flag`` and
+    ``coef`` are the two marks, so that the caller can warn where they
+    disagree."""
+    flag, coef = nongrav_marks(arr)
     out = {}
-    for k in np.flatnonzero(cand):
+    for k in np.flatnonzero(flag | coef):
         try:
             ng = _ng.nongrav_params(arr[k].as_py())
         except ValueError as e:
-            out[int(k)] = e
-            continue
-        if ng.model:
-            out[int(k)] = ng
+            ng = e
+        out[int(k)] = (ng, bool(flag[k]), bool(coef[k]))
     return out
 
 
@@ -416,8 +432,8 @@ def parse_car(json_strings, nthreads=16, chunk=20_000, nongrav=False):
     and the JSON arc_length_total of an array of mpc_orb_jsonb strings, in
     ``nthreads`` threads (Arrow's kernels release the GIL). See
     ``_parse_car_chunk`` for the outputs. With ``nongrav``, a fourth output:
-    {row: ssp.nongrav.NonGrav, or the ValueError of an unknown model} for
-    the rows with a non-gravitational fit (``_nongrav_chunk``)."""
+    {row: (NonGrav or ValueError, flag, coef)} for the rows marked as having
+    a non-gravitational fit (``_nongrav_chunk``)."""
     arr = json_strings
     if isinstance(arr, pa.Array):
         arrays = [arr]
@@ -599,8 +615,8 @@ def fill_nongrav(out, rows, ngd):
     """Fill ``ng_model``, ``ng_A``, ``ng_fitted`` and ``cov_full`` of
     ``out`` (ORBIT_DTYPE, with state0, cov0 and has_cov already set), whose
     row k came from file row ``rows[k]``; ``ngd`` is ``parse_car``'s
-    {file row: NonGrav or ValueError}. See ``_contract`` ("Non-gravitational
-    parameters").
+    {file row: (NonGrav or ValueError, flag, coef)}. See ``_contract``
+    ("Non-gravitational parameters").
 
     Gravity-only rows get cov0 padded with zeros (NaN where has_cov is
     False), and are otherwise untouched. A non-grav row's cov_full has cov0
@@ -610,7 +626,9 @@ def fill_nongrav(out, rows, ngd):
     matrix, as cov0 does), or has_cov becomes False (and cov0 NaN). A block
     that ``make_psd`` clips to PSD is used as repaired (its state block then
     differs from cov0 by ~PSD_TOL relative). An unknown model (ValueError)
-    leaves the row gravity-only. Returns the counts.
+    leaves the row gravity-only. A row whose two marks (the ``non_gravs``
+    flag and the CAR coefficients beyond vz) disagree is parsed all the same,
+    with a warning naming it on stderr. Returns the counts.
     """
     cf = out["cov_full"]             # a view: filled in place
     cf[...] = 0.0
@@ -620,14 +638,24 @@ def fill_nongrav(out, rows, ngd):
     inv = np.full(int(max(rows.max(initial=-1), keys.max(initial=-1))) + 1, -1)
     inv[rows] = np.arange(len(rows))
     pos = {int(r): int(inv[r]) for r in keys if inv[r] >= 0}
-    counts = dict(comet=0, yarkovsky=0, unparsed=0, cov_missing=0, cov_not_psd=0, cov_clipped=0)
+    counts = dict(comet=0, yarkovsky=0, unparsed=0, cov_missing=0, cov_not_psd=0, cov_clipped=0,
+                  marks_disagree=0)
     blocks = {}                      # fitted-block size -> [(k, sel, block)]
-    for r, ng in ngd.items():
+    for r, (ng, flag, coef) in ngd.items():
         k = pos.get(int(r))
         if k is None:
             continue
+        des = str(out["designation"][k])
+        if flag != coef:
+            counts["marks_disagree"] += 1
+            print(f"WARNING: load_orbits: {des}: mpc_orb_jsonb non_gravs flag "
+                  f"{'true' if flag else 'not true'} but {'' if coef else 'no '}CAR coefficients "
+                  f"beyond vz; parsed anyway", file=sys.stderr)
         if isinstance(ng, Exception):
             counts["unparsed"] += 1
+            print(f"WARNING: load_orbits: {des}: {ng}; kept gravity-only", file=sys.stderr)
+            continue
+        if not ng.model:
             continue
         counts[ng.model] += 1
         out["ng_model"][k] = ng.model

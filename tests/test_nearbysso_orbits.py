@@ -159,7 +159,7 @@ def test_load_synthetic(tmp_path, capsys):
     assert "8 kept" in line and "has_cov false 1 (0 missing, 1 not PSD)" in line
     rms = stats.pop("normalized_rms")
     assert stats.pop("nongrav") == dict(comet=0, yarkovsky=0, unparsed=0, cov_missing=0, cov_not_psd=0,
-                                        cov_clipped=0)
+                                        cov_clipped=0, marks_disagree=0)
     assert stats == dict(rows_read=16, kept=8, removed=dict(satellite=1, elements=2, arc=5), has_cov_false=1,
                          cov_missing=0, cov_not_psd=1, cov_clipped_to_psd=stats["cov_clipped_to_psd"])
     assert set(rms) == {"p5", "p50", "p95", "p99", "n", "n_zero"} and rms["n"] + rms["n_zero"] <= 8

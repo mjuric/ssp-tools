@@ -1,14 +1,13 @@
 """WP N2: non-gravitational forces in NearbySSO's loader and coarse pass.
 
-``tests/data/nearbysso_nongrav_orbits.json`` holds five ``mpc_orbits`` rows of the
-2026-10-01 snapshot: the comets P/1991 T1 (145P; A1, A2) and P/2010 J5
+``tests/data/nearbysso_nongrav_orbits.json`` holds five ``mpc_orbits`` rows
+of the 2026-10-01 snapshot: the comets P/1991 T1 (145P; A1, A2) and P/2010 J5
 (the catalog's largest A1), the Yarkovsky asteroids 2004 MN4 (Apophis) and
 2018 CW2 (whose fitted A2 is exactly 0), and the gravity-only 1978 VN9.
 The loader tests need no ASSIST; the propagation tests are skipped unless
 ``SSP_ASSIST_PLANETS`` and ``SSP_ASSIST_ASTEROIDS`` are set.
 """
 
-import inspect
 import json
 import os
 import tempfile
@@ -71,7 +70,7 @@ def test_load_nongrav_fields():
     stats = {}
     rows, out = _load(FakeSun(), stats=stats)
     assert stats["nongrav"] == dict(comet=2, yarkovsky=2, unparsed=0, cov_missing=0, cov_not_psd=0,
-                                    cov_clipped=0)
+                                    cov_clipped=0, marks_disagree=0)
     js = _json_by_name()
     for name, model in [(COMET, "comet"), (COMET_BIG, "comet"), (YARK, "yarkovsky"),
                         (YARK_ZERO, "yarkovsky")]:
@@ -109,16 +108,58 @@ def test_load_summary_line(capsys):
            "0 without a usable full covariance)" in line
 
 
-def _rewrite(tmp_path, edit):
+def _rewrite(tmp_path, edit, dumps=json.dumps):
     """The test data, with ``edit(name, dict) -> dict`` applied to each
-    row's JSON."""
+    row's JSON, written back with ``dumps``."""
     t = pq.read_table(_data())
     names = t["unpacked_primary_provisional_designation"].to_pylist()
-    js = [json.dumps(edit(n, json.loads(s))) for n, s in zip(names, t["mpc_orb_jsonb"].to_pylist())]
+    js = [dumps(edit(n, json.loads(s))) for n, s in zip(names, t["mpc_orb_jsonb"].to_pylist())]
     t = t.set_column(t.schema.get_field_index("mpc_orb_jsonb"), "mpc_orb_jsonb", pa.array(js, pa.string()))
     path = tmp_path / "orbits.parquet"
     pq.write_table(t, path)
     return path
+
+
+@pytest.mark.parametrize("dumps", [
+    lambda j: json.dumps(j, separators=(",", ":")),      # compact
+    lambda j: json.dumps(j, indent=2),                    # indented
+], ids=["compact", "indented"])
+def test_load_whitespace_independent(tmp_path, dumps):
+    """The non-grav rows are found whatever the JSON's whitespace, with the
+    same results as from the jsonb text."""
+    ref, _ = _load(FakeSun())
+    stats = {}
+    rows, _ = _load(FakeSun(), _rewrite(tmp_path, lambda n, j: j, dumps), stats=stats)
+    assert stats["nongrav"]["comet"] == 2 and stats["nongrav"]["yarkovsky"] == 2
+    assert stats["nongrav"]["marks_disagree"] == 0
+    for name, r in ref.items():
+        q = rows[name]
+        assert q["ng_model"] == r["ng_model"] and q["has_cov"] == r["has_cov"]
+        np.testing.assert_array_equal(q["ng_A"], r["ng_A"])
+        np.testing.assert_array_equal(q["ng_fitted"], r["ng_fitted"])
+        np.testing.assert_allclose(q["cov_full"], r["cov_full"], rtol=1e-14, atol=0)
+
+
+def test_nongrav_marks_disagree(tmp_path, capsys):
+    """A row with only one of the two marks is parsed anyway, with a
+    warning naming it: the comet without its non_gravs flag keeps its fit;
+    the gravity-only orbit with the flag set stays gravity-only."""
+    def edit(name, j):
+        if name == COMET:
+            j["non_grav_booleans"]["non_gravs"] = False
+        if name == GRAV:
+            j["non_grav_booleans"] = {"non_gravs": True}
+        return j
+    stats = {}
+    rows, _ = _load(FakeSun(), _rewrite(tmp_path, edit), stats=stats)
+    err = capsys.readouterr().err
+    assert stats["nongrav"]["marks_disagree"] == 2 and stats["nongrav"]["comet"] == 2
+    assert f"{COMET}: mpc_orb_jsonb non_gravs flag not true but CAR coefficients beyond vz" in err
+    assert f"{GRAV}: mpc_orb_jsonb non_gravs flag true but no CAR coefficients beyond vz" in err
+    assert rows[COMET]["ng_model"] == "comet" and rows[GRAV]["ng_model"] == ""
+    flag, coef = O.nongrav_marks(pa.array(['{"non_gravs" :true}', '["vz",\n "A1"]', '["vz"]', None]))
+    np.testing.assert_array_equal(flag, [True, False, False, False])
+    np.testing.assert_array_equal(coef, [False, True, False, False])
 
 
 def test_load_unknown_model_kept_gravity_only(tmp_path):
@@ -345,8 +386,6 @@ def test_covariance_monte_carlo(rows, ephem):
 
 
 @needs_assist
-@pytest.mark.skipif("nongrav" not in inspect.signature(ea._propagate_one).parameters,
-                    reason="ephem_assist._propagate_one has no nongrav= yet (WP N1)")
 @pytest.mark.parametrize("name", [COMET, YARK])
 def test_coarse_vs_precise_pass(rows, ephem, name):
     """The coarse states agree with the precise pass's _propagate_one with

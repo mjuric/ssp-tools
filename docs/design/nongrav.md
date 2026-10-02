@@ -117,7 +117,8 @@ The work is split into work packages built by subagents in worktrees, per `CLAUD
 With 500 draws the sampling error of a σ is ~3%. The mean sample offset is under 0.11σ everywhere, so the problem stays linear. The state-only covariance is wrong in both directions, by up to 16× too small and 10× too large, because the state–A correlations can shrink σ as well as grow it.
 
 **Load and runtime:**
-- `load_orbits` on the full catalog: +1 s (14.0 s against 12.8 s), for the substring scan and parsing the 638 non-grav rows.
+- `load_orbits` on the full catalog: +1 s (14.0 s against 12.8 s), for the scan and parsing the 638 non-grav rows. Its peak RSS rises from about 9.6 to 10.7 GB, because `cov_full` (9×9 doubles) is written for every row.
+- **Selecting the non-grav rows:** a row is parsed when its JSON matches either the `non_gravs` flag (`"non_gravs"\s*:\s*true`) or a CAR coefficient name after `vz` (`"vz"\s*,\s*"`). Both are regular expressions, so compact or indented JSON is found too. A row where the two disagree is parsed anyway, with a warning naming it. On the 2026-10-01 catalog both mark the same 638 orbits. The test is shared with SSSource's `load_nongravs` (`ssp.nearbysso.orbits.nongrav_marks`).
 - `coarse`, 31 nightly samples: comets 2.8 against 2.2 ms per orbit, Yarkovsky 11.8 against 9.4 ms, both ×1.25.
 - SSSource's error ellipses (`ssp.sssource_ellipse`, through `coarse`) now include the A's for the 638 non-grav orbits.
 
