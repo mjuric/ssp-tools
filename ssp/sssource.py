@@ -30,6 +30,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from . import nongrav as _nongrav
 from . import util
 from .photfit import hg_V_mag
 from .ephem_assist import MJD_J2000, compute_ephemerides_one, open_ephem
@@ -117,7 +118,72 @@ def along_cross_track(off_ra, off_dec, rate_ra, rate_dec):
     return along, cross
 
 
-def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None):
+#: mpc_orb_jsonb of the orbits with a non-gravitational fit (the
+#: non_grav_booleans.non_gravs flag; on the 2026-10-01 catalog it marks
+#: exactly the 638 orbits whose CAR has coefficients beyond vz).
+_NON_GRAVS_TRUE = r'"non_gravs"\s*:\s*true'
+
+
+def load_nongravs(mpc_orbits_path, designations):
+    """``({designation: ssp.nongrav.NonGrav}, n_errors)`` for the
+    ``designations`` whose mpc_orbits row has a non-gravitational fit.
+
+    Only the designation and mpc_orb_jsonb columns are streamed, one thread
+    per row group; rows are filtered by designation first and then by the
+    ``non_gravs: true`` flag in the JSON text, so only the few non-grav
+    orbits' JSON is parsed. A ValueError from ``ssp.nongrav.nongrav_params``
+    is printed and counted in ``n_errors``, and the orbit left out (it is
+    integrated with gravity only). Orbits whose JSON parses to
+    ``ssp.nongrav.NONE`` are left out too. A designation on several rows
+    gets the last of them.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    key = "unpacked_primary_provisional_designation"
+    d = pc.unique(pa.array([str(x) for x in designations if x is not None and str(x) != ""],
+                           type=pa.string()))
+    if len(d) == 0:
+        return {}, 0
+
+    def scan(rg):
+        f = pq.ParquetFile(mpc_orbits_path)
+        out = []
+        for b in f.iter_batches(batch_size=20_000, row_groups=[rg],
+                                columns=[key, "mpc_orb_jsonb"], use_threads=False):
+            b = b.filter(pc.is_in(b.column(key), value_set=d))
+            if b.num_rows:
+                b = b.filter(pc.fill_null(
+                    pc.match_substring_regex(b.column("mpc_orb_jsonb"), _NON_GRAVS_TRUE), False))
+            if b.num_rows:
+                out += zip(b.column(key).to_pylist(), b.column("mpc_orb_jsonb").to_pylist())
+        return out
+
+    pf = pq.ParquetFile(mpc_orbits_path)
+    if "mpc_orb_jsonb" not in pf.schema_arrow.names:
+        print("WARNING: mpc_orbits has no mpc_orb_jsonb column; every orbit is integrated with "
+              "gravity only", file=sys.stderr)
+        return {}, 0
+    nrg = pf.num_row_groups
+    with ThreadPoolExecutor(max_workers=max(1, min(nrg, 16))) as ex:
+        rows = [r for part in ex.map(scan, range(nrg)) for r in part]   # (in file order)
+
+    nongravs, n_errors = {}, 0
+    for des, j in rows:
+        try:
+            ng = _nongrav.nongrav_params(j)
+        except ValueError as exc:
+            print(f"WARNING: {des}: {exc}; integrated with gravity only", file=sys.stderr)
+            n_errors += 1
+            nongravs.pop(des, None)
+            continue
+        if ng.model:
+            nongravs[des] = ng
+        else:
+            nongravs.pop(des, None)
+    return nongravs, n_errors
+
+
+def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None, nongravs=None):
     """Fill the ephemeris-derived SSSource columns (EPH_FIELDS) for one
     object.
 
@@ -128,6 +194,9 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None):
     midpointMjdTai, ra and dec. ``covs`` maps designations to their orbits
     with covariances (from ssp.sssource_ellipse.load_orbit_covariances);
     objects not in it, or all if it is None, get a NaN error ellipse.
+    ``nongravs`` maps designations to their ``ssp.nongrav.NonGrav`` (from
+    load_nongravs); the others, or all if it is None, are integrated with
+    gravity only.
     """
 
     # extract only the subset of observations related to this object
@@ -147,6 +216,7 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None):
         row=mpcorb.loc[provID],
         obs_pos=assoc["obs_pos"].T,
         obs_vel=assoc["obs_vel"].T,
+        nongrav=nongravs.get(provID, _nongrav.NONE) if nongravs is not None else _nongrav.NONE,
     )
 
     sss["ephRateRa"] = e.mu_lon
@@ -270,7 +340,7 @@ def _sssource_chunk(g0, g1):
             s, e = idx_start[g] - r0, idx_end[g] - r0
             compute_sssource_entry(out[s:e], obs_state[r0 + s:r0 + e],
                                    _PARALLEL["mpcorb"], _PARALLEL["dia_eph"], _EPHEM,
-                                   covs=_PARALLEL["covs"])
+                                   covs=_PARALLEL["covs"], nongravs=_PARALLEL["nongravs"])
     sys.stdout.write(buf.getvalue())
     sys.stdout.flush()
 
@@ -280,11 +350,13 @@ def _sssource_chunk(g0, g1):
     return res, int(_propagate.STEP_CAP_STOPS)
 
 
-def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor=8, covs=None):
+def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor=8, covs=None,
+                        nongravs=None):
     """Fill the EPH_FIELDS of ``sss`` with compute_sssource_entry, per
     object (``sss`` grouped by ssObjectId; ``obs_state`` its rows' observer
     states and DiaSource rows in ``dia_eph``; ``covs`` the orbit
-    covariances for the error ellipse, see compute_sssource_entry).
+    covariances for the error ellipse, and ``nongravs`` their non-gravitational
+    parameters, see compute_sssource_entry).
 
     With ``workers`` > 1, the objects are split into about ``chunk_factor *
     workers`` chunks, balanced by observation count, and computed in a
@@ -301,7 +373,8 @@ def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor
         _propagate.STEP_CAP_STOPS = 0
         util.group_by(
             [sss, obs_state], "ssObjectId",
-            partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem, covs=covs),
+            partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem, covs=covs,
+                    nongravs=nongravs),
         )
         return int(_propagate.STEP_CAP_STOPS)
 
@@ -319,7 +392,7 @@ def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor
     print(f"Computing ephemerides of {len(counts):,} objects in {len(chunks)} chunks "
           f"on {workers} workers...", flush=True)
     _PARALLEL.update(sss=sss, obs_state=obs_state, dia_eph=dia_eph, mpcorb=mpcorb, covs=covs,
-                     idx_start=idx_start, idx_end=idx_end)
+                     nongravs=nongravs, idx_start=idx_start, idx_end=idx_end)
     try:
         results = util.run_chunks(_sssource_chunk, chunks, workers, "ephemerides",
                                   weights=[int(counts[g0:g1].sum()) for g0, g1 in chunks])
@@ -724,11 +797,18 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
                                            open_ephem())
 
     print(f"[{time.perf_counter() - t_start:.1f} s] orbit covariances loaded", flush=True)
+    # The non-gravitational parameters of the objects present that have them.
+    nongravs, n_ng_errors = load_nongravs(mpc_orbits_path, np.unique(sss["designation"][:n_orbit]))
+    n_ng = {m: sum(ng.model == m for ng in nongravs.values()) for m in ("comet", "yarkovsky")}
+    print(f"[{time.perf_counter() - t_start:.1f} s] non-gravitational parameters: "
+          f"{n_ng['comet']:,} comets, {n_ng['yarkovsky']:,} Yarkovsky asteroids; "
+          f"{n_ng_errors:,} unparseable (integrated with gravity only)", flush=True)
     # ephemerides for the objects with orbits (the first n_orbit rows);
     # every orbit-derived column of the rest is NaN (NULL when written).
     t_eph = time.perf_counter()
     step_cap_stops = compute_ephemerides(sss[:n_orbit], obs_state[:n_orbit], dia_eph, mpcorb,
-                                         workers=workers, chunk_factor=chunk_factor, covs=covs)
+                                         workers=workers, chunk_factor=chunk_factor, covs=covs,
+                                         nongravs=nongravs)
     t_eph = time.perf_counter() - t_eph
     n_ell = int(np.sum(np.isnan(sss["ephRaErr"][:n_orbit])))
     print(f"Ephemerides in {t_eph:.1f} s; error ellipse NULL on {n_ell:,} of {n_orbit:,} rows with an "
@@ -736,7 +816,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     for name in EPHEMERIS_COLUMNS:
         if sss.dtype[name].kind == "f" and name not in MEASURED_EPH_COLUMNS:
             sss[name][n_orbit:] = np.nan
-    del obs_state, mpcorb, covs
+    del obs_state, mpcorb, covs, nongravs
 
     #
     # Assemble the SSSource columns, in the output's row order
