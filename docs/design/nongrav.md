@@ -141,7 +141,7 @@ The work is split into work packages built by subagents in worktrees, per `CLAUD
 
 - NearbySSO's precise pass gets each orbit's NonGrav (`ssp.nongrav.from_orbit`). The contract named this wiring, but no WP owned it; `tests/test_nearbysso_build.py::test_precise_pass_gets_nongrav` covers it.
 - The scalar `ephem_assist.solve_kepler_hyperbolic` got N3's fallback. Converged results are unchanged.
-- Merged into `nongrav`: N3 (#60), N1 (#61), N2 (#63), N4 (#64).
+- Merged into `nongrav`: N3 (#60), N1 (#61), N2 (#63), N4 (#64), N5 (#66).
 
 ### The full daily rerun (2026-10-01)
 
@@ -186,6 +186,50 @@ The work is split into work packages built by subagents in worktrees, per `CLAUD
 - The `a1`/`a2` Parquet columns disagree with the CAR block for some comets, e.g. P/1818 W1's a1 = 1.82 against 1.82e-10. The code uses CAR, as decided.
 - P/1973 S1's JSON fit statistics say `orbit_quality: 'no_orbit'`, nobs 0 and arc 0, yet its non-grav orbit works (3.0″ → 0.55″). It passes the arc filter because its arc is the JSON number 0, not the text '0 days': that is get-mpcorb.py's rule, kept as is.
 
+## WP N5 results (the comparison with JPL, 2026-10-01)
+
+`bench/jpl_compare.py` ran on the fixture's SSSource, built from fbfd345. It made 97 JPL requests, all serial and cached; the cache and reports are in `/sdf/data/rubin/user/mjuric/nongrav/work/n5/`. Horizons observer tables were requested in TT, vector tables in TDB. Every Horizons solution ID matches SBDB's `orbit_id`.
+
+**1. MPC orbits against JPL's own orbits, at the Rubin times** (a report). The table gives medians over each class's objects:
+
+| class | objects | separation | nσ (combined) | offset, MPC orbit | offset, JPL orbit | JPL fits better | our σ / JPL's |
+|---|---|---|---|---|---|---|---|
+| comets with a non-grav fit | 15 | 0.117″ (max 1.19″) | 1.69 | 0.477″ | 0.391″ | 7 of 15 | 0.98 |
+| Yarkovsky asteroids | 24 | 0.040″ (max 0.33″) | 0.82 | 0.096″ | 0.091″ | 17 of 24 | 0.72 |
+| comets without one | 5 | 0.542″ | 0.80 | 0.394″ | 0.189″ | 2 of 5 | 0.95 |
+| controls | 5 | 0.030″ | 0.71 | 0.054″ | 0.069″ | 3 of 5 | 0.70 |
+
+- **The two catalogs agree** at about the level of their uncertainties. Our σ (from the MPC covariance) is about 0.6–0.9× JPL's for asteroids and about 1× for comets with non-grav fits.
+- **More than 3σ apart.** These are mostly where the two catalogs model the comet differently:
+  - 67P: 24.8σ, 1.19″. JPL fits DT = 45.7 d and A3.
+  - 3I/ATLAS (C/2025 N1): 23σ, 0.54″. JPL fits A1–A3, DT and g = 1/r²; the MPC's orbit is gravity-only.
+  - 141P (P/1994 P1): 19σ, 83″. JPL's 2024 solution fits Rubin worse than the MPC's (145″ against 62″).
+  - 2P: 7.2σ. 210P (P/2003 K2): 5.8σ, where JPL fits A2 only. 47P: 4.3σ. 32P: 3.1σ.
+  - JPL's orbit fits Rubin better for 2P and 210P.
+- **The model differs:**
+  - JPL adds A3 for 32P, 67P, 77P and 131P, and fits A2 alone for 138P, 228P and 210P; the MPC always fits A1+A2.
+  - 228P and 3I use a non-standard g(r) at JPL.
+  - Five MPC Yarkovsky fits are gravity-only at JPL: 1998 FG2, 1998 YW5, 2004 TG10, 2012 KA4 and 2025 QH138.
+- **2025 QH138:** JPL has no fit of its own. Horizons serves the MPC's published orbit, gravity-only, and the two positions are 0.05″ apart. The MPC's large Yarkovsky A2 (−4.1e-10 ± 4.1e-10) is consistent with zero.
+- **P/1999 RO28:** the MPC orbit is 356″ off Rubin's observations; JPL's is 0.35″ off. The MPC's own ellipse is about 4,000″, so the MPC orbit is within 1σ.
+
+**2. ASSIST against JPL's integrator, with JPL's own orbits** (pass/fail). The objects:
+- 6 comets: 2P, 47P, 78P, 210P, 32P, and 228P with its non-standard g(r);
+- 4 Yarkovsky asteroids: Ryugu, Adonis, 2008 NP3, 1998 FW4;
+- 3 gravity-only controls: 2007 GK33, 2016 PR243, 6120 P-L.
+
+The comparison runs over epoch ±2 yr and through perihelion. The initial state comes from the osculating elements printed in Horizons' header. The vector at the epoch agrees to 1.1 m, and the round trip back to elements to 5e-15. **13 of 13 PASS.**
+- **Light-time, aberration and the observer:** Horizons' own vectors run through our code agree to ≤ 0.22 mas.
+- **Integration:** the residual against Horizons grows by about 0.13 km/yr, with or without non-gravs: 0.5–1.5 mas for the controls a few years from their epochs. It is not IAS15's step control or the planets' harmonics; ASSIST's force model differs slightly from JPL's integrator. Issue #67.
+- **The non-grav displacement itself** (1,300–57,000 km for these comets) agrees to within 1e-4 of its size for the comets, and to about 3% for 1998 FW4, whose 8.6 mas sits on the same floor, 15 yr from its epoch.
+
+**2b. The MPC's own elements and A's, sent to Horizons as user elements,** against our SSSource on exactly the published orbits: **0.03–0.30 mas** on 210P, 78P, 261P, 2025 QH138 and 2008 NP3. Horizons applies the A's: adding them moves 210P by 5,861.1 mas in both Horizons and our code.
+
+**Conclusions:**
+- Our integration with non-gravs reproduces JPL's, to the sub-mas level over Rubin's span.
+- The MPC orbits agree with JPL's at roughly their stated uncertainties.
+- The large disagreements come where the two catalogs fit different models: DT, A3, or a non-standard g(r). Neither DT nor non-standard g(r) is in any current MPC orbit.
+
 ## WP N2 results (coarse pass and uncertainty, 2026-10-01)
 
 **ASSIST 1.2.3 covers the non-gravs in its variational equations** (`assist_additional_force_non_gravitational`, `src/forces.c`):
@@ -220,5 +264,5 @@ With 500 draws the sampling error of a σ is ~3%. The mean sample offset is unde
 ## Open (for the plan)
 
 - ~~**Covariance:** the error ellipse uses the 6×6 state block only.~~ Done in WP N2: the A's are in the covariance, through ASSIST's variational equations.
-- **Validation:** WP N4, the black-box harness (`bench/nongrav_validate.py`), and the full daily rerun.
+- ~~**Validation:**~~ Done: WP N4 (`bench/nongrav_validate.py`), WP N5 (`bench/jpl_compare.py`) and the full daily rerun.
 - **Comet magnitudes:** `ephVmag` from HG is wrong for active comets, and SSObject's HG12 fits for comets aren't meaningful. To be decided.
