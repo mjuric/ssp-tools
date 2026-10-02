@@ -83,7 +83,9 @@ def _synthetic_table(rng):
     rows = [
         # designation, packed, json, q (None: missing)
         ("2000 AA", "K00A00A", _orbit_json(good, "2001-2020"), 2.0),        # kept
-        ("C/2024 G7", "CK24G070", _orbit_json(good, "2001-2020"), 2.0),     # comet ('/')
+        ("C/2024 G7", "CK24G070", _orbit_json(good, "2001-2020"), 2.0),     # kept: a comet
+        ("S/2004 S 46", "SK04S460", _orbit_json(good, "2001-2020"), 2.0),   # natural satellite
+        ("C/2002 VQ94", "CK02V94Q", None, None),                            # comet placeholder
         ("2025 OF623", "_PO001I", _orbit_json(good, "2001-2020"), 2.0),     # kept: extended packed asteroid
         ("2001 BB", "K01B00B", _orbit_json(good, "2001-2020"), None),       # elements missing
         ("2002 CC", "K02C00C", _orbit_json(good, "2 days"), 2.0),           # short arc
@@ -119,18 +121,21 @@ def _synthetic_table(rng):
 
 def test_filter_masks():
     desig = ["2000 AA", "C/2024 G7", "P/2010 A2", "2025 OF623", "2001 BB", "2002 CC", "2002 CD", "2002 CE",
-             "1999 ZZ"]
+             "1999 ZZ", "S/2004 S 46", "A/2024 U2", "C/2025 N1", "D/1826 D1", "S/2023 U 1"]
     packed = ["K00A00A", "CK24G070", "PK10A020", "_PO001I", "K01B00B", "K02C00C", "K02C00D", "K02C00E",
-              "J99Z00Z"]
+              "J99Z00Z", "SK04S460", "AK24U020", "CK25N010", "DI26D010", "SK23U010"]
     el = {k: np.ones(len(desig)) for k in O.ELEMENTS}
     el["peri_time"][4] = np.nan
+    el["q"][12] = np.nan          # D/1826 D1: a placeholder without elements
     arc = ['"2001-2020"', '"4 days"', '"4 days"', '"4 days"', '"4 days"', '"2 days"', '"1 days"', None,
-           '"3 days"']
-    not_comet, has_el, long_arc = O.filter_masks(desig, packed, el, arc)
-    # 2025 OF623 (_PO001I): an asteroid in the extended packed format
-    np.testing.assert_array_equal(not_comet, [1, 0, 0, 1, 1, 1, 1, 1, 1])
-    np.testing.assert_array_equal(has_el, [1, 1, 1, 1, 0, 1, 1, 1, 1])
-    np.testing.assert_array_equal(long_arc, [1, 1, 1, 1, 1, 0, 0, 0, 1])
+           '"3 days"', '"4 days"', '"4 days"', '"4 days"', None, '"4 days"']
+    not_sat, has_el, long_arc = O.filter_masks(desig, packed, el, arc)
+    # comets (C/, P/, D/) and A/ objects are kept, natural satellites (S/)
+    # are not; 2025 OF623 (_PO001I) is an asteroid in the extended packed
+    # format
+    np.testing.assert_array_equal(not_sat, [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0])
+    np.testing.assert_array_equal(has_el, [1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1])
+    np.testing.assert_array_equal(long_arc, [1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 1])
     # JSON null and "0 days" drop; the number 0 (MPC "no_orbit" statistics)
     # is kept, as in get-mpcorb.py's text comparison
     _, _, la = O.filter_masks(["a"] * 4, ["a"] * 4, {k: np.ones(4) for k in O.ELEMENTS},
@@ -149,20 +154,21 @@ def test_load_synthetic(tmp_path, capsys):
     out = O.load_orbits(path, ephem=ephem, stats=stats)
     line = capsys.readouterr().out
     # rows without an arc (no JSON, or none in it) drop, as in get-mpcorb.py
-    assert "14 rows read" in line and "removed 1 comets, 1 missing elements, 5 arcs <= 2 d" in line
-    assert "7 kept" in line and "has_cov false 1 (0 missing, 1 not PSD)" in line
+    assert ("16 rows read" in line
+            and "removed 1 natural satellites, 2 missing elements, 5 arcs <= 2 d" in line)
+    assert "8 kept" in line and "has_cov false 1 (0 missing, 1 not PSD)" in line
     rms = stats.pop("normalized_rms")
-    assert stats == dict(rows_read=14, kept=7, removed=dict(comet=1, elements=1, arc=5), has_cov_false=1,
+    assert stats == dict(rows_read=16, kept=8, removed=dict(satellite=1, elements=2, arc=5), has_cov_false=1,
                          cov_missing=0, cov_not_psd=1, cov_clipped_to_psd=stats["cov_clipped_to_psd"])
-    assert set(rms) == {"p5", "p50", "p95", "p99", "n", "n_zero"} and rms["n"] + rms["n_zero"] <= 7
+    assert set(rms) == {"p5", "p50", "p95", "p99", "n", "n_zero"} and rms["n"] + rms["n_zero"] <= 8
     assert f"{rms['p50']:.3f}" in line
 
     assert out.dtype == ORBIT_DTYPE
     assert list(out["designation"]) == ["1993 TT", "1994 UU", "1995 VV", "1998 YY", "1999 ZZ", "2000 AA",
-                                        "2025 OF623"]
-    assert list(out["has_cov"]) == [True, True, True, False, True, True, True]
+                                        "2025 OF623", "C/2024 G7"]
+    assert list(out["has_cov"]) == [True, True, True, False, True, True, True, True]
     assert list(out["packed"]) == ["J93T00T", "J94U00U", "J95V00V", "J98Y00Y", "J99Z00Z", "K00A00A",
-                                   "_PO001I"]
+                                   "_PO001I", "CK24G070"]
 
     Ceq = O.R6 @ good @ O.R6.T
     for r in out[out["has_cov"]]:
@@ -179,7 +185,7 @@ def test_load_synthetic(tmp_path, capsys):
 
     # without the filter, every row, and the incomputable states are NaN
     allrows = O.load_orbits(path, with_filter=False, ephem=ephem, verbose=False)
-    assert len(allrows) == 14
+    assert len(allrows) == 16
     assert np.all(allrows["designation"][:-1] < allrows["designation"][1:])
     bad = allrows[allrows["designation"] == "2001 BB"][0]
     assert np.all(np.isnan(bad["state0"]))
@@ -268,6 +274,60 @@ def test_vectorized_kepler_matches_scalar():
         np.testing.assert_allclose(V[k], v, rtol=1e-12, atol=1e-13 * np.linalg.norm(v))
 
 
+def test_vectorized_kepler_comet_orbits():
+    """Near-parabolic and hyperbolic orbits, as comets have them: the
+    vectorized conversion agrees with the scalar one wherever that one
+    converges, and its states have the energy and angular momentum of
+    (q, e)."""
+    mu = ea.GM_SUN
+    rows = [(q, e, dt) for q in (0.005, 0.1, 1.35, 14.0)
+            for e in (0.99, 0.99999, 1 - 1e-7, 1 + 1e-7, 1.00001, 1.0035, 3.36, 6.12)
+            for dt in (-3e4, -400.0, -1.0, 0.0, 0.5, 30.0, 1000.0)]
+    q, e, dt = (np.array(x) for x in zip(*rows))
+    n = len(q)
+    inc, Om, om = np.full(n, 2.1), np.full(n, 0.4), np.full(n, 5.0)
+    X, V = O.cometary_to_helio_ecliptic_vec(q, e, inc, Om, om, dt)
+    assert np.all(np.isfinite(X)) and np.all(np.isfinite(V))
+    r = np.linalg.norm(X, axis=1)
+    energy = 0.5 * np.sum(V * V, axis=1) - mu / r
+    np.testing.assert_allclose(energy, -mu * (1 - e) / (2 * q), rtol=0, atol=1e-8 * np.max(mu / r))
+    h = np.linalg.norm(np.cross(X, V), axis=1)
+    np.testing.assert_allclose(h, np.sqrt(mu * q * (1 + e)), rtol=1e-8)
+    n_scalar_failed = 0
+    for k in range(n):
+        with np.errstate(all="ignore"):
+            x, v = ea.cometary_to_helio_ecliptic(q[k], e[k], inc[k], Om[k], om[k], dt[k])
+            ok = np.all(np.isfinite(x)) and np.all(np.isfinite(v))
+            rk = np.linalg.norm(x)
+            ok = ok and abs(0.5 * v @ v - mu / rk + mu * (1 - e[k]) / (2 * q[k])) < 1e-8 * mu / rk
+        if not ok:
+            n_scalar_failed += 1          # the scalar solver's bad start (see below)
+            continue
+        np.testing.assert_allclose(X[k], x, rtol=1e-12, atol=1e-13 * np.linalg.norm(x))
+        np.testing.assert_allclose(V[k], v, rtol=1e-12, atol=1e-13 * np.linalg.norm(v))
+    assert n_scalar_failed < n // 20
+
+
+def test_hyperbolic_kepler_fallback():
+    """e -> 1 at small |M|: arcsinh(M / e) is a bad start (the first Newton
+    step overflows); the fallback start converges to the root."""
+    q, e, dt = 0.005, 1.000001, 3e4           # 80 years from perihelion
+    a = q / (1 - e)
+    M = np.sqrt(ea.GM_SUN / abs(a) ** 3) * dt
+    H = O._solve_kepler_hyperbolic_vec(np.array([M, -M, 0.0, 2.0]), np.array([e, e, e, 1.5]))
+    assert np.all(np.isfinite(H))
+    ee = np.array([e, e, e, 1.5])
+    np.testing.assert_allclose(ee * np.sinh(H) - H, [M, -M, 0.0, 2.0], rtol=1e-12, atol=1e-15)
+    X, V = O.cometary_to_helio_ecliptic_vec(*(np.array([x]) for x in (q, e, 0.3, 1.0, 2.0, dt)))
+    r = np.linalg.norm(X)
+    np.testing.assert_allclose(0.5 * np.sum(V * V) - ea.GM_SUN / r, -ea.GM_SUN * (1 - e) / (2 * q),
+                               rtol=0, atol=1e-10 * ea.GM_SUN / r)
+    # Newton that doesn't converge from either start: NaN, not garbage
+    with np.errstate(all="ignore"):
+        bad = O._solve_kepler_hyperbolic_vec(np.array([1.0]), np.array([1.5]), max_iter=1)
+    assert np.isnan(bad[0])
+
+
 # --------------------------------------------------------------------------
 # Real rows
 # --------------------------------------------------------------------------
@@ -288,22 +348,23 @@ def sample(tmp_path_factory):
 def test_real_ordering_and_filter(sample):
     d = sample.out["designation"]
     assert np.all(d[:-1] < d[1:])                      # sorted, unique
-    assert not np.any(np.char.find(d.astype(str), "/") >= 0)
-    # extended-format packed designations ("_...") are asteroids: never comets
+    assert not np.any(np.char.startswith(d.astype(str), "S/"))
+    # extended-format packed designations ("_...") are asteroids: never
+    # natural satellites
     t = sample.table
     packed = t["packed_primary_provisional_designation"].to_numpy(zero_copy_only=False).astype(str)
     desig = t["unpacked_primary_provisional_designation"].to_numpy(zero_copy_only=False).astype(str)
     ext = np.char.startswith(packed, "_")
-    not_comet, _, _ = O.filter_masks(desig[ext], packed[ext], {k: np.ones(ext.sum()) for k in O.ELEMENTS},
-                                     ['"2001-2020"'] * int(ext.sum()))
-    assert not_comet.all()
+    not_sat, _, _ = O.filter_masks(desig[ext], packed[ext], {k: np.ones(ext.sum()) for k in O.ELEMENTS},
+                                   ['"2001-2020"'] * int(ext.sum()))
+    assert not_sat.all()
     assert 0.9 * NSAMPLE < len(sample.out) < NSAMPLE
 
 
 def test_real_state_matches_elements_row_to_bary_icrf(sample):
     rng = np.random.default_rng(11)
     rows = sample.out[rng.choice(len(sample.out), 300, replace=False)]
-    # plus any hyperbolic ones (the sample's are all comets, so filtered out)
+    # plus any hyperbolic ones
     rows = np.concatenate([rows, sample.out[sample.out["e"] > 1]])
     for r in rows:
         t0 = _epoch_like_ephem_assist(r["epoch_mjd"])
