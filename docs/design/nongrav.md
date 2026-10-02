@@ -141,7 +141,7 @@ The work is split into work packages built by subagents in worktrees, per `CLAUD
 
 - NearbySSO's precise pass gets each orbit's NonGrav (`ssp.nongrav.from_orbit`). The contract named this wiring, but no WP owned it; `tests/test_nearbysso_build.py::test_precise_pass_gets_nongrav` covers it.
 - The scalar `ephem_assist.solve_kepler_hyperbolic` got N3's fallback. Converged results are unchanged.
-- Merged into `nongrav`: N3 (#60), N1 (#61), N2 (#63).
+- Merged into `nongrav`: N3 (#60), N1 (#61), N2 (#63), N4 (#64).
 
 ### The full daily rerun (2026-10-01)
 
@@ -168,6 +168,23 @@ The work is split into work packages built by subagents in worktrees, per `CLAUD
   - **Unchanged:** all 1,290,586 asteroid rows, bitwise.
   - **Updated:** the 246 rows of Yarkovsky asteroids.
 - **SSObject:** 297,762 rows.
+
+**The N4 harness on the rerun** (`bench/nongrav_validate.py` at d4ee667 plus the fix below; reports in `/sdf/data/rubin/user/mjuric/nongrav/rerun/2026-10-01/checks/`):
+- **offsets,** against the earlier 2026-10-01 delivery: PASS, 8 checks.
+  - 38 ephemeris, geometry and error columns are bitwise identical for the 8,070,115 gravity-only rows; all 39 non-grav objects changed.
+  - comet_ng: the median of the per-object medians goes 0.645″ → 0.477″; no comet is much worse.
+  - Yarkovsky: within tolerance, 0.0993″ → 0.0962″.
+- **nearbysso,** against the PPDB DiaSources: PASS, 8 checks.
+  - No S/ objects, and no row for an orbit the filter drops. Every miss is explained.
+  - 215,111 matched rows agree in position to 7e-6 mas, with identical rates and V.
+  - ephOffset agrees to 1e-8″ on the 214,882 rows matched by diaSourceId. The other 229 rows are matched by (visit, ra, dec); there the observed positions come from different measurements (SSSource's science-image Source against the DiaSource), so they differ by up to 0.001″.
+  - The comet-coverage gate is not applicable: none of the comets' SSSource DiaSources are in the PPDB DiaSources, as N3 found. The harness used to report this 0-of-0 case as a FAIL; it now notes it.
+- **uncertainty,** on a catalog sample of 10 comets and 10 Yarkovsky orbits at the rerun's SSSource times: PASS. 57 of 57 are within the Monte Carlo band, for both `coarse`+`ellipse_at` and the SSSource columns. Median ratios: comets 1.000 (RA) and 0.999 (Dec), Yarkovsky 1.014 and 0.995.
+
+**Other findings from N4:**
+- Issue #65: the linear covariance is meaningless for some short-arc orbits whose epoch is far from the arc. This is gravity-only and predates this work.
+- The `a1`/`a2` Parquet columns disagree with the CAR block for some comets, e.g. P/1818 W1's a1 = 1.82 against 1.82e-10. The code uses CAR, as decided.
+- P/1973 S1's JSON fit statistics say `orbit_quality: 'no_orbit'`, nobs 0 and arc 0, yet its non-grav orbit works (3.0″ → 0.55″). It passes the arc filter because its arc is the JSON number 0, not the text '0 days': that is get-mpcorb.py's rule, kept as is.
 
 ## WP N2 results (coarse pass and uncertainty, 2026-10-01)
 

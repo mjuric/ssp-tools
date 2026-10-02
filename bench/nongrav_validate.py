@@ -49,7 +49,8 @@ exit 0 on PASS, 1 on FAIL)::
       sungrazer (q < 0.02 au), a nearer object, or (asked of
       propagate.coarse for what's left) sigma > 10" within +-0.34 d of the
       observation, where NearbySSO's nightly sample may gate the night.
-      Gates: no unexplained misses; most comet rows matched; agreement of
+      Gates: no unexplained misses; most comet rows matched (when the input
+      has any; otherwise noted as not applicable); agreement of
       the matched rows; no S/ objects; no NearbySSO row for an orbit the
       filter drops. ``--table FILE``: the per-row table (Parquet).
 
@@ -869,8 +870,14 @@ def _nearbysso_gates(df, rep):
     comets = df["class"].isin(("comet_ng", "comet_grav"))
     nc = int(comets.sum())
     mc = int((comets & (df["status"] == "match")).sum())
-    rep.check("most comet rows matched", nc > 0 and mc >= COMET_MATCH_MIN_FRAC * nc,
-              f"{mc:,} of {nc:,} comet rows ({mc / max(nc, 1):.1%}; >= {COMET_MATCH_MIN_FRAC:.0%})")
+    if nc:
+        rep.check("most comet rows matched", mc >= COMET_MATCH_MIN_FRAC * nc,
+                  f"{mc:,} of {nc:,} comet rows ({mc / nc:.1%}; >= {COMET_MATCH_MIN_FRAC:.0%})")
+    else:
+        # e.g. the daily PPDB DiaSources, which hold none of the comets'
+        # SSSource DiaSources (2026-10-01): nothing to match, not a failure
+        rep.info("most comet rows matched: not applicable, no comet SSSource row's DiaSource is in "
+                 "the NearbySSO input")
     un = df[df["status"] == "UNEXPLAINED"]
     rep.check("every miss explained", un.empty,
               f"{len(un):,} unexplained" + (": " + "; ".join(

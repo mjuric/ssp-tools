@@ -264,6 +264,18 @@ def test_nearbysso_defects(defect, failed):
     assert any(f.startswith(failed) for f in rep.failed), rep.text()
 
 
+def test_nearbysso_no_comets_in_input():
+    """No comet SSSource row's DiaSource in the NearbySSO input: the comet
+    gate is not applicable, not a failure."""
+    sss, dia, nss, orbits, cmap = _nss_case()
+    keep = (sss["designation"] == "2000 CA").to_numpy()
+    sss, dia = sss[keep].reset_index(drop=True), dia[keep].reset_index(drop=True)
+    nss = nss[nss["designation"] == "2000 CA"]
+    rep, _ = _nss_run(sss, dia, nss, orbits, cmap)
+    assert rep.ok, rep.text()
+    assert "most comet rows matched: not applicable" in rep.text()
+
+
 def test_nearbysso_coarse_sigma_explains():
     sss, dia, nss, orbits, cmap = _nss_case()
     nss = nss[nss["diaSourceId"] != 1008]
