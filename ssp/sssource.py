@@ -122,8 +122,8 @@ def along_cross_track(off_ra, off_dec, rate_ra, rate_dec):
 #: non_grav_booleans.non_gravs flag, or a CAR coefficient after vz (the
 #: coefficient_names list continuing past "vz"). Either selects the row for
 #: parsing; on the 2026-10-01 catalog both mark exactly the same 638 orbits.
-_NON_GRAVS_TRUE = r'"non_gravs"\s*:\s*true'
-_CAR_BEYOND_VZ = '"vz", "'
+#: (Shared with NearbySSO's loader: ssp.nearbysso.orbits.nongrav_marks,
+#: whitespace-independent regular expressions.)
 
 
 def load_nongravs(mpc_orbits_path, designations):
@@ -145,6 +145,8 @@ def load_nongravs(mpc_orbits_path, designations):
     """
     from concurrent.futures import ThreadPoolExecutor
 
+    from .nearbysso.orbits import nongrav_marks
+
     key = "unpacked_primary_provisional_designation"
     d = pc.unique(pa.array([str(x) for x in designations if x is not None and str(x) != ""],
                            type=pa.string()))
@@ -160,8 +162,7 @@ def load_nongravs(mpc_orbits_path, designations):
             if not b.num_rows:
                 continue
             j = b.column("mpc_orb_jsonb")
-            flag = pc.fill_null(pc.match_substring_regex(j, _NON_GRAVS_TRUE), False)
-            coef = pc.fill_null(pc.match_substring(j, _CAR_BEYOND_VZ), False)
+            flag, coef = (pa.array(x) for x in nongrav_marks(j))
             b = b.append_column("flag", flag).append_column("coef", coef)
             b = b.filter(pc.or_(flag, coef))
             if b.num_rows:

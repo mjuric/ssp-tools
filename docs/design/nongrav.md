@@ -91,6 +91,37 @@ The work is split into work packages built by subagents in worktrees, per `CLAUD
 
 **Out of scope:** comet magnitudes. `ephVmag` from HG stays wrong for active comets, and SSObject's HG12 fits for comets aren't meaningful; to be decided separately.
 
+## WP N2 results (coarse pass and uncertainty, 2026-10-01)
+
+**ASSIST 1.2.3 covers the non-gravs in its variational equations** (`assist_additional_force_non_gravitational`, `src/forces.c`):
+- each `testparticle` variation gets the non-grav acceleration's partials with respect to position and velocity, plus `dA1·∂a/∂A1 + dA2·∂a/∂A2 + dA3·∂a/∂A3`;
+- `particle_params` holds one (A1, A2, A3) triple per real particle, then one per variational configuration: configuration v reads its (dA1, dA2, dA3) from `particle_params[3·(N_real + v)]`;
+- so `coarse` adds three variational particles seeded at zero, with unit dA's, and gets ∂state/∂A directly; the six state variations carry dA = 0;
+- a particle whose three A's are all 0 is skipped altogether, variations included. 2018 CW2's fitted A2 is exactly 0, so for it one fitted A is set to 1e-300 (no effect on the orbit).
+
+**Checks** (`tests/test_nearbysso_nongrav.py`; scripts and outputs in `/sdf/data/rubin/user/mjuric/nongrav/work/n2/`):
+- ∂state/∂A against central differences in A: agrees to 1e-6–1e-8 at steps of 1000σ(A). At 1σ the plain integrations' own noise limits the difference to ~1e-3.
+- Phi's non-grav part (P/2010 J5, the largest A1: 2e-2 at a year) against central differences in the state: agrees to 2e-5.
+- The states are bitwise those of a plain integration with `ssp.nongrav.apply`. The variational particles don't change IAS15's steps.
+- Gravity-only orbits are bitwise unchanged against the previous code: `coarse` on 1,000 catalog orbits, and `load_orbits` on the full catalog, with and without the filter.
+
+**Monte Carlo** (500 draws of (state0, A) from `cov_full`, integrated with ASSIST). The table is the ratio of the sample σ to the predicted σ: the largest position σ, and σ_major on the sky seen from the geocentre.
+
+| set (samples) | times | MC / C(t), position: median (range) | MC / C(t), sky: median (range) | MC / state-only (Φ cov0 Φᵀ), sky: range |
+|---|---|---|---|---|
+| fixture comet_ng (15 orbits, 168 times) | epoch ±30, 182, 365 d; up to 6 SSSource epochs each | 1.00 (0.93–1.08) | 1.00 (0.92–1.08) | 0.26–1.27 |
+| fixture yarkovsky (24, 264) | the same | 0.99 (0.92–1.08) | 1.00 (0.94–1.08) | 0.77–1.10 |
+| the 10 comets of the catalog where the A's matter most (100) | ±30 d to ±3 yr | 1.01 (0.93–1.04) | 1.01 (0.93–1.05) | 0.09–15.7 (P/1983 V1, +3 yr) |
+| the 10 such Yarkovsky orbits (100) | ±30 d to ±3 yr | 0.98 (0.94–1.04) | 0.98 (0.94–1.05) | 0.29–3.5 |
+
+With 500 draws the sampling error of a σ is ~3%. The mean sample offset is under 0.11σ everywhere, so the problem stays linear. The state-only covariance is wrong in both directions, by up to 16× too small and 10× too large, because the state–A correlations can shrink σ as well as grow it.
+
+**Load and runtime:**
+- `load_orbits` on the full catalog: +1 s (14.0 s against 12.8 s), for the scan and parsing the 638 non-grav rows. Its peak RSS rises from about 9.6 to 10.7 GB, because `cov_full` (9×9 doubles) is written for every row.
+- **Selecting the non-grav rows:** a row is parsed when its JSON matches either the `non_gravs` flag (`"non_gravs"\s*:\s*true`) or a CAR coefficient name after `vz` (`"vz"\s*,\s*"`). Both are regular expressions, so compact or indented JSON is found too. A row where the two disagree is parsed anyway, with a warning naming it. On the 2026-10-01 catalog both mark the same 638 orbits. The test is shared with SSSource's `load_nongravs` (`ssp.nearbysso.orbits.nongrav_marks`).
+- `coarse`, 31 nightly samples: comets 2.8 against 2.2 ms per orbit, Yarkovsky 11.8 against 9.4 ms, both ×1.25.
+- SSSource's error ellipses (`ssp.sssource_ellipse`, through `coarse`) now include the A's for the 638 non-grav orbits.
+
 ## Open (for the plan)
 
 - **Covariance:** the error ellipse uses the 6×6 state block only. Propagating the A1/A2 (or Yarkovsky) partials is needed so that σ isn't understated. The options are finite differences in the parameters, or the variational equations if ASSIST covers them.
