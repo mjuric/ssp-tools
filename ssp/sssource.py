@@ -118,12 +118,9 @@ def along_cross_track(off_ra, off_dec, rate_ra, rate_dec):
     return along, cross
 
 
-#: The mpc_orb_jsonb of an orbit with a non-gravitational fit: its
-#: non_grav_booleans.non_gravs flag, or a CAR coefficient after vz (the
-#: coefficient_names list continuing past "vz"). Either selects the row for
-#: parsing; on the 2026-10-01 catalog both mark exactly the same 638 orbits.
-#: (Shared with NearbySSO's loader: ssp.nearbysso.orbits.nongrav_marks,
-#: whitespace-independent regular expressions.)
+# Rows with a non-gravitational fit are selected by
+# ssp.nearbysso.orbits.nongrav_marks (the non_gravs flag, or a CAR coefficient
+# after vz; on the 2026-10-01 catalog both mark the same 638 orbits).
 
 
 def load_nongravs(mpc_orbits_path, designations):
