@@ -143,6 +143,32 @@ The work is split into work packages built by subagents in worktrees, per `CLAUD
 - The scalar `ephem_assist.solve_kepler_hyperbolic` got N3's fallback. Converged results are unchanged.
 - Merged into `nongrav`: N3 (#60), N1 (#61), N2 (#63).
 
+### The full daily rerun (2026-10-01)
+
+`ssp-build-sso` on the 2026-10-01 daily inputs (the same inputs as that day's delivery, MPC snapshot 2026-10-01T19:47:15Z), from `nongrav` 6bdfe06, with 32 workers on sdfiana031 (load about 24). The output is in `/sdf/data/rubin/user/mjuric/nongrav/rerun/2026-10-01/run/`.
+- **Deliverable:** true; all 8 checks PASS.
+
+| step | wall | largest process | before (the 2026-10-01 delivery) |
+|---|---|---|---|
+| mpc | 40 s | 6.9 GB | 40 s, 6.9 GB |
+| sssource | 4:16 | 13.7 GB | 3:03, 13.7 GB |
+| ssobject | 1:26 | 2.8 GB | 1:14, 2.9 GB |
+| nearbysso | 5:35 | 16.0 GB | 5:26, 12.9 GB |
+| check | 47 s | 5.8 GB | 48 s, 5.8 GB |
+
+- **Memory:** NearbySSO's peak rises by 3.1 GB. Part of it is `cov_full` written for every orbit (+1.1 GB in `load_orbits`, WP N2); the rest is likely that larger array as the build's processes hold it. The sssource step's longer wall time is the node's load, not the code: its ephemerides change for only 495 rows.
+- **SSSource** (8,070,610 rows, joined on obsid with the earlier delivery; ephemeris, geometry and error columns):
+  - **Unchanged:** every row of the 8,005,803 ordinary asteroids and the 462 rows of comets without non-grav fits, bitwise.
+  - **The 15 comets with non-grav fits** (205 rows): ephOffset median 0.651″ → 0.360″, p95 3.005″ → 0.750″, max 6.389″ → 0.962″. The error ellipse (ephRaErr) changes by ×0.26–1.21, median 0.57, now including the A's.
+  - **The 24 Yarkovsky asteroids** (290 rows): median 0.076″ → 0.074″, p95 0.279″ → 0.276″. ephRaErr changes by ×0.99–1.03.
+  - These are exactly the fixture's numbers: the fixture holds every comet and Yarkovsky asteroid with SSSource rows.
+- **NearbySSO** (1,290,832 → 1,290,839 rows, joined on (diaSourceId, designation)):
+  - **Added: 7 comet rows,** the same 7 that N3's comets-only build found on the PPDB DiaSources: C/2026 C1, P/2009 U6, P/2010 L1, P/2008 A2 (2), P/1970 Y1 and C/2019 E3, at 0.03″–2.6″. P/1970 Y1 has a non-grav fit.
+  - **Removed:** none.
+  - **Unchanged:** all 1,290,586 asteroid rows, bitwise.
+  - **Updated:** the 246 rows of Yarkovsky asteroids.
+- **SSObject:** 297,762 rows.
+
 ## WP N2 results (coarse pass and uncertainty, 2026-10-01)
 
 **ASSIST 1.2.3 covers the non-gravs in its variational equations** (`assist_additional_force_non_gravitational`, `src/forces.c`):
