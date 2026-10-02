@@ -238,6 +238,57 @@ def test_yarkovsky_along_track_drift(ephem):
     assert np.all(r > 1.2) and np.all(r < 1.4)
 
 
+#: Marsden, Sekanina & Yeomans (1973) water-ice g(r), written out here
+#: independently of ssp.nongrav.G_OF_R.
+MARSDEN = dict(alpha=0.1112620426, r0=2.808, nm=2.15, nn=5.093, nk=4.6142)
+
+
+def _g(r, alpha, r0, nm, nn, nk):
+    return alpha * (r / r0) ** -nm * (1 + (r / r0) ** nn) ** -nk
+
+
+def test_g_of_r_pinned():
+    """The comet g(r) constants, and its normalization g(1 au) = 1."""
+    assert N.G_OF_R["comet"] == MARSDEN
+    assert N.G_OF_R["yarkovsky"] == dict(alpha=1.0, r0=1.0, nm=2.0, nn=5.093, nk=0.0)
+    assert abs(_g(1.0, **N.G_OF_R["comet"]) - 1.0) < 1e-8
+    np.testing.assert_allclose(_g(2.808, **N.G_OF_R["comet"]), 0.1112620426 * 2 ** -4.6142, rtol=1e-12)
+    for r in (0.3, 1.0, 2.5, 7.0):
+        assert _g(r, **N.G_OF_R["yarkovsky"]) == pytest.approx(r ** -2, rel=1e-14)
+
+
+@needs_assist
+@pytest.mark.parametrize("model", ["comet", "yarkovsky"])
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_acceleration_rtn(ephem, model, axis):
+    """The non-gravitational acceleration at the epoch, from the symmetric
+    second difference of short integrations with and without it, (d(+h) +
+    d(-h)) / h^2, is A_i g(r) along the radial (A1), transverse (A2, along
+    h x r, i.e. with the motion) or normal (A3, along r x v) heliocentric
+    direction, with g(r) for the model written out independently. This pins
+    the sign and direction of each component and the g(r) constants."""
+    from ssp import ephem_assist as ea
+    row = _rows()[COMET]          # (P/2003 K2's state; any orbit would do)
+    X0, V0, t0 = _state0(row, ephem)
+    sun = ephem.get_particle(ea.ASSIST_SUN, t0)
+    r = X0 - np.array([sun.x, sun.y, sun.z])
+    v = V0 - np.array([sun.vx, sun.vy, sun.vz])
+    rhat = r / np.linalg.norm(r)
+    hhat = np.cross(r, v) / np.linalg.norm(np.cross(r, v))
+    that = np.cross(hhat, rhat)
+    A = np.zeros(3)
+    A[axis] = 1e-7
+    ng = N.NonGrav(A, model, A != 0, None)
+    h = 2.0
+    t = np.array([-h, h])
+    d = _propagate(row, ephem, t, ng)[0] - _propagate(row, ephem, t)[0]
+    acc = (d[:, 0] + d[:, 1]) / h**2
+    g = _g(np.linalg.norm(r), **(MARSDEN if model == "comet" else dict(alpha=1.0, r0=1.0, nm=2.0,
+                                                                         nn=5.093, nk=0.0)))
+    expect = A[axis] * g * (rhat, that, hhat)[axis]
+    assert np.dot(that, v) > 0
+    np.testing.assert_allclose(acc, expect, rtol=0, atol=1e-3 * abs(expect).max())
+
 # --------------------------------------------------------------------------
 # SSSource
 # --------------------------------------------------------------------------
@@ -353,3 +404,56 @@ def test_build_sssource_passes_nongrav(tmp_path, monkeypatch):
     assert rec[B].model == "comet"
     np.testing.assert_array_equal(rec[B].A, [1e-9, -2e-10, 0])
     assert rec[D] is N.NONE
+
+
+def test_load_nongravs_flag_or_coefficients(tmp_path, capsys):
+    """A row is parsed when either its non_gravs flag is true or its CAR
+    has coefficients beyond vz; a disagreement is warned about."""
+    rows = [
+        ("2020 AA", _car(["yarkovsky"], [-2.0], non_gravs=False)),   # coefficients, no flag
+        ("2020 BB", _car(non_gravs=True)),                           # flag, no coefficients
+        ("2020 CC", _car(["A1", "A2"], [1e-9, 2e-10])),              # both
+        ("2020 DD", _car(non_gravs=False)),                          # neither
+    ]
+    p = tmp_path / "mpc_orbits.parquet"
+    _orbits_file(p, rows)
+    ng, n_err = sssource.load_nongravs(p, [r[0] for r in rows])
+    assert n_err == 0 and sorted(ng) == ["2020 AA", "2020 CC"]
+    np.testing.assert_allclose(ng["2020 AA"].A, [0, -2e-10, 0])
+    err = capsys.readouterr().err
+    assert "2020 AA" in err and "2020 BB" in err and "2020 CC" not in err and "2020 DD" not in err
+
+
+def test_load_nongravs_duplicates(tmp_path, capsys):
+    """A designation on several rows: the last parseable fit wins, and a
+    later unparseable or gravity-only row does not remove an earlier fit."""
+    rows = [
+        ("2020 AA", _car(["A1"], [1e-9])),
+        ("2020 AA", _car(["A1"], [2e-9])),          # last fit: wins
+        ("2020 AA", _car(["DT"], [1.0])),           # unparseable: counted, the fit kept
+        ("2020 AA", _car(non_gravs=False)),         # gravity only: the fit kept
+        ("2020 BB", _car(["DT"], [1.0])),           # unparseable alone: gravity only
+    ]
+    p = tmp_path / "mpc_orbits.parquet"
+    _orbits_file(p, rows)
+    ng, n_err = sssource.load_nongravs(p, ["2020 AA", "2020 BB"])
+    assert n_err == 2 and sorted(ng) == ["2020 AA"]
+    np.testing.assert_array_equal(ng["2020 AA"].A, [2e-9, 0, 0])
+    err = capsys.readouterr().err
+    assert "earlier row's fit kept" in err and "2020 BB" in err
+
+
+def test_compute_ephemerides_batch_passes_nongrav(monkeypatch):
+    from ssp import ephem_assist as ea
+    rec = {}
+
+    def fake(provID, ephTimes, mpcorb, ephem, observer_code="X05", nongrav=None, **kw):
+        rec[provID] = nongrav
+        return provID
+    monkeypatch.setattr(ea, "compute_ephemerides_one", fake)
+    monkeypatch.setattr(ea, "open_ephem", lambda *a: None)
+    ng = N.NonGrav(np.array([1e-9, 0, 0]), "comet", np.array([1, 0, 0], bool), None)
+    out = ea.compute_ephemerides_batch({"A": None, "B": None}, None, nongravs={"B": ng})
+    assert out == {"A": "A", "B": "B"} and rec["A"] is N.NONE and rec["B"] is ng
+    ea.compute_ephemerides_batch({"A": None}, None)
+    assert rec["A"] is N.NONE

@@ -118,10 +118,12 @@ def along_cross_track(off_ra, off_dec, rate_ra, rate_dec):
     return along, cross
 
 
-#: mpc_orb_jsonb of the orbits with a non-gravitational fit (the
-#: non_grav_booleans.non_gravs flag; on the 2026-10-01 catalog it marks
-#: exactly the 638 orbits whose CAR has coefficients beyond vz).
+#: The mpc_orb_jsonb of an orbit with a non-gravitational fit: its
+#: non_grav_booleans.non_gravs flag, or a CAR coefficient after vz (the
+#: coefficient_names list continuing past "vz"). Either selects the row for
+#: parsing; on the 2026-10-01 catalog both mark exactly the same 638 orbits.
 _NON_GRAVS_TRUE = r'"non_gravs"\s*:\s*true'
+_CAR_BEYOND_VZ = '"vz", "'
 
 
 def load_nongravs(mpc_orbits_path, designations):
@@ -130,12 +132,16 @@ def load_nongravs(mpc_orbits_path, designations):
 
     Only the designation and mpc_orb_jsonb columns are streamed, one thread
     per row group; rows are filtered by designation first and then by the
-    ``non_gravs: true`` flag in the JSON text, so only the few non-grav
-    orbits' JSON is parsed. A ValueError from ``ssp.nongrav.nongrav_params``
-    is printed and counted in ``n_errors``, and the orbit left out (it is
-    integrated with gravity only). Orbits whose JSON parses to
-    ``ssp.nongrav.NONE`` are left out too. A designation on several rows
-    gets the last of them.
+    JSON text (the ``non_gravs: true`` flag, or a CAR coefficient beyond vz),
+    so only the few non-grav orbits' JSON is parsed. A row where the flag and
+    the coefficients disagree is parsed anyway, with a warning. A ValueError
+    from ``ssp.nongrav.nongrav_params`` is printed and counted in
+    ``n_errors``; such an orbit, and one whose JSON parses to
+    ``ssp.nongrav.NONE``, is left out (integrated with gravity only).
+
+    A designation on several rows (none in the catalog; build_sssource
+    rejects them in mpc_orbits anyway) gets the last of its rows with a
+    parseable fit: a later unparseable or gravity-only row doesn't remove it.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -151,11 +157,15 @@ def load_nongravs(mpc_orbits_path, designations):
         for b in f.iter_batches(batch_size=20_000, row_groups=[rg],
                                 columns=[key, "mpc_orb_jsonb"], use_threads=False):
             b = b.filter(pc.is_in(b.column(key), value_set=d))
+            if not b.num_rows:
+                continue
+            j = b.column("mpc_orb_jsonb")
+            flag = pc.fill_null(pc.match_substring_regex(j, _NON_GRAVS_TRUE), False)
+            coef = pc.fill_null(pc.match_substring(j, _CAR_BEYOND_VZ), False)
+            b = b.append_column("flag", flag).append_column("coef", coef)
+            b = b.filter(pc.or_(flag, coef))
             if b.num_rows:
-                b = b.filter(pc.fill_null(
-                    pc.match_substring_regex(b.column("mpc_orb_jsonb"), _NON_GRAVS_TRUE), False))
-            if b.num_rows:
-                out += zip(b.column(key).to_pylist(), b.column("mpc_orb_jsonb").to_pylist())
+                out += zip(*(b.column(c).to_pylist() for c in (key, "mpc_orb_jsonb", "flag", "coef")))
         return out
 
     pf = pq.ParquetFile(mpc_orbits_path)
@@ -168,18 +178,19 @@ def load_nongravs(mpc_orbits_path, designations):
         rows = [r for part in ex.map(scan, range(nrg)) for r in part]   # (in file order)
 
     nongravs, n_errors = {}, 0
-    for des, j in rows:
+    for des, j, flag, coef in rows:
+        if flag != coef:
+            print(f"WARNING: {des}: mpc_orb_jsonb non_gravs flag {'true' if flag else 'not true'} but "
+                  f"{'' if coef else 'no '}CAR coefficients beyond vz", file=sys.stderr)
         try:
             ng = _nongrav.nongrav_params(j)
         except ValueError as exc:
-            print(f"WARNING: {des}: {exc}; integrated with gravity only", file=sys.stderr)
+            kept = "an earlier row's fit kept" if des in nongravs else "integrated with gravity only"
+            print(f"WARNING: {des}: {exc}; {kept}", file=sys.stderr)
             n_errors += 1
-            nongravs.pop(des, None)
             continue
         if ng.model:
             nongravs[des] = ng
-        else:
-            nongravs.pop(des, None)
     return nongravs, n_errors
 
 
