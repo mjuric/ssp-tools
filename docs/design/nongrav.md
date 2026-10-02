@@ -1,6 +1,6 @@
 # Design: non-gravitational forces (comets and Yarkovsky asteroids)
 
-Status: **in progress.** The scope is decided (2026-10-01); the units check comes first, and the implementation plan follows it, for approval.
+Status: **proposed.** The scope is decided and the units check done (2026-10-01); the implementation plan is below, for approval.
 
 ## Context
 
@@ -52,7 +52,44 @@ For a few objects with both an MPC non-grav fit and a JPL fit, compare the MPC's
 - the MPC Yarkovsky coefficient's definition and normalization, against JPL's A2 with g = 1/r²;
 - that "yc" with DT absent means the standard Marsden g(r).
 
-The queries to SBDB are serial and polite. The results go below.
+Six serial SBDB queries were made (2026-10-01), comparing the MPC's coefficients (2026-10-01 snapshot) with JPL's:
+
+| object | MPC (`CAR.coefficient_values`) | JPL SBDB (`model_pars`) | result |
+|---|---|---|---|
+| Apophis (2004 MN4) | `yarkovski` −2.869e-4 | A2 −2.902e-14 au/d²; ALN 1, NM 2, NK 0, R0 1 | ×1e-10 matches (1.1%) |
+| 1862 Apollo (1932 HA) | `yarkovsky` −3.647e-5 | A2 −3.657e-15 au/d², g = 1/r² | ×1e-10 matches (0.3%) |
+| 29075 (1950 DA) | `yarkovsky` −4.538e-5 | A2 −5.203e-15 au/d², g = 1/r² | ×1e-10, 13% (different fits) |
+| 145P (P/1991 T1) | A1 1.869e-9, A2 −1.814e-10 | A1 1.798e-9, A2 −1.826e-10 au/d², default (Marsden) g(r) | same units (4%, 0.7%) |
+| C/2022 N2 | A1 7.42e-8, A2 3.93e-10 | A1 1.11e-7, A2 1.32e-9, with a non-standard g(r) (R0 5 au, NK 2.6, NN 3, ALN 0.0408) | not comparable: different models |
+| 402P (P/2002 T5) | A1, A2 | no non-grav fit | — |
+
+**Conclusions:**
+- **Comets ("yc"):** A1 and A2 are in **au/day²**, with the **standard Marsden water-ice g(r)** (alpha 0.1112620426, r0 2.808 au, m 2.15, n 5.093, k 4.6142). JPL's 145P uses the same g(r) and agrees within a few percent.
+- **Asteroids ("yarkovski" or "yarkovsky", both spellings occur):** the coefficient is a **transverse A2 in units of 1e-10 au/day²**, with **g = (r / 1 au)⁻²**, which is ASSIST's default g(r). A1 = A3 = 0.
+- **Left open:** that the MPC uses the standard g(r) for every "yc" comet. It can't be checked against JPL where JPL uses another model, so the validation step tests it empirically (the comets' offsets should shrink).
+
+
+## Implementation plan
+
+The work is split into work packages built by subagents in worktrees, per `CLAUDE.md`.
+
+**First (integrator): the contract.**
+- `ssp/nongrav.py`: `nongrav_params(mpc_orb_jsonb) -> NonGrav(A1, A2, A3, model)`, the parsing and units rules above, and `G_OF_R` per model (`"comet"`: Marsden; `"yarkovsky"`: 1/r²).
+- The `ORBIT_DTYPE` change: the non-grav coefficients, the model, and the full covariance of the fitted parameters.
+- Fixtures: the 184 comets and 454 Yarkovsky asteroids, plus a gravity-only control sample.
+
+**Then, in parallel:**
+
+| WP | builds | independent review |
+|---|---|---|
+| **N1 precise pass** | `ephem_assist._propagate_one` and `compute_ephemerides_one` take the non-grav coefficients and g(r) (`particle_params`; `alpha`, `r0`, `nm`, `nn`, `nk`), including the self-perturber path. Gravity-only orbits must stay **bitwise unchanged**. SSSource reads the coefficients for every object. | yes |
+| **N2 coarse pass and uncertainty** | `nearbysso.propagate.coarse` with the non-gravs. The covariance includes the fitted A's (the 8×8 or 7×7 CAR block). Φ is extended with ∂state/∂A by finite differences, or by the variational equations if ASSIST covers non-gravs; that has to be checked first. `orbits.load_orbits` carries the A's and the full covariance. | yes |
+| **N3 NearbySSO comets** | Remove the comet exclusion from the orbit filter. Keep the `S/` satellites and the element-less placeholders out. Check the candidate tolerance for comets: near-parabolic and hyperbolic orbits, close approaches. | light |
+| **N4 validation (black box)** | SSSource offsets before and after, for the comets and Yarkovsky asteroids, against the gravity-only controls. A Horizons spot check with MPC elements plus non-gravs, if Horizons accepts them for user-supplied elements (strictly serial). The uncertainty against a Monte Carlo over the fitted A's. | — |
+
+**Last (integrator):** a full daily rerun with every check, results recorded here.
+
+**Out of scope:** comet magnitudes. `ephVmag` from HG stays wrong for active comets, and SSObject's HG12 fits for comets aren't meaningful; to be decided separately.
 
 ## Open (for the plan)
 
