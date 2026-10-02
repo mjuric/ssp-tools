@@ -44,6 +44,7 @@ Measured on the 2026-10-01 daily run (observed − predicted, SSSource `ephOffse
 | NearbySSO | **Comets enabled** (the comet exclusion removed). The `S/` natural satellites and the element-less placeholders stay out. |
 | Comets without non-grav fits (~1,900) | Integrated with gravity only. |
 | First step | Confirm the units and definitions of the MPC's coefficients. |
+| JPL comparison (added 2026-10-01) | A new WP, N5, with two checks. (1) MPC orbits against JPL's own orbits, at the Rubin observation times: a report, not pass/fail. (2) ASSIST against JPL's integrator: JPL's elements and non-gravs run through our code, compared with Horizons for the same JPL orbit: pass/fail. Also included: gravity-only controls, JPL's 3σ uncertainties against our error ellipse, times far from the epoch and through perihelion, and flagging comets where JPL uses another g(r) or DT. Requests strictly serial and cached; N4 makes none. |
 
 ## Step 1: the units check
 
@@ -85,6 +86,7 @@ The work is split into work packages built by subagents in worktrees, per `CLAUD
 | **N1 precise pass** | `ephem_assist._propagate_one` and `compute_ephemerides_one` take the non-grav coefficients and g(r) (`particle_params`; `alpha`, `r0`, `nm`, `nn`, `nk`). (As built, per the contract: the self-perturber paths ignore non-gravs, since none of ASSIST's 16 perturbing asteroids or Pluto has a non-grav fit.) Gravity-only orbits must stay **bitwise unchanged**. SSSource reads the coefficients for every object. | yes |
 | **N2 coarse pass and uncertainty** | `nearbysso.propagate.coarse` with the non-gravs. The covariance includes the fitted A's (the 8×8 or 7×7 CAR block). Φ is extended with ∂state/∂A by finite differences, or by the variational equations if ASSIST covers non-gravs; that has to be checked first. `orbits.load_orbits` carries the A's and the full covariance. | yes |
 | **N3 NearbySSO comets** | Remove the comet exclusion from the orbit filter. Keep the `S/` satellites and the element-less placeholders out. Check the candidate tolerance for comets: near-parabolic and hyperbolic orbits, close approaches. | light |
+| **N5 JPL comparison** (added 2026-10-01) | (1) Our SSSource positions from MPC orbits against Horizons (JPL's orbits) at the Rubin observation times; a report. (2) JPL's SBDB elements and non-gravs through our ASSIST code against Horizons for the same orbit; pass/fail. See the decisions table. | — |
 | **N4 validation (black box)** | SSSource offsets before and after, for the comets and Yarkovsky asteroids, against the gravity-only controls. A Horizons spot check with MPC elements plus non-gravs, if Horizons accepts them for user-supplied elements (strictly serial). The uncertainty against a Monte Carlo over the fitted A's. | — |
 
 **Last (integrator):** a full daily rerun with every check, results recorded here.
