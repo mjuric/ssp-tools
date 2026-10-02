@@ -22,6 +22,11 @@ It is rotated to equatorial ICRF with the obliquity of
 block diagonal of the 3x3 rotation for position and velocity. The helio ->
 bary translation leaves the covariance unchanged.
 
+The non-gravitational parameters (``ng_*``) and ``cov_full`` come from
+``ssp.nongrav.nongrav_params`` on the ~640 rows whose CAR coefficient names
+go on past ``vz`` (a substring test in the same pass over the JSON); see
+``fill_nongrav``.
+
 The JSON is not parsed with a JSON library: the ``CAR`` block (always first,
 as PostgreSQL's jsonb orders keys) is cut out with a regular expression and
 split with Arrow string kernels, in threads. Rows whose JSON doesn't have
@@ -41,6 +46,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .. import ephem_assist as ea
+from .. import nongrav as _ng
 from ._contract import ORBIT_DTYPE
 
 #: The element columns an orbit must have (as get-mpcorb.py requires).
@@ -365,11 +371,53 @@ def _parse_car_chunk(arr):
     return cov, state, arc
 
 
-def parse_car(json_strings, nthreads=16, chunk=20_000):
+#: Rows whose JSON contains this have coefficient names after ``vz`` (a
+#: non-gravitational fit, ~640 of the 1.5M orbits); only those are parsed by
+#: ``ssp.nongrav.nongrav_params``, which makes the final decision.
+_NG_MARK = '"vz", "'
+
+
+def _nongrav_chunk(arr):
+    """{row in arr: NonGrav, or the ValueError the parser raised} for the
+    rows of an Arrow string array of mpc_orb_jsonb that have a
+    non-gravitational fit."""
+    cand = pc.fill_null(pc.match_substring(arr, _NG_MARK), False).to_numpy(zero_copy_only=False)
+    out = {}
+    for k in np.flatnonzero(cand):
+        try:
+            ng = _ng.nongrav_params(arr[k].as_py())
+        except ValueError as e:
+            out[int(k)] = e
+            continue
+        if ng.model:
+            out[int(k)] = ng
+    return out
+
+
+def _chunk_job(arr, nongrav):
+    res = _parse_car_chunk(arr)
+    return (*res, _nongrav_chunk(arr)) if nongrav else res
+
+
+def _combine(parts, nongrav):
+    out = (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]),
+           pa.chunked_array([p[2] for p in parts], type=pa.string()))
+    if not nongrav:
+        return out
+    ngd, off = {}, 0
+    for p in parts:
+        ngd.update({off + k: v for k, v in p[3].items()})
+        off += len(p[2])
+    return (*out, ngd)
+
+
+def parse_car(json_strings, nthreads=16, chunk=20_000, nongrav=False):
     """Parse the CAR covariance (6x6 state block, ecliptic), the CAR state
     and the JSON arc_length_total of an array of mpc_orb_jsonb strings, in
     ``nthreads`` threads (Arrow's kernels release the GIL). See
-    ``_parse_car_chunk`` for the outputs."""
+    ``_parse_car_chunk`` for the outputs. With ``nongrav``, a fourth output:
+    {row: ssp.nongrav.NonGrav, or the ValueError of an unknown model} for
+    the rows with a non-gravitational fit (``_nongrav_chunk``)."""
     arr = json_strings
     if isinstance(arr, pa.Array):
         arrays = [arr]
@@ -382,12 +430,11 @@ def parse_car(json_strings, nthreads=16, chunk=20_000):
     if not pieces:
         pieces = [pa.array([], type=pa.string())]
     with ThreadPoolExecutor(max_workers=max(1, nthreads)) as ex:
-        parts = list(ex.map(_parse_car_chunk, pieces))
-    return (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]),
-            pa.chunked_array([p[2] for p in parts], type=pa.string()))
+        parts = list(ex.map(lambda a: _chunk_job(a, nongrav), pieces))
+    return _combine(parts, nongrav)
 
 
-def parse_car_file(path, nthreads=16, chunk=20_000):
+def parse_car_file(path, nthreads=16, chunk=20_000, nongrav=False):
     """``parse_car`` on a Parquet file's mpc_orb_jsonb, streamed: one reader
     thread per row group decompresses batches and hands them to the parsing
     threads, so the ~10 GB of JSON is never in memory at once and reading
@@ -398,15 +445,14 @@ def parse_car_file(path, nthreads=16, chunk=20_000):
             ThreadPoolExecutor(max_workers=max(1, min(nrg, nthreads))) as readers:
         def read_rg(rg):
             f = pq.ParquetFile(path)
-            return [ex.submit(_parse_car_chunk, b.column(0))
+            return [ex.submit(_chunk_job, b.column(0), nongrav)
                     for b in f.iter_batches(batch_size=chunk, row_groups=[rg],
                                             columns=["mpc_orb_jsonb"], use_threads=False)]
         rg_futs = [readers.submit(read_rg, rg) for rg in range(nrg)]
         parts = [f.result() for rf in rg_futs for f in rf.result()]
     if not parts:
-        return parse_car(pa.array([], type=pa.string()))
-    return (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]),
-            pa.chunked_array([p[2] for p in parts], type=pa.string()))
+        return parse_car(pa.array([], type=pa.string()), nongrav=nongrav)
+    return _combine(parts, nongrav)
 
 
 def rotate_cov_to_equatorial(cov):
@@ -549,6 +595,74 @@ def filter_masks(designation, packed, elements, arc):
     return not_satellite, has_elements, long_arc
 
 
+def fill_nongrav(out, rows, ngd):
+    """Fill ``ng_model``, ``ng_A``, ``ng_fitted`` and ``cov_full`` of
+    ``out`` (ORBIT_DTYPE, with state0, cov0 and has_cov already set), whose
+    row k came from file row ``rows[k]``; ``ngd`` is ``parse_car``'s
+    {file row: NonGrav or ValueError}. See ``_contract`` ("Non-gravitational
+    parameters").
+
+    Gravity-only rows get cov0 padded with zeros (NaN where has_cov is
+    False), and are otherwise untouched. A non-grav row's cov_full has cov0
+    as its state block, the CAR cross terms rotated to equatorial on their
+    state side (R6 C_sA), and the A block as fitted; its fitted block (the
+    state plus the fitted A's) must pass ``make_psd`` (on the correlation
+    matrix, as cov0 does), or has_cov becomes False (and cov0 NaN). A block
+    that ``make_psd`` clips to PSD is used as repaired (its state block then
+    differs from cov0 by ~PSD_TOL relative). An unknown model (ValueError)
+    leaves the row gravity-only. Returns the counts.
+    """
+    cf = out["cov_full"]             # a view: filled in place
+    cf[...] = 0.0
+    cf[:, :6, :6] = out["cov0"]
+    rows = np.asarray(rows, dtype=np.int64)
+    keys = np.array(sorted(ngd), dtype=np.int64)
+    inv = np.full(int(max(rows.max(initial=-1), keys.max(initial=-1))) + 1, -1)
+    inv[rows] = np.arange(len(rows))
+    pos = {int(r): int(inv[r]) for r in keys if inv[r] >= 0}
+    counts = dict(comet=0, yarkovsky=0, unparsed=0, cov_missing=0, cov_not_psd=0, cov_clipped=0)
+    blocks = {}                      # fitted-block size -> [(k, sel, block)]
+    for r, ng in ngd.items():
+        k = pos.get(int(r))
+        if k is None:
+            continue
+        if isinstance(ng, Exception):
+            counts["unparsed"] += 1
+            continue
+        counts[ng.model] += 1
+        out["ng_model"][k] = ng.model
+        out["ng_A"][k] = ng.A
+        out["ng_fitted"][k] = ng.fitted
+        if not out["has_cov"][k]:
+            continue
+        if ng.cov is None:
+            counts["cov_missing"] += 1
+            out["has_cov"][k] = False
+            continue
+        sel = np.concatenate([np.arange(6), 6 + np.flatnonzero(ng.fitted)])
+        C = np.asarray(ng.cov, dtype=np.float64)          # CAR order: state, fitted A's
+        b = np.empty((len(sel), len(sel)))
+        b[:6, :6] = out["cov0"][k]
+        b[:6, 6:] = R6 @ C[:6, 6:]
+        b[6:, :6] = b[:6, 6:].T
+        b[6:, 6:] = C[6:, 6:]
+        blocks.setdefault(len(sel), []).append((k, sel, b))
+    for items in blocks.values():
+        fixed, usable, clipped = make_psd(np.array([b for _, _, b in items]))
+        for (k, sel, _), b, u, c in zip(items, fixed, usable, clipped):
+            if not u:
+                counts["cov_not_psd"] += 1
+                out["has_cov"][k] = False
+                continue
+            counts["cov_clipped"] += int(c)
+            cf[k] = 0.0
+            cf[k][np.ix_(sel, sel)] = b
+    bad = np.flatnonzero(~out["has_cov"])
+    cf[bad] = np.nan
+    out["cov0"][bad] = np.nan
+    return counts
+
+
 def _col(table, name):
     col = table[name]
     if pa.types.is_floating(col.type):
@@ -577,7 +691,7 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True, s
     elements = {k: num[k] for k in ELEMENTS}
 
     del table
-    cov_ecl, _, arc = parse_car_file(path, nthreads=nthreads)
+    cov_ecl, _, arc, ngd = parse_car_file(path, nthreads=nthreads, nongrav=True)
     if len(arc) != n_read:
         raise RuntimeError(f"{path}: {len(arc)} JSON rows parsed, {n_read} expected")
     t_parse = time.perf_counter() - t0
@@ -616,6 +730,8 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True, s
     c, pd_ok, clipped = make_psd(c)
     out["has_cov"] = pd_ok
     out["cov0"] = c
+    ngc = fill_nongrav(out, idx, ngd)
+    pd_ok = out["has_cov"]
     t_conv = time.perf_counter() - t2
 
     # 0 is the MPC's placeholder in zeroed ("no_orbit") fit statistics
@@ -628,6 +744,7 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True, s
                      removed=dict(counts) if with_filter else None,
                      has_cov_false=int((~pd_ok).sum()), cov_missing=int(missing.sum()),
                      cov_not_psd=int((~missing & ~pd_ok).sum()), cov_clipped_to_psd=int(clipped.sum()),
+                     nongrav=ngc,
                      normalized_rms=dict(p5=float(pct[0]), p50=float(pct[1]), p95=float(pct[2]),
                                          p99=float(pct[3]), n=int(len(rms)), n_zero=n_zero))
     if verbose:
@@ -637,6 +754,9 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True, s
         print(f"load_orbits: {n_read:,} rows read, {removed}; {len(out):,} kept; "
               f"has_cov false {int((~pd_ok).sum()):,} ({int(missing.sum()):,} missing, "
               f"{int((~missing & ~pd_ok).sum()):,} not PSD), {int(clipped.sum()):,} clipped to PSD; "
+              f"non-grav {ngc['comet']:,} comets and {ngc['yarkovsky']:,} Yarkovsky "
+              f"({ngc['unparsed']:,} unknown models kept gravity-only, "
+              f"{ngc['cov_missing'] + ngc['cov_not_psd']:,} without a usable full covariance); "
               f"normalized_rms p5/p50/p95/p99 "
               f"{pct[0]:.3f}/{pct[1]:.3f}/{pct[2]:.3f}/{pct[3]:.3f} ({len(rms):,} with it, "
               f"{n_zero:,} zero excluded); "
