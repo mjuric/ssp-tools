@@ -22,6 +22,11 @@ It is rotated to equatorial ICRF with the obliquity of
 block diagonal of the 3x3 rotation for position and velocity. The helio ->
 bary translation leaves the covariance unchanged.
 
+The non-gravitational parameters (``ng_*``) and ``cov_full`` come from
+``ssp.nongrav.nongrav_params`` on the ~640 rows whose CAR coefficient names
+go on past ``vz`` (a substring test in the same pass over the JSON); see
+``fill_nongrav``.
+
 The JSON is not parsed with a JSON library: the ``CAR`` block (always first,
 as PostgreSQL's jsonb orders keys) is cut out with a regular expression and
 split with Arrow string kernels, in threads. Rows whose JSON doesn't have
@@ -31,6 +36,7 @@ the expected layout fall back to ``json.loads``.
 from __future__ import annotations
 
 import json
+import sys
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +47,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .. import ephem_assist as ea
+from .. import nongrav as _ng
 from ._contract import ORBIT_DTYPE
 
 #: The element columns an orbit must have (as get-mpcorb.py requires).
@@ -103,17 +110,52 @@ def _solve_kepler_vec(M, e, tol=1e-14, max_iter=50):
     return E
 
 
-def _solve_kepler_hyperbolic_vec(M, e, tol=1e-14, max_iter=100):
-    """``ea.solve_kepler_hyperbolic`` for arrays of M and e."""
-    H = np.arcsinh(M / e)
+def _newton_hyperbolic(H, M, e, tol, max_iter):
+    """Newton iterations on e sinh H - H = M from ``H`` (in place), each
+    element stopped when its own step is below ``tol`` (relative to
+    max(1, |H|)). Returns the indices that failed: non-finite, or still
+    taking steps above ``_HYP_FAIL`` (relative) after ``max_iter``. (Steps
+    between ``tol`` and that are rounding cycles: converged.)"""
     act = np.arange(len(M))
-    for _ in range(max_iter):
-        Ha, ea_, Ma = H[act], e[act], M[act]
-        dH = -(ea_ * np.sinh(Ha) - Ha - Ma) / (ea_ * np.cosh(Ha) - 1.0)
-        H[act] = Ha + dH
-        act = act[np.abs(dH) >= tol * np.maximum(1.0, np.abs(H[act]))]
-        if len(act) == 0:
-            break
+    dH = np.zeros(0)
+    with np.errstate(over="ignore", invalid="ignore"):
+        for _ in range(max_iter):
+            Ha, ea_, Ma = H[act], e[act], M[act]
+            dH = -(ea_ * np.sinh(Ha) - Ha - Ma) / (ea_ * np.cosh(Ha) - 1.0)
+            H[act] = Ha + dH
+            # (a non-finite step fails the test, and stays active)
+            moving = ~(np.abs(dH) < tol * np.maximum(1.0, np.abs(H[act])))
+            act, dH = act[moving], dH[moving]
+            if len(act) == 0:
+                break
+        failed = ~(np.abs(dH) < _HYP_FAIL * np.maximum(1.0, np.abs(H[act])))
+    return act[failed]
+
+
+# Newton steps still above this (relative) after max_iter: not converged.
+_HYP_FAIL = 1e-10
+
+
+def _solve_kepler_hyperbolic_vec(M, e, tol=1e-14, max_iter=100):
+    """``ea.solve_kepler_hyperbolic`` for arrays of M and e, with a fallback.
+
+    The elements that converge from ``ea.solve_kepler_hyperbolic``'s start,
+    arcsinh(M / e), get its result. That start fails for e -> 1 at small
+    |M| (e.g. e - 1 = 1e-6, q = 0.005 AU, 80 years from perihelion): there
+    e cosh H - 1 ~ e - 1, and the first Newton step overflows. Those
+    elements restart from sign(M) ln(2 |M| / e + 1.8) (Danby's start; on
+    the convex branch, Newton then converges monotonically), and any that
+    still don't converge are NaN. (No orbit of the 2026-10-01 catalog needs
+    the fallback.)
+    """
+    H = np.arcsinh(M / e)
+    bad = _newton_hyperbolic(H, M, e, tol, max_iter)
+    if len(bad):
+        Mb, eb = M[bad], e[bad]
+        Hb = np.sign(Mb) * np.log(2.0 * np.abs(Mb) / eb + 1.8)
+        still = _newton_hyperbolic(Hb, Mb, eb, tol, max_iter)
+        Hb[still] = np.nan
+        H[bad] = Hb
     return H
 
 
@@ -330,11 +372,68 @@ def _parse_car_chunk(arr):
     return cov, state, arc
 
 
-def parse_car(json_strings, nthreads=16, chunk=20_000):
+#: The mpc_orb_jsonb of an orbit with a non-gravitational fit: its
+#: ``non_grav_booleans.non_gravs`` flag, or CAR coefficient names going on
+#: past ``vz`` (~640 of the 1.5M orbits). Either selects the row for
+#: ``ssp.nongrav.nongrav_params``, which makes the final decision. Both are
+#: regular expressions, so that they don't depend on the JSON's whitespace
+#: (PostgreSQL's jsonb text has ", " and ": ", but a compact or indented
+#: serialization must not make every orbit silently gravity-only).
+NON_GRAVS_TRUE_RE = r'"non_gravs"\s*:\s*true'
+CAR_BEYOND_VZ_RE = r'"vz"\s*,\s*"'
+
+
+def nongrav_marks(arr):
+    """(flag, coef): boolean numpy arrays, for an Arrow string array of
+    mpc_orb_jsonb, of the rows matching ``NON_GRAVS_TRUE_RE`` and
+    ``CAR_BEYOND_VZ_RE`` (null rows are False)."""
+    def m(rx):
+        return pc.fill_null(pc.match_substring_regex(arr, rx), False).to_numpy(zero_copy_only=False)
+    return m(NON_GRAVS_TRUE_RE), m(CAR_BEYOND_VZ_RE)
+
+
+def _nongrav_chunk(arr):
+    """{row in arr: (result, flag, coef)} for the rows of an Arrow string
+    array of mpc_orb_jsonb that ``nongrav_marks`` selects (either mark).
+    ``result`` is the row's ssp.nongrav.NonGrav (``NONE`` if it has no
+    fit after all), or the ValueError the parser raised; ``flag`` and
+    ``coef`` are the two marks, so that the caller can warn where they
+    disagree."""
+    flag, coef = nongrav_marks(arr)
+    out = {}
+    for k in np.flatnonzero(flag | coef):
+        try:
+            ng = _ng.nongrav_params(arr[k].as_py())
+        except ValueError as e:
+            ng = e
+        out[int(k)] = (ng, bool(flag[k]), bool(coef[k]))
+    return out
+
+
+def _chunk_job(arr, nongrav):
+    res = _parse_car_chunk(arr)
+    return (*res, _nongrav_chunk(arr)) if nongrav else res
+
+
+def _combine(parts, nongrav):
+    out = (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]),
+           pa.chunked_array([p[2] for p in parts], type=pa.string()))
+    if not nongrav:
+        return out
+    ngd, off = {}, 0
+    for p in parts:
+        ngd.update({off + k: v for k, v in p[3].items()})
+        off += len(p[2])
+    return (*out, ngd)
+
+
+def parse_car(json_strings, nthreads=16, chunk=20_000, nongrav=False):
     """Parse the CAR covariance (6x6 state block, ecliptic), the CAR state
     and the JSON arc_length_total of an array of mpc_orb_jsonb strings, in
     ``nthreads`` threads (Arrow's kernels release the GIL). See
-    ``_parse_car_chunk`` for the outputs."""
+    ``_parse_car_chunk`` for the outputs. With ``nongrav``, a fourth output:
+    {row: (NonGrav or ValueError, flag, coef)} for the rows marked as having
+    a non-gravitational fit (``_nongrav_chunk``)."""
     arr = json_strings
     if isinstance(arr, pa.Array):
         arrays = [arr]
@@ -347,12 +446,11 @@ def parse_car(json_strings, nthreads=16, chunk=20_000):
     if not pieces:
         pieces = [pa.array([], type=pa.string())]
     with ThreadPoolExecutor(max_workers=max(1, nthreads)) as ex:
-        parts = list(ex.map(_parse_car_chunk, pieces))
-    return (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]),
-            pa.chunked_array([p[2] for p in parts], type=pa.string()))
+        parts = list(ex.map(lambda a: _chunk_job(a, nongrav), pieces))
+    return _combine(parts, nongrav)
 
 
-def parse_car_file(path, nthreads=16, chunk=20_000):
+def parse_car_file(path, nthreads=16, chunk=20_000, nongrav=False):
     """``parse_car`` on a Parquet file's mpc_orb_jsonb, streamed: one reader
     thread per row group decompresses batches and hands them to the parsing
     threads, so the ~10 GB of JSON is never in memory at once and reading
@@ -363,15 +461,14 @@ def parse_car_file(path, nthreads=16, chunk=20_000):
             ThreadPoolExecutor(max_workers=max(1, min(nrg, nthreads))) as readers:
         def read_rg(rg):
             f = pq.ParquetFile(path)
-            return [ex.submit(_parse_car_chunk, b.column(0))
+            return [ex.submit(_chunk_job, b.column(0), nongrav)
                     for b in f.iter_batches(batch_size=chunk, row_groups=[rg],
                                             columns=["mpc_orb_jsonb"], use_threads=False)]
         rg_futs = [readers.submit(read_rg, rg) for rg in range(nrg)]
         parts = [f.result() for rf in rg_futs for f in rf.result()]
     if not parts:
-        return parse_car(pa.array([], type=pa.string()))
-    return (np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]),
-            pa.chunked_array([p[2] for p in parts], type=pa.string()))
+        return parse_car(pa.array([], type=pa.string()), nongrav=nongrav)
+    return _combine(parts, nongrav)
 
 
 def rotate_cov_to_equatorial(cov):
@@ -468,7 +565,7 @@ def filter_masks(designation, packed, elements, arc):
     ``elements`` is a dict of the ``ELEMENTS`` arrays (NaN where missing) and
     ``arc`` the JSON ``orbit_fit_statistics.arc_length_total`` values as
     text (None or "null" when absent), a sequence or Arrow array. Returns
-    (not_comet, has_elements, long_arc).
+    (not_satellite, has_elements, long_arc).
 
     The arc rule is get-mpcorb.py's SQL, exactly: ``mpc_orb_jsonb->
     'orbit_fit_statistics'->>'arc_length_total' NOT IN ('0 days', '1 days',
@@ -485,17 +582,25 @@ def filter_masks(designation, packed, elements, arc):
     the JSON text, strings still quoted (as ``_parse_car_chunk`` returns
     them).
 
-    Comets are the designations containing "/" (C/, P/, D/, and also A/
-    and S/, which are dropped with them). A packed designation starting
-    with "_" is *not* a comet. It is the MPC's extended packed format for
-    asteroid provisional designations with a cycle count above 619 (e.g.
-    ``_FB0088`` = 2015 BE640, ``_PO001I`` = 2025 OF623). Rejecting those
-    removed 6,140 asteroids from the 2026-09-29 catalog, and no comet's
-    packed designation starts with "_". ``packed`` is kept in the
-    signature for callers.
+    Comets are kept (since 2026-10-01, docs/design/nongrav.md): C/, P/,
+    D/ and I/ designations, and A/ (asteroids on cometary orbits: inactive,
+    but with ordinary orbits, often near-parabolic). Their unpacked primary
+    provisional designation is always the provisional one ("P/1991 T1",
+    not "145P"), and the element-less placeholders (in the 2026-10-01
+    catalog all 18 D/, 2,499 C/, 9 P/ and A/2017 U1) are dropped by
+    ``has_elements``; 1,942 comets are kept (1,188 C/, 728 P/, 26 A/).
+    Natural satellites, the designations starting "S/" ("S/2004 S 46"),
+    are dropped: their elements are heliocentric two-body fits, which
+    can't follow the motion about the planet.
+
+    A packed designation starting with "_" is the MPC's extended packed
+    format for asteroid provisional designations with a cycle count above
+    619 (e.g. ``_FB0088`` = 2015 BE640, ``_PO001I`` = 2025 OF623); no
+    comet's or satellite's packed designation starts with "_" (2026-10-01
+    catalog). ``packed`` is kept in the signature for callers.
     """
     designation = np.asarray(designation, dtype=str)
-    not_comet = ~(np.char.find(designation, "/") >= 0)
+    not_satellite = ~np.char.startswith(designation, "S/")
     has_elements = np.ones(len(designation), dtype=bool)
     for k in ELEMENTS:
         has_elements &= np.isfinite(np.asarray(elements[k], dtype=np.float64))
@@ -503,7 +608,87 @@ def filter_masks(designation, packed, elements, arc):
         arc = pa.array(list(arc), type=pa.string())
     short = pc.or_kleene(pc.is_in(arc, value_set=pa.array(_SHORT_ARCS + ["null"])), pc.is_null(arc))
     long_arc = ~pc.fill_null(short, True).to_numpy(zero_copy_only=False)
-    return not_comet, has_elements, long_arc
+    return not_satellite, has_elements, long_arc
+
+
+def fill_nongrav(out, rows, ngd):
+    """Fill ``ng_model``, ``ng_A``, ``ng_fitted`` and ``cov_full`` of
+    ``out`` (ORBIT_DTYPE, with state0, cov0 and has_cov already set), whose
+    row k came from file row ``rows[k]``; ``ngd`` is ``parse_car``'s
+    {file row: (NonGrav or ValueError, flag, coef)}. See ``_contract``
+    ("Non-gravitational parameters").
+
+    Gravity-only rows get cov0 padded with zeros (NaN where has_cov is
+    False), and are otherwise untouched. A non-grav row's cov_full has cov0
+    as its state block, the CAR cross terms rotated to equatorial on their
+    state side (R6 C_sA), and the A block as fitted; its fitted block (the
+    state plus the fitted A's) must pass ``make_psd`` (on the correlation
+    matrix, as cov0 does), or has_cov becomes False (and cov0 NaN). A block
+    that ``make_psd`` clips to PSD is used as repaired (its state block then
+    differs from cov0 by ~PSD_TOL relative). An unknown model (ValueError)
+    leaves the row gravity-only. A row whose two marks (the ``non_gravs``
+    flag and the CAR coefficients beyond vz) disagree is parsed all the same,
+    with a warning naming it on stderr. Returns the counts.
+    """
+    cf = out["cov_full"]             # a view: filled in place
+    cf[...] = 0.0
+    cf[:, :6, :6] = out["cov0"]
+    rows = np.asarray(rows, dtype=np.int64)
+    keys = np.array(sorted(ngd), dtype=np.int64)
+    inv = np.full(int(max(rows.max(initial=-1), keys.max(initial=-1))) + 1, -1)
+    inv[rows] = np.arange(len(rows))
+    pos = {int(r): int(inv[r]) for r in keys if inv[r] >= 0}
+    counts = dict(comet=0, yarkovsky=0, unparsed=0, cov_missing=0, cov_not_psd=0, cov_clipped=0,
+                  marks_disagree=0)
+    blocks = {}                      # fitted-block size -> [(k, sel, block)]
+    for r, (ng, flag, coef) in ngd.items():
+        k = pos.get(int(r))
+        if k is None:
+            continue
+        des = str(out["designation"][k])
+        if flag != coef:
+            counts["marks_disagree"] += 1
+            print(f"WARNING: load_orbits: {des}: mpc_orb_jsonb non_gravs flag "
+                  f"{'true' if flag else 'not true'} but {'' if coef else 'no '}CAR coefficients "
+                  f"beyond vz; parsed anyway", file=sys.stderr)
+        if isinstance(ng, Exception):
+            counts["unparsed"] += 1
+            print(f"WARNING: load_orbits: {des}: {ng}; kept gravity-only", file=sys.stderr)
+            continue
+        if not ng.model:
+            continue
+        counts[ng.model] += 1
+        out["ng_model"][k] = ng.model
+        out["ng_A"][k] = ng.A
+        out["ng_fitted"][k] = ng.fitted
+        if not out["has_cov"][k]:
+            continue
+        if ng.cov is None:
+            counts["cov_missing"] += 1
+            out["has_cov"][k] = False
+            continue
+        sel = np.concatenate([np.arange(6), 6 + np.flatnonzero(ng.fitted)])
+        C = np.asarray(ng.cov, dtype=np.float64)          # CAR order: state, fitted A's
+        b = np.empty((len(sel), len(sel)))
+        b[:6, :6] = out["cov0"][k]
+        b[:6, 6:] = R6 @ C[:6, 6:]
+        b[6:, :6] = b[:6, 6:].T
+        b[6:, 6:] = C[6:, 6:]
+        blocks.setdefault(len(sel), []).append((k, sel, b))
+    for items in blocks.values():
+        fixed, usable, clipped = make_psd(np.array([b for _, _, b in items]))
+        for (k, sel, _), b, u, c in zip(items, fixed, usable, clipped):
+            if not u:
+                counts["cov_not_psd"] += 1
+                out["has_cov"][k] = False
+                continue
+            counts["cov_clipped"] += int(c)
+            cf[k] = 0.0
+            cf[k][np.ix_(sel, sel)] = b
+    bad = np.flatnonzero(~out["has_cov"])
+    cf[bad] = np.nan
+    out["cov0"][bad] = np.nan
+    return counts
 
 
 def _col(table, name):
@@ -534,21 +719,21 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True, s
     elements = {k: num[k] for k in ELEMENTS}
 
     del table
-    cov_ecl, _, arc = parse_car_file(path, nthreads=nthreads)
+    cov_ecl, _, arc, ngd = parse_car_file(path, nthreads=nthreads, nongrav=True)
     if len(arc) != n_read:
         raise RuntimeError(f"{path}: {len(arc)} JSON rows parsed, {n_read} expected")
     t_parse = time.perf_counter() - t0
 
-    not_comet, has_el, long_arc = filter_masks(desig, packed, elements, arc)
+    not_sat, has_el, long_arc = filter_masks(desig, packed, elements, arc)
     has_el &= np.isfinite(num["epoch_mjd"])
     if with_filter:
-        keep = not_comet & has_el & long_arc
+        keep = not_sat & has_el & long_arc
     else:
         keep = np.ones(n_read, dtype=bool)
     counts = dict(
-        comet=int((~not_comet).sum()),
-        elements=int((not_comet & ~has_el).sum()),
-        arc=int((not_comet & has_el & ~long_arc).sum()),
+        satellite=int((~not_sat).sum()),
+        elements=int((not_sat & ~has_el).sum()),
+        arc=int((not_sat & has_el & ~long_arc).sum()),
     )
 
     idx = np.flatnonzero(keep)
@@ -573,6 +758,8 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True, s
     c, pd_ok, clipped = make_psd(c)
     out["has_cov"] = pd_ok
     out["cov0"] = c
+    ngc = fill_nongrav(out, idx, ngd)
+    pd_ok = out["has_cov"]
     t_conv = time.perf_counter() - t2
 
     # 0 is the MPC's placeholder in zeroed ("no_orbit") fit statistics
@@ -585,14 +772,19 @@ def load_orbits(path, with_filter=True, ephem=None, nthreads=16, verbose=True, s
                      removed=dict(counts) if with_filter else None,
                      has_cov_false=int((~pd_ok).sum()), cov_missing=int(missing.sum()),
                      cov_not_psd=int((~missing & ~pd_ok).sum()), cov_clipped_to_psd=int(clipped.sum()),
+                     nongrav=ngc,
                      normalized_rms=dict(p5=float(pct[0]), p50=float(pct[1]), p95=float(pct[2]),
                                          p99=float(pct[3]), n=int(len(rms)), n_zero=n_zero))
     if verbose:
-        removed = (f"removed {counts['comet']:,} comets, {counts['elements']:,} missing elements, "
-                   f"{counts['arc']:,} arcs <= 2 d" if with_filter else "no filter")
+        removed = (f"removed {counts['satellite']:,} natural satellites, "
+                   f"{counts['elements']:,} missing elements, {counts['arc']:,} arcs <= 2 d"
+                   if with_filter else "no filter")
         print(f"load_orbits: {n_read:,} rows read, {removed}; {len(out):,} kept; "
               f"has_cov false {int((~pd_ok).sum()):,} ({int(missing.sum()):,} missing, "
               f"{int((~missing & ~pd_ok).sum()):,} not PSD), {int(clipped.sum()):,} clipped to PSD; "
+              f"non-grav {ngc['comet']:,} comets and {ngc['yarkovsky']:,} Yarkovsky "
+              f"({ngc['unparsed']:,} unknown models kept gravity-only, "
+              f"{ngc['cov_missing'] + ngc['cov_not_psd']:,} without a usable full covariance); "
               f"normalized_rms p5/p50/p95/p99 "
               f"{pct[0]:.3f}/{pct[1]:.3f}/{pct[2]:.3f}/{pct[3]:.3f} ({len(rms):,} with it, "
               f"{n_zero:,} zero excluded); "

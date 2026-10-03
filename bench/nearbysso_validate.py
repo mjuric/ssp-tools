@@ -361,16 +361,16 @@ def _empty_orbits(with_json):
 
 def filter_reason(orbits):
     """Why each orbit is excluded by NearbySSO's rules ('' if kept): the
-    first of 'comet' (designation with '/'; a packed designation starting
-    with '_' is an asteroid in the MPC's extended format, not a comet),
-    'missing_elements' (any of q, e, i, node, argperi, peri_time NaN) and
-    'short_arc' (the JSON arc text is one of SHORT_ARC_TEXTS) and
-    'null_arc' (the arc is null or absent: get-mpcorb.py's SQL, ``WHERE NOT
-    ...->>'arc_length_total' IN (...)``, is NULL there, so the row is
-    dropped). ``orbits`` needs ``arc_text`` (from `read_orbits`) or
-    ``mpc_orb_jsonb``."""
+    first of 'satellite' (a natural satellite: the designation starts with
+    'S/'; comets, C/ P/ D/ I/ and A/, are kept since 2026-10-01,
+    docs/design/nongrav.md), 'missing_elements' (any of q, e, i, node,
+    argperi, peri_time NaN) and 'short_arc' (the JSON arc text is one of
+    SHORT_ARC_TEXTS) and 'null_arc' (the arc is null or absent:
+    get-mpcorb.py's SQL, ``WHERE NOT ...->>'arc_length_total' IN (...)``,
+    is NULL there, so the row is dropped). ``orbits`` needs ``arc_text``
+    (from `read_orbits`) or ``mpc_orb_jsonb``."""
     des = orbits["designation"].astype(str).to_numpy()
-    comet = np.char.find(des.astype(str), "/") >= 0
+    satellite = np.char.startswith(des.astype(str), "S/")
     missing = np.zeros(len(orbits), bool)
     for c in ELEMENTS:
         missing |= ~np.isfinite(orbits[c].to_numpy(dtype=np.float64))
@@ -380,8 +380,8 @@ def filter_reason(orbits):
         arc = arc_text_from_json(orbits["mpc_orb_jsonb"])
     null = np.array([not isinstance(a, str) for a in arc], dtype=bool)
     short = np.array([isinstance(a, str) and a in SHORT_ARC_TEXTS for a in arc], dtype=bool)
-    return np.select([comet, missing, short, null],
-                     ["comet", "missing_elements", "short_arc", "null_arc"], "")
+    return np.select([satellite, missing, short, null],
+                     ["satellite", "missing_elements", "short_arc", "null_arc"], "")
 
 
 def reason_lookup(orbits):

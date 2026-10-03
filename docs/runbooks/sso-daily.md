@@ -11,7 +11,7 @@ This builds and delivers the six PPDB Solar System tables (RFC-1188), in three s
 
 The tables: SSSource, SSObject, NearbySSO, `mpc_orbits`, `current_identifications` and `numbered_identifications`, per `sdm_schemas` `ppdb.yaml`/`sso_base.yaml` (tickets/DM-55375, lsst/sdm_schemas#549; copies in `tests/data/sdm_schemas/`).
 
-Design: `docs/design/sso-delivery.md` (the stages), `docs/design/sssource-widened.md` (SSSource, SSObject) and `docs/design/nearbysso.md` (NearbySSO). The contract between the stages is `ssp/delivery_contract.py`.
+Design: `docs/design/sso-delivery.md` (the stages), `docs/design/sssource-widened.md` (SSSource, SSObject), `docs/design/nearbysso.md` (NearbySSO) and `docs/design/nongrav.md` (non-gravitational forces, and comets in NearbySSO). The contract between the stages is `ssp/delivery_contract.py`.
 
 ## Setup (once)
 
@@ -118,3 +118,12 @@ See the end of this file, "Reference run".
 
 - All 8 checks PASS: the six `delivery:<Table>` checks plus `sssource:conformance` and `sssource:offsets`. `deliverable` is true.
 - The dry-run upload planned `gs://ppdb-dev-sso-ingest/20261001T201900014/<Table>.parquet` for the five accepted tables, with NearbySSO held back.
+
+## Rerun with non-gravitational forces (2026-10-01)
+
+Since `docs/design/nongrav.md`, the ephemerides apply the MPC's non-gravitational fits: 184 comets and 454 Yarkovsky asteroids. NearbySSO also includes comets.
+- The run is the same: no new inputs, options or steps.
+- Expect about 3 GB more peak memory in the nearbysso step (16.0 GB).
+- Warnings in the sssource and nearbysso logs name any orbit whose non-grav fit can't be parsed (it is integrated gravity-only), or whose `non_gravs` flag and CAR coefficients disagree. There were none on 2026-10-01.
+
+`ssp-build-sso` on the 2026-10-01 inputs above, `nongrav` 6bdfe06, 32 workers: deliverable, all 8 checks PASS, in `/sdf/data/rubin/user/mjuric/nongrav/rerun/2026-10-01/run/`. SSSource 8,070,610 rows (only the 495 rows of non-grav objects changed); NearbySSO 1,290,839 rows (7 comet rows added). Timings and the comparison are in the design doc, "The full daily rerun".

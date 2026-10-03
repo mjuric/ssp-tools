@@ -684,3 +684,34 @@ def test_dead_worker_names_the_pass():
         pytest.skip("no fork")
     with pytest.raises(BrokenProcessPool, match=r"\[pass 9: test\] a worker process died"):
         util.run_chunks(_die, [(0, 1), (1, 2)], 2, "pass 9: test", unit="slices")
+
+
+@needs_assist
+def test_precise_pass_gets_nongrav(tmp_path, synth, orbits, monkeypatch):
+    """The precise pass integrates each orbit with its own non-gravitational
+    parameters (ssp.nongrav.from_orbit), and gravity-only orbits with none."""
+    from ssp import nongrav
+    o = orbits.copy()
+    k = int(np.flatnonzero(o["designation"] == WIDE)[0])
+    o["ng_model"][k] = "yarkovsky"
+    o["ng_A"][k] = (0.0, -2.9e-14, 0.0)
+    o["ng_fitted"][k] = (False, True, False)
+    o["cov_full"][k] = 0.0
+    o["cov_full"][k, :6, :6] = o["cov0"][k]
+    seen = {}
+    real_eph = B.compute_ephemerides_one
+
+    def eph(desig, *a, **kw):
+        seen.setdefault(desig, []).append(kw.get("nongrav"))
+        return real_eph(desig, *a, **kw)
+
+    monkeypatch.setattr(B, "compute_ephemerides_one", eph)
+    _run(tmp_path, synth, o, "ng", workers=1)
+    assert WIDE in seen and len(seen) > 1
+    for desig, ngs in seen.items():
+        for ng in ngs:
+            if desig == WIDE:
+                assert ng.model == "yarkovsky" and ng.A[1] == -2.9e-14
+                assert ng.fitted.tolist() == [False, True, False]
+            else:
+                assert ng is nongrav.NONE or not ng.model

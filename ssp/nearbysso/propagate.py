@@ -54,6 +54,28 @@ propagation"):
   integrations with that force group off. (Not from variational
   particles: ASSIST's variational equations keep the perturbers' tidal
   terms even with their force group off, and blow up next to the body.)
+- **Non-gravitational orbits** (``ng_model`` set; docs/design/nongrav.md)
+  are integrated with ``ssp.nongrav.apply`` (the A's and the g(r)), and
+  C(t) = J cov_full J^T with J = [Phi | d state / d (A1, A2, A3)]. ASSIST
+  1.2.3 covers both parts in its variational equations
+  (``assist_additional_force_non_gravitational`` in ``src/forces.c``): it
+  adds the non-grav acceleration's partials with respect to position and
+  velocity to every variational particle of a ``testparticle`` variation,
+  plus ``dA1 * da/dA1 + dA2 * da/dA2 + dA3 * da/dA3``, reading
+  (dA1, dA2, dA3) for variational configuration v from
+  ``particle_params[3 * (N_real + v)]``: so ``particle_params`` holds one
+  triple per real particle, then one per variational configuration. So
+  three more variational particles, seeded at zero with unit dA's, give
+  d state / d A directly (``_nongrav_params``); the state variations get
+  zero dA's. Checked against central differences in A (to 1e-6..1e-8 at
+  steps of 1000 sigma(A), where the integrations' own noise no longer
+  dominates) and, for Phi's non-grav part, against central differences of
+  the state (the comet with the largest A1). The variational particles
+  don't affect IAS15's step control: the states are bitwise those of a
+  plain integration. Gravity-only orbits run exactly as before (six
+  variations, no ``particle_params``). ASSIST skips a particle whose three
+  A's are all 0, variations included; see ``_nongrav_params`` for the one
+  such orbit. The self-perturber path ignores non-gravs (none has one).
 - **Non-PSD sky covariances** (e.g. from a non-PSD cov0) are treated like
   missing ones: NaN errors, infinite sigma_major.
 - **Orbits with has_cov False** get NaN ellipses and sigma_major = inf, but
@@ -106,14 +128,46 @@ STEP_CAP_STOPS = 0
 _PSD_EPS = 1e-10
 
 
-def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
+def _nongrav_params(ng):
+    """ASSIST's ``particle_params`` for one non-grav orbit with six state
+    and three A variational particles: one (A1, A2, A3) triple per particle,
+    the real one first, then one per variational configuration in the order
+    added (ASSIST reads ``particle_params[3 * (N_real + v)]`` as the
+    variation of the A's carried by configuration v; see the module
+    docstring). The state variations carry dA = 0, the A variations the
+    unit vectors, so their particles integrate d state / d A_i.
+
+    ASSIST skips a particle whose A1 = A2 = A3 = 0 altogether, variations
+    included (2018 CW2's fitted Yarkovsky A2 is exactly 0), so then one
+    fitted A is set to ``_A_TINY``: its acceleration (~1e-300 au/day^2)
+    vanishes in the sum, and the d/dA terms, which don't depend on A, are
+    computed."""
+    A = np.array(ng.A, dtype=np.float64)
+    if not np.any(A != 0.0):
+        A[int(np.argmax(ng.fitted))] = _A_TINY
+    p = np.zeros((10, 3))
+    p[0] = A
+    p[7:] = np.eye(3)
+    return p.reshape(-1)
+
+
+#: See _nongrav_params.
+_A_TINY = 1e-300
+
+
+def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx, ng=None, dA=None):
     """One ASSIST simulation with six variational particles, from ``epoch``
     through ``t_seq`` (monotonic, in the direction away from epoch), which
     are the times ``t[idx]``. Fills ``X[idx]`` (6-vector states),
-    ``Phi[idx]`` and ``ok[idx]``, up to the first failure."""
+    ``Phi[idx]`` and ``ok[idx]``, up to the first failure.
+
+    With a non-grav ``ng`` (ssp.nongrav.NonGrav with a model), the forces
+    include it (ssp.nongrav.apply), three more variational particles carry
+    d state / d (A1, A2, A3), and ``dA[idx]`` (K, 6, 3) is filled too."""
     import assist
     import rebound
 
+    with_ng = ng is not None and bool(ng.model)
     sim = rebound.Simulation()
     sim.t = float(epoch)
     sim.add(x=float(state0[0]), y=float(state0[1]), z=float(state0[2]),
@@ -121,12 +175,17 @@ def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
     # testparticle=0: the variations of particle 0 alone. REBOUND's default
     # (-1) makes ASSIST skip the variational accelerations, and Phi comes
     # out as the free-motion [[I, tI], [0, I]] with no error.
-    for j in range(6):
+    for j in range(9 if with_ng else 6):
         var = sim.add_variation(testparticle=0)
         vp = var.particles[0]
         vp.x = vp.y = vp.z = vp.vx = vp.vy = vp.vz = 0.0
-        setattr(vp, ("x", "y", "z", "vx", "vy", "vz")[j], 1.0)
+        if j < 6:
+            setattr(vp, ("x", "y", "z", "vx", "vy", "vz")[j], 1.0)
     ax = assist.Extras(sim, ephem)
+    if with_ng:
+        from .. import nongrav
+        nongrav.apply(ax, ng)                 # the g(r) constants (and the A's)
+        ax.particle_params = _nongrav_params(ng)   # with the variations' dA's
     sim.ri_ias15.adaptive_mode = 2   # after attaching: ASSIST resets it
 
     years = abs(float(t_seq[-1]) - float(epoch)) / 365.25 if len(t_seq) else 0.0
@@ -141,7 +200,7 @@ def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
             simp.contents.stop()
     sim.heartbeat = heartbeat
 
-    n = sim.N            # 7: the particle, then its six variations
+    n = sim.N            # 7 (10 with ng): the particle, then its variations
     stride = ctypes.sizeof(rebound.Particle) // 8
     buf_t = ctypes.c_double * (n * stride)
     S = np.empty((len(idx), n, 6))
@@ -171,7 +230,9 @@ def _integrate(state0, epoch, t_seq, ephem, X, Phi, ok, idx):
         m = int(np.argmax(bad))
     done = idx[:m]
     X[done] = S[:m, 0]
-    Phi[done] = np.transpose(S[:m, 1:], (0, 2, 1))  # column k: d/d state0_k
+    Phi[done] = np.transpose(S[:m, 1:7], (0, 2, 1))  # column k: d/d state0_k
+    if with_ng:
+        dA[done] = np.transpose(S[:m, 7:10], (0, 2, 1))  # column i: d/d A_i
     ok[done] = True
 
 
@@ -322,15 +383,25 @@ def _perihelion(state0, epoch, ephem):
     return float((h @ h) / GM_SUN / (1.0 + np.sqrt(e @ e)))
 
 
+def _orbit_nongrav(orbit):
+    """ssp.nongrav.from_orbit, or NONE for a row without the ng_* fields."""
+    from .. import nongrav
+    names = getattr(getattr(orbit, "dtype", None), "names", None) or ()
+    if "ng_model" not in names:
+        return nongrav.NONE
+    return nongrav.from_orbit(orbit)
+
+
 def coarse(orbit, t, obs_pos, ephem, _phi=None):
     """Sample one orbit at ASSIST times ``t`` (K,), observed from
     ``obs_pos`` (K, 3). Returns a CoarseTrack; see ``_contract`` and the
     module docstring. ``delta`` is the geometric topocentric distance
     |object - observer| [AU] (NaN where ``ok`` is False).
 
-    ``_phi``, for tests: a dict, which gets ``state`` (K, 6) and ``phi``
-    (K, 6, 6), Phi[k, i, j] = d state_i(t_k) / d state0_j (NaN where not
-    ok).
+    ``_phi``, for tests: a dict, which gets ``state`` (K, 6), ``phi``
+    (K, 6, 6), Phi[k, i, j] = d state_i(t_k) / d state0_j, and ``dA``
+    (K, 6, 3), dA[k, i, j] = d state_i(t_k) / d A_(j+1) (0 for
+    gravity-only orbits; NaN where not ok).
 
     The times need not be sorted; samples on either side of the epoch are
     integrated by two simulations, each moving away from the epoch."""
@@ -343,6 +414,11 @@ def coarse(orbit, t, obs_pos, ephem, _phi=None):
     X = np.full((K, 6), np.nan)
     Phi = np.full((K, 6, 6), np.nan)
     ok = np.zeros(K, dtype=bool)
+    ng = _orbit_nongrav(orbit)
+    # d state / d (A1, A2, A3); stays 0 for gravity-only orbits
+    dA = np.zeros((K, 6, 3))
+    if ng.model:
+        dA[:] = np.nan
 
     state0 = np.asarray(orbit["state0"], dtype=np.float64)
     epoch = float(orbit["epoch"])
@@ -356,18 +432,21 @@ def coarse(orbit, t, obs_pos, ephem, _phi=None):
         # ASSIST's own perturbers: see the module docstring
         body = ea.self_perturber(state0[:3], state0[3:], epoch, ephem)
         if body is not None:
+            # (none of them has non-gravs: ng is ignored, dA stays 0)
             _self_perturber_track(state0, epoch, t, ephem, body, X, Phi, ok)
+            dA[ok] = 0.0
         else:
             for idx in (fwd, bwd):
                 if len(idx):
-                    _integrate(state0, epoch, t[idx], ephem, X, Phi, ok, idx)
+                    _integrate(state0, epoch, t[idx], ephem, X, Phi, ok, idx, ng=ng, dA=dA)
     # A sample without a finite observer position has no track.
     bad = ~np.all(np.isfinite(obs_pos), axis=1)
     ok &= ~bad
     X[bad] = np.nan
     Phi[bad] = np.nan
+    dA[~ok] = np.nan
     if _phi is not None:
-        _phi.update(state=X, phi=Phi)
+        _phi.update(state=X, phi=Phi, dA=dA)
 
     # Topocentric geometry ---------------------------------------------------
     rho = X[:, :3] - obs_pos
@@ -389,7 +468,14 @@ def coarse(orbit, t, obs_pos, ephem, _phi=None):
     rate_dec = np.sum(udot * e_dec, axis=1) * _RAD2DEG
 
     # Uncertainty -------------------------------------------------------------
-    if bool(orbit["has_cov"]):
+    if bool(orbit["has_cov"]) and ng.model:
+        # J = [Phi | d state / d A] (K, 6, 9), the unfitted A's columns 0
+        J = np.concatenate([Phi, np.where(np.asarray(ng.fitted, bool), dA, 0.0)], axis=2)
+        cov_full = np.asarray(orbit["cov_full"], dtype=np.float64)
+        cov = J @ cov_full @ np.transpose(J, (0, 2, 1))    # (K, 6, 6)
+        cov = 0.5 * (cov + np.transpose(cov, (0, 2, 1)))
+        s00, s01, s11 = _sky(cov[:, :3, :3], rho)
+    elif bool(orbit["has_cov"]):
         cov0 = np.asarray(orbit["cov0"], dtype=np.float64)
         cov = Phi @ cov0 @ np.transpose(Phi, (0, 2, 1))    # (K, 6, 6)
         cov = 0.5 * (cov + np.transpose(cov, (0, 2, 1)))

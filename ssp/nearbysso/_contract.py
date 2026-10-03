@@ -64,12 +64,23 @@ ORBIT_DTYPE = np.dtype([
     ("has_cov", "?"),            # False: no usable covariance (missing, or
                                  # its 6x6 block not positive definite)
     ("normalized_rms", "f8"),    # from mpc_orbits, for the run report
+    # non-gravitational parameters (ssp.nongrav; docs/design/nongrav.md)
+    ("ng_model", "U16"),         # "" (none), "comet" or "yarkovsky"
+    ("ng_A", "f8", (3,)),        # A1, A2, A3 [au/day^2]; zeros where not fitted
+    ("ng_fitted", "?", (3,)),    # which of A1..A3 were fitted
+    ("cov_full", "f8", (9, 9)),  # covariance of (state0, A1, A2, A3): the
+                                 # state block as cov0 (barycentric ICRF), the
+                                 # A rows/columns as fitted (au/day^2; the
+                                 # A's are along the orbit's radial/transverse/
+                                 # normal frame, so unaffected by the frame
+                                 # rotation); zero rows/columns for unfitted
+                                 # A's; NaN where has_cov is False
 ])
 
 # orbits.load_orbits(path, with_filter=True) -> np.ndarray[ORBIT_DTYPE]
-#   Reads mpc_orbits Parquet. The filter keeps orbits that aren't comets
-#   (designation without '/'; a packed designation starting with '_' is an
-#   asteroid in the MPC's extended format, not a comet), have all of
+#   Reads mpc_orbits Parquet. The filter keeps asteroids and comets
+#   (comets since 2026-10-01, docs/design/nongrav.md) but not natural
+#   satellites (designations starting "S/"), and requires all of
 #   q, e, i, node, argperi and peri_time, and an arc filtered exactly as
 #   lsst-gen-ephemcache's get-mpcorb.py does: on the JSON
 #   orbit_fit_statistics.arc_length_total *text*, NOT IN ('0 days',
@@ -79,6 +90,26 @@ ORBIT_DTYPE = np.dtype([
 #   so a numeric filter on it would wrongly drop them.) It
 #   returns rows sorted by designation, and prints a one-line summary (rows
 #   read, kept, has_cov false and why).
+
+# Non-gravitational parameters (docs/design/nongrav.md):
+#   load_orbits fills ng_model/ng_A/ng_fitted from mpc_orb_jsonb via
+#   ssp.nongrav.nongrav_params, for every row it returns (with_filter or
+#   not); a ValueError from the parser drops nothing silently: the orbit is
+#   kept gravity-only (ng_model "") and counted in the summary line. cov_full
+#   is built from NonGrav.cov (the 6x6 state block rotated exactly as cov0,
+#   the A cross terms rotated on their state side only) for non-grav orbits,
+#   and is cov0 padded with zeros for gravity-only ones; NaN wherever
+#   has_cov is False. has_cov also requires the fitted block of cov_full to
+#   be positive definite. ssp.nongrav.from_orbit(row) gives a row's NonGrav.
+#
+# ssp.ephem_assist (the precise pass; WP N1):
+#   _propagate_one(..., nongrav=ssp.nongrav.NONE) and
+#   compute_ephemerides_one(..., nongrav=ssp.nongrav.NONE) integrate with
+#   ssp.nongrav.apply(extras, nongrav) right after the Extras is attached.
+#   With NONE the result is bitwise what it was before. The self-perturber
+#   paths (bodies 11-26, Pluto) ignore nongrav (none of them has one).
+#   Callers pass the NonGrav explicitly: SSSource from the object's
+#   mpc_orb_jsonb, NearbySSO's precise pass ssp.nongrav.from_orbit(orbit).
 
 # --------------------------------------------------------------------------
 # WP3: DiaSources and visits
@@ -190,6 +221,12 @@ class CoarseTrack(NamedTuple):
 #   position, for the observer at obs_pos). Orbits with has_cov False get an
 #   infinite sigma_major (so they're never eligible) and NaN ellipses, but
 #   positions and rates as usual.
+#
+#   Non-gravitational orbits (ng_model != ""; WP N2): the integration
+#   applies ssp.nongrav.apply, and C(t) = J cov_full J^T with
+#   J = [Phi | d state(t) / d (A1, A2, A3)] (K, 6, 9), the A columns zero
+#   for unfitted A's. Gravity-only orbits are bitwise unchanged. CoarseTrack
+#   and its fields are unchanged (cov stays the (K, 6, 6) state covariance).
 #
 # propagate.ellipse_at(track, t, topo_pos=None)
 #       -> (ra_err, dec_err, ra_dec_cov, sigma_major)

@@ -38,6 +38,7 @@ import pandas as pd
 from astropy.time import Time
 import astropy.units as u
 
+from . import nongrav as _nongrav
 from . import util
 
 
@@ -207,17 +208,35 @@ def ecliptic_to_equatorial(v: np.ndarray) -> np.ndarray:
 
 
 def solve_kepler_hyperbolic(M: np.ndarray, e: float, tol: float = 1e-14, max_iter: int = 100) -> np.ndarray:
-    """Solve the hyperbolic Kepler equation e sinh H - H = M for e > 1."""
+    """Solve the hyperbolic Kepler equation e sinh H - H = M for e > 1.
+
+    Newton from arcsinh(M / e). That start fails for e -> 1 at small |M|
+    (e cosh H - 1 ~ e - 1, so the first step overflows): then it restarts
+    from sign(M) ln(2 |M| / e + 1.8) (Danby's start, from which Newton
+    converges monotonically), and returns NaN if that fails too. Results
+    that converge from the first start are unchanged (the same fallback as
+    ssp.nearbysso.orbits._solve_kepler_hyperbolic_vec)."""
     M = np.atleast_1d(np.asarray(M, dtype=np.float64))
-    H = np.arcsinh(M / e)  # good initial guess for all M
-    for _ in range(max_iter):
-        f = e * np.sinh(H) - H - M
-        fp = e * np.cosh(H) - 1.0
-        dH = -f / fp
-        H = H + dH
-        if np.all(np.abs(dH) < tol * np.maximum(1.0, np.abs(H))):
-            break
+    H, ok = _newton_hyperbolic(np.arcsinh(M / e), M, e, tol, max_iter)
+    if not ok:
+        H, ok = _newton_hyperbolic(np.sign(M) * np.log(2.0 * np.abs(M) / e + 1.8), M, e, tol, max_iter)
+        if not ok:
+            H = np.full_like(M, np.nan)
     return H
+
+
+def _newton_hyperbolic(H, M, e, tol, max_iter):
+    """Newton iterations for solve_kepler_hyperbolic: (H, converged)."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        for _ in range(max_iter):
+            f = e * np.sinh(H) - H - M
+            fp = e * np.cosh(H) - 1.0
+            dH = -f / fp
+            H = H + dH
+            if np.all(np.abs(dH) < tol * np.maximum(1.0, np.abs(H))):
+                return H, True
+        # (steps between tol and 1e-10 are rounding cycles: converged)
+        return H, bool(np.all(np.abs(dH) < 1e-10 * np.maximum(1.0, np.abs(H))))
 
 
 def cometary_to_helio_ecliptic(
@@ -409,7 +428,7 @@ _DETECT = object()
 
 def _propagate_one(
     state_X_au, state_V_au_day, t_epoch_assist, t_targets_assist, ephem,
-    perturber=_DETECT, integrate_pluto=False,
+    perturber=_DETECT, integrate_pluto=False, nongrav=_nongrav.NONE,
 ):
     """Integrate one test particle with ASSIST through a sorted list of times.
 
@@ -418,6 +437,14 @@ def _propagate_one(
     11-26 are integrated without asteroid forces, and Pluto's states come
     from the planet ephemeris (or, with ``integrate_pluto``, from an
     integration without the planets, e.g. to difference for Phi).
+
+    ``nongrav`` (an ``ssp.nongrav.NonGrav``; ``ssp.nongrav.NONE``, the default,
+    or None for gravity only) sets the non-gravitational acceleration with
+    ``ssp.nongrav.apply`` right after ASSIST is attached (its
+    NON_GRAVITATIONAL force is on by default and does nothing without
+    particle_params). Gravity-only orbits never call it, so they integrate
+    bitwise as before. The self-perturber paths ignore it (none of those
+    bodies has non-gravitational parameters).
 
     Parameters
     ----------
@@ -452,6 +479,8 @@ def _propagate_one(
     sim.t = float(t_epoch_assist)
     ax = _assist.Extras(sim, ephem)  # noqa: F841 (sim holds reference)
     forces_without_self(ax, perturber)
+    if perturber is None and nongrav is not None and nongrav.model:
+        _nongrav.apply(ax, nongrav)
     # after attaching: ASSIST resets the step control (see PRECISE_EPSILON)
     sim.ri_ias15.adaptive_mode = PRECISE_ADAPTIVE_MODE
     sim.ri_ias15.epsilon = PRECISE_EPSILON
@@ -619,6 +648,7 @@ def compute_ephemerides_one(
     row=None,
     obs_pos: Optional[np.ndarray] = None,
     obs_vel: Optional[np.ndarray] = None,
+    nongrav=_nongrav.NONE,
 ) -> EphResult:
     """Per-epoch ephemeris quantities for *one* object from its local mpcorb
     elements (no Horizons fetch), propagated with ASSIST.
@@ -637,6 +667,11 @@ def compute_ephemerides_one(
     supply the observer's barycentric ICRF state at ``ephTimes``, e.g.
     sliced from one vectorized util.observatory_barycentric_posvel call over
     all observations; that call has a large fixed cost per invocation.
+
+    ``nongrav`` (an ``ssp.nongrav.NonGrav``, e.g. from
+    ``ssp.nongrav.nongrav_params`` of the object's mpc_orb_jsonb) adds its
+    non-gravitational acceleration to the integration; None or
+    ``ssp.nongrav.NONE`` integrates gravity only (see _propagate_one).
     """
     if row is None:
         row = (
@@ -666,7 +701,7 @@ def compute_ephemerides_one(
     X0_bary, V0_bary = elements_row_to_bary_icrf(row, sun_pos_epoch, sun_vel_epoch)
 
     # Propagate ----------------------------------------------------------
-    X, V = _propagate_one(X0_bary, V0_bary, t0_assist, t_assist, ephem)
+    X, V = _propagate_one(X0_bary, V0_bary, t0_assist, t_assist, ephem, nongrav=nongrav)
 
     # Sun barycentric position at each observation time (for light-time
     # acceleration term and for caller's helio* columns).
@@ -730,8 +765,11 @@ def compute_ephemerides_batch(
     planets_path: Optional[str] = None,
     asteroids_path: Optional[str] = None,
     observer_code: str = "X05",
+    nongravs: Optional[dict] = None,
 ) -> dict:
     """Batched form. ``schedule`` maps provID → astropy.Time array (TAI MJD).
+    ``nongravs`` optionally maps provIDs to their ``ssp.nongrav.NonGrav``
+    (the others integrate gravity only).
 
     Loads the ASSIST ephemeris exactly once and reuses it across every
     object. Returns ``{provID: EphResult}``.
@@ -742,5 +780,6 @@ def compute_ephemerides_batch(
         out[provID] = compute_ephemerides_one(
             provID, eph_times, mpcorb, ephem,
             observer_code=observer_code,
+            nongrav=_nongrav.NONE if nongravs is None else nongravs.get(provID, _nongrav.NONE),
         )
     return out
