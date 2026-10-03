@@ -33,7 +33,8 @@ import pyarrow.parquet as pq
 from . import nongrav as _nongrav
 from . import util
 from .photfit import hg_V_mag
-from .ephem_assist import MJD_J2000, compute_ephemerides_one, open_ephem
+from .ephem_assist import (MJD_J2000, compute_ephemerides_one, open_ephem, tail_position_angles,
+                           tail_position_angles_f32)
 from .nearbysso import propagate as _propagate
 # (a module attribute, so tests can substitute it)
 from . import sssource_ellipse as _ellipse
@@ -75,6 +76,7 @@ DIA_DROPPED = VIEW_DROPPED + ("parentId", "obssubid", "match",
 # (tests/test_sssource_parallel.py checks).
 EPH_FIELDS = [
     "ephRateRa", "ephRateDec", "ephRate",
+    "ephAntiSunPA", "ephAntiMotionPA",
     "ephRa", "ephDec", "ephOffsetDec", "ephOffsetRa", "ephOffset",
     "ephOffsetAlongTrack", "ephOffsetCrossTrack",
     "helio_x", "helio_y", "helio_z", "helioRange",
@@ -231,6 +233,12 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None, nongravs=N
     sss["ephRateRa"] = e.mu_lon
     sss["ephRateDec"] = e.mu_lat
     sss["ephRate"] = e.mu_total
+
+    # The tail position angles, from the float64 light-emission-time vectors
+    # (as NearbySSO computes them; docs/design/tail-angles.md)
+    anti_sun, anti_motion = tail_position_angles(e.helio_pos, e.helio_vel, e.topo_pos)
+    sss["ephAntiSunPA"] = tail_position_angles_f32(anti_sun)
+    sss["ephAntiMotionPA"] = tail_position_angles_f32(anti_motion)
 
     # Heliocentric and topocentric vectors are at light-emission time, per
     # the SSSource schema, following JPL Horizons conventions (see
