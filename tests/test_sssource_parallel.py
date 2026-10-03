@@ -137,6 +137,24 @@ def test_eph_fields_are_what_compute_sssource_entry_writes(fake_ephem):
     assert len(set(EPH_FIELDS)) == len(EPH_FIELDS)
 
 
+def test_tail_angles_from_the_ephresult(fake_ephem):
+    """ephAntiSunPA/ephAntiMotionPA are tail_position_angles of the
+    EphResult's float64 vectors, stored through tail_position_angles_f32
+    (bitwise)."""
+    from ssp.ephem_assist import tail_position_angles, tail_position_angles_f32
+    from astropy.time import Time
+    sss, obs_state, dia_eph, mpcorb = _tables(n_obj=1, seed=6)
+    compute_sssource_entry(sss, obs_state, mpcorb, dia_eph, None)
+    row = mpcorb.loc[sss["designation"][0]]
+    dia = dia_eph[obs_state["dia_index"]]
+    e = _fake_ephemerides(None, Time(dia["midpointMjdTai"], format="mjd", scale="tai"), None, None, row=row,
+                          obs_pos=obs_state["obs_pos"].T, obs_vel=obs_state["obs_vel"].T)
+    s, m = tail_position_angles(e.helio_pos, e.helio_vel, e.topo_pos)
+    assert sss["ephAntiSunPA"].tobytes() == tail_position_angles_f32(s).tobytes()
+    assert sss["ephAntiMotionPA"].tobytes() == tail_position_angles_f32(m).tobytes()
+    assert np.isfinite(s).all() and np.isfinite(m).all()
+
+
 class _FakeEllipse:
     """A stand-in for ssp.sssource_ellipse: records the inputs it gets
     (serial runs only: forked workers record in their own copy), counts one

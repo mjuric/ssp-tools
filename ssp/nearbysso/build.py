@@ -13,7 +13,7 @@ sliced:
    ``propagate.coarse``, ``VisitIndex.candidates``, the precise
    ``compute_ephemerides_one`` at the candidate visits (as SSSource), the
    error ellipse there (``propagate.ellipse_at``) and the sigma gate. The
-   eligible predictions (``PRED_DTYPE``, 48 bytes each) come back to the
+   eligible predictions (``PRED_DTYPE``, 56 bytes each) come back to the
    parent, which sorts them by (visit, orbit).
 3. **Matching** (``read_workers`` processes, one slice each; the
    predictions shared through fork): read the slice again, index it
@@ -65,7 +65,8 @@ import astropy.units as u
 
 from .. import util
 from .. import nongrav as _nongrav
-from ..ephem_assist import MJD_J2000, compute_ephemerides_one, open_ephem
+from ..ephem_assist import (MJD_J2000, compute_ephemerides_one, open_ephem, tail_position_angles,
+                            tail_position_angles_f32)
 from ..photfit import hg_V_mag
 from . import orbits as _orbits
 from . import propagate, visits as _visits
@@ -79,13 +80,14 @@ MIN_HALF_SPAN_DAYS = 1.0 / 24.0
 #: Exceptions kept per type, for the run report.
 _N_EXAMPLES = 5
 
-#: An eligible prediction: an orbit at a candidate visit (48 bytes).
+#: An eligible prediction: an orbit at a candidate visit (56 bytes).
 PRED_DTYPE = np.dtype([
     ("visit", "i4"),         # into the visits (of all nights)
     ("orbit", "i4"),         # into the (designation-sorted) orbits
     ("ra", "f8"), ("dec", "f8"),
     ("vmag", "f4"), ("rate_ra", "f4"), ("rate_dec", "f4"),
     ("ra_err", "f4"), ("dec_err", "f4"), ("ra_dec_cov", "f4"),
+    ("anti_sun_pa", "f4"), ("anti_motion_pa", "f4"),
 ])
 
 #: Predictions per DiaIndex.match call (it has a fixed cost per call).
@@ -311,6 +313,10 @@ def process_orbit(i, w, ephem, stage_t):
     p["ra_err"] = ra_err[k]
     p["dec_err"] = dec_err[k]
     p["ra_dec_cov"] = ra_dec_cov[k]
+    # the tail position angles, exactly as SSSource computes them
+    anti_sun, anti_motion = tail_position_angles(e.helio_pos[:, k], e.helio_vel[:, k], e.topo_pos[:, k])
+    p["anti_sun_pa"] = tail_position_angles_f32(anti_sun)
+    p["anti_motion_pa"] = tail_position_angles_f32(anti_motion)
     stage_t["ellipse"] += time.perf_counter() - t3
     return p, c
 
@@ -532,6 +538,10 @@ def ssobject_ids(path, designations):
     return ids, found
 
 
+#: NEARBYSSO_DTYPE float columns written nullable, NaN as NULL.
+_NULLABLE_FLOAT = ("ephAntiSunPA", "ephAntiMotionPA")
+
+
 def write_parquet(rows, has_ssobject, path):
     """Write ``rows`` (NEARBYSSO_DTYPE, sorted by diaSourceId) with
     ``ssObjectId`` null where ``has_ssobject`` is False."""
@@ -540,12 +550,16 @@ def write_parquet(rows, has_ssobject, path):
         col = rows[name]
         if name == "ssObjectId":
             a = pa.array(col, type=pa.int64(), mask=~has_ssobject)
+        elif name in _NULLABLE_FLOAT:
+            # (NaN is NULL)
+            nan = np.isnan(col)
+            a = pa.array(col, type=pa.float32(), mask=nan if nan.any() else None)
         elif col.dtype.kind == "U":
             a = pa.array(col.tolist(), type=pa.string())
         else:
             a = pa.array(col)
         arrays.append(a)
-        fields.append(pa.field(name, a.type, nullable=(name == "ssObjectId")))
+        fields.append(pa.field(name, a.type, nullable=(name == "ssObjectId" or name in _NULLABLE_FLOAT)))
     table = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
     pq.write_table(table, path, row_group_size=1 << 20)
 
@@ -732,6 +746,8 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     rows["ephRaErr"] = p["ra_err"]
     rows["ephDecErr"] = p["dec_err"]
     rows["ephRa_ephDec_Cov"] = p["ra_dec_cov"]
+    rows["ephAntiSunPA"] = p["anti_sun_pa"]
+    rows["ephAntiMotionPA"] = p["anti_motion_pa"]
     sso_id, has_sso = ssobject_ids(ssobject_path, rows["designation"])
     rows["ssObjectId"] = sso_id
     tim["reduce"] = time.perf_counter() - t

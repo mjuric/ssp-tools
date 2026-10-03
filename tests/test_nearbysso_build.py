@@ -260,6 +260,15 @@ def test_write_parquet_null_ssobjectid(tmp_path):
     assert t.schema.field("ephOffset").type == pa.float32()
     assert t.schema.field("ephRa").type == pa.float64()
     assert t["designation"].to_pylist() == rows["designation"].tolist()
+    # the tail angles: float32, nullable, NaN written as NULL
+    for c in ("ephAntiSunPA", "ephAntiMotionPA"):
+        assert t.schema.field(c).type == pa.float32() and t.schema.field(c).nullable
+        assert t[c].null_count == 0
+    assert not t.schema.field("ephRaErr").nullable
+    rows["ephAntiSunPA"] = [1.5, np.nan, 359.0]
+    B.write_parquet(rows, has, tmp_path / "n2.parquet")
+    t = pq.read_table(tmp_path / "n2.parquet")
+    assert t["ephAntiSunPA"].to_pylist() == [1.5, None, 359.0]
 
 
 def test_ssobject_ids(tmp_path):
@@ -551,6 +560,13 @@ def test_end_to_end(tmp_path, synth, orbits, ephem, expected):
         # (V goes through SSSource's float32 columns: identical, as the
         # noise is far below their precision)
         np.testing.assert_array_equal(grp["ephVmag"], sss["ephVmag"], err_msg=f"{desig} ephVmag")
+        # the tail angles, computed the same way (equal unless the integrator
+        # noise straddles a float32 rounding boundary)
+        for c in ("ephAntiSunPA", "ephAntiMotionPA"):
+            got = grp[c].to_numpy()
+            assert got.dtype == np.float32 and np.isfinite(got).all() and ((got >= 0) & (got < 360)).all()
+            d = (got.astype(np.float64) - sss[c] + 180.0) % 360.0 - 180.0
+            assert np.abs(d).max() < 1e-4, f"{desig} {c}"
 
 
 @needs_assist

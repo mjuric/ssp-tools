@@ -635,6 +635,65 @@ def _vector_to_radec(rho):
     return ra, dec
 
 
+def _position_angle_deg(w, east, north):
+    """Position angle [deg, in [0, 360)] of the vectors ``w`` (3, N) in the
+    tangent basis (east, north); NaN where the projection is exactly zero."""
+    we = np.sum(w * east, axis=0)
+    wn = np.sum(w * north, axis=0)
+    pa = np.degrees(np.arctan2(we, wn)) % 360.0
+    pa[pa >= 360.0] = 0.0              # (x % 360 is 360 for a tiny negative x)
+    pa[(we == 0.0) & (wn == 0.0)] = np.nan
+    return pa
+
+
+def tail_position_angles(helio_pos, helio_vel, topo_pos):
+    """The tail position angles ``(anti_sun_pa, anti_motion_pa)`` [deg]
+    (JPL Horizons quantity 27, ``PsAng`` and ``PsAMV``; SSSource and
+    NearbySSO ``ephAntiSunPA``, ``ephAntiMotionPA``).
+
+    ``helio_pos`` [AU], ``helio_vel`` [km/s] and ``topo_pos`` [AU] are (3, N)
+    arrays from one ``EphResult`` (light-emission-time vectors). Each angle
+    is the position angle, from ICRS north through east, of a vector
+    projected onto the sky at ``topo_pos``'s direction: the extended
+    Sun -> object vector (``helio_pos``) and the negative heliocentric
+    velocity (``-helio_vel``). Returns two (N,) float64 arrays in [0, 360),
+    NaN where the vector's projection is exactly zero or any input of the
+    row is NaN. See ssp/sssource_contract.py, "Tail position angles".
+    """
+    hp = np.asarray(helio_pos, dtype=np.float64)
+    hv = np.asarray(helio_vel, dtype=np.float64)
+    tp = np.asarray(topo_pos, dtype=np.float64)
+    shape = np.broadcast_shapes(hp.shape, hv.shape, tp.shape)
+    if shape[:1] != (3,):
+        raise ValueError(f"tail_position_angles: expected (3, N) arrays, "
+                         f"got {hp.shape}, {hv.shape}, {tp.shape}")
+    hp, hv, tp = (np.broadcast_to(a, shape).reshape(3, -1) for a in (hp, hv, tp))
+
+    # the ICRS tangent basis at (alpha, delta) of topo_pos
+    a = np.arctan2(tp[1], tp[0])
+    d = np.arctan2(tp[2], np.hypot(tp[0], tp[1]))
+    sa, ca, sd, cd = np.sin(a), np.cos(a), np.sin(d), np.cos(d)
+    north = np.stack([-sd * ca, -sd * sa, cd])
+    east = np.stack([-sa, ca, np.zeros_like(a)])
+
+    anti_sun = _position_angle_deg(hp, east, north)
+    anti_motion = _position_angle_deg(-hv, east, north)
+    bad = np.isnan(hp).any(axis=0) | np.isnan(hv).any(axis=0) | np.isnan(tp).any(axis=0)
+    anti_sun[bad] = np.nan
+    anti_motion[bad] = np.nan
+    return anti_sun.reshape(shape[1:]), anti_motion.reshape(shape[1:])
+
+
+def tail_position_angles_f32(pa):
+    """``pa`` (from ``tail_position_angles``) as the float32 column values:
+    rounded to float32, with a value that rounds up to 360 wrapped to 0 so
+    that the column stays in [0, 360). SSSource and NearbySSO both store
+    the angles through this, so the two tables agree bitwise."""
+    f = np.asarray(pa, dtype=np.float64).astype(np.float32)
+    f[f >= np.float32(360.0)] = np.float32(0.0)
+    return f
+
+
 # ---------------------------------------------------------------------------
 # Public APIs
 # ---------------------------------------------------------------------------
