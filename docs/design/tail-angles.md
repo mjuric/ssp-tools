@@ -25,17 +25,19 @@ This is the first step of the comet work discussed on 2026-10-03. Comet magnitud
 | Tables | SSSource **and** NearbySSO. |
 | Objects | All objects with an orbit, comets or not. |
 | Schema | Changed on the existing `sdm_schemas` branch `tickets/DM-55375` (lsst/sdm_schemas#549). |
+| Names and type (2026-10-03) | `ephAntiSunPA` and `ephAntiMotionPA`, both float32 (Felis `float`). |
+| Plan (2026-10-03) | Approved, with ICRF north, and filled at every phase angle (no opposition cut). |
 
 ## Outputs
 
-Two new nullable `float` columns, in degrees, in both tables. In SSSource and NearbySSO they go right after `ephRateDec`.
+Two new nullable `float` (float32) columns, in degrees, in both tables. In SSSource and NearbySSO they go right after `ephRateDec`.
 
 | column | definition (Horizons quantity 27) | UCD |
 |---|---|---|
 | `ephAntiSunPA` | Position angle of the extended Sun→object radius vector, projected onto the sky at the object, measured from north through east, in [0, 360). Horizons `PsAng`. | `pos.posAng;pos.ephem` |
-| `ephNegVelPA` | Position angle of the negative of the object's heliocentric velocity vector, projected the same way. Horizons `PsAMV`. | `pos.posAng;pos.ephem` |
+| `ephAntiMotionPA` | Position angle of the negative of the object's heliocentric velocity vector, projected the same way. Horizons `PsAMV`. | `pos.posAng;pos.ephem` |
 
-The names are proposals (see "Open").
+Names and type as decided above.
 
 **Conventions,** chosen to match Horizons, so that users can compare directly:
 - The vectors are the ones already published in SSSource's `helio_*` columns: at light-emission time, relative to the apparent Sun (`EphResult.helio_pos`/`helio_vel`).
@@ -86,8 +88,6 @@ The names are proposals (see "Open").
 - **push** the `sdm_schemas` branch, which updates lsst/sdm_schemas#549, and tell the DM-55678 owners that two columns were added;
 - the PR to master, for the owner's approval.
 
-## Open (for the owner)
+## Open
 
-- **Column names:** `ephAntiSunPA`/`ephNegVelPA`, or Horizons' `PsAng`/`PsAMV` style?
-- **The frame:** ICRF (proposed, consistent with `ephRa`/`ephDec`), or the equator of date if that's what Horizons uses?
-- **Near opposition:** always fill, as proposed, or NULL the column below some phase angle?
+- Which frame Horizons reports `PsAng`/`PsAMV` in (settled by T2); ours is ICRF.
