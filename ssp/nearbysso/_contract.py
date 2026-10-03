@@ -266,7 +266,13 @@ NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
     ("ephVmag", "f4"),
     ("ephRateRa", "f4"),         # [deg/day]
     ("ephRateDec", "f4"),
+    ("ephAntiSunPA", "f4"),      # [deg] tail position angles (docs/design/tail-angles.md;
+    ("ephAntiMotionPA", "f4"),   #   ssp/sssource_contract.py "Tail position angles")
 ])
+
+# ephAntiSunPA, ephAntiMotionPA: from the precise pass's EphResult, with
+#   ssp.ephem_assist.tail_position_angles, exactly as SSSource computes them,
+#   so that the two tables agree bitwise at the same (object, DiaSource).
 
 # diaDistanceRank: the 1-based rank of the row's DiaSource by its separation
 #   from the row's object's prediction in that visit, among ALL of that
