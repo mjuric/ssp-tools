@@ -104,3 +104,11 @@ Names and type as decided above.
   - the range;
   - SSSource and NearbySSO agreeing at the same DiaSource, within one float32 ulp;
   - SSSource's angles against a recomputation from its own helio/topo columns.
+
+**The full 2026-10-01 rerun:**
+- `ssp-build-sso` on the 2026-10-01 daily inputs, from `tail-angles` 9e59f94, with 32 workers. The output is in `/sdf/data/rubin/user/mjuric/tail-angles/rerun/2026-10-01/run/`. (The later commits change only the bench, the docs and contract comments.)
+- **Deliverable:** true; all 8 checks PASS.
+- **Time and memory:** sssource 3:16 (13.9 GB), nearbysso 5:29 (15.9 GB), essentially as before.
+- **Against the non-grav rerun** (the same inputs): every other column of SSSource (8,070,610 rows) and NearbySSO (1,290,839 rows) is identical.
+- **The two new columns** are filled on all 8,006,742 SSSource rows with an orbit and all 1,290,839 NearbySSO rows, NULL elsewhere, and in [0, 360).
+- **`tail_angles_validate consistency`:** PASS. SSSource and NearbySSO are bitwise equal at all 214,882 matching pairs, for both angles.
