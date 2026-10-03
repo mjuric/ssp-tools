@@ -43,7 +43,7 @@ Names and type as decided above.
 - The vectors are the ones already published in SSSource's `helio_*` columns: at light-emission time, relative to the apparent Sun (`EphResult.helio_pos`/`helio_vel`).
 - They are projected onto the plane of the sky at the object's astrometric direction (`EphResult.topo_pos`).
 - North is the ICRF pole, as for `ephRa`/`ephDec`.
-- Horizons may report `PsAng`/`PsAMV` in the equator of date. If so, its angles differ from ICRF ones by up to about 0.4° in 2026, from precession. The validation must settle which frame Horizons uses, and the column descriptions must state ours.
+- Horizons measures `PsAng`/`PsAMV` from the ICRF pole when asked for `REF_SYSTEM=ICRF` (WP T2: RMS 0.0003° against the ICRS pole, 0.097° against the equator of date), so the two compare directly.
 
 **NULL** where the row has no orbit, like every other `eph*` column.
 
@@ -88,6 +88,19 @@ Names and type as decided above.
 - **push** the `sdm_schemas` branch, which updates lsst/sdm_schemas#549, and tell the DM-55678 owners that two columns were added;
 - the PR to master, for the owner's approval.
 
-## Open
+## Results (2026-10-03)
 
-- Which frame Horizons reports `PsAng`/`PsAMV` in (settled by T2); ours is ICRF.
+**T1 (#69):**
+- `ssp.ephem_assist.tail_position_angles` computes the angles, and `tail_position_angles_f32` stores them in [0, 360).
+- SSSource fills both columns. Without T1, the schema-driven writer would have silently written 0.0 for every row with an orbit. NearbySSO computes them with the same functions in its precise pass.
+- On the non-grav fixture, every pre-existing column is bitwise unchanged. SSSource and NearbySSO agree bitwise at all 7,795 matching DiaSources.
+
+**T2 (#70, `bench/tail_angles_validate.py`, black box):**
+- **Against Horizons quantity 27** for 10 objects (4 comets, 6 asteroids including NEOs), at phase angles 0.2–73°, using JPL's own orbits; 10 requests, serial and cached.
+  - Every residual is ≤ 0.0007°, which is Horizons' print rounding; the threshold is 0.01°.
+  - Horizons uses the ICRF pole. The ICRS and equator-of-date poles differ by about 0.14° in 2026, not the 0.4° first estimated.
+- **The consistency checker** (`consistency SSSOURCE NEARBYSSO`) checks:
+  - the type and NULLs;
+  - the range;
+  - SSSource and NearbySSO agreeing at the same DiaSource, within one float32 ulp;
+  - SSSource's angles against a recomputation from its own helio/topo columns.

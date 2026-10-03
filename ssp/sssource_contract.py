@@ -113,8 +113,13 @@ ELLIPSE_COLUMNS = ("ephRaErr", "ephDecErr", "ephRa_ephDec_Cov")
 #                                          JPL Horizons PsAng)
 #     anti_motion_pa for w = -helio_vel  (JPL Horizons PsAMV)
 #   NaN where w's projection on the sky is exactly zero, or any input is NaN.
-#   Horizons may refer its angles to another pole (e.g. the equator of date);
-#   ours is ICRS, as ephRa/ephDec.
+#   (A vector along the line of sight rarely projects to exactly zero in
+#   floating point; there the angle is arbitrary, as Horizons' is. At
+#   dec = +-90 deg, alpha = atan2(0, 0) = 0 fixes "east".) The pole is ICRS,
+#   as for ephRa/ephDec, and Horizons' with REF_SYSTEM=ICRF (WP T2).
+# The stored float32 columns are ssp.ephem_assist.tail_position_angles_f32 of
+# these: a value that rounds up to 360.0f is stored as 0, so the stored
+# columns are in [0, 360) too.
 # Both columns are block-6 columns: float32, NULL without an orbit, filled
 # for every object with one (comet or not), at every phase angle.
 
