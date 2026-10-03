@@ -29,8 +29,34 @@ import numpy as np
 # Constants (owner decisions, 2026-09-28)
 # --------------------------------------------------------------------------
 
-#: A DiaSource is "near" a prediction within this separation.
+#: A DiaSource is "near" a prediction within this separation (every object
+#: but comets and ISOs; see match_radius).
 MATCH_RADIUS_ARCSEC = 5.0
+
+#: The match radius of comets and interstellar objects (owner decision,
+#: 2026-10-03; docs/design/comet-radius.md): their orbits are less well known
+#: and they are extended.
+MATCH_RADIUS_COMET_ARCSEC = 15.0
+
+#: Unpacked primary provisional designations with these prefixes are comets
+#: or ISOs (ISOs carry comet designations, e.g. 3I/ATLAS is C/2025 N1). Not
+#: A/ (inactive objects on comet-like orbits) and not S/ (natural satellites,
+#: excluded from NearbySSO).
+COMET_PREFIXES = ("C/", "P/", "D/", "I/")
+
+
+def match_radius(designation):
+    """The match radius [arcsec] of an object, by its unpacked primary
+    provisional designation: MATCH_RADIUS_COMET_ARCSEC for COMET_PREFIXES,
+    else MATCH_RADIUS_ARCSEC. Accepts a str or an array of them (returns a
+    float64 array)."""
+    if isinstance(designation, str):
+        return MATCH_RADIUS_COMET_ARCSEC if designation.startswith(COMET_PREFIXES) else MATCH_RADIUS_ARCSEC
+    d = np.asarray(designation, dtype=str)
+    comet = np.zeros(d.shape, dtype=bool)
+    for p in COMET_PREFIXES:
+        comet |= np.char.startswith(d, p)
+    return np.where(comet, MATCH_RADIUS_COMET_ARCSEC, MATCH_RADIUS_ARCSEC)
 
 #: A prediction is eligible only while the 1-sigma semi-major axis of its
 #: on-sky error ellipse is at most this.
@@ -276,10 +302,17 @@ NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
 
 # diaDistanceRank: the 1-based rank of the row's DiaSource by its separation
 #   from the row's object's prediction in that visit, among ALL of that
-#   visit's DiaSources within MATCH_RADIUS_ARCSEC of that prediction (an
+#   visit's DiaSources within match_radius(object) of that prediction (an
 #   eligible one, i.e. past the sigma cut), whichever object each of those
 #   DiaSources' own NearbySSO row ends up naming. Ties: the lower diaSourceId
 #   ranks first. The pool counts distinct DiaSources: input rows repeating a
 #   diaSourceId (the input may contain duplicates) count once, at their
 #   smallest separation. It is computed from the matches of each (orbit, visit)
 #   prediction before the nearest-object reduction.
+#
+# Matching (docs/design/comet-radius.md): each prediction matches the
+#   DiaSources within its own object's match_radius. The nearest-object
+#   reduction is unchanged (it compares separations in arcsec, whatever the
+#   radii), so every row naming a non-comet object is exactly as with a
+#   single 5" radius, except where a comet's prediction is nearer to the
+#   DiaSource than the asteroid's.
