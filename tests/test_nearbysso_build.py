@@ -18,7 +18,8 @@ from astropy.time import Time
 
 from ssp.nearbysso import build as B
 from ssp.nearbysso import visits as V
-from ssp.nearbysso._contract import NEARBYSSO_DTYPE, ORBIT_DTYPE, VISIT_DTYPE
+from ssp.nearbysso._contract import (MATCH_RADIUS_ARCSEC, MATCH_RADIUS_COMET_ARCSEC, NEARBYSSO_DTYPE,
+                                     ORBIT_DTYPE, VISIT_DTYPE, match_radius)
 
 from test_nearbysso_propagate import HAVE_ASSIST, load_orbit_rows
 
@@ -191,9 +192,13 @@ def _rank_synth(tmp_path):
     return tmp_path / "rank.parquet", p, want
 
 
-def _pass3(path, preds, slice_days, read_workers):
+def _pass3(path, preds, slice_days, read_workers, orbit_radius=None, full=False):
     """Pass 3 and the parent's reduction, as ``build`` runs them, for
-    given predictions (the visits indexed over all nights in order)."""
+    given predictions (the visits indexed over all nights in order), with
+    ``orbit_radius`` [arcsec] per orbit (default: 5" for all). ``full``
+    also returns the separations."""
+    if orbit_radius is None:
+        orbit_radius = np.full(int(preds["orbit"].max()) + 1, MATCH_RADIUS_ARCSEC)
     nights, tmin, tmax, nsrc = B.night_ranges(path)
     slices = B.plan_slices(nights, tmin, tmax, slice_days, nsrc)
     vis_parts = []
@@ -207,7 +212,8 @@ def _pass3(path, preds, slice_days, read_workers):
     visits = np.concatenate(vis_parts)
     vstart = np.r_[0, np.cumsum([v.size for v in vis_parts])].astype(np.int64)
     p, poff = B.sort_predictions([preds.copy()], visits.size)
-    B._W.update(dia_path=path, slices=slices, threads=1, visits=visits, vstart=vstart, preds=p, poff=poff)
+    B._W.update(dia_path=path, slices=slices, threads=1, visits=visits, vstart=vstart, preds=p, poff=poff,
+                orbit_radius=np.asarray(orbit_radius, float))
     try:
         res = B._map(B._match_slice, [(s, s + 1) for s in range(len(slices))], read_workers, "test",
                      unit="slices")
@@ -216,6 +222,8 @@ def _pass3(path, preds, slice_days, read_workers):
     per = [r for chunk, _, _ in res for r in chunk]
     ids, k, sep, rank = (np.concatenate([r[j] for r in per]) for j in range(4))
     sel = B.nearest(ids, sep, k)
+    if full:
+        return ids[sel], p["orbit"][k[sel]], rank[sel], sep[sel]
     return ids[sel], p["orbit"][k[sel]], rank[sel], len(slices)
 
 
@@ -239,6 +247,134 @@ def test_rank_around_predictions(tmp_path, monkeypatch):
     i3, o3, r3, _ = _pass3(path, preds, 30, 1)
     np.testing.assert_array_equal(i3, ids)
     np.testing.assert_array_equal(r3, rank)
+
+
+# ---------------------------------------------------------------------------
+# Comets and ISOs: a 15" match radius (docs/design/comet-radius.md)
+# ---------------------------------------------------------------------------
+
+def _comet_synth(tmp_path):
+    """One visit, four groups of predictions far apart; orbits 0, 2, 4 are
+    comets (15"), 1, 3, 5 asteroids (5").
+
+    - C0 alone: DiaSources 3", 8", 14" and 16" east (ids 11-14): the pool
+      at 15" ranks the first three 1, 2, 3; the fourth is out.
+    - A1 alone: a DiaSource 10" east (id 21): out.
+    - C2, with A3 6" east of it: id 31 10" east of C2 (4" from A3: A3's),
+      id 32 2" west of C2 (C2's, rank 1 of C2's pool {32, 31}).
+    - C4, with A5 7.5" east of it: id 41 3" east of C4 (4.5" from A5):
+      C4's.
+    Returns the path, the predictions, the per-orbit radii and the expected
+    {diaSourceId: (orbit, rank, separation ["])}."""
+    v1 = 2025093000001
+    ctr = {0: (10.0, 20.0), 1: (50.0, 20.0), 2: (100.0, -10.0), 4: (150.0, 40.0)}
+    p = np.zeros(6, dtype=B.PRED_DTYPE)
+    p["orbit"] = np.arange(6)
+    for o, (ra, dec) in ctr.items():
+        p["ra"][o], p["dec"][o] = ra, dec
+    p["ra"][3], p["dec"][3] = _east(*ctr[2], 6.0)
+    p["ra"][5], p["dec"][5] = _east(*ctr[4], 7.5)
+    src = [(11, 0, 3.0), (12, 0, 8.0), (13, 0, 14.0), (14, 0, 16.0), (21, 1, 10.0),
+           (31, 2, 10.0), (32, 2, -2.0), (41, 4, 3.0)]
+    sid = np.array([s_[0] for s_ in src])
+    ra, dec = np.array([_east(*ctr[o], off) for _, o, off in src]).T
+    _write_dia(tmp_path / "comet.parquet", np.full(sid.size, v1), np.full(sid.size, 60949.1), ra, dec, sid)
+    radius = match_radius(np.array(["C/2020 A1", "2020 AA1", "P/2002 T6", "2020 AB1", "I/2017 U1",
+                                    "2020 AC1"]))
+    want = {11: (0, 1, 3.0), 12: (0, 2, 8.0), 13: (0, 3, 14.0), 31: (3, 1, 4.0), 32: (2, 1, 2.0),
+            41: (4, 1, 3.0)}
+    return tmp_path / "comet.parquet", p, radius, want
+
+
+def test_comet_radius_matching(tmp_path, monkeypatch):
+    """A comet matches at 10" and 14", an asteroid not at 10"; the comet's
+    rank pool is its 15"; the nearest object wins by arcsec whatever the
+    radii (asteroid at 4" over a comet at 10"; a comet at 3" over an
+    asteroid at 4.5")."""
+    path, preds, radius, want = _comet_synth(tmp_path)
+    assert radius.tolist() == [15.0, 5.0, 15.0, 5.0, 15.0, 5.0]
+    ids, orbit, rank, sep = _pass3(path, preds, 30, 1, orbit_radius=radius, full=True)
+    got = {int(i): (int(o), int(r), round(float(s_), 3)) for i, o, r, s_ in zip(ids, orbit, rank, sep)}
+    assert got == want
+    # one prediction per DiaIndex call, so every batch has a single radius
+    monkeypatch.setattr(B, "_MATCH_BATCH", 1)
+    ids1, orbit1, rank1, sep1 = _pass3(path, preds, 30, 1, orbit_radius=radius, full=True)
+    np.testing.assert_array_equal(ids1, ids)
+    np.testing.assert_array_equal(orbit1, orbit)
+    np.testing.assert_array_equal(rank1, rank)
+    np.testing.assert_array_equal(sep1, sep)
+    # all at 5": the comet rows within 5" stay, those beyond go
+    ids5, orbit5, rank5, _ = _pass3(path, preds, 30, 1)
+    assert dict(zip(ids5.tolist(), zip(orbit5.tolist(), rank5.tolist()))) == {
+        11: (0, 1), 31: (3, 1), 32: (2, 1), 41: (4, 1)}
+
+
+def test_match_per_radius_equals_filtered_single_radius(tmp_path):
+    """``match_per_radius`` returns exactly what one 15" ``DiaIndex.match``
+    returns, filtered to each prediction's own radius (same order, same
+    floats), and its 5" predictions' matches are exactly a 5" call's."""
+    rng = np.random.default_rng(5)
+    n = 3000
+    visit = np.repeat([2025093000001, 2025093000002], n // 2)
+    ra = np.where(visit == visit[0], 30.0, 31.0) + rng.uniform(-0.01, 0.01, n)
+    dec = rng.uniform(-0.01, 0.01, n)
+    _write_dia(tmp_path / "d.parquet", visit, np.full(n, 60949.1), ra, dec)
+    nights, tmin, tmax, nsrc = B.night_ranges(tmp_path / "d.parquet")
+    (sl,) = B.plan_slices(nights, tmin, tmax, 30, nsrc)
+    dia = B._read_slice(tmp_path / "d.parquet", sl)
+    u, start = np.unique(dia["visit"], return_index=True)
+    vis = np.zeros(u.size, dtype=VISIT_DTYPE)
+    vis["visit"], vis["night"] = u, u // 100000
+    vis["dia_start"], vis["dia_end"] = start, np.r_[start[1:], dia["visit"].size]
+    di = V.DiaIndex(dia, vis, threads=1)
+    m = 400
+    vi = rng.integers(0, 2, m)
+    pra = np.where(vi == 0, 30.0, 31.0) + rng.uniform(-0.01, 0.01, m)
+    pdec = rng.uniform(-0.01, 0.01, m)
+    rad = np.where(rng.random(m) < 0.3, MATCH_RADIUS_COMET_ARCSEC, MATCH_RADIUS_ARCSEC)
+    k, row, sep = B.match_per_radius(di, vi, pra, pdec, rad)
+    k15, row15, sep15 = di.match(vi, pra, pdec, MATCH_RADIUS_COMET_ARCSEC)
+    keep = sep15 <= rad[k15]
+    np.testing.assert_array_equal(k, k15[keep])
+    np.testing.assert_array_equal(row, row15[keep])
+    np.testing.assert_array_equal(sep, sep15[keep])
+    assert (sep > MATCH_RADIUS_ARCSEC).any() and (rad[k] == MATCH_RADIUS_ARCSEC).any()
+    a = np.flatnonzero(rad == MATCH_RADIUS_ARCSEC)
+    ka, rowa, sepa = di.match(vi[a], pra[a], pdec[a], MATCH_RADIUS_ARCSEC)
+    sub = rad[k] == MATCH_RADIUS_ARCSEC
+    np.testing.assert_array_equal(k[sub], a[ka])
+    np.testing.assert_array_equal(row[sub], rowa)
+    np.testing.assert_array_equal(sep[sub], sepa)
+    # a single radius: exactly one DiaIndex.match call
+    for r in (MATCH_RADIUS_ARCSEC, MATCH_RADIUS_COMET_ARCSEC):
+        got = B.match_per_radius(di, vi, pra, pdec, np.full(m, r))
+        for x, y in zip(got, di.match(vi, pra, pdec, r)):
+            np.testing.assert_array_equal(x, y)
+    assert all(x.size == 0 for x in B.match_per_radius(di, vi[:0], pra[:0], pdec[:0], rad[:0]))
+
+
+def test_candidate_margin_covers_comet_radius():
+    """The candidate margin grows by the comet radius's extra 10": a
+    stationary object 95" outside a visit's edge (beyond the 90" margin)
+    is a candidate for a comet, not for an asteroid; asteroids keep
+    exactly DEFAULT_CANDIDATE_MARGIN_ARCSEC."""
+    from test_nearbysso_visits import great_circle_path, make_track, unit
+
+    assert B.candidate_margin("2020 AA1") == V.DEFAULT_CANDIDATE_MARGIN_ARCSEC
+    assert B.candidate_margin("A/2017 U1") == V.DEFAULT_CANDIDATE_MARGIN_ARCSEC
+    for d in ("C/2020 A1", "P/2002 T6", "D/1993 F2", "I/2017 U1"):
+        assert B.candidate_margin(d) == V.DEFAULT_CANDIDATE_MARGIN_ARCSEC + 10.0
+    vis = np.zeros(1, dtype=VISIT_DTYPE)
+    vis["night"] = 20250501
+    vis["visit"] = vis["night"] * 100000
+    vis["t"] = 26356.0
+    vis["center"] = unit(np.array([100.0]), np.array([0.0]))
+    vis["radius"] = np.radians(1.75)
+    vi = V.VisitIndex(vis)
+    pos = great_circle_path(np.array(100.0 + 1.75 + 95 / 3600), np.array(0.0), 90.0, 0.0, 26356.0)
+    tr = make_track(pos, np.array([26356.0]), delta=1e6)
+    assert list(vi.candidates(tr, B.candidate_margin("2020 AA1"))) == []
+    assert list(vi.candidates(tr, B.candidate_margin("C/2020 A1"))) == [0]
 
 
 def test_write_parquet_null_ssobjectid(tmp_path):

@@ -18,7 +18,8 @@ sliced:
 3. **Matching** (``read_workers`` processes, one slice each; the
    predictions shared through fork): read the slice again, index it
    (``DiaIndex``), match the slice's predictions (a contiguous range of the
-   visit-sorted ones), rank each prediction's matches by separation
+   visit-sorted ones), each within its object's ``match_radius`` (15" for
+   comets and ISOs, 5" otherwise), rank each prediction's matches by separation
    (``diaDistanceRank``, ties by diaSourceId) and keep the nearest per
    DiaSource (ties by designation). A slice owns its DiaSources, and so
    every DiaSource of a visit, so both are exact.
@@ -70,8 +71,8 @@ from ..ephem_assist import (MJD_J2000, compute_ephemerides_one, open_ephem, tail
 from ..photfit import hg_V_mag
 from . import orbits as _orbits
 from . import propagate, visits as _visits
-from ._contract import (MATCH_RADIUS_ARCSEC, NEARBYSSO_DTYPE, OBSCODE, ORBIT_DTYPE, SIGMA_MAX_ARCSEC,
-                        VISIT_DTYPE)
+from ._contract import (MATCH_RADIUS_ARCSEC, MATCH_RADIUS_COMET_ARCSEC, NEARBYSSO_DTYPE, OBSCODE, ORBIT_DTYPE,
+                        SIGMA_MAX_ARCSEC, VISIT_DTYPE, match_radius)
 
 #: The smallest spacing [day] of a night's three coarse samples (for a night
 #: with a single visit, or visits close in time; see the module docstring).
@@ -256,6 +257,14 @@ def _visits_slice(s0, s1):
 # Pass 2: the orbits, once
 # --------------------------------------------------------------------------
 
+def candidate_margin(designation):
+    """The ``VisitIndex.candidates`` margin [arcsec] of an object:
+    ``DEFAULT_CANDIDATE_MARGIN_ARCSEC``, which budgets the 5" match radius,
+    widened by how much the object's ``match_radius`` exceeds that (10" for
+    comets and ISOs), so the safety allowance stays the same."""
+    return _visits.DEFAULT_CANDIDATE_MARGIN_ARCSEC + (match_radius(designation) - MATCH_RADIUS_ARCSEC)
+
+
 def process_orbit(i, w, ephem, stage_t):
     """Orbit ``i`` of ``w["orbits"]`` over every night: its eligible
     predictions (``PRED_DTYPE``, or None) and its counters."""
@@ -268,7 +277,7 @@ def process_orbit(i, w, ephem, stage_t):
     if not track.ok.all():
         c["coarse_all_fail" if not track.ok.any() else "coarse_partial_fail"] = 1
     vindex = w["vindex"]
-    cand = vindex.candidates(track, _visits.DEFAULT_CANDIDATE_MARGIN_ARCSEC)
+    cand = vindex.candidates(track, candidate_margin(str(orbit["designation"])))
     c["nights_skipped"] = int(vindex.last_skipped)
     c["sigma_gated_nights"] = int(vindex.last_sigma_gated)
     t2 = time.perf_counter()
@@ -412,13 +421,35 @@ def sort_predictions(chunks, nvisits):
 # Pass 3: matching, per slice
 # --------------------------------------------------------------------------
 
+def match_per_radius(dindex, visit_idx, ra, dec, radius):
+    """``DiaIndex.match`` with a radius per prediction (``radius[k]``
+    [arcsec]): one call per distinct radius, merged and sorted by (pred,
+    dia_row) as ``DiaIndex.match`` sorts them. With a single radius it is
+    exactly one ``DiaIndex.match`` call; with several, each prediction's
+    matches are those of a call at its own radius (the separations are
+    elementwise, so they're the same floats)."""
+    radii = np.unique(radius)
+    if radii.size <= 1:
+        r = float(radii[0]) if radii.size else MATCH_RADIUS_ARCSEC
+        return dindex.match(visit_idx, ra, dec, r)
+    parts = []
+    for r in radii:
+        sub = np.flatnonzero(radius == r)
+        k, row, sep = dindex.match(visit_idx[sub], ra[sub], dec[sub], float(r))
+        parts.append((sub[k], row, sep))
+    k, row, sep = (np.concatenate([q[j] for q in parts]) for j in range(3))
+    order = np.lexsort((row, k))
+    return k[order], row[order], sep[order]
+
+
 def _match_slice(s0, s1):
     """Slices [s0, s1): per slice, the nearest match of each of its
     DiaSources, as (diaSourceId, prediction index, separation,
-    diaDistanceRank), plus the number of matches before that reduction;
-    then (seconds reading, indexing, matching) and the peak RSS."""
+    diaDistanceRank), plus the numbers of matches, and of comets' (and
+    ISOs') matches, before that reduction; then (seconds reading, indexing,
+    matching) and the peak RSS."""
     w = _W
-    preds, vstart, poff = w["preds"], w["vstart"], w["poff"]
+    preds, vstart, poff, orbit_radius = w["preds"], w["vstart"], w["poff"], w["orbit_radius"]
     out, tim = [], np.zeros(3)
     for s in range(s0, s1):
         t0 = time.perf_counter()
@@ -435,8 +466,8 @@ def _match_slice(s0, s1):
         for b0 in range(p0, p1, _MATCH_BATCH):
             b1 = min(b0 + _MATCH_BATCH, p1)
             p = preds[b0:b1]
-            k, row, sep = dindex.match(p["visit"].astype(np.int64) - v0, p["ra"], p["dec"],
-                                       MATCH_RADIUS_ARCSEC)
+            k, row, sep = match_per_radius(dindex, p["visit"].astype(np.int64) - v0, p["ra"], p["dec"],
+                                           orbit_radius[p["orbit"]])
             k_all.append(k + b0)
             row_all.append(row)
             sep_all.append(sep)
@@ -455,7 +486,8 @@ def _match_slice(s0, s1):
         # stable (visit, diaSourceId) sort keeps the input order of twins,
         # so the lower row wins, deterministically.)
         sel = nearest(row, sep, k)
-        out.append((ids[row[sel]], k[sel], sep[sel], rank[sel], n_match))
+        n_comet = int((orbit_radius[preds["orbit"][k]] > MATCH_RADIUS_ARCSEC).sum())
+        out.append((ids[row[sel]], k[sel], sep[sel], rank[sel], n_match, n_comet))
         tim += (t1 - t0, t2 - t1, time.perf_counter() - t2)
     return out, tim, _peak_rss_gb()
 
@@ -706,8 +738,9 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
 
     # Pass 3: matching -----------------------------------------------------
     t = time.perf_counter()
+    orbit_radius = match_radius(orbits["designation"])
     _W.update(dia_path=dia_path, slices=slices, threads=threads, visits=visits, vstart=vstart, preds=preds,
-              poff=poff)
+              poff=poff, orbit_radius=orbit_radius)
     try:
         res = _map(_match_slice, one, rw, "pass 3: matching", weights=[sl["n"] for sl in slices],
                    unit="slices")
@@ -724,6 +757,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     sep = np.concatenate([r[2] for r in per_slice]) if per_slice else np.zeros(0)
     rank = np.concatenate([r[3] for r in per_slice]) if per_slice else np.zeros(0, np.int16)
     n_matches = int(sum(r[4] for r in per_slice))
+    n_comet_matches = int(sum(r[5] for r in per_slice))
     del per_slice
     tim["pass3_matching"] = time.perf_counter() - t
     tim["pass3_cpu"] = dict(read=float(t3[0]), dia_index=float(t3[1]), match=float(t3[2]))
@@ -733,6 +767,13 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     sel = nearest(ids, sep, k)
     ids, k, sep, rank = ids[sel], k[sel], sep[sel], rank[sel]
     p = preds[k]
+    # (a comet row beyond MATCH_RADIUS_ARCSEC is one the comet radius
+    # added: no non-comet matched its DiaSource, since any would be within
+    # MATCH_RADIUS_ARCSEC, nearer than the comet)
+    comet = orbit_radius[p["orbit"]] > MATCH_RADIUS_ARCSEC
+    comets = dict(matches_before_nearest=n_comet_matches, rows=int(comet.sum()),
+                  rows_beyond_match_radius=int((comet & (sep > MATCH_RADIUS_ARCSEC)).sum()),
+                  objects=int(np.unique(p["orbit"][comet]).size))
     rows = np.zeros(k.size, dtype=NEARBYSSO_DTYPE)
     rows["diaSourceId"] = ids
     rows["designation"] = orbits["designation"][p["orbit"]]
@@ -773,6 +814,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
         exceptions=dict(errors), exception_examples=examples,
         predictions=int(preds.size), predictions_gb=preds.nbytes / 2**30,
         matches_before_nearest=n_matches, output_rows=int(rows.size), with_ssobject=int(has_sso.sum()),
+        comets=comets,
     )
     tmp_rep = f"{report_path}.tmp-{os.getpid()}"
     try:
@@ -809,6 +851,10 @@ def _print_report(rep):
           f"{c['eligible']:,} eligible, {c['sigma_rejected']:,} rejected by sigma; "
           f"{rep['matches_before_nearest']:,} matches; "
           f"{rep['output_rows']:,} rows (nearest; {rep['with_ssobject']:,} with an ssObjectId)")
+    cm = rep["comets"]
+    print(f"comets and ISOs (match radius {MATCH_RADIUS_COMET_ARCSEC:g}\"): {cm['matches_before_nearest']:,} "
+          f"matches; {cm['rows']:,} rows of {cm['objects']:,} objects, {cm['rows_beyond_match_radius']:,} "
+          f"beyond {MATCH_RADIUS_ARCSEC:g}\" (added by the comet radius)")
     print("timings [s]: " + ", ".join(f"{k} {v:.1f}" for k, v in tim.items() if not isinstance(v, dict))
           + "; pass 2 worker CPU: " + ", ".join(f"{k} {v:.1f}" for k, v in tim["worker_cpu"].items())
           + "; pass 3 worker CPU: " + ", ".join(f"{k} {v:.1f}" for k, v in tim["pass3_cpu"].items()))
@@ -818,7 +864,7 @@ def _print_report(rep):
 def main():
     parser = argparse.ArgumentParser(
         description="Build the NearbySSO table: the nearest known Solar System object predicted "
-                    "within 5\" of each DiaSource",
+                    "within 5\" (15\" for comets and ISOs) of each DiaSource",
         epilog=(
             "The ASSIST ephemeris files are taken from the SSP_ASSIST_PLANETS and "
             "SSP_ASSIST_ASTEROIDS environment variables. The run report is written as JSON next "
