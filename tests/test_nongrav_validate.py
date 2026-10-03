@@ -229,12 +229,73 @@ def test_nearbysso_clean():
 
 def test_nearbysso_explained_misses():
     sss, dia, nss, orbits, cmap = _nss_case()
-    sss.loc[0, "ephOffset"] = 6.0                     # beyond the radius
+    sss.loc[0, "ephOffset"] = 20.0                    # a comet beyond its 15" radius
+    sss.loc[7, "ephOffset"] = 6.0                     # an asteroid beyond its 5" radius
     sss.loc[4, ["ephRaErr", "ephDecErr"]] = 1.0       # sigma 3600"
-    nss = nss[~nss["diaSourceId"].isin([1000, 1004])]
+    nss = nss[~nss["diaSourceId"].isin([1000, 1004, 1007])]
     rep, df = _nss_run(sss, dia, nss, orbits, cmap)
     assert rep.ok, rep.text()
-    assert df.loc[0, "status"] == "offset > 5\"" and df.loc[4, "status"] == "sigma > 10\""
+    assert df.loc[0, "status"] == "offset > radius" and df.loc[4, "status"] == "sigma > 10\""
+    assert df.loc[7, "status"] == "offset > radius"
+    assert df.loc[0, "match_radius"] == 15.0 and df.loc[7, "match_radius"] == 5.0
+
+
+# the per-object match radius (docs/design/comet-radius.md): 15" for comets
+
+BEYOND_GATE = "no NearbySSO row beyond its object's match radius"
+
+
+def test_match_radius_from_contract():
+    assert V.match_radius(["P/2000 A1", "C/2000 G1", "2000 CA", "A/2017 U1", "I/2017 U1"]).tolist() == \
+        [15.0, 15.0, 5.0, 5.0, 15.0]
+    assert V.MATCH_RADIUS_ARCSEC == 5.0 and V.MATCH_RADIUS_COMET_ARCSEC == 15.0
+
+
+def test_nearbysso_comet_row_at_10_accepted():
+    """A comet's NearbySSO row at 10" (inside its 15" radius) is a match."""
+    sss, dia, nss, orbits, cmap = _nss_case()
+    sss.loc[0, "ephOffset"] = 10.0
+    nss.loc[0, "ephOffset"] = 10.0
+    rep, df = _nss_run(sss, dia, nss, orbits, cmap)
+    assert rep.ok, rep.text()
+    assert df.loc[0, "status"] == "match"
+
+
+def test_nearbysso_comet_missing_at_10_unexplained():
+    """A comet's DiaSource at 10" with no NearbySSO row: an unexplained
+    miss."""
+    sss, dia, nss, orbits, cmap = _nss_case()
+    sss.loc[0, "ephOffset"] = 10.0
+    nss = nss[nss["diaSourceId"] != 1000]
+    rep, df = _nss_run(sss, dia, nss, orbits, cmap)
+    assert df.loc[0, "status"] == "UNEXPLAINED"
+    assert "every miss explained" in rep.failed
+
+
+def test_nearbysso_asteroid_row_at_10_flagged():
+    """An asteroid's NearbySSO row at 10" (beyond its 5" radius) is wrong;
+    its SSSource row at 10" without a NearbySSO row is explained."""
+    sss, dia, nss, orbits, cmap = _nss_case()
+    sss.loc[7, "ephOffset"] = 10.0
+    nss.loc[7, "ephOffset"] = 10.0
+    rep, _ = _nss_run(sss, dia, nss, orbits, cmap)
+    assert BEYOND_GATE in rep.failed, rep.text()
+    rep, df = _nss_run(sss, dia, nss[nss["diaSourceId"] != 1007], orbits, cmap)
+    assert rep.ok, rep.text()
+    assert df.loc[7, "status"] == "offset > radius"
+
+
+def test_nearbysso_comet_at_20_beyond_radius():
+    """A comet's DiaSource at 20" is explained as beyond its radius; a
+    NearbySSO row for it would be wrong."""
+    sss, dia, nss, orbits, cmap = _nss_case()
+    sss.loc[0, "ephOffset"] = 20.0
+    rep, df = _nss_run(sss, dia, nss[nss["diaSourceId"] != 1000], orbits, cmap)
+    assert rep.ok, rep.text()
+    assert df.loc[0, "status"] == "offset > radius"
+    nss.loc[0, "ephOffset"] = 20.0
+    rep, _ = _nss_run(sss, dia, nss, orbits, cmap)
+    assert BEYOND_GATE in rep.failed
 
 
 @pytest.mark.parametrize("defect,failed", [
@@ -259,7 +320,7 @@ def test_nearbysso_defects(defect, failed):
         nss.loc[5, "ephRateRa"] += 1e-4
     elif defect == "comets_missing":
         nss = nss[nss["designation"] == "2000 CA"]
-        sss.loc[sss["designation"] != "2000 CA", "ephOffset"] = 7.0    # explained, but not matched
+        sss.loc[sss["designation"] != "2000 CA", "ephOffset"] = 20.0   # explained, but not matched
     rep, _ = _nss_run(sss, dia, nss, orbits, cmap)
     assert any(f.startswith(failed) for f in rep.failed), rep.text()
 

@@ -823,7 +823,7 @@ def test_rank_fail_prediction_and_dia(tmp_path):
     assert _rank_failed(tmp_path, nss)[0] == {"ephOffset == its separation (rel. 1e-06)"}
     nss, _ = _rank_case()
     nss.loc[2, "ephRa"] += 6 * AS                     # 103 now > 5" from the prediction
-    assert "the row's DiaSource is within 5\" of ephRa/ephDec" in _rank_failed(tmp_path, nss)[0]
+    assert V.RANK_WITHIN_GATE in _rank_failed(tmp_path, nss)[0]
     nss, _ = _rank_case()
     nss.loc[0, "diaSourceId"] = 999
     assert "every row's DiaSource is in the DiaSource file" in _rank_failed(tmp_path, nss)[0]
@@ -872,3 +872,169 @@ def test_rank_repeated_dia_ids(tmp_path):
     n_path, d_path = _rank_files(tmp_path, nss.drop(columns="diaDistanceRank"), dia2)
     V.add_ranks(n_path, d_path, str(tmp_path / "m.parquet"))
     assert pd.read_parquet(tmp_path / "m.parquet")["diaDistanceRank"].tolist() == [1, 2, 1, 2, 3]
+
+
+# --------------------------------------------------------------------------
+# the per-object match radius (docs/design/comet-radius.md): 5", 15" for
+# comets and ISOs (C/ P/ D/ I/)
+# --------------------------------------------------------------------------
+
+COMET, ROCK = "P/2002 T6", "2020 AB"
+
+
+def _radius_case(offsets):
+    """One SSSource row per (diaSourceId, designation, offset ["]) in
+    ``offsets``, each with its own DiaSource; a NearbySSO row for each
+    (same ephemeris)."""
+    ra0, dec0 = 150.0, 10.0
+    ids = [o[0] for o in offsets]
+    dia = pd.DataFrame({"diaSourceId": ids, "midpointMjdTai": 60800.0, "ra": ra0, "dec": dec0})
+    sss = pd.DataFrame({
+        "diaSourceId": ids, "designation": [o[1] for o in offsets],
+        "ephRa": [ra0 + o[2] / 3600.0 / np.cos(np.deg2rad(dec0)) for o in offsets], "ephDec": dec0,
+        "ephRateRa": np.float32(0.1), "ephRateDec": np.float32(-0.05), "ephVmag": np.float32(20.0)})
+    sep = util.sky_separation_arcsec(sss["ephRa"].to_numpy(), sss["ephDec"].to_numpy(),
+                                     dia["ra"].to_numpy(), dia["dec"].to_numpy())
+    nss = sss.assign(ephOffset=sep.astype(np.float32))
+    lookup = {COMET: "", ROCK: ""}
+    return nss, sss, dia, lookup, (lambda des, t: np.ones(len(des)))
+
+
+def test_radius_of():
+    assert V.radius_of([COMET, "C/2025 N1", "D/1993 F2", "I/2017 U1", ROCK, "A/2017 U1", "S/2004 S 1"]
+                       ).tolist() == [15.0, 15.0, 15.0, 15.0, 5.0, 5.0, 5.0]
+    assert V.radius_of([COMET, ROCK], radius=5.0).tolist() == [5.0, 5.0]
+    assert V.radius_of([]).shape == (0,)
+
+
+def test_same_orbits_comet_at_10_accepted():
+    rows, summ = V.compare_to_sssource(*_radius_case([(1, COMET, 10.0)]))
+    assert rows["status"].tolist() == ["match"] and summ["n_fail"] == 0
+    assert rows["match_radius"].tolist() == [15.0]
+
+
+def test_same_orbits_comet_missing_at_10_unexplained():
+    nss, sss, dia, lookup, sigma_fn = _radius_case([(1, COMET, 10.0), (2, ROCK, 10.0)])
+    rows, summ = V.compare_to_sssource(nss[:0], sss, dia, lookup, sigma_fn)
+    st = dict(zip(rows["diaSourceId"], rows["status"]))
+    assert st == {1: "unexplained", 2: "separation"}       # the asteroid's 10" is beyond its 5"
+    assert summ["n_fail"] == 1
+    # with the old single radius, the comet would have been explained away
+    rows, _ = V.compare_to_sssource(nss[:0], sss, dia, lookup, sigma_fn, radius=5.0)
+    assert rows["status"].tolist() == ["separation", "separation"]
+
+
+def test_same_orbits_asteroid_row_at_10_flagged():
+    nss, sss, dia, lookup, sigma_fn = _radius_case([(1, ROCK, 10.0), (2, COMET, 10.0)])
+    rows, summ = V.compare_to_sssource(nss, sss, dia, lookup, sigma_fn)
+    assert summ["n_nearbysso_beyond_radius"] == 1 and summ["nearbysso_beyond_radius"] == [1]
+    assert summ["n_fail"] == 1
+    assert V.beyond_radius(nss).tolist() == [True, False]
+
+
+def test_same_orbits_comet_at_20_beyond_radius():
+    nss, sss, dia, lookup, sigma_fn = _radius_case([(1, COMET, 20.0)])
+    rows, summ = V.compare_to_sssource(nss[:0], sss, dia, lookup, sigma_fn)
+    assert rows["status"].tolist() == ["separation"] and summ["n_fail"] == 0
+    rows, summ = V.compare_to_sssource(nss, sss, dia, lookup, sigma_fn)     # a row would be wrong
+    assert summ["n_nearbysso_beyond_radius"] == 1 and summ["n_fail"] == 1
+
+
+def test_same_orbits_nearest_in_arcsec_across_radii():
+    """A DiaSource 4" from an asteroid and 10" from a comet stays with the
+    asteroid; a comet nearer than the asteroid takes it."""
+    nss, sss, dia, lookup, sigma_fn = _radius_case([(1, COMET, 10.0), (1, ROCK, 4.0)])
+    rows, summ = V.compare_to_sssource(nss[nss["designation"] == ROCK], sss, dia, lookup, sigma_fn)
+    assert dict(zip(rows["designation"], rows["status"])) == {COMET: "nearer_object", ROCK: "match"}
+    rows, _ = V.compare_to_sssource(nss[nss["designation"] == COMET], sss, dia, lookup, sigma_fn)
+    assert dict(zip(rows["designation"], rows["status"])) == {COMET: "match", ROCK: "wrong_nearest"}
+
+
+def test_adjudicate_rows_per_object_radius():
+    disc = pd.DataFrame({
+        "designation": [COMET, ROCK, COMET], "nss_designation": [None] * 3,
+        "sss_ephRa": [10.0] * 3, "sss_ephDec": [0.0] * 3, "nss_ephRa": [np.nan] * 3, "nss_ephDec": [0.0] * 3,
+        "dia_ra": [10.0 + 10 / 3600, 10.0 + 10 / 3600, 10.0 + 20 / 3600], "dia_dec": [0.0] * 3})
+    v = V.adjudicate_rows(disc, np.full(3, 10.0), np.zeros(3))["verdict"].tolist()
+    assert v == ["sss_matches, within radius: NearbySSO missed it",
+                 "sss_matches, outside radius per Horizons", "sss_matches, outside radius per Horizons"]
+
+
+def test_strata_near_radius_per_object():
+    orbits = _orbits(designation=[COMET, ROCK], packed=["a", "b"], q=[2.0, 2.2], e=[0.5, 0.1],
+                     arc_text=["2014-2024", "2014-2024"])
+    nss = pd.DataFrame({"designation": [COMET, COMET, ROCK], "ephOffset": [4.8, 14.0, 4.8],
+                        "ephRaErr": 1 / 3600, "ephDecErr": 1 / 3600, "ephRa_ephDec_Cov": 0.0,
+                        "ephRateRa": 0.1, "ephRateDec": 0.0})
+    m, _ = V.strata_masks(nss, orbits)
+    assert list(m["near_radius"]) == [False, True, True]
+
+
+def test_match_within_per_prediction_radius():
+    arc = 1 / 3600.0
+    pr, pd_ = np.array([10.0, 30.0]), np.array([0.0, 0.0])
+    dr = np.array([10.0 + 10 * arc, 10.0 + 20 * arc, 30.0 + 10 * arc, 30.0 + 4 * arc])
+    dd = np.zeros(4)
+    k, h, sep = V.match_within(pr, pd_, dr, dd, np.array([15.0, 5.0]))
+    assert sorted(zip(k.tolist(), h.tolist())) == [(0, 0), (1, 3)]
+    k, h, _ = V.match_within(pr, pd_, dr, dd)                       # the scalar default: 5"
+    assert sorted(zip(k.tolist(), h.tolist())) == [(1, 3)]
+
+
+def test_brute_force_expected_comet_radius():
+    pairs = pd.DataFrame({
+        "diaSourceId": [1, 2, 3, 4, 4, 5, 5],
+        "designation": [COMET, ROCK, COMET, COMET, ROCK, COMET, ROCK],
+        "sep": [10.0, 10.0, 20.0, 10.0, 4.0, 3.0, 4.0],
+        "sigma": 1.0})
+    e = V.expected_nearest(pairs)
+    # 1: the comet at 10"; 2: the asteroid at 10" is out; 3: the comet at
+    # 20" is out; 4: the asteroid at 4" beats the comet at 10"; 5: the
+    # comet at 3" wins
+    assert dict(zip(e["diaSourceId"], e["designation"])) == {1: COMET, 4: ROCK, 5: COMET}
+    nss = pd.DataFrame({"diaSourceId": [1, 4, 5, 2, 3], "designation": [COMET, ROCK, COMET, ROCK, COMET],
+                        "ephOffset": [10.0, 4.0, 3.0, 10.0, 20.0]})
+    st = dict(zip(*V.compare_expected(e, nss)[["diaSourceId", "status"]].T.values))
+    assert st == {1: "found", 4: "found", 5: "found", 2: "extra_beyond_radius", 3: "extra_beyond_radius"}
+    # the comet's row missing at 10": a miss
+    st = dict(zip(*V.compare_expected(e, nss[nss["diaSourceId"] != 1])[["diaSourceId", "status"]].T.values))
+    assert st[1] == "missing"
+
+
+def test_rank_comet_radius(tmp_path):
+    """The rank check's radius gate and pool, per object: a comet row at
+    10" passes, an asteroid row at 10" fails; the comet's pool counts the
+    DiaSources within 15"."""
+    dia = pd.DataFrame({"diaSourceId": [1, 2, 3, 4], "visit": 1, "midpointMjdTai": 61000.1,
+                        "ra": [10.0 + 10 * AS, 10.0 + 12 * AS, 10.0 + 25 * AS, 50.0], "dec": 0.0})
+
+    def nss_for(des):
+        n = pd.DataFrame({"diaSourceId": [1], "ssObjectId": [1], "designation": [des],
+                          "ephRa": [10.0], "ephDec": [0.0]})
+        n["ephOffset"] = np.float32(util.sky_separation_arcsec(10.0, 0.0, 10.0 + 10 * AS, 0.0))
+        n["diaDistanceRank"] = np.int16(1)
+        return n
+    verdict, rep, s = V.check_rank(*_rank_files(tmp_path, nss_for(COMET), dia))
+    assert verdict == "PASS", "\n".join(rep.lines)
+    assert s["n_within"].tolist() == [2]                    # 1 and 2; 3 at 25" is out
+    failed = {n for n, ok in V.check_rank(*_rank_files(tmp_path, nss_for(ROCK), dia))[1].gates if not ok}
+    assert failed == {V.RANK_WITHIN_GATE}
+    bf = V.brute_force_ranks([1, 1], [10.0, 10.0], [0.0, 0.0], [1, 1],
+                             dia.sort_values(["visit", "diaSourceId"]).reset_index(drop=True),
+                             radius=np.array([15.0, 5.0]))
+    assert bf["n_within"].tolist() == [2, 0]
+
+
+def test_mock_keeps_comet_at_10():
+    nss, sss, dia, lookup, _ = _radius_case([(1, COMET, 10.0), (2, ROCK, 10.0), (3, COMET, 20.0)])
+    mock, _ = V.mock_from_sssource(sss, dia, lookup)
+    assert mock["diaSourceId"].tolist() == [1]
+
+
+def test_same_orbits_null_designation():
+    """SSSource rows with a NULL designation (no known object) are
+    'filtered:not_in_orbits', also under pandas 3's string dtype."""
+    nss, sss, dia, lookup, sigma_fn = _radius_case([(1, ROCK, 1.0), (2, ROCK, 1.0)])
+    sss["designation"] = pd.array([ROCK, None], dtype="str")
+    rows, summ = V.compare_to_sssource(nss[:1], sss, dia, lookup, sigma_fn)
+    assert rows["status"].tolist() == ["match", "filtered:not_in_orbits"] and summ["n_fail"] == 0

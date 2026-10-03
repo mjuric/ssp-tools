@@ -45,11 +45,13 @@ exit 0 on PASS, 1 on FAIL)::
       is in the input (by diaSourceId; by (visit, ra, dec) where SSSource's
       diaSourceId is NULL, i.e. measuredOn = science) must have a NearbySSO
       row for the same object with the same ephemeris, or a miss explained
-      by: offset > 5", sigma > 10" (or no covariance), orbit filtered,
+      by: offset > radius (the object's match radius: 5", 15" for comets
+      and ISOs, C/ P/ D/ I/), sigma > 10" (or no covariance), orbit filtered,
       sungrazer (q < 0.02 au), a nearer object, or (asked of
       propagate.coarse for what's left) sigma > 10" within +-0.34 d of the
       observation, where NearbySSO's nightly sample may gate the night.
-      Gates: no unexplained misses; most comet rows matched (when the input
+      Gates: no unexplained misses; no NearbySSO row beyond its object's
+      match radius; most comet rows matched (when the input
       has any; otherwise noted as not applicable); agreement of
       the matched rows; no S/ objects; no NearbySSO row for an orbit the
       filter drops. ``--table FILE``: the per-row table (Parquet).
@@ -109,6 +111,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from bench.sssource_validate import bitwise_mismatch, to_np  # noqa: E402
+from ssp.nearbysso import _contract as _C  # noqa: E402
 
 # --------------------------------------------------------------------------
 # Constants
@@ -162,16 +165,19 @@ ERR_CHANGE_REL = 1e-3
 
 # nearbysso ----------------------------------------------------------------
 
-#: The NearbySSO contract's radius and sigma cut, and its precise pass's
+#: The NearbySSO contract's radii and sigma cut, and its precise pass's
 #: object filter (``_contract.MATCH_RADIUS_ARCSEC``/``SIGMA_MAX_ARCSEC``).
-MATCH_RADIUS_ARCSEC = 5.0
+#: The match radius is per object: ``_contract.match_radius(designation)``,
+#: MATCH_RADIUS_COMET_ARCSEC for comets and ISOs (docs/design/comet-radius.md).
+MATCH_RADIUS_ARCSEC = _C.MATCH_RADIUS_ARCSEC
+MATCH_RADIUS_COMET_ARCSEC = _C.MATCH_RADIUS_COMET_ARCSEC
 SIGMA_MAX_ARCSEC = 10.0
 #: Sungrazers: perihelion below this [au] is an accepted miss category.
 SUNGRAZER_Q_AU = 0.02
-#: Rows within this of a cut (5" offset, 10" sigma) are "borderline": the
-#: two tables compute their values separately (float32 output, NearbySSO's
-#: ellipse from the nightly samples, SSSource's at the observation), so a
-#: miss within 2% of a cut is explained by the cut.
+#: Rows within this of a cut (the match radius, 10" sigma) are
+#: "borderline": the two tables compute their values separately (float32
+#: output, NearbySSO's ellipse from the nightly samples, SSSource's at the
+#: observation), so a miss within 2% of a cut is explained by the cut.
 CUT_BORDER_REL = 0.02
 #: (visit, ra, dec) matching of SSSource rows without a diaSourceId to the
 #: NearbySSO input: both copy the same measurement, so any real difference
@@ -708,6 +714,15 @@ def orbit_filter_reason(orbits):
                      ["satellite", "missing_elements", "arc"], "").astype(object)
 
 
+def match_radius(designations):
+    """The match radius [arcsec] of each designation (the contract's
+    ``match_radius``), as a float64 array."""
+    des = [str(d) for d in designations]
+    if not des:
+        return np.zeros(0)
+    return np.asarray(_C.match_radius(np.array(des)), dtype=np.float64)
+
+
 def _f(x):
     try:
         return float(x)
@@ -773,6 +788,13 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     dropped = [d for d in named if reason.get(d, "") != ""]
     rep.check("no NearbySSO row names an orbit the filter drops", not dropped,
               f"{len(named)} objects named" + (f"; dropped by the filter: {dropped[:10]}" if dropped else ""))
+    if "ephOffset" in nss:
+        with np.errstate(invalid="ignore"):
+            far = nss["ephOffset"].to_numpy(np.float64) > match_radius(nd) + OFFSET_TOL_ARCSEC
+        rep.check("no NearbySSO row beyond its object's match radius", not far.any(),
+                  f"{int(far.sum())} rows" + (": " + "; ".join(
+                      f"{d} {o:.3f}\"" for d, o in zip(nd[far][:5], nss["ephOffset"].to_numpy()[far][:5]))
+                      if far.any() else ""))
 
     # SSSource rows with an orbit and a DiaSource in the input
     sss = sss[sss["designation"].notna() & sss["ephRa"].notna()].reset_index(drop=True)
@@ -815,12 +837,13 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     rsn = np.array([reason.get(d, "not in mpc_orbits") for d in des], dtype=object)
     q = np.array([qmap.get(d, np.nan) for d in des], dtype=np.float64)
     sig, off = df["sss_sigma"].to_numpy(), df["sss_offset"].to_numpy()
+    df["match_radius"] = rad = match_radius(des)
     with np.errstate(invalid="ignore"):
         conds = [match, rsn != "", np.isfinite(q) & (q < SUNGRAZER_Q_AU), ~np.isfinite(sig),
-                 sig * border > SIGMA_MAX_ARCSEC, off * border > MATCH_RADIUS_ARCSEC,
+                 sig * border > SIGMA_MAX_ARCSEC, off * border > rad,
                  has & (df["nss_offset"].to_numpy() <= off * border)]
     labels = ["match", "orbit filtered", "sungrazer (q < 0.02 au)", "no covariance", "sigma > 10\"",
-              "offset > 5\"", "nearer object"]
+              "offset > radius", "nearer object"]
     status = np.select(conds, labels, "UNEXPLAINED").astype(object)
     filt = status == "orbit filtered"
     status[filt] = [f"orbit filtered ({r})" for r in rsn[filt]]
