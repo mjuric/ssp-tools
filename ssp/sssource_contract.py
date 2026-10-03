@@ -95,6 +95,35 @@ ELLIPSE_COLUMNS = ("ephRaErr", "ephDecErr", "ephRa_ephDec_Cov")
 #   usable covariance.
 
 # --------------------------------------------------------------------------
+# Tail position angles (docs/design/tail-angles.md): ephAntiSunPA,
+# ephAntiMotionPA in SSSource and NearbySSO
+# --------------------------------------------------------------------------
+#
+# ssp.ephem_assist.tail_position_angles(helio_pos, helio_vel, topo_pos)
+#     -> (anti_sun_pa, anti_motion_pa)
+#   (3, N) arrays from one EphResult (helio_pos [AU], helio_vel [km/s],
+#   topo_pos [AU]: the light-emission-time vectors, as published in the
+#   helio_* and topo_* columns). Returns two (N,) float64 arrays [deg] in
+#   [0, 360). With u = topo_pos / |topo_pos| at (alpha, delta) and the ICRS
+#   tangent basis
+#     north = (-sin d cos a, -sin d sin a, cos d),  east = (-sin a, cos a, 0),
+#   a vector w has position angle atan2(w . east, w . north) mod 360, i.e.
+#   measured from ICRS north through east:
+#     anti_sun_pa    for w = helio_pos   (the extended Sun -> object vector;
+#                                          JPL Horizons PsAng)
+#     anti_motion_pa for w = -helio_vel  (JPL Horizons PsAMV)
+#   NaN where w's projection on the sky is exactly zero, or any input is NaN.
+#   (A vector along the line of sight rarely projects to exactly zero in
+#   floating point; there the angle is arbitrary, as Horizons' is. At
+#   dec = +-90 deg, alpha = atan2(0, 0) = 0 fixes "east".) The pole is ICRS,
+#   as for ephRa/ephDec, and Horizons' with REF_SYSTEM=ICRF (WP T2).
+# The stored float32 columns are ssp.ephem_assist.tail_position_angles_f32 of
+# these: a value that rounds up to 360.0f is stored as 0, so the stored
+# columns are in [0, 360) too.
+# Both columns are block-6 columns: float32, NULL without an orbit, filled
+# for every object with one (comet or not), at every phase angle.
+
+# --------------------------------------------------------------------------
 # WP1: extract-submitted-sources
 # --------------------------------------------------------------------------
 #

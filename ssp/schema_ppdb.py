@@ -313,6 +313,10 @@ SSSourceDtype = np.dtype([
     ('ephRateRa', '<f4'),           # [deg/d] Predicted on-sky angular rate in the R.A. direction (includes
                                     # the cos(dec) factor).
     ('ephRateDec', '<f4'),          # [deg/d] Predicted on-sky angular rate in the declination direction.
+    ('ephAntiSunPA', '<f4'),        # [deg] Predicted position angle of the extended Sun-to-object radius
+                                    # vector (the anti-Sun direction, along which an ion tail points),...
+    ('ephAntiMotionPA', '<f4'),     # [deg] Predicted position angle of the negative of the object's
+                                    # heliocentric velocity vector (the direction a dust trail lags toward...
     ('ephOffset', '<f4'),           # [arcsec] Total observed versus predicted angular separation on the sky.
     ('ephOffsetRa', '<f8'),         # [arcsec] Offset between observed and predicted position in the R.A.
                                     # direction (includes cos(dec) term).
@@ -363,4 +367,8 @@ NearbySSODtype = np.dtype([
     ('ephRateRa', '<f4'),           # [deg/d] Predicted on-sky angular rate in the R.A. direction (includes
                                     # the cos(dec) factor).
     ('ephRateDec', '<f4'),          # [deg/d] Predicted on-sky angular rate in the declination direction.
+    ('ephAntiSunPA', '<f4'),        # [deg] Predicted position angle of the extended Sun-to-object radius
+                                    # vector (the anti-Sun direction, along which an ion tail points),...
+    ('ephAntiMotionPA', '<f4'),     # [deg] Predicted position angle of the negative of the object's
+                                    # heliocentric velocity vector (the direction a dust trail lags toward...
 ])

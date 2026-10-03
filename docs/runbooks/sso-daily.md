@@ -127,3 +127,13 @@ Since `docs/design/nongrav.md`, the ephemerides apply the MPC's non-gravitationa
 - Warnings in the sssource and nearbysso logs name any orbit whose non-grav fit can't be parsed (it is integrated gravity-only), or whose `non_gravs` flag and CAR coefficients disagree. There were none on 2026-10-01.
 
 `ssp-build-sso` on the 2026-10-01 inputs above, `nongrav` 6bdfe06, 32 workers: deliverable, all 8 checks PASS, in `/sdf/data/rubin/user/mjuric/nongrav/rerun/2026-10-01/run/`. SSSource 8,070,610 rows (only the 495 rows of non-grav objects changed); NearbySSO 1,290,839 rows (7 comet rows added). Timings and the comparison are in the design doc, "The full daily rerun".
+
+## Tail position angles (2026-10-03)
+
+SSSource and NearbySSO have two new columns, `ephAntiSunPA` and `ephAntiMotionPA` (`docs/design/tail-angles.md`), from sdm_schemas `tickets/DM-55375` f2541a5. Nothing changes in the run itself. To check a delivery's angles:
+
+```bash
+python -m bench.tail_angles_validate consistency RUN_DIR/delivery/SSSource.parquet RUN_DIR/delivery/NearbySSO.parquet
+```
+
+**2026-10-01 rerun:** deliverable, all checks PASS. The output is in `/sdf/data/rubin/user/mjuric/tail-angles/rerun/2026-10-01/run/`.

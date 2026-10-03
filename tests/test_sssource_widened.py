@@ -397,6 +397,29 @@ def test_along_cross_track_in_sssource(tmp_path, offline):
     np.testing.assert_allclose(along**2 + cross**2, off2, rtol=1e-12)
 
 
+def test_tail_angles_in_sssource(tmp_path, offline):
+    """ephAntiSunPA/ephAntiMotionPA: float32, NULL exactly without an orbit,
+    in [0, 360), from the published helio_*/topo_* vectors (here to their
+    float32 precision)."""
+    from ssp.ephem_assist import tail_position_angles
+    sss, _, _ = _build(tmp_path)
+    has = sss["ephRa"].is_valid()
+    assert pc.any(has).as_py() and not pc.all(has).as_py()
+    for c in ("ephAntiSunPA", "ephAntiMotionPA"):
+        assert sss.schema.field(c).type == pa.float32() and sss.schema.field(c).nullable
+        assert sss[c].is_valid().equals(has), c
+    t = sss.filter(has)
+    vec = {k: np.stack([t[f"{k}_{x}"].to_numpy().astype(np.float64) for x in "xyz"])
+           for k in ("helio", "topo")}
+    hv = np.stack([t[f"helio_v{x}"].to_numpy().astype(np.float64) for x in "xyz"])
+    want = tail_position_angles(vec["helio"], hv, vec["topo"])
+    for c, w in zip(("ephAntiSunPA", "ephAntiMotionPA"), want):
+        got = t[c].to_numpy()
+        assert got.dtype == np.float32 and (got >= 0).all() and (got < 360).all(), c
+        d = (got - w + 180.0) % 360.0 - 180.0
+        assert np.abs(d).max() < 1e-3, c
+
+
 def test_along_cross_track_zero_rate(tmp_path, offline, monkeypatch):
     def still(*args, **kw):
         e = _fake_ephemerides(*args, **kw)
