@@ -82,7 +82,7 @@ from ssp.sssource_contract import (  # noqa: E402
 DEFAULT_SCHEMA = os.path.join(_ROOT, "tests", "data", "sdm_schemas", "sso_base.yaml")
 
 # ClickHouse (read-only; the server is shared)
-CH_HOST = "sdfiana035.sdf.slac.stanford.edu"
+from ssp.export.submittable import DEFAULT_HOST as CH_HOST  # noqa: E402 (one definition)
 CH_PORT = 8123
 CH_DATABASE = "ssp"
 CH_VIEW = "SubmittableSources"
@@ -825,11 +825,12 @@ def ch_fetch(keys, host=CH_HOST, port=CH_PORT, database=CH_DATABASE, user=None, 
 
     import clickhouse_connect
 
-    from ssp.export.submittable import credentials
+    from ssp.export.submittable import bypass_proxy, credentials
 
     if not 1 <= workers <= CH_MAX_WORKERS:
         raise ValueError(f"workers must be 1..{CH_MAX_WORKERS} (the server is shared)")
     user, password = credentials(host, port, database, user)
+    bypass_proxy(host)
     tasks = [(p, np.asarray(ids[k:k + chunk], dtype=np.int64))
              for p, ids in keys.items() for k in range(0, len(ids), chunk)]
 

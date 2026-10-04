@@ -43,7 +43,10 @@ from astropy.time import Time
 
 from ssp.sssource_contract import MATCH_METHODS
 
-DEFAULT_HOST = "sdfiana035.sdf.slac.stanford.edu"
+# ClickHouse moved to Kubernetes on 2026-10-04 (sdfiana035 is stopped). The
+# pinned IP is the stable address (DNS: sdf-metallb-priv-10-116.sdf.slac.
+# stanford.edu); HTTP only. SDF's proxy refuses it, see bypass_proxy.
+DEFAULT_HOST = "172.24.10.116"
 DEFAULT_PORT = 8123
 DEFAULT_DATABASE = "ssp"
 VIEW = "SubmittableSources"
@@ -171,6 +174,19 @@ def read_chpass(path, host, port, database, user=None):
                 and (user is None or f_user in ("*", user)):
             return (user or f_user), f_pass
     raise SystemExit(f"{path}: no line matches {user or '<any user>'}@{host}:{port}/{database}")
+
+
+def bypass_proxy(host):
+    """Exclude ``host`` from the http(s)_proxy that clickhouse_connect would
+    otherwise take from the environment (SDF sets one, and its squid proxy
+    refuses the ClickHouse server: HTTP 403). Adds ``host`` to ``no_proxy``
+    and ``NO_PROXY``; a no-op without a proxy, or if it's already there."""
+    if not any(os.environ.get(v) for v in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY")):
+        return
+    for var in ("no_proxy", "NO_PROXY"):
+        names = [n.strip() for n in os.environ.get(var, "").split(",") if n.strip()]
+        if host not in names and "*" not in names:
+            os.environ[var] = ",".join([host] + names)
 
 
 def credentials(host, port, database, user=None):
@@ -511,6 +527,7 @@ def run_queries(tasks, host, port, database, user, workers):
     import clickhouse_connect
 
     user, password = credentials(host, port, database, user)
+    bypass_proxy(host)
     local = threading.local()
 
     def run(task):

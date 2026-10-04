@@ -77,7 +77,9 @@ The rules here are for development in ssp-tools, by Claude sessions and their su
 
 ## Shared resources: etiquette
 
-- **ClickHouse** (sdfiana035:8123): read-only, at most **8 concurrent queries**.
+- **ClickHouse** (`172.24.10.116:8123`, HTTP only; on Kubernetes since 2026-10-04, replacing sdfiana035): read-only, at most **8 concurrent queries**.
+  - The code excludes it from SDF's HTTP proxy (`ssp.export.submittable.bypass_proxy`); with curl, use `--noproxy '*'`.
+  - If a query hangs with no progress, report it rather than retrying in a loop. The server's data sits on NFS, which has stalled reads before.
   - Credentials come from `~/.chpass` through `ssp.export.submittable.credentials`.
   - Admin (`default`) access is the owner's to use, not ours.
 - **MPC replica** (`mpcorb-db.slac.stanford.edu`, `mpc_sbn`, user `rubin`): read-only, in one transaction when tables must be consistent.

@@ -79,7 +79,7 @@ MPC_PORT = 5432
 MPC_DBNAME = "mpc_sbn"
 MPC_USER = "rubin"
 
-CH_HOST = "sdfiana035.sdf.slac.stanford.edu"
+from ssp.export.submittable import DEFAULT_HOST as CH_HOST  # noqa: E402 (one definition)
 CH_PORT = 8123
 CH_DATABASE = "ssp"     # the database the ~/.chpass line is for
 
@@ -208,9 +208,10 @@ def export_ppdb(out_path, args):
     """The five ``ppdb.DiaSource`` columns, streamed to ``out_path``."""
     import clickhouse_connect
 
-    from ssp.export.submittable import credentials
+    from ssp.export.submittable import bypass_proxy, credentials
 
     user, password = credentials(args.ch_host, args.ch_port, CH_DATABASE, args.ch_user)
+    bypass_proxy(args.ch_host)
     client = clickhouse_connect.get_client(
         host=args.ch_host, port=args.ch_port, username=user, password=password,
         settings={"max_execution_time": 3600, "cancel_http_readonly_queries_on_client_close": 1},

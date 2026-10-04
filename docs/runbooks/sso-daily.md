@@ -21,7 +21,7 @@ Design: `docs/design/sso-delivery.md` (the stages), `docs/design/sssource-widene
   - If a console script is missing after a pull, refresh the entry points: `VIRTUAL_ENV=$PWD/.venv uv pip install --no-deps -e .`
 - **ASSIST data:** `data/assist/linux_p1550p2650.440` and `data/assist/sb441-n16.bsp`. Export `SSP_ASSIST_PLANETS` and `SSP_ASSIST_ASTEROIDS`, and set `OMP_NUM_THREADS=1`.
 - **The MPC replica:** `mpcorb-db.slac.stanford.edu:5432`, database `mpc_sbn`, user `rubin`, password in `~/.pgpass`. It is exported read-only, in one REPEATABLE READ transaction.
-- **ClickHouse:** `sdfiana035.sdf.slac.stanford.edu:8123`, user `ssp_xmatch`, read-only. It needs `SELECT` on `ssp.*` and `ppdb.DiaSource`. Credentials go in `~/.chpass` (mode 600, `host:port:database:user:password`). The server is shared, so use **at most 8 concurrent queries**; that is the default.
+- **ClickHouse:** `172.24.10.116:8123` (HTTP only; on Kubernetes since 2026-10-04, replacing `sdfiana035.sdf.slac.stanford.edu`), user `ssp_xmatch`, read-only. The tools keep it out of SDF's HTTP proxy, which refuses it. It needs `SELECT` on `ssp.*` and `ppdb.DiaSource`. Credentials go in `~/.chpass` (mode 600, `host:port:database:user:password`). The server is shared, so use **at most 8 concurrent queries**; that is the default.
 - **Uploads:** Google application-default credentials for the `sso-uploader` service account, which has object-user access on the bucket and publish access on the topic (`lsst/idf_deploy` `services/sso-uploader.tf`). **Not yet issued to SSP**; ask the DM-55678 owners.
 - **Machine:** about 30 GB of RAM (the extract peaks at 28 GB), and 32 or more cores for the build.
   - Disk: about 5.5 GB for the inputs and about 5.5 GB for the delivery, per day.
