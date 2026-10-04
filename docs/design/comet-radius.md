@@ -22,7 +22,7 @@ NearbySSO matches each DiaSource to the nearest eligible predicted position with
 - **Outputs and script:** `/sdf/data/rubin/user/mjuric/comet-radius/measure/`.
 
 **P/2002 T6: a comet missed entirely at 5″.**
-- **Found:** 92 of its DiaSources sit at 6.6–6.9″ from its prediction, over three nights.
+- **Found:** 89 of its DiaSources (one per visit, rank 1) sit at 5.3–6.9″ from its prediction, over three nights.
 - **They are the comet:** they move with the prediction at 20.8″/h.
 - **Coma or tail pieces:** 34 more of its DiaSources, mostly second DiaSources of the same visits (`diaDistanceRank` 2), sit at 11–20″.
 - **Never submitted:** it has no SSSource rows, so none of these detections has been reported.
@@ -55,8 +55,9 @@ The sample is small: besides P/2002 T6, 26 comets and about 12 real matches. So 
   - One way to do it: match every prediction at the larger radius, then drop the matches beyond the prediction's own radius. This keeps `DiaIndex.match`'s scalar interface.
 - **The nearest-object reduction is unchanged:** it compares separations in arcsec. A DiaSource 4″ from an asteroid and 10″ from a comet stays with the asteroid.
 - **`diaDistanceRank`:** its pool is all of the visit's DiaSources within *that prediction's* radius. So a comet's rank counts the DiaSources within 15″ of it, and its coma and tail fragments get ranks 2, 3 and so on.
-- **Unchanged:** the σ gate (`SIGMA_MAX_ARCSEC` = 10″), and the candidate margin (90″). N3's worst coarse-to-precise gap was 23.5″; with a 15″ radius that makes 38.5″, well inside the margin.
-- **Asteroid rows don't change.** A DiaSource gains a comet row only if no asteroid is within 5″ of it, or the comet is nearer than that asteroid. So every row that names an asteroid stays bitwise identical. The comet radius can only add comet rows, or move a DiaSource from a farther asteroid to a nearer comet; at most a handful of DiaSources should move this way.
+- **Unchanged:** the σ gate (`SIGMA_MAX_ARCSEC` = 10″).
+- **Asteroid rows don't change, and no DiaSource moves from an asteroid to a comet.** An asteroid match is always within 5″. A comet can take that DiaSource only by being nearer still, so also within 5″, and the single 5″ rule already allowed that. The comet radius can only add comet rows, for DiaSources with no asteroid within 5″. (WP R1 pointed this out, correcting an earlier draft of this paragraph.)
+- **Candidate margin:** comets get the 90″ coarse-pass margin plus the 10″ by which their radius exceeds 5″, i.e. 100″, so they keep the same safety allowance (`build.candidate_margin`, WP R1).
 - **Schema** (`sso_base.yaml` NearbySSO, on `tickets/DM-55375`): text only.
   - The table description gives the radii: 5″, and 15″ for comets and ISOs (designations C/, P/, D/, I/).
   - The `diaDistanceRank` description says "within the object's matching radius".
@@ -102,3 +103,34 @@ The sample is small: besides P/2002 T6, 26 comets and about 12 real matches. So 
 ## Related, not in scope
 
 P/2002 T6's 92 unsubmitted detections are good candidates for MPC submission, through ssp-submit's own process. That is outside ssp-tools; it's for the owner to raise there.
+
+## Results (2026-10-03)
+
+**R1 (#73), matching:**
+- `match_per_radius`: one `DiaIndex.match` call per distinct radius. A batch where every prediction is 5″ is exactly the old call.
+- `diaDistanceRank` pools use each prediction's own radius.
+- `candidate_margin` (100″ for comets).
+- A `comets` block in the run report.
+
+**R2 (#74), harnesses:** `bench/nearbysso_validate.py` (brute force, same-orbits, rank) and `bench/nongrav_validate.py nearbysso` use `match_radius`. They also check that no row sits beyond its object's radius. On the old 5″ build, brute-force flagged exactly P/2002 T6's detections as missing.
+
+**The full 2026-10-01 rerun:**
+- `ssp-build-sso` from `comet-radius` 82afb1a, with 32 workers. The output is in `/sdf/data/rubin/user/mjuric/comet-radius/rerun/2026-10-01/`.
+- **Deliverable:** true; all 8 checks PASS.
+- **Time and memory:** nearbysso 5:37 (15.7 GB), as before.
+- **Against the tail-angles rerun** (the same inputs):
+  - SSSource, SSObject and `mpc_orbits` are byte-identical (same md5);
+  - NearbySSO goes 1,290,839 → 1,290,943 rows. Every old row is reproduced exactly, and 104 comet rows are added, all at 5.3–14.9″:
+
+| comet | rows | offsets |
+|---|---|---|
+| P/2002 T6 | 99 (89 rank 1, 10 rank 2) | 5.27–14.87″ |
+| C/2003 A2 | 2 | 6.08–6.87″ |
+| P/2021 V2 | 1 | 12.18″ |
+| P/2007 N1 | 1 | 11.79″ |
+| C/2025 M1 | 1 | 13.40″ |
+
+- **These are the same DiaSources as the 60″ measurement cut at 15″.** None was lost to the nearest-object competition with asteroids.
+- **The checks:**
+  - **brute-force,** over all 89 of P/2002 T6's visits (480,184 DiaSources): all 51,535 adjudicable pairs found, including P/2002 T6's 99. One pair can't be adjudicated, so the exit status is "incomplete": the asteroid 2011 UM169 at 4.6″. Its orbit has no usable covariance (σ infinite), so it's never eligible, and its absence is correct.
+  - **same-orbits, rank, nongrav nearbysso, tail-angles consistency:** PASS. Of the 111 comet rows, 104 are beyond 5″; 101 have rank 1 and 10 rank 2.
