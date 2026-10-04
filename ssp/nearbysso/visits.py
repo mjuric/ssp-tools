@@ -60,7 +60,8 @@ MAX_SAMPLE_GAP_DAYS = 1.0
 #: The ``margin_arcsec`` for ``VisitIndex.candidates``: what its explicit
 #: terms don't cover of the difference between the coarse track and the
 #: precise prediction, i.e. the 5" match radius + <= 55" of light time + 30"
-#: of safety (see ``candidates``). The light time: the coarse track is
+#: of safety (see ``candidates``; the build widens it by 10" for comets and
+#: ISOs, whose match radius is 15"). The light time: the coarse track is
 #: geometric and the prediction light-time corrected, which moves it by
 #: (velocity x light time) / distance = v_perp / c whatever the distance,
 #: <= 55" for v_perp <= 80 km/s.
@@ -666,7 +667,8 @@ class VisitIndex:
           light-time corrected, which moves it by (barycentric velocity x
           light time) / distance = v_perp / c, whatever the distance: <= 55"
           for v_perp <= 80 km/s, beyond any object observed near 1 AU.
-        - the match radius, 5".
+        - the match radius, 5" (15" for comets and ISOs: the build passes
+          them a margin 10" larger, ``build.candidate_margin``).
 
         The last two, plus 30" of safety for what isn't modelled (e.g. the
         coarse pass vs the precise one) are the margin:

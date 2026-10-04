@@ -9,6 +9,13 @@ filter, the visits, the brute-force prefilter and the matching are
 re-implemented here, and the builder's code is called only through the
 contract (``propagate.coarse`` for sigma), so a shared bug is unlikely.
 
+Match radius: per object, the contract's ``match_radius(designation)``
+(5", and 15" for comets and ISOs, designations C/ P/ D/ I/;
+docs/design/comet-radius.md). Every "within the radius" decision below
+(the brute-force matcher, the explanation of misses, the rank check's
+pool, the mock) uses the radius of the object concerned; the competition
+between objects for a DiaSource compares separations in arcsec.
+
 Subcommands (each writes ``<out>/<name>.txt`` and ``<out>/<name>.parquet``)::
 
   same-orbits          NearbySSO vs SSSource built from the SAME mpc_orbits
@@ -77,7 +84,11 @@ from ssp.ephem_assist import (  # noqa: E402
 )
 from ssp.nearbysso import _contract as C  # noqa: E402
 
+#: The default (non-comet) match radius; per object, see `radius_of`.
 RADIUS = C.MATCH_RADIUS_ARCSEC
+#: A NearbySSO row whose ephOffset exceeds its object's match radius by more
+#: than this [arcsec] (the float32 ephOffset's resolution) is wrong.
+OFFSET_EPS = 1e-4
 SIGMA_MAX = C.SIGMA_MAX_ARCSEC
 NSS_COLUMNS = list(C.NEARBYSSO_DTYPE.names)
 EPH_COMPARED = ["ephRa", "ephDec", "ephRateRa", "ephRateDec", "ephVmag"]
@@ -382,6 +393,19 @@ def filter_reason(orbits):
     short = np.array([isinstance(a, str) and a in SHORT_ARC_TEXTS for a in arc], dtype=bool)
     return np.select([satellite, missing, short, null],
                      ["satellite", "missing_elements", "short_arc", "null_arc"], "")
+
+
+def radius_of(designations, radius=None):
+    """The match radius [arcsec] of each designation, as a float64 array:
+    the contract's ``match_radius`` per object, or, if ``radius`` is given
+    (a number), that radius for all (an override for ad-hoc studies)."""
+    des = np.asarray(designations, dtype=object)
+    if radius is not None:
+        return np.full(des.shape, float(radius))
+    if des.size == 0:
+        return np.zeros(des.shape)
+    return np.asarray(C.match_radius(np.array([str(d) for d in des.ravel()])),
+                      dtype=np.float64).reshape(des.shape)
 
 
 def reason_lookup(orbits):
@@ -714,13 +738,15 @@ def derive_visits(dia):
 # ---------------------------------------------------------------------------
 
 def compare_to_sssource(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
-                        radius=RADIUS, sigma_max=SIGMA_MAX):
+                        radius=None, sigma_max=SIGMA_MAX):
     """Compare NearbySSO rows (``nss``) with SSSource rows (``sss``).
 
     ``dia``: diaSourceId, midpointMjdTai, ra, dec for the SSSource rows'
     DiaSources. ``reason_of``: designation -> filter reason ('' kept).
     ``sigma_fn(designations, mjd_tai) -> sigma_major [arcsec]`` (NaN:
-    unknown), called only for rows no cheaper reason explains.
+    unknown), called only for rows no cheaper reason explains. ``radius``:
+    None (the default) for each SSSource row's object's own match radius
+    (`radius_of`), or one radius [arcsec] for all.
 
     Returns (rows, summary): one row per SSSource row with its status:
 
@@ -728,7 +754,8 @@ def compare_to_sssource(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
     - ``value_mismatch``: same designation, an eph* value outside ``tol``;
     - ``filtered:<reason>``: the object fails NearbySSO's orbit filter;
     - ``no_diasource`` / ``sss_no_ephemeris``: incomparable inputs;
-    - ``separation``: SSSource's prediction is > radius from the DiaSource;
+    - ``separation``: SSSource's prediction is beyond its object's match
+      radius from the DiaSource;
     - ``nearer_object``: NearbySSO gave the DiaSource a nearer object
       (ties by designation);
     - ``sigma``: sigma_major > sigma_max at that time;
@@ -748,7 +775,11 @@ def compare_to_sssource(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
     d = d.merge(nsub, on="diaSourceId", how="left")
     n = len(d)
 
-    des = d["designation"].astype(str).to_numpy()
+    # a NULL designation (SSSource rows of no known object) is "" (not in
+    # mpc_orbits); pandas 3 keeps NaN through astype(str)
+    des = np.array(["" if pd.isna(x) else str(x) for x in d["designation"].to_numpy(dtype=object)],
+                   dtype=object)
+    rad =radius_of(des, radius)
     nss_des = d["nss_designation"].to_numpy(dtype=object)
     has_nss = pd.notna(d["nss_designation"]).to_numpy()
     same = has_nss & (nss_des == des)
@@ -791,7 +822,7 @@ def compare_to_sssource(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
         (reason != "", None),
         (~have_dia, "no_diasource"),
         (~sss_ok, "sss_no_ephemeris"),
-        (np.nan_to_num(sep, nan=np.inf) > radius, "separation"),
+        (np.nan_to_num(sep, nan=np.inf) > rad, "separation"),
     ):
         m = todo & cond
         status[m] = ["filtered:" + r for r in reason[m]] if label is None else label
@@ -816,28 +847,45 @@ def compare_to_sssource(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
     status[rest & ~has_nss] = "unexplained"
     d["sigma"] = sigma
     d["status"] = status
-    d["borderline"] = (np.abs(np.nan_to_num(sep, nan=1e9) - radius) < 1e-3) | (
+    d["match_radius"] = rad
+    d["borderline"] = (np.abs(np.nan_to_num(sep, nan=1e9) - rad) < 1e-3) | (
         np.abs(sigma - sigma_max) < 0.01 * sigma_max)
     d["identical"] = identical
 
     # NearbySSO rows for DiaSources not in this SSSource at all
     in_sss = np.isin(nss["diaSourceId"].to_numpy(), d["diaSourceId"].to_numpy())
+    # NearbySSO rows beyond their own object's match radius (wrong,
+    # whatever SSSource says)
+    beyond = beyond_radius(nss, radius)
     counts = pd.Series(status).value_counts().to_dict()
     ms = d[same]
     summary = {
         "n_sssource": n, "n_nearbysso": len(nss), "n_nearbysso_duplicate_ids": n_dup,
         "n_nearbysso_not_in_sssource": int((~in_sss).sum()),
+        "n_nearbysso_beyond_radius": int(beyond.sum()),
+        "nearbysso_beyond_radius": nss.loc[beyond, "diaSourceId"].head(10).tolist(),
         "status_counts": {k: int(v) for k, v in sorted(counts.items())},
         "n_identical": int(identical.sum()),
         "max_d_pos_mas": float(np.nanmax(ms["d_pos_mas"])) if len(ms) else np.nan,
         "max_d_rateRa_deg_day": float(np.nanmax(np.abs(ms["d_ephRateRa"]))) if len(ms) else np.nan,
         "max_d_rateDec_deg_day": float(np.nanmax(np.abs(ms["d_ephRateDec"]))) if len(ms) else np.nan,
         "max_d_vmag": float(np.nanmax(np.abs(ms["d_ephVmag"]))) if len(ms) else np.nan,
-        "n_fail": int(sum(counts.get(s, 0) for s in FAIL_STATUSES)) + n_dup,
+        "n_fail": int(sum(counts.get(s, 0) for s in FAIL_STATUSES)) + n_dup + int(beyond.sum()),
         "n_unknown": int(counts.get("sigma_unknown", 0)),
         "n_borderline_fail": int((d["borderline"] & np.isin(status, FAIL_STATUSES)).sum()),
     }
     return d, summary
+
+
+def beyond_radius(nss, radius=None):
+    """Mask of NearbySSO rows whose ephOffset exceeds their object's match
+    radius (`radius_of`) by more than OFFSET_EPS: rows that shouldn't
+    exist (all False if there's no ephOffset)."""
+    nss = pd.DataFrame(nss)
+    if "ephOffset" not in nss or not len(nss):
+        return np.zeros(len(nss), bool)
+    off = nss["ephOffset"].to_numpy(np.float64)
+    return np.nan_to_num(off, nan=0.0) > radius_of(nss["designation"].to_numpy(), radius) + OFFSET_EPS
 
 
 def report_comparison(rep, summary, tol=None):
@@ -845,6 +893,9 @@ def report_comparison(rep, summary, tol=None):
     rep(f"NearbySSO rows:         {summary['n_nearbysso']:,} "
         f"({summary['n_nearbysso_not_in_sssource']:,} for DiaSources not in SSSource; "
         f"{summary['n_nearbysso_duplicate_ids']} duplicate diaSourceIds)")
+    rep(f"NearbySSO rows with ephOffset beyond their object's match radius: "
+        f"{summary['n_nearbysso_beyond_radius']:,}"
+        + (f" (e.g. {summary['nearbysso_beyond_radius']})" if summary['n_nearbysso_beyond_radius'] else ""))
     rep("status of each SSSource row:")
     for k, v in summary["status_counts"].items():
         rep(f"  {k:32s} {v:>10,}")
@@ -856,7 +907,7 @@ def report_comparison(rep, summary, tol=None):
     if tol:
         rep(f"tolerances: {tol}")
     if summary["n_borderline_fail"]:
-        rep(f"({summary['n_borderline_fail']} failing rows are within 1e-3\" of the radius or "
+        rep(f"({summary['n_borderline_fail']} failing rows are within 1e-3\" of their match radius or "
             f"1% of the sigma gate)")
 
 
@@ -1007,9 +1058,10 @@ def cmd_dp2_intersection(args):
 # 3. Horizons adjudication
 # ---------------------------------------------------------------------------
 
-def adjudicate_rows(disc, h_ra, h_dec, tol_mas=1.0, radius=RADIUS):
+def adjudicate_rows(disc, h_ra, h_dec, tol_mas=1.0, radius=None):
     """Which side of each discrepancy agrees with Horizons (pure logic).
-    Adds sep_{sss,nss,dia}_h and ``verdict``."""
+    Adds sep_{sss,nss,dia}_h and ``verdict``. ``radius``: None for each
+    row's object's match radius (`radius_of`), or one for all."""
     d = disc.copy()
 
     def sep(ra, dec):
@@ -1025,7 +1077,7 @@ def adjudicate_rows(disc, h_ra, h_dec, tol_mas=1.0, radius=RADIUS):
     d["sep_nss_h_mas"] = np.where(same, s, np.nan)
     d["sep_dia_h_arcsec"] = sep(d["dia_ra"], d["dia_dec"])
     ss, ns = d["sep_sss_h_mas"].to_numpy() < tol_mas, d["sep_nss_h_mas"].to_numpy() < tol_mas
-    within = d["sep_dia_h_arcsec"].to_numpy() <= radius
+    within = d["sep_dia_h_arcsec"].to_numpy() <= radius_of(d["designation"].to_numpy(), radius)
     v = np.full(len(d), "no_horizons", dtype=object)
     have = np.isfinite(h_ra)
     v[have & same & ss & ns] = "both_match"
@@ -1098,7 +1150,7 @@ def strata_masks(nss, orbits, short_arc_days=30.0):
     masks = {
         "main_belt": cls == "main_belt", "neo": cls == "neo", "trojan": cls == "trojan",
         "tno": cls == "tno", "short_arc": arc < short_arc_days,
-        "near_radius": nss["ephOffset"].to_numpy(float) > 0.9 * RADIUS,
+        "near_radius": nss["ephOffset"].to_numpy(float) > 0.9 * radius_of(nss["designation"].to_numpy()),
         "near_sigma": sig > 0.8 * SIGMA_MAX,
     }
     # the NEO rows moving fastest on the sky: a proxy for a close approach
@@ -1520,10 +1572,13 @@ def assist_prefilter(orbits, state, t0, t_assist, obs_pos, ephem, workers, batch
 def match_within(pred_ra, pred_dec, dia_ra, dia_dec, radius=RADIUS):
     """Every (prediction k, DiaSource h) pair within ``radius`` arcsec, by a
     KD tree on unit vectors (independent of WP3's HEALPix index); returns
-    (k, h, sep [arcsec]), separations as ssp.util.sky_separation_arcsec."""
+    (k, h, sep [arcsec]), separations as ssp.util.sky_separation_arcsec.
+    ``radius``: one radius, or one per prediction (each prediction's
+    object's match radius)."""
     from scipy.spatial import cKDTree
     if len(pred_ra) == 0 or len(dia_ra) == 0:
         return np.zeros(0, int), np.zeros(0, int), np.zeros(0)
+    radius = np.broadcast_to(np.asarray(radius, dtype=np.float64), np.shape(pred_ra))
     chord = 2 * np.sin(np.deg2rad(radius / 3600.0) / 2) * (1 + 1e-6)
     tree = cKDTree(radec_to_vec(dia_ra, dia_dec))
     hits = tree.query_ball_point(radec_to_vec(pred_ra, pred_dec), chord)
@@ -1531,17 +1586,19 @@ def match_within(pred_ra, pred_dec, dia_ra, dia_dec, radius=RADIUS):
     h = np.fromiter((i for x in hits for i in x), dtype=np.int64, count=len(k))
     sep = util.sky_separation_arcsec(np.asarray(pred_ra)[k], np.asarray(pred_dec)[k],
                                      np.asarray(dia_ra)[h], np.asarray(dia_dec)[h])
-    m = sep <= radius
+    m = sep <= radius[k]
     return k[m], h[m], sep[m]
 
 
-def expected_nearest(pairs, sigma_max=SIGMA_MAX, radius=RADIUS):
-    """From all (diaSourceId, designation, sep, sigma) pairs within the
-    radius, the nearest *eligible* object per DiaSource (sigma <= max; ties
-    by designation). Where some candidate's sigma is unknown (NaN) and no
-    eligible one is nearer, the row is flagged ``sigma_unknown``."""
+def expected_nearest(pairs, sigma_max=SIGMA_MAX, radius=None):
+    """From all (diaSourceId, designation, sep, sigma) pairs within each
+    object's match radius (``radius``: None for `radius_of` per object, or
+    one for all), the nearest *eligible* object per DiaSource (sigma <= max;
+    nearest in arcsec, whatever the radii; ties by designation). Where some
+    candidate's sigma is unknown (NaN) and no eligible one is nearer, the
+    row is flagged ``sigma_unknown``."""
     p = pd.DataFrame(pairs)
-    p = p[p["sep"] <= radius]
+    p = p[p["sep"].to_numpy(float) <= radius_of(p["designation"].to_numpy(), radius)]
     unk = ~np.isfinite(p["sigma"].to_numpy(float))
     keep = unk | (p["sigma"].to_numpy(float) <= sigma_max)
     p = p[keep].assign(sigma_unknown=unk[keep])
@@ -1552,7 +1609,8 @@ def expected_nearest(pairs, sigma_max=SIGMA_MAX, radius=RADIUS):
 def compare_expected(expected, nss):
     """Expected nearest matches vs NearbySSO rows of the same DiaSources.
     Status: found, missing, wrong_object (NearbySSO has another), and for
-    NearbySSO rows not expected, extra."""
+    NearbySSO rows not expected, extra (or extra_beyond_radius: its
+    ephOffset exceeds its object's match radius, so it's wrong)."""
     e = expected.merge(nss[["diaSourceId", "designation", "ephOffset"]].rename(
         columns={"designation": "nss_designation", "ephOffset": "nss_ephOffset"}),
         on="diaSourceId", how="left")
@@ -1563,6 +1621,7 @@ def compare_expected(expected, nss):
     st[unk & ~same] = [s + "_sigma_unknown" for s in st[unk & ~same]]
     e["status"] = st
     extra = nss[~nss["diaSourceId"].isin(expected["diaSourceId"])].assign(status="extra")
+    extra.loc[beyond_radius(extra), "status"] = "extra_beyond_radius"
     return pd.concat([e, extra], ignore_index=True)
 
 
@@ -1688,20 +1747,26 @@ def cmd_brute_force(args):
     # match exact predictions to DiaSources (KD tree on unit vectors)
     parts = []
     des_all = orbits["designation"].to_numpy(dtype=object)
+    rad_all = radius_of(des_all)
     for j in range(len(V)):
         s, e_ = V["dia_start"].iloc[j], V["dia_end"].iloc[j]
         dv = dia.iloc[s:e_]
         ex = exact[exact["vj"] == j]
         k, h, sep = match_within(ex["ra"].to_numpy(), ex["dec"].to_numpy(),
-                                 dv["ra"].to_numpy(), dv["dec"].to_numpy(), RADIUS)
+                                 dv["ra"].to_numpy(), dv["dec"].to_numpy(),
+                                 rad_all[ex["oi"].to_numpy()])
         parts.append(pd.DataFrame({
             "diaSourceId": dv["diaSourceId"].to_numpy(dtype=np.int64)[h],
             "designation": des_all[ex["oi"].to_numpy()[k]], "sep": sep,
             "midpointMjdTai": dv["midpointMjdTai"].to_numpy(dtype=np.float64)[h]}))
     pairs = pd.concat(parts, ignore_index=True)
-    pairs = pairs[pairs["sep"] <= RADIUS].reset_index(drop=True)
-    rep(f"(object, DiaSource) pairs within {RADIUS}\": {len(pairs):,} "
-        f"({pairs['designation'].nunique():,} objects)")
+    pairs = pairs[pairs["sep"].to_numpy(float) <= radius_of(pairs["designation"].to_numpy())]
+    pairs = pairs.reset_index(drop=True)
+    comet = radius_of(pairs["designation"].to_numpy()) > RADIUS
+    rep(f"(object, DiaSource) pairs within the object's match radius ({RADIUS:g}\", comets and ISOs "
+        f"{C.MATCH_RADIUS_COMET_ARCSEC:g}\"): {len(pairs):,} ({pairs['designation'].nunique():,} objects; "
+        f"comets and ISOs: {int(comet.sum()):,} pairs, {pairs['designation'][comet].nunique():,} objects, "
+        f"{int((pairs['sep'][comet] > RADIUS).sum()):,} pairs beyond {RADIUS:g}\")")
     oracle = SigmaOracle(args.orbits, ephem)
     pairs["sigma"] = oracle(pairs["designation"].to_numpy(), pairs["midpointMjdTai"].to_numpy())
     if oracle.note:
@@ -1713,10 +1778,18 @@ def cmd_brute_force(args):
     cmp = compare_expected(exp, nss_v)
     for k, v in cmp["status"].value_counts().items():
         rep(f"  {k:28s} {v:>8,}")
-    n_bad = int(cmp["status"].isin(["missing", "wrong_object"]).sum())
+    n_bad = int(cmp["status"].isin(["missing", "wrong_object", "extra_beyond_radius"]).sum())
     n_unk = int(cmp["status"].str.endswith("_sigma_unknown").sum())
     verdict = "FAIL" if n_bad else ("INCOMPLETE" if n_unk or not margin_ok else "PASS")
     rep(f"GATE: every eligible nearest match is in NearbySSO: {verdict}")
+    bad = cmp[cmp["status"].isin(["missing", "wrong_object"])]
+    if len(bad):
+        rep("missing / wrong_object by object (the first 20):")
+        g = bad.groupby("designation").agg(n=("diaSourceId", "size"), sep_min=("sep", "min"),
+                                           sep_max=("sep", "max")).sort_values("n", ascending=False)
+        for des, r in g.head(20).iterrows():
+            rep(f"  {des:24s} {int(r['n']):>6,}  sep {r['sep_min']:.2f}-{r['sep_max']:.2f}\" "
+                f"(radius {radius_of([des])[0]:g}\")")
     rep.write(cmp, pairs=pairs)
     return {"PASS": 0, "FAIL": 1}.get(verdict, 3)
 
@@ -1726,6 +1799,8 @@ def cmd_brute_force(args):
 # ---------------------------------------------------------------------------
 
 RANK = "diaDistanceRank"
+RANK_WITHIN_GATE = (f"the row's DiaSource is within its object's match radius ({C.MATCH_RADIUS_ARCSEC:g}\", "
+                    f"comets and ISOs {C.MATCH_RADIUS_COMET_ARCSEC:g}\") of ephRa/ephDec")
 RANK_FAULTS = {
     "plus1": "one row's rank increased by 1",
     "swap": "the ranks of two rows of one (object, visit) swapped",
@@ -1761,7 +1836,8 @@ def brute_force_ranks(visit, pred_ra, pred_dec, own_id, dia, radius=RADIUS, chun
     - ``own_sep`` [arcsec]: of the named DiaSource (NaN: not in that visit);
     - ``n_closer``: the visit's DiaSources nearer than it, or as near with a
       lower diaSourceId, so its rank is ``n_closer + 1``;
-    - ``n_within``: the visit's DiaSources within ``radius``;
+    - ``n_within``: the visit's DiaSources within ``radius`` (one radius,
+      or one per prediction: its object's match radius), the rank's pool;
     - ``nearest_id``, ``nearest_sep``: the visit's nearest DiaSource (ties:
       the lower diaSourceId);
     - ``near_dup``: the named DiaSource, or one at most as far, is on
@@ -1771,6 +1847,7 @@ def brute_force_ranks(visit, pred_ra, pred_dec, own_id, dia, radius=RADIUS, chun
     pred_ra, pred_dec = np.asarray(pred_ra, np.float64), np.asarray(pred_dec, np.float64)
     own_id = np.asarray(own_id, dtype=np.int64)
     n = len(visit)
+    radius = np.broadcast_to(np.asarray(radius, dtype=np.float64), (n,))
     out = {"own_sep": np.full(n, np.nan), "n_closer": np.full(n, -1, np.int64),
            "n_within": np.zeros(n, np.int64), "nearest_id": np.full(n, -1, np.int64),
            "nearest_sep": np.full(n, np.nan), "near_dup": np.zeros(n, bool)}
@@ -1799,7 +1876,7 @@ def brute_force_ranks(visit, pred_ra, pred_dec, own_id, dia, radius=RADIUS, chun
             closer = (S < own[:, None]) | ((S == own[:, None]) & (ids[None, :] < own_id[k][:, None]))
             out["own_sep"][k] = own
             out["n_closer"][k] = np.where(found, closer.sum(axis=1), -1)
-            out["n_within"][k] = (S <= radius).sum(axis=1)
+            out["n_within"][k] = (S <= radius[k][:, None]).sum(axis=1)
             out["near_dup"][k] = ((S <= own[:, None]) & dup[None, :]).any(axis=1)
             j = np.argmin(S, axis=1)      # the first minimum: the lowest id (ids ascending)
             out["nearest_id"][k] = ids[j]
@@ -1923,7 +2000,8 @@ def check_rank(nss_path, dia_path, orbits_path=None, n=100_000, seed=42, rep=Non
     s = nss.iloc[pick].reset_index(drop=True)
     rep(f"sample: {len(s):,} rows (seed {seed}) in {s['visit'].nunique():,} visits")
     t0 = time.time()
-    bf = brute_force_ranks(s["visit"], s["ephRa"], s["ephDec"], s["diaSourceId"], dia)
+    rad = radius_of(s["designation"].to_numpy())
+    bf = brute_force_ranks(s["visit"], s["ephRa"], s["ephDec"], s["diaSourceId"], dia, radius=rad)
     rep(f"brute force: every DiaSource of each sampled row's visit, {time.time() - t0:.1f} s")
     s = pd.concat([s, bf], axis=1)
     s["expected_rank"] = s["n_closer"] + 1
@@ -1932,11 +2010,11 @@ def check_rank(nss_path, dia_path, orbits_path=None, n=100_000, seed=42, rep=Non
         rep(f"sampled rows whose rank involves a repeated diaSourceId: {int(nd.sum()):,} "
             f"(rank as brute force: {int((s[RANK][nd] == s['expected_rank'][nd]).sum()):,})")
 
-    within = s["own_sep"].to_numpy() <= RADIUS
+    within = s["own_sep"].to_numpy() <= rad
     eo = s["ephOffset"].to_numpy(np.float64)
     with np.errstate(invalid="ignore"):
         eo_ok = np.abs(eo - s["own_sep"].to_numpy()) <= sep_rtol * np.maximum(s["own_sep"].to_numpy(), 1e-3)
-    gate(f"the row's DiaSource is within {RADIUS:g}\" of ephRa/ephDec", within.all(),
+    gate(RANK_WITHIN_GATE, within.all(),
          f"{int((~within).sum()):,} not" + (f" (e.g. {s['diaSourceId'][~within].head(3).tolist()})"
                                             if not within.all() else ""))
     ex = list(zip(s["diaSourceId"][~eo_ok].head(3), eo[~eo_ok][:3], s["own_sep"][~eo_ok].head(3)))
@@ -1958,7 +2036,12 @@ def check_rank(nss_path, dia_path, orbits_path=None, n=100_000, seed=42, rep=Non
          f"{int(one.sum()):,} rank-1 rows sampled; {int(not_nearest.sum()):,} with a nearer one"
          + (f" (e.g. {s['diaSourceId'][not_nearest].head(3).tolist()})" if not_nearest.any() else ""))
     rep(f"brute-force ranks (sample): {_hist(want)}")
-    rep(f"DiaSources within {RADIUS:g}\" of the prediction (sample): {_hist(s['n_within'])}")
+    rep(f"DiaSources within the object's match radius of the prediction (sample): {_hist(s['n_within'])}")
+    comet = rad > RADIUS
+    if comet.any():
+        rep(f"sampled rows of comets and ISOs (radius {C.MATCH_RADIUS_COMET_ARCSEC:g}\"): "
+            f"{int(comet.sum()):,}; ranks {_hist(want[comet])}; "
+            f"beyond {RADIUS:g}\": {int((s['own_sep'][comet] > RADIUS).sum()):,}")
     rep(f"rows whose rank > 1 (their object has a nearer DiaSource, named by another row or not "
         f"in NearbySSO): {int(np.sum(want > 1)):,} of {len(s):,} ({100 * np.mean(want > 1):.2f}%)")
 
@@ -2044,14 +2127,16 @@ def cmd_mock_rank(args):
 
 def mock_from_sssource(sss, dia, reason_of, rng=None, n_drop=0, n_perturb=0):
     """A NEARBYSSO_DTYPE table from SSSource rows that NearbySSO should
-    contain (object kept by the filter, prediction within 5"), nearest per
-    DiaSource, zero ellipses; then ``n_drop`` rows removed and ``n_perturb``
-    positions shifted by 1-10 mas. Returns (table, injected faults)."""
+    contain (object kept by the filter, prediction within its match
+    radius), nearest per DiaSource, zero ellipses; then ``n_drop`` rows
+    removed and ``n_perturb`` positions shifted by 1-10 mas. Returns
+    (table, injected faults)."""
     rng = np.random.default_rng(rng)
     d = pd.DataFrame(sss).merge(pd.DataFrame(dia)[["diaSourceId", "ra", "dec"]], on="diaSourceId")
     d = d[np.isfinite(d["ephRa"].to_numpy(float))]
     d["ephOffset"] = util.sky_separation_arcsec(d["ephRa"], d["ephDec"], d["ra"], d["dec"])
-    d = d[(reasons_for(d["designation"].to_numpy(), reason_of) == "") & (d["ephOffset"] <= RADIUS)]
+    d = d[(reasons_for(d["designation"].to_numpy(), reason_of) == "")
+          & (d["ephOffset"].to_numpy(float) <= radius_of(d["designation"].to_numpy()))]
     d = d.sort_values(["diaSourceId", "ephOffset", "designation"]).drop_duplicates("diaSourceId")
     out = pd.DataFrame({c: d[c].to_numpy() if c in d else 0 for c in NSS_COLUMNS})
     for c in ("ephRaErr", "ephDecErr", "ephRa_ephDec_Cov"):

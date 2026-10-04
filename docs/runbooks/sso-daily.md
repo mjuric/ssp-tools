@@ -137,3 +137,9 @@ python -m bench.tail_angles_validate consistency RUN_DIR/delivery/SSSource.parqu
 ```
 
 **2026-10-01 rerun:** deliverable, all checks PASS. The output is in `/sdf/data/rubin/user/mjuric/tail-angles/rerun/2026-10-01/run/`.
+
+## Comet match radius (2026-10-03)
+
+NearbySSO matches comets and ISOs (designations C/, P/, D/, I/) within 15″, and every other object within 5″ (`docs/design/comet-radius.md`). Nothing changes in the run itself. The nearbysso log's "comets and ISOs" line counts the rows the larger radius adds.
+
+**2026-10-01 rerun:** deliverable, all checks PASS; 104 comet rows added, 99 of them P/2002 T6. The output is in `/sdf/data/rubin/user/mjuric/comet-radius/rerun/2026-10-01/run/`.

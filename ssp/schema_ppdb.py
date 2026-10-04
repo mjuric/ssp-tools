@@ -344,8 +344,9 @@ SSSourceDtype = np.dtype([
 ])
 
 # NearbySSO: For each DiaSource, the nearest known Solar System object whose predicted position (from
-# mpc_orbits) is within the matching radius, and whose predicted 1-sigma uncertainty is small enough for the
-# association to be meaningful. Regenerated daily (RFC-1188).
+# mpc_orbits) is within the object's matching radius (5 arcsec; 15 arcsec for comets and interstellar
+# objects, i.e. designations starting C/, P/, D/ or I/), and whose predicted 1-sigma uncertainty is small
+# enough for the association to be meaningful. Regenerated daily (RFC-1188).
 NearbySSODtype = np.dtype([
     ('diaSourceId', '<i8'),         # Unique identifier of the DiaSource.
     ('ssObjectId', '<i8'),          # Id of the SSObject found within a matching radius of this source, if
@@ -361,7 +362,7 @@ NearbySSODtype = np.dtype([
                                     # ephRaErr and ephDecErr, the predicted position's error ellipse, in t...
     ('ephOffset', '<f4'),           # [arcsec] Total observed versus predicted angular separation on the sky.
     ('diaDistanceRank', '<i2'),     # Rank of this DiaSource by its separation from the object's predicted
-                                    # position, among all DiaSources of the same visit within the matching...
+                                    # position, among all DiaSources of the same visit within the object's...
     ('ephVmag', '<f4'),             # [mag] Predicted magnitude in V band, computed from mpc_orbits data
                                     # including the mpc_orbits-provided (H, G) estimates.
     ('ephRateRa', '<f4'),           # [deg/d] Predicted on-sky angular rate in the R.A. direction (includes
