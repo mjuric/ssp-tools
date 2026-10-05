@@ -1,0 +1,73 @@
+{panel:title=Revision (2026-10)}
+This description was revised in October 2026 to match the implementation. It renames {{NearbyAsteroids}} to {{NearbySSO}} and defines it, makes the {{SSSource}} and {{SSObject}} design concrete, and proposes removing {{ssObjectId}} from {{DiaSource}}. The schema is in [lsst/sdm_schemas#549|https://github.com/lsst/sdm_schemas/pull/549] (DM-55375). The original text is in the issue history.
+{panel}
+
+h2. Summary
+
+This RFC proposes changing the PPDB Solar System table baseline from the current model, where {{SSSource}} is tightly linked 1:1 to {{DiaSource}}, to a decoupled model. In the new model, the Solar System tables are built from a durable record of the measurements submitted to the MPC. {{SSSource}} and {{SSObject}} become independent of the contents and the identifier namespace of the PPDB {{DiaSource}} table. A separate, daily-regenerated association table, {{NearbySSO}}, lets users relate PPDB {{DiaSource}} detections to known Solar System objects predicted near them.
+
+h2. Motivation
+
+The current baseline assumes that Solar System detections accepted by the MPC can be mapped back to PPDB {{DiaSource}} rows and used to regenerate {{SSSource}} and {{SSObject}} daily. This assumption fails once Rubin data releases begin replacing previously submitted prompt-processing measurements with DRP-derived ones. At that point the MPC's list of accepted source identifiers mixes PP-generated and DRP-generated IDs, while the PPDB {{DiaSource}} table contains only PP-generated rows.
+
+It also creates problems for commissioning, early survey validation, source-based moving-object measurements made before templates are available, and special processing campaigns. These measurements may be legitimate Rubin-submitted Solar System observations, but they may not exist as PPDB {{DiaSource}} rows. The current baseline therefore risks making the PPDB Solar System products incomplete, hard to regenerate, and difficult to explain to users.
+
+h2. Proposed Change
+
+Adopt a new PPDB Solar System table baseline with the following design:
+
+# *A durable record of submitted measurements.* For every submission to the MPC, keep the full measurement it was made from: the Source or DiaSource astrometric and photometric fields, and their provenance. Keep it so that it can be found again by the identifiers the MPC returns. How the record is kept is an implementation detail.
+# *{{SSSource}} from the MPC's accepted observations.* {{SSSource}} has one row per Rubin observation accepted by the MPC, keyed by the MPC's observation identifier ({{obsid}}). Each row carries:
+#* the link to the MPC submission;
+#* the full measurement the observation was submitted from, from a difference image or a science image, with its processing provenance;
+#* the predicted position with its error ellipse, and the observed-minus-predicted residuals.
+Observations the MPC accepted but hasn't linked to a known object are kept, with a NULL {{ssObjectId}}. {{DiaSource}} is not consulted.
+# *{{SSObject}} from {{SSSource}}.* Per-object quantities, including the photometric phase-curve fits, are computed from {{SSSource}} alone.
+# *Break the schema dependency between {{DiaSource}} and the Solar System tables.* Remove {{ssObjectId}} and {{ssObjectReassocTimeMjdTai}} from {{DiaSource}}, and {{SSSource}} and {{SSObject}} from the APDB.
+# *No Solar System updates to {{DiaSource}}.* Treat all {{DiaSource}} rows as normal {{DiaObject}}-associated difference-image detections, rather than mutating them daily based on Solar System associations.
+# *Add {{NearbySSO}}* (previously "NearbyAsteroids"): a daily-regenerated table that, for each {{DiaSource}}, names the nearest known Solar System object predicted near it.
+#* An object is matched to a {{DiaSource}} if its predicted position lies within an AP-determined matching radius. The radius may differ between classes of objects, e.g. asteroids and comets, which are extended and less well predicted. A prediction is used only if its uncertainty is small enough for the association to be meaningful.
+#* Each row gives the object, its predicted position and error ellipse, the offset from the {{DiaSource}}, the rank of the {{DiaSource}} among those near the prediction, and the predicted magnitude, rates of motion and tail directions.
+#* Rows are not linked to {{SSSource}}: most associated detections have not been submitted to the MPC.
+#* We leave open the option for the table to also list objects predicted to be in the field of view but not matched to any {{DiaSource}}, with a NULL {{diaSourceId}}.
+# *Daily delivery.* Each day, {{SSSource}}, {{SSObject}}, {{NearbySSO}} and the MPC tables ({{mpc_orbits}}, {{current_identifications}}, {{numbered_identifications}}) are rebuilt from one consistent MPC snapshot and bulk-loaded into the PPDB.
+
+The schema of all these tables is in [lsst/sdm_schemas#549|https://github.com/lsst/sdm_schemas/pull/549].
+
+h2. Consequences
+
+This change makes the PPDB Solar System products independent of whether a measurement originated in prompt processing, DRP, commissioning processing, source-based early processing, or a special run. It also removes the need for daily bulk updates to {{DiaSource}}, avoids rewriting or invalidating previously published alert identifiers, and lets the Solar System side of the PPDB be managed as a smaller, more self-contained data product.
+
+The primary user-facing model becomes:
+
+* For the most up-to-date, best-quality, evergreen Rubin understanding of the Solar System, use the PPDB Solar System tables.
+* For a homogeneous, versioned, pipeline-consistent catalog with well-characterized systematics, use the most recent DRP Solar System data products.
+
+It may also allow the DRP side to retire the proposed "gold reprocessing" Solar System product, and keep only the LSST-only Solar System catalog. That would reduce DRP complexity by removing the MPC from that processing flow.
+
+{{NearbySSO}} associations are statistical and must be read together with their predicted uncertainties. A validation on the current PPDB (13.1 million DiaSources, 1.29 million associations) characterizes them:
+* An association is real with probability 0.99 at 1″ and about 0.5 at 2.5–3″, and 0.2–0.4% of all associations are chance coincidences.
+* Comparing the measured and predicted magnitudes is a strong second test.
+* The table recovers about 96% of the expected detections.
+* It agrees with 99.8% of the associations Alert Production made independently.
+The validation is in the {{NearbySSO}} paper (link to be added).
+
+h2. Implementation Notes
+
+* The record of submitted measurements must keep enough astrometric, photometric, provenance and processing-context metadata to reconstruct {{SSSource}} and {{SSObject}} without consulting {{DiaSource}}.
+* {{SSSource}} should be measurement-complete for Solar System use cases: its schema includes the fields needed for Solar System science queries without a join to {{DiaSource}}.
+* {{NearbySSO}} is regenerated in full and bulk-loaded daily. It is not the authoritative Solar System association state; that role belongs to {{SSSource}}/{{SSObject}}.
+* The matching radius and the uncertainty cut of {{NearbySSO}} are set by the AP team and may be tuned without a further RFC.
+
+{code:title=Data flow}
+ MPC replica (one snapshot) ──┬─> obs_sbn (accepted Rubin observations)
+                              │        │  resolved to the submitted measurement
+                              │        v
+ record of submitted ─────────┼─> SSSource ──> SSObject
+   measurements               │
+                              ├─> mpc_orbits, current_identifications, numbered_identifications
+                              │
+ PPDB DiaSource ──────────────┴─> NearbySSO  (orbits from mpc_orbits)
+                                     │
+            all tables, daily ───────┴─> bulk load into the PPDB
+{code}

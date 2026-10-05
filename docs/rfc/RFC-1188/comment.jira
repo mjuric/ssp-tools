@@ -1,0 +1,21 @@
+I've revised the description to match what has been built (see the *Revision* panel at the top). The main changes:
+
+* *{{NearbyAsteroids}} → {{NearbySSO}}*, now defined:
+** the nearest known object predicted within an AP-determined matching radius of each {{DiaSource}}, which may differ between classes of objects, e.g. asteroids and comets;
+** its columns: the prediction with its error ellipse, the offset, a rank among nearby DiaSources, and the predicted magnitude, rates and tail directions;
+** no link to {{SSSource}}, because most associated detections were never submitted;
+** an open option to also list objects predicted in the field but not detected (NULL {{diaSourceId}}).
+* *{{SSSource}} is concrete:*
+** one row per Rubin observation accepted by the MPC, keyed by the MPC's {{obsid}};
+** it carries the full submitted measurement, from a difference or a science image, with its provenance;
+** observations the MPC accepted but hasn't linked to an object are kept.
+* *{{ssObjectId}} and {{ssObjectReassocTimeMjdTai}} are to be removed from {{DiaSource}}*, and {{SSSource}}/{{SSObject}} from the APDB.
+* *How the record of submitted measurements is kept is now an implementation detail.*
+
+The schema is in [lsst/sdm_schemas#549|https://github.com/lsst/sdm_schemas/pull/549] (DM-55375). The daily build is running at USDF from the current MPC catalog, and is staged for the PPDB loader (DM-55678).
+
+*On the comments so far:*
+
+* *2026-06-25, MPC submissions from DR Solar System processing.* Right: the MPC is not an input to DR Solar System processing. It is an input only to the PPDB Solar System products. {{SSSource}} already handles observations submitted from different processings, prompt and DRP alike, and records which one each came from.
+* *2026-06-30, DiaObject light curves contaminated by SSObjects.* Loading {{NearbySSO}} into Prompt Processing is a natural follow-up. The validation gives what's needed to choose a threshold: an association is real with probability 0.99 at 1″, and 0.2–0.4% of associations are chance coincidences. It also found that Alert Production's own associations, made since 2026-02-18, agree with {{NearbySSO}} 99.8% of the time, but cover only about 54% of the detections {{NearbySSO}} associates within 1″ over the same period. That is one more reason to move this information out of {{DiaSource}}.
+* *2026-08-24, what to do with this RFC.* With this revision I think it is ready for review and adoption. On adoption, DM-55375's link can be upgraded to "is triggering", as noted on 2026-07-02.
