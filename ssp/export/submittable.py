@@ -43,10 +43,15 @@ from astropy.time import Time
 
 from ssp.sssource_contract import MATCH_METHODS
 
-# ClickHouse moved to Kubernetes on 2026-10-04 (sdfiana035 is stopped). The
-# pinned IP is the stable address (DNS: sdf-metallb-priv-10-116.sdf.slac.
-# stanford.edu); HTTP only. SDF's proxy refuses it, see bypass_proxy.
-DEFAULT_HOST = "172.24.10.116"
+# The ClickHouse ("River") server has moved more than once (sdfiana035 ->
+# 172.24.10.116 on 2026-10-04 -> sdfiana032 on 2026-10-05). Its operators keep
+# the current host in HOST_FILE, one line "river:<host>"; current_host() reads
+# it, and FALLBACK_HOST is used only when the file is missing or has no such
+# line. An explicit --host always wins. HTTP only; keep it out of SDF's proxy
+# (bypass_proxy).
+HOST_FILE = Path.home() / ".clickhouse.host"
+HOST_KEY = "river"
+FALLBACK_HOST = "sdfiana032.sdf.slac.stanford.edu"
 DEFAULT_PORT = 8123
 DEFAULT_DATABASE = "ssp"
 VIEW = "SubmittableSources"
@@ -174,6 +179,22 @@ def read_chpass(path, host, port, database, user=None):
                 and (user is None or f_user in ("*", user)):
             return (user or f_user), f_pass
     raise SystemExit(f"{path}: no line matches {user or '<any user>'}@{host}:{port}/{database}")
+
+
+def current_host(path=None):
+    """The ClickHouse host named by ``path`` (default HOST_FILE), a line
+    "river:<host>"; FALLBACK_HOST if the file is missing, unreadable or has
+    no such line."""
+    path = Path(path) if path is not None else HOST_FILE
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return FALLBACK_HOST
+    for line in lines:
+        key, sep, host = line.strip().partition(":")
+        if sep and key.strip() == HOST_KEY and host.strip():
+            return host.strip()
+    return FALLBACK_HOST
 
 
 def bypass_proxy(host):
@@ -776,7 +797,8 @@ def main():
     )
     parser.add_argument("obs_sbn", help="MPC obs_sbn Parquet file")
     parser.add_argument("output", help="Output dia_sources Parquet file")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="ClickHouse host (default: %(default)s)")
+    parser.add_argument("--host", default=None,
+                        help=f"ClickHouse host (default: from {HOST_FILE}, else {FALLBACK_HOST})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help="ClickHouse HTTP port (default: %(default)s)")
     parser.add_argument("--database", default=DEFAULT_DATABASE,
@@ -790,6 +812,7 @@ def main():
     if not 1 <= args.workers <= MAX_WORKERS:
         parser.error(f"--workers must be between 1 and {MAX_WORKERS} (the server is shared)")
 
+    args.host = args.host or current_host()
     t0 = time.time()
     def fetch(tasks):
         return run_queries(tasks, args.host, args.port, args.database, args.user, args.workers)

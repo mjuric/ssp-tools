@@ -1,5 +1,6 @@
 """ssp.export.submittable.bypass_proxy: the ClickHouse host is kept out of
-the environment's HTTP proxy (SDF's squid refuses it)."""
+the environment's HTTP proxy (SDF's squid refuses it); and
+current_host, which reads the host from ~/.clickhouse.host."""
 from ssp.export import submittable as S
 
 
@@ -30,5 +31,13 @@ def test_noop_without_proxy_or_with_wildcard(monkeypatch):
     assert os.environ["no_proxy"] == "*" and os.environ["NO_PROXY"] == "*"
 
 
-def test_default_host_is_the_kubernetes_server():
-    assert S.DEFAULT_HOST == "172.24.10.116" and S.DEFAULT_PORT == 8123
+def test_current_host(tmp_path):
+    f = tmp_path / ".clickhouse.host"
+    assert S.current_host(f) == S.FALLBACK_HOST                 # missing file
+    f.write_text("river:sdfiana032.sdf.slac.stanford.edu\n")
+    assert S.current_host(f) == "sdfiana032.sdf.slac.stanford.edu"
+    f.write_text("# comment\nother:x\n  river : 172.24.10.116  \n")
+    assert S.current_host(f) == "172.24.10.116"
+    f.write_text("river:\n")                                   # empty host
+    assert S.current_host(f) == S.FALLBACK_HOST
+    assert S.DEFAULT_PORT == 8123
