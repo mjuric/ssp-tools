@@ -79,7 +79,7 @@ MPC_PORT = 5432
 MPC_DBNAME = "mpc_sbn"
 MPC_USER = "rubin"
 
-from ssp.export.submittable import DEFAULT_HOST as CH_HOST  # noqa: E402 (one definition)
+from ssp.export.submittable import current_host  # noqa: E402 (the ClickHouse host, see there)
 CH_PORT = 8123
 CH_DATABASE = "ssp"     # the database the ~/.chpass line is for
 
@@ -541,7 +541,7 @@ def build_parser():
     g.add_argument("--mpc-dbname", default=MPC_DBNAME, help="(default: %(default)s)")
     g.add_argument("--mpc-user", default=MPC_USER, help="(default: %(default)s; password from ~/.pgpass)")
     g = p.add_argument_group("ClickHouse")
-    g.add_argument("--ch-host", default=CH_HOST, help="(default: %(default)s)")
+    g.add_argument("--ch-host", default=None, help="(default: from ~/.clickhouse.host)")
     g.add_argument("--ch-port", type=int, default=CH_PORT, help="(default: %(default)s)")
     g.add_argument("--ch-user", default=None, help="(default: from the credentials)")
     g.add_argument("--workers", type=int, default=MAX_WORKERS,
@@ -555,6 +555,7 @@ def main(argv=None):
 
     p = build_parser()
     args = p.parse_args(argv)
+    args.ch_host = args.ch_host or current_host()
     if not 1 <= args.workers <= MAX_WORKERS:
         p.error(f"--workers must be between 1 and {MAX_WORKERS} (the server is shared)")
     t0 = time.time()

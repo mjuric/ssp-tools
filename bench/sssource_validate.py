@@ -82,7 +82,7 @@ from ssp.sssource_contract import (  # noqa: E402
 DEFAULT_SCHEMA = os.path.join(_ROOT, "tests", "data", "sdm_schemas", "sso_base.yaml")
 
 # ClickHouse (read-only; the server is shared)
-from ssp.export.submittable import DEFAULT_HOST as CH_HOST  # noqa: E402 (one definition)
+from ssp.export.submittable import current_host  # noqa: E402 (the ClickHouse host, see there)
 CH_PORT = 8123
 CH_DATABASE = "ssp"
 CH_VIEW = "SubmittableSources"
@@ -817,7 +817,7 @@ def stratified_sample(strata, n, rng):
     return np.sort(np.concatenate(out)) if out else np.zeros(0, int)
 
 
-def ch_fetch(keys, host=CH_HOST, port=CH_PORT, database=CH_DATABASE, user=None, workers=CH_MAX_WORKERS,
+def ch_fetch(keys, host=None, port=CH_PORT, database=CH_DATABASE, user=None, workers=CH_MAX_WORKERS,
              chunk=CH_CHUNK):
     """``{processing: ids}`` -> the view rows, one query per (processing,
     chunk of ids), at most ``workers`` (<= 4) at once. Read-only."""
@@ -829,6 +829,7 @@ def ch_fetch(keys, host=CH_HOST, port=CH_PORT, database=CH_DATABASE, user=None, 
 
     if not 1 <= workers <= CH_MAX_WORKERS:
         raise ValueError(f"workers must be 1..{CH_MAX_WORKERS} (the server is shared)")
+    host = host or current_host()
     user, password = credentials(host, port, database, user)
     bypass_proxy(host)
     tasks = [(p, np.asarray(ids[k:k + chunk], dtype=np.int64))
@@ -1603,7 +1604,7 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--workers", type=int, default=CH_MAX_WORKERS,
                    help=f"concurrent queries (<= {CH_MAX_WORKERS})")
-    p.add_argument("--host", default=CH_HOST)
+    p.add_argument("--host", default=None, help="(default: ~/.clickhouse.host)")
     p.add_argument("--port", type=int, default=CH_PORT)
     p.add_argument("--user", default=None)
     p.add_argument("--schema", default=DEFAULT_SCHEMA)
