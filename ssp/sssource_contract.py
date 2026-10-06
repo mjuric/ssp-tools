@@ -96,6 +96,15 @@ MAX_NOT_BUILT_VISITS = 20
 #: warning, counted in the manifest as time_mismatch (docs/design/
 #: shutter-timing.md, "Visit-time guard").
 MAX_HEADER_MISMATCH_S = 0.001
+#: The guard also passes a pipeline time that equals the corrected time to
+#: within MAX_HEADER_MISMATCH_S (an input whose times are already corrected,
+#: e.g. once AP writes shutter-corrected DiaSource times): the time stands.
+#:
+#: A correction that moves a time by more than this [s] from the pipeline's
+#: visit time is not applied: the visit time, midpointMjdTai_flag True, a
+#: warning; counted in the manifest as shift_too_large. (The largest
+#: understood shift, the late-readout visits, is ~1.94 s.)
+MAX_CORRECTION_S = 3.0
 
 #: The predicted position's error ellipse (deg, deg, deg^2): the
 #: NearbySSO convention, i.e. the DiaSource raErr/decErr/ra_dec_Cov one.

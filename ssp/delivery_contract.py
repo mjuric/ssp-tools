@@ -77,7 +77,7 @@ SHUTTER_MANIFEST_FIELD = ("shutter_timing",
                           "{table_dir, table_format, calibration_id, package_version,"
                           " obstime_basis: {visit, corrected, both}: row counts,"
                           " status: {ok, degraded, omitted, not_built, outside_coverage,"
-                          " time_mismatch}: row counts,"
+                          " time_mismatch, shift_too_large, already_corrected}: row counts,"
                           " not_built_visits: [visit, ...], time_mismatch_visits: [visit, ...],"
                           " first_night: the table's first day_obs}")
 
