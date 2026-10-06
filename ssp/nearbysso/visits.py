@@ -363,7 +363,7 @@ def build_visits(dia, threads=None):
     # (exactly the shared time where there is one, so that rows at the
     # visit's time are evaluated exactly as before)
     for v in np.flatnonzero(tmax != tmin).tolist():
-        t_tai[v] = np.median(tsrc[starts[v]:ends[v]])
+        t_tai[v] = np.nanmedian(tsrc[starts[v]:ends[v]])
     out["t_tai_mjd"] = t_tai
 
     # centre and radius, a block of whole visits at a time

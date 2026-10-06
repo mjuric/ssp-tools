@@ -53,28 +53,45 @@ its own DiaSource's ``midpointMjdTai``, as read (``at_source_time``):
   predicted, bitwise;
 - a row at another time (shutter-corrected DiaSources: |dt| <= ~0.25 s,
   up to ~2 s for header-timed visits) is moved there: its position by dt
-  along the great circle of its rates (at dt/2, so to second order), its
-  ``ephOffset`` measured from there, and its
-  ellipse, rates, ``ephVmag`` and tail angles by their rates of change
-  times dt. The orbit pass computes those rates of change only at visits
-  whose sources' times differ (none, today), by a second, separate precise
-  evaluation ``DOT_STEP_DAYS`` later (``ellipse_at`` with the line of sight
-  moved by the topocentric velocity, for the ellipse); the first one is
-  untouched.
+  along the great circle of its rates at dt/2 (with the rotation of the
+  local east/north frame along the path, so to second order also near the
+  poles), its ``ephOffset`` measured from there, and its ellipse, rates,
+  ``ephVmag`` and tail angles by their rates of change times dt. The orbit
+  pass computes those rates of change only at visits whose sources' times
+  differ (none, today), from a second, separate precise evaluation
+  ``DOT_STEP_DAYS`` later; the first one is untouched. The ellipse's are
+  taken on both sides (``ellipse_at`` a step later and a step earlier),
+  the forward ones for dt > 0 and the backward ones for dt < 0, because
+  ``ellipse_at`` has a kink at each coarse sample and is constant beyond a
+  night's first and last, where visits often lie. If the second evaluation
+  fails (an exception, or non-finite values), the rates of change fall
+  back to 0, so the rows keep their visit's values; the run report counts
+  those predictions (``source_times.rates_of_change_fallback``).
 
 This costs a second ``compute_ephemerides_one`` per orbit with such visits
-(the precise stage is ~2.5% of the orbit pass), where an exact evaluation
+(~3.4% of the orbit pass's CPU on 2026-10-04), where an exact evaluation
 at each row's own time would cost a third pass re-integrating every matched
 orbit (and its coarse track, for the ellipse). Against that exact
 evaluation (``compute_ephemerides_one`` and ``ellipse_at`` at the row's
-time), the moved values agree to float32 rounding, and the positions to
-< 1e-4 mas, for |dt| up to 3 s (``test_rows_at_their_own_time``). The
-neglected terms are of order (third derivative) dt^3 for the position:
-< 1e-4 mas at 3 s even for an NEO at 0.001 AU, whose diurnal parallax
-would put a move with the visit's rates alone ~0.2 mas off. For the other
-values they are of order (second derivative) dt^2. Because the match is
-decided at the visit's time, a row's ``ephOffset`` may exceed its match
-radius by up to |rate x dt|.
+time), for |dt| up to 3 s, on objects picked for fast motion, the poles,
+opposition and RA 0/360 (the WP S3 review's set):
+
+- positions to < 1e-4 mas (|dec| <= 85 deg; 0.003 mas at 89.9 deg and 10
+  deg/day, where the neglected terms grow as tan(dec)^2);
+- the rates, ``ephVmag``, the sigmas to a few float32 ulps (``ra_dec_cov``
+  to ~20 of its own, small, ulps), and the tail angles to float32 rounding
+  except the anti-Sun angle near opposition, where it turns fast (~20
+  ulps, 6e-4 deg, at 3 s; 1 ulp at 0.24 s);
+- the ellipse at visits on a night's first, middle or last coarse sample
+  as elsewhere (a few ulps). Not covered: a coarse sample strictly between
+  the visit's time and the row's (a visit within |dt| of a sample, but not
+  on it) bends ``ellipse_at`` where the move does not, by (the change of
+  slope) x (the part of dt beyond the sample): at most what an on-sample
+  visit gave with one-sided rates, ~7e-4 relative at 3 s for the fastest
+  NEOs, and far less at 0.24 s.
+
+Because the match is decided at the visit's time, a row's ``ephOffset`` may
+exceed its match radius by up to |rate x dt|.
 
 The output is byte-identical for any ``workers``, ``read_workers``,
 ``chunk_factor`` and ``slice_days``: the orbit pass sees all nights at
@@ -133,11 +150,17 @@ PRED_DTYPE = np.dtype([
 #: their rates of change (``at_source_time``).
 _MOVED = ("vmag", "rate_ra", "rate_dec", "ra_err", "dec_err", "ra_dec_cov", "anti_sun_pa", "anti_motion_pa")
 
-#: The rates of change [per day] of a prediction's ``_MOVED`` values (32
-#: bytes), aligned with the predictions; only computed (``process_orbit``)
-#: when some visit's sources carry their own times, and nonzero only at
-#: those visits (and where finite).
-DOT_DTYPE = np.dtype([(f"{c}_dot", "f4") for c in _MOVED])
+#: The error ellipse's values among ``_MOVED``: their rates of change are
+#: taken on either side of the visit's time (``ellipse_at`` has a kink at
+#: each coarse sample, and is constant beyond the sampled span).
+_ELLIPSE = ("ra_err", "dec_err", "ra_dec_cov")
+
+#: The rates of change [per day] of a prediction's ``_MOVED`` values (44
+#: bytes), aligned with the predictions; ``<name>_dot`` forward in time,
+#: and for the ellipse also ``<name>_dot_back``, backward. Only computed
+#: (``process_orbit``) when some visit's sources carry their own times;
+#: nonzero only at those visits, and where finite.
+DOT_DTYPE = np.dtype([(f"{c}_dot", "f4") for c in _MOVED] + [(f"{c}_dot_back", "f4") for c in _ELLIPSE])
 
 #: A row's published values at its DiaSource's own time (``at_source_time``).
 PUB_DTYPE = np.dtype([
@@ -148,8 +171,10 @@ PUB_DTYPE = np.dtype([
 ])
 
 #: The step [day] of the rates of change of the published values
-#: (``process_orbit``).
-DOT_STEP_DAYS = 1e-4
+#: (``process_orbit``): 0.86 s. Their error is truncation (~ h/2 times the
+#: second derivative), 10x below 1e-4 d's, with no noise floor down to
+#: 1e-6 d.
+DOT_STEP_DAYS = 1e-5
 
 #: Rows further than this [s] from their visit's time are counted in the
 #: run report, with a warning: ``at_source_time``'s move is
@@ -163,7 +188,7 @@ _MATCH_BATCH = 1 << 18
 #: Per-orbit counters of the orbit pass.
 _COUNTS = ("orbits", "coarse_partial_fail", "coarse_all_fail", "exceptions", "with_candidates",
            "candidate_visits", "eligible", "sigma_rejected", "sigma_gated_nights", "nights_skipped",
-           "step_cap_stops")
+           "step_cap_stops", "rates_of_change_exception", "rates_of_change_nonfinite")
 _STAGES = ("coarse", "candidates", "precise", "ellipse", "dots")
 
 
@@ -331,26 +356,17 @@ def _visits_slice(s0, s1):
     return out, _peak_rss_gb()
 
 
-def dot_steps(visits, own, ts):
-    """Per visit, the step [day] of the rates of change of its predictions
-    (``process_orbit``): 0 unless ``own`` (its sources carry their own
-    times), else +-``DOT_STEP_DAYS``, the sign keeping the visit's time and
-    the step's between the same two coarse samples ``ts`` of its night (three
-    per night, as ``sample_times`` gives them), so that ``ellipse_at``
-    blends the same two."""
-    h = np.zeros(visits.size)
-    if not own.any():
-        return h
-    s3 = np.asarray(ts, dtype=np.float64).reshape(-1, 3)
-    nights = np.unique(visits["night"])
-    n = np.searchsorted(nights, visits["night"])
-    t = visits["t"]
-    # the sample above (or at) the visit's time, of its night; a visit on
-    # the night's first sample steps forward
-    upper = np.where(t <= s3[n, 0], s3[n, 1], np.where(t <= s3[n, 1], s3[n, 1], s3[n, 2]))
-    fwd = (t <= s3[n, 0]) | (t + DOT_STEP_DAYS <= upper)
-    h[own] = np.where(fwd, DOT_STEP_DAYS, -DOT_STEP_DAYS)[own]
-    return h
+def rates_of_change(x0, x1, h, angle=False):
+    """(x1 - x0) / h, the difference wrapped to [-180, 180) for an
+    ``angle`` [deg] (so across 0/360), and 0 where not finite. Returns it
+    and the mask of those non-finite."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        d = np.asarray(x1, np.float64) - np.asarray(x0, np.float64)
+        if angle:
+            d = (d + 180.0) % 360.0 - 180.0
+        dot = d / h
+    bad = ~np.isfinite(dot)
+    return np.where(bad, 0.0, dot), bad
 
 
 # --------------------------------------------------------------------------
@@ -435,36 +451,58 @@ def process_orbit(i, w, ephem, stage_t):
 
     # the rates of change of the published values, at the visits whose
     # sources carry their own times (at_source_time): from a second,
-    # separate evaluation a step (dot_steps) away, so that the first stays
-    # as it is
+    # separate evaluation DOT_STEP_DAYS later, so that the first stays as it
+    # is; the ellipse's also a step earlier. A failure leaves them 0 (the
+    # rows keep their visit's values), counted, never losing the orbit's rows.
     dots = np.zeros(k.size, dtype=DOT_DTYPE)
     own = w["dot_h"][cand[k]] != 0.0
     if own.any():
-        kd, vt = k[own], cand[k[own]]
-        h = w["dot_h"][vt]
-        e2 = compute_ephemerides_one(str(orbit["designation"]), w["times_h"][vt], None, ephem, row=orbit,
-                                     obs_pos=w["obs_pos_h"][vt].T, obs_vel=w["obs_vel_h"][vt].T,
-                                     nongrav=_nongrav.from_orbit(orbit))
-        ell2 = propagate.ellipse_at(track, w["t_h"][vt], topo_pos=e2.topo_pos.T)
-
-        def values(e, j, ell):
-            # (V from the float64 vectors here: only differences are taken)
-            vm = hg_V_mag(e.H, e.G, np.linalg.norm(e.helio_pos[:, j], axis=0),
-                          np.linalg.norm(e.topo_pos[:, j], axis=0), e.phase_angle[j])
-            pa = tail_position_angles(e.helio_pos[:, j], e.helio_vel[:, j], e.topo_pos[:, j])
-            return dict(vmag=vm, rate_ra=e.mu_lon[j], rate_dec=e.mu_lat[j], ra_err=ell[0], dec_err=ell[1],
-                        ra_dec_cov=ell[2], anti_sun_pa=pa[0], anti_motion_pa=pa[1])
-        x0 = values(e, kd, (ra_err[kd], dec_err[kd], ra_dec_cov[kd]))
-        x1 = values(e2, slice(None), ell2)
-        with np.errstate(invalid="ignore"):
-            for name in _MOVED:
-                d = x1[name] - x0[name]
-                if name.endswith("_pa"):
-                    d = (d + 180.0) % 360.0 - 180.0
-                dot = d / h
-                dots[f"{name}_dot"][own] = np.where(np.isfinite(dot), dot, 0.0)
+        try:
+            dots[own], n_bad = _rates_of_change_at(orbit, track, e, k[own], cand[k[own]],
+                                                   (ra_err, dec_err, ra_dec_cov), w, ephem)
+            c["rates_of_change_nonfinite"] = n_bad
+        except Exception:
+            dots[own] = 0.0
+            c["rates_of_change_exception"] = int(own.sum())
         stage_t["dots"] += time.perf_counter() - t4
     return p, c, dots
+
+
+def _rates_of_change_at(orbit, track, e, kd, vt, ell0, w, ephem):
+    """``process_orbit``'s rates of change (``DOT_DTYPE``) of the
+    predictions ``kd`` (into the first evaluation ``e`` and its ellipse
+    ``ell0``) at visits ``vt``, and the number of predictions with a
+    non-finite one (left 0)."""
+    h = w["dot_h"][vt]
+    e2 = compute_ephemerides_one(str(orbit["designation"]), w["times_h"][vt], None, ephem, row=orbit,
+                                 obs_pos=w["obs_pos_h"][vt].T, obs_vel=w["obs_vel_h"][vt].T,
+                                 nongrav=_nongrav.from_orbit(orbit))
+    t = w["visits"]["t"][vt]
+    ell_fwd = propagate.ellipse_at(track, w["t_h"][vt], topo_pos=e2.topo_pos.T)
+    # (the line of sight a step earlier: mirrored from the second
+    # evaluation's, to O(h^2); EphResult.topo_vel is not its derivative to
+    # the 1e-8 a fast NEO's covariance projection needs)
+    topo_back = 2.0 * e.topo_pos[:, kd] - e2.topo_pos
+    ell_back = propagate.ellipse_at(track, t - h, topo_pos=topo_back.T)
+
+    def values(e, j, ell):
+        # (V from the float64 vectors here: only differences are taken)
+        vm = hg_V_mag(e.H, e.G, np.linalg.norm(e.helio_pos[:, j], axis=0),
+                      np.linalg.norm(e.topo_pos[:, j], axis=0), e.phase_angle[j])
+        pa = tail_position_angles(e.helio_pos[:, j], e.helio_vel[:, j], e.topo_pos[:, j])
+        return dict(vmag=vm, rate_ra=e.mu_lon[j], rate_dec=e.mu_lat[j], ra_err=ell[0], dec_err=ell[1],
+                    ra_dec_cov=ell[2], anti_sun_pa=pa[0], anti_motion_pa=pa[1])
+    x0 = values(e, kd, tuple(x[kd] for x in ell0))
+    x1 = values(e2, slice(None), ell_fwd)
+    out = np.zeros(kd.size, dtype=DOT_DTYPE)
+    bad = np.zeros(kd.size, bool)
+    for name in _MOVED:
+        out[f"{name}_dot"], b = rates_of_change(x0[name], x1[name], h, angle=name.endswith("_pa"))
+        bad |= b
+    for j, name in enumerate(_ELLIPSE):
+        out[f"{name}_dot_back"], b = rates_of_change(ell_back[j], x0[name], h)
+        bad |= b
+    return out, int(bad.sum())
 
 
 def _orbit_chunk(o0, o1):
@@ -601,12 +639,20 @@ def at_source_time(p, dots, t_visit, t_row, ra_src, dec_src, sep):
     ``t_row`` (both TAI MJD), ``sep`` [arcsec] from the prediction.
 
     A row with ``t_row == t_visit`` gets the prediction and ``sep`` as
-    they are, bitwise. The others, at dt = t_row - t_visit, to first order:
-    the position moved by |rate| dt along the great circle of its rates
-    (``rate_ra``, ``rate_dec``, taken at dt/2), the separation from there,
-    and the ``_MOVED`` values plus their rates of change times dt (the
-    sigmas clipped at 0, the angles wrapped to [0, 360)). (dt is in TAI
-    days and the rates per TDB day: they differ by < 1e-8.)"""
+    they are, bitwise. The others, at dt = t_row - t_visit:
+
+    - the position moved by |rate| dt along the great circle of its rates
+      at dt/2, in the tangent frame at the prediction (``rate_ra``,
+      ``rate_dec`` plus their rates of change, plus the rotation of the
+      local east/north frame along the path: -tan(dec) mu_ra mu_dec and
+      +tan(dec) mu_ra^2, in deg/day^2 with the rates in rad/day); so to
+      second order in dt, also near the poles;
+    - the separation from the moved position;
+    - the ``_MOVED`` values plus their rates of change times dt (for the
+      ellipse, the forward rate for dt > 0 and the backward one for
+      dt < 0; the sigmas clipped at 0, the angles wrapped to [0, 360)).
+
+    (dt is in TAI days and the rates per TDB day: they differ by < 1e-8.)"""
     n = len(p)
     out = np.empty(n, dtype=PUB_DTYPE)
     out["ra"], out["dec"], out["sep"] = p["ra"], p["dec"], sep
@@ -629,8 +675,10 @@ def at_source_time(p, dots, t_visit, t_row, ra_src, dec_src, sep):
     north = np.stack([-sd * ca, -sd * sa, cd])
     # the displacement on the tangent plane [rad], and the point that far
     # along the great circle in its direction
-    rate_ra = q["rate_ra"].astype(np.float64) + qd["rate_ra_dot"].astype(np.float64) * (dt / 2.0)
-    rate_dec = q["rate_dec"].astype(np.float64) + qd["rate_dec_dot"].astype(np.float64) * (dt / 2.0)
+    mu_l, mu_b = q["rate_ra"].astype(np.float64), q["rate_dec"].astype(np.float64)
+    rot = np.tan(d) * np.radians(1.0)
+    rate_ra = mu_l + (qd["rate_ra_dot"].astype(np.float64) - rot * mu_l * mu_b) * (dt / 2.0)
+    rate_dec = mu_b + (qd["rate_dec_dot"].astype(np.float64) + rot * mu_l * mu_l) * (dt / 2.0)
     w = (east * rate_ra + north * rate_dec) * np.radians(dt)
     th = np.sqrt(np.sum(w * w, axis=0))
     x = pos * np.cos(th) + w * np.sinc(th / np.pi)
@@ -638,7 +686,10 @@ def at_source_time(p, dots, t_visit, t_row, ra_src, dec_src, sep):
     dec = out["dec"][m] = np.degrees(np.arctan2(x[2], np.hypot(x[0], x[1])))
     out["sep"][m] = util.sky_separation_arcsec(ra, dec, np.asarray(ra_src)[m], np.asarray(dec_src)[m])
     for c in _MOVED:
-        v = q[c].astype(np.float64) + qd[c + "_dot"].astype(np.float64) * dt
+        dot = qd[c + "_dot"].astype(np.float64)
+        if c in _ELLIPSE:
+            dot = np.where(dt > 0, dot, qd[c + "_dot_back"].astype(np.float64))
+        v = q[c].astype(np.float64) + dot * dt
         if c in ("ra_err", "dec_err"):
             v = np.maximum(v, 0.0)
         elif c.endswith("_pa"):
@@ -919,7 +970,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     times = Time(visits["t_tai_mjd"], format="mjd", scale="tai").tdb
     # (the second evaluation, at the visits whose sources carry their own
     # times: see process_orbit)
-    dot_h = dot_steps(visits, own, ts)
+    dot_h = np.where(own, DOT_STEP_DAYS, 0.0)
     times_h = times + TimeDelta(dot_h, format="jd")
     t_h = times_h.tdb.mjd - MJD_J2000
     obs_pos_h = np.full((visits.size, 3), np.nan)
@@ -1037,6 +1088,15 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     rows["ephAntiSunPA"] = pub["anti_sun_pa"]
     rows["ephAntiMotionPA"] = pub["anti_motion_pa"]
     source_times = _source_time_stats(pub, p, orbit_radius)
+    # (predictions whose rates of change fell back to 0, so whose rows
+    # keep their visit's values: the second evaluation raised, or some rate
+    # came out non-finite)
+    source_times["rates_of_change_fallback"] = dict(exception=counts["rates_of_change_exception"],
+                                                    nonfinite=counts["rates_of_change_nonfinite"])
+    if counts["rates_of_change_exception"]:
+        warnings.warn(f"{counts['rates_of_change_exception']} predictions' rates of change failed (an "
+                      "exception in the second evaluation); their rows keep their visit's values",
+                      stacklevel=2)
     sso_id, has_sso = ssobject_ids(ssobject_path, rows["designation"])
     rows["ssObjectId"] = sso_id
     tim["reduce"] = time.perf_counter() - t

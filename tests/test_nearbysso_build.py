@@ -8,6 +8,7 @@ and need no network.
 """
 
 import json
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -437,6 +438,7 @@ def _preds_moving(n, rng):
     p["anti_motion_pa"] = np.nan                   # (undefined: stays NaN)
     d = np.zeros(n, dtype=B.DOT_DTYPE)
     d["ra_err_dot"], d["dec_err_dot"], d["ra_dec_cov_dot"] = 1e-3, -2e-3, 1e-8
+    d["ra_err_dot_back"], d["dec_err_dot_back"], d["ra_dec_cov_dot_back"] = 2e-3, -1e-3, 2e-8
     d["rate_ra_dot"], d["rate_dec_dot"] = rng.normal(0, 1e4, n), rng.normal(0, 1e4, n)
     d["vmag_dot"] = 1.0
     d["anti_sun_pa_dot"] = 1e2
@@ -480,8 +482,12 @@ def test_at_source_time_moves_along_the_rates():
     m = ~same
     dt = out["dt"]
     np.testing.assert_array_equal(dt[m], (t_v + np.where(m, dt, 0.0) - t_v)[m])
-    r_ra = p["rate_ra"].astype(np.float64) + d["rate_ra_dot"].astype(np.float64) * dt / 2
-    r_dec = p["rate_dec"].astype(np.float64) + d["rate_dec_dot"].astype(np.float64) * dt / 2
+    # (the rates at dt/2 in the tangent frame at the prediction: theirs, and
+    # the rotation of the local frame along the path)
+    mu_l, mu_b = p["rate_ra"].astype(np.float64), p["rate_dec"].astype(np.float64)
+    rot = np.tan(np.radians(p["dec"])) * np.pi / 180.0
+    r_ra = mu_l + (d["rate_ra_dot"].astype(np.float64) - rot * mu_l * mu_b) * dt / 2
+    r_dec = mu_b + (d["rate_dec_dot"].astype(np.float64) + rot * mu_l * mu_l) * dt / 2
     moved = sky_separation_arcsec(p["ra"], p["dec"], out["ra"], out["dec"])
     want = np.hypot(r_ra, r_dec) * np.abs(dt) * 3600.0
     np.testing.assert_allclose(moved[m], want[m], rtol=1e-8, atol=1e-9)
@@ -497,8 +503,12 @@ def test_at_source_time_moves_along_the_rates():
     np.testing.assert_array_equal(out["sep"][m], sky_separation_arcsec(out["ra"], out["dec"], ra_s, dec_s)[m])
     assert ((out["ra"] >= 0) & (out["ra"] < 360)).all()
     # the rest, with their rates of change
-    for c, want, rtol in (("ra_err", 1e-4 + 1e-3 * dt, 1e-7), ("dec_err", 2e-4 - 2e-3 * dt, 1e-7),
-                          ("ra_dec_cov", -1e-9 + 1e-8 * dt, 1e-6), ("vmag", 20.0 + dt, 1e-7),
+    # (the ellipse: forward rates for dt > 0, backward ones for dt < 0)
+    fwd = dt > 0
+    for c, want, rtol in (("ra_err", 1e-4 + np.where(fwd, 1e-3, 2e-3) * dt, 1e-7),
+                          ("dec_err", 2e-4 + np.where(fwd, -2e-3, -1e-3) * dt, 1e-7),
+                          ("ra_dec_cov", -1e-9 + np.where(fwd, 1e-8, 2e-8) * dt, 1e-6),
+                          ("vmag", 20.0 + dt, 1e-7),
                           ("rate_ra", p["rate_ra"] + d["rate_ra_dot"].astype(np.float64) * dt, 1e-6),
                           ("rate_dec", p["rate_dec"] + d["rate_dec_dot"].astype(np.float64) * dt, 1e-6)):
         np.testing.assert_allclose(out[c][m], want[m].astype(np.float32), rtol=rtol, err_msg=c)
@@ -508,12 +518,69 @@ def test_at_source_time_moves_along_the_rates():
     np.testing.assert_allclose(dpa[m], (1e2 * dt)[m], rtol=0, atol=3e-5)
     assert (pa[1:3] < 1.0).all()
     assert np.isnan(out["anti_motion_pa"]).all()
-    # without rates of change (None): moved along the rates alone
+    # without rates of change (None): moved along the rates (and the frame
+    # rotation) alone
     out0 = B.at_source_time(p, None, t_v, t_v + dt, ra_s, dec_s, sep0)
     moved0 = sky_separation_arcsec(p["ra"], p["dec"], out0["ra"], out0["dec"])
-    rate = np.hypot(p["rate_ra"].astype(np.float64), p["rate_dec"].astype(np.float64))
+    rate = np.hypot(mu_l - rot * mu_l * mu_b * dt / 2, mu_b + rot * mu_l * mu_l * dt / 2)
     np.testing.assert_allclose(moved0[m], (rate * np.abs(dt) * 3600.0)[m], rtol=1e-8, atol=1e-9)
     np.testing.assert_array_equal(out0["vmag"], p["vmag"])
+
+
+@pytest.mark.parametrize("dec", [85.0, 89.9, -89.9])
+def test_at_source_time_near_the_poles(dec):
+    """A small circle of constant declination (local rates constant, so
+    their rates of change 0) and a great circle passing as far from the
+    pole, at 10 deg/day for 3 s: the moved position follows them, with the
+    rotation of the local east/north frame (without it: 0.04 mas off at 85
+    deg, 2 mas at 89.9)."""
+    from ssp.util import sky_separation_arcsec
+    dt = np.array([0.24, -2.0, 3.0, -3.0]) / 86400.0
+    mu = 10.0                                      # [deg/day]
+    h = B.DOT_STEP_DAYS
+
+    def radec(x):
+        return np.degrees(np.arctan2(x[1], x[0])) % 360.0, np.degrees(np.arctan2(x[2], np.hypot(x[0], x[1])))
+
+    def small(t):
+        a, d = np.radians(359.9999 + mu / np.cos(np.radians(dec)) * t), np.radians(dec)
+        return np.array([np.cos(d) * np.cos(a), np.cos(d) * np.sin(a), np.full_like(a, np.sin(d))])
+
+    def great(t):
+        b = np.radians(dec)
+        n, u = np.array([np.cos(b), 0.0, np.sin(b)]), np.array([0.0, 1.0, 0.0])
+        th = np.radians(mu * np.asarray(t)) - 1e-4
+        return n[:, None] * np.cos(th) + u[:, None] * np.sin(th)
+
+    def rates(f, t, eps=1e-7):
+        (a1, d1), (a2, d2) = radec(f(np.array([t - eps]))), radec(f(np.array([t + eps])))
+        _, d0 = radec(f(np.array([t])))
+        da = (a2 - a1 + 180.0) % 360.0 - 180.0
+        return np.cos(np.radians(d0)) * da / (2 * eps), (d2 - d1) / (2 * eps)
+
+    for f in (small, great):
+        ra0, dec0 = radec(f(np.zeros(1)))
+        (l0, b0), (l1, b1) = rates(f, 0.0), rates(f, h)
+        p = np.zeros(dt.size, B.PRED_DTYPE)
+        p["ra"], p["dec"], p["rate_ra"], p["rate_dec"] = ra0[0], dec0[0], l0[0], b0[0]
+        d = np.zeros(dt.size, B.DOT_DTYPE)
+        d["rate_ra_dot"], d["rate_dec_dot"] = (l1 - l0)[0] / h, (b1 - b0)[0] / h
+        out = B.at_source_time(p, d, np.zeros(dt.size), dt, p["ra"], p["dec"], np.zeros(dt.size))
+        ra1, dec1 = radec(f(dt))
+        err_mas = sky_separation_arcsec(out["ra"], out["dec"], ra1, dec1) * 1e3
+        assert err_mas.max() < (1e-4 if abs(dec) < 89 else 1e-2), (f.__name__, err_mas)
+
+
+def test_rates_of_change_across_0_360():
+    """The rates of change of angles go the short way across 0/360; non-
+    finite ones are 0, and flagged."""
+    h = 1e-5
+    dot, bad = B.rates_of_change([359.9, 0.1, 10.0, 5.0], [0.1, 359.9, 10.5, np.nan], h, angle=True)
+    np.testing.assert_allclose(dot, [0.2 / h, -0.2 / h, 0.5 / h, 0.0], rtol=1e-9)
+    assert bad.tolist() == [False, False, False, True]
+    dot, bad = B.rates_of_change([359.9, 1.0], [0.1, np.inf], h)
+    np.testing.assert_allclose(dot, [-359.8 / h, 0.0], rtol=1e-12)
+    assert bad.tolist() == [False, True]
 
 
 # ---------------------------------------------------------------------------
@@ -1000,49 +1067,38 @@ def synth_own_times(tmp_path_factory, synth):
     return out
 
 
-@needs_assist
-def test_rows_at_their_own_time(tmp_path, synth, synth_own_times, orbits, ephem):
-    """Sources with their own times: the same rows (the match is decided at
-    the visit's time), each row's published values evaluated at its own
-    DiaSource's time, as an exact evaluation there gives them; and the same
-    output for any workers and slicing."""
+def _check_own_time_rows(res, path, orbits, ephem):
+    """Each row of the build ``res`` (from the DiaSources at ``path``)
+    against an exact evaluation at its own DiaSource's time. Returns, per
+    sample position (0, 1, 2: the night's first, middle, last coarse
+    sample), the number of rows not at their visit's time whose visit's
+    time is exactly on that sample (ellipse_at has a kink at each, and
+    clamps beyond the first and the last)."""
     from ssp import nongrav
     from ssp.ephem_assist import MJD_J2000, compute_ephemerides_one, tail_position_angles
     from ssp.nearbysso import propagate
     from ssp.photfit import hg_V_mag
     from ssp.util import sky_separation_arcsec
 
-    ref = pq.read_table(_run(tmp_path, synth, orbits, "ref", workers=1)[0]).to_pandas()
-    ref = ref.set_index("diaSourceId")
-    out, rep = _run(tmp_path, (synth_own_times,), orbits, "own", workers=1)
-    res = pq.read_table(out).to_pandas().set_index("diaSourceId")
-    out2, _ = _run(tmp_path, (synth_own_times,), orbits, "own2", workers=2, read_workers=2, slice_days=1)
-    assert out2.read_bytes() == out.read_bytes()
-    assert list(res.index) == list(ref.index)
-    np.testing.assert_array_equal(res["designation"], ref["designation"])
-    np.testing.assert_array_equal(res["diaDistanceRank"], ref["diaDistanceRank"])
-
-    dia = pq.read_table(synth_own_times).to_pandas()
-    vis = V.build_visits(V.read_dia(synth_own_times))
+    dia = pq.read_table(path).to_pandas()
+    vis = V.build_visits(V.read_dia(path))
     ts = B.sample_times(V.VisitIndex(vis))
     obs = B.observer_at(ts)
+    on = {int(v): int(np.flatnonzero(ts == t)[0]) % 3
+          for v, t in zip(vis["visit"], vis["t"]) if (ts == t).any()}
+    t_visit = dict(zip(vis["visit"].tolist(), vis["t_tai_mjd"].tolist()))
+    at_sample = Counter()
     by_desig = {str(o["designation"]): o for o in orbits}
     # (the repeated diaSourceId loses to its first copy, as in test_end_to_end)
     first = dia.sort_values("visit", kind="stable").drop_duplicates("diaSourceId").set_index("diaSourceId")
-    n_moved, max_move, rate_change = 0, 0.0, 0.0
     for desig, grp in res.groupby("designation"):
         o = by_desig[desig]
         src = first.loc[grp.index]
         tt = Time(src["midpointMjdTai"].to_numpy(), format="mjd", scale="tai")
         e = compute_ephemerides_one(desig, tt, None, ephem, row=o, nongrav=nongrav.from_orbit(o))
         ra = e.ra_deg % 360.0
-        moved = sky_separation_arcsec(ref.loc[grp.index, "ephRa"].to_numpy(),
-                                      ref.loc[grp.index, "ephDec"].to_numpy(), grp["ephRa"].to_numpy(),
-                                      grp["ephDec"].to_numpy())
-        n_moved += int((moved > 0).sum())
-        max_move = max(max_move, float(moved.max()))
         # the position: to the integrator noise of the two evaluations (see
-        # test_end_to_end), against moves of up to tens of mas
+        # test_end_to_end), against moves of up to 0.2"
         err = sky_separation_arcsec(ra, e.dec_deg, grp["ephRa"].to_numpy(), grp["ephDec"].to_numpy())
         assert err.max() < 2e-5, (desig, err.max())
         off = sky_separation_arcsec(ra, e.dec_deg, src["ra"].to_numpy(), src["dec"].to_numpy())
@@ -1063,13 +1119,96 @@ def test_rows_at_their_own_time(tmp_path, synth, synth_own_times, orbits, ephem)
             got = grp[c].to_numpy()
             d = (got.astype(np.float64) - x + 180.0) % 360.0 - 180.0
             assert (np.abs(d) <= np.spacing(got)).all(), (desig, c, np.abs(d).max())
-        rel = grp["ephRateDec"] / ref.loc[grp.index, "ephRateDec"] - 1.0
-        rate_change = max(rate_change, float(np.abs(rel).max()))
+        for v, t in zip(src["visit"].tolist(), src["midpointMjdTai"].tolist()):
+            if v in on and t != t_visit[v]:
+                at_sample[on[v]] += 1
+    return at_sample
+
+
+@needs_assist
+def test_rows_at_their_own_time(tmp_path, synth, synth_own_times, orbits, ephem):
+    """Sources with their own times: the same rows (the match is decided at
+    the visit's time), each row's published values evaluated at its own
+    DiaSource's time, as an exact evaluation there gives them, including
+    at visits on a night's first, middle and last coarse sample; and the
+    same output for any workers and slicing."""
+    from ssp.util import sky_separation_arcsec
+
+    ref = pq.read_table(_run(tmp_path, synth, orbits, "ref", workers=1)[0]).to_pandas()
+    ref = ref.set_index("diaSourceId")
+    out, rep = _run(tmp_path, (synth_own_times,), orbits, "own", workers=1)
+    res = pq.read_table(out).to_pandas().set_index("diaSourceId")
+    out2, _ = _run(tmp_path, (synth_own_times,), orbits, "own2", workers=2, read_workers=2, slice_days=1)
+    assert out2.read_bytes() == out.read_bytes()
+    assert list(res.index) == list(ref.index)
+    np.testing.assert_array_equal(res["designation"], ref["designation"])
+    np.testing.assert_array_equal(res["diaDistanceRank"], ref["diaDistanceRank"])
+    # (the first and last visits of each night are on its first and last
+    # samples)
+    at_sample = _check_own_time_rows(res, synth_own_times, orbits, ephem)
+    assert at_sample[0] >= 3 and at_sample[2] >= 3, at_sample
+
     # a real test: most rows moved, some by more than the tolerances above
+    moved = sky_separation_arcsec(ref["ephRa"].to_numpy(), ref["ephDec"].to_numpy(), res["ephRa"].to_numpy(),
+                                  res["ephDec"].to_numpy())
+    assert (moved > 0).sum() > 0.6 * len(res) and moved.max() > 1e-3
+    assert np.abs(res["ephRateDec"] / ref["ephRateDec"] - 1.0).max() > 1e-5
     st = rep["source_times"]
-    assert n_moved > 0.6 * len(res) and max_move > 1e-3, (n_moved, len(res), max_move)
-    assert rate_change > 1e-5
     # (the report's moves are from the visit-level prediction, at the visit's
     # median time; the moves above, from the original visit time)
     assert st["rows_at_own_time"] > 0.6 * len(res) and st["rows_beyond_max_dt"] == 0
     assert 2.0 < st["max_abs_dt_s"] <= 3.0 + 1e-6 and st["max_move_arcsec"] > 1e-3
+    assert st["rates_of_change_fallback"] == dict(exception=0, nonfinite=0)
+
+    # one visit per night: its time is the night's middle sample (and the
+    # first and last are an hour away)
+    t = pq.read_table(synth_own_times)
+    visit = t["visit"].to_numpy()
+    with_rows = visit[np.isin(t["diaSourceId"].to_numpy(), res.index.to_numpy())]
+    keep = [with_rows[with_rows // 100000 == n].min() for n in np.unique(with_rows // 100000)]
+    path = tmp_path / "one_visit_per_night.parquet"
+    pq.write_table(t.filter(pa.array(np.isin(visit, keep))), path)
+    out3, _ = _run(tmp_path, (path,), orbits, "mid", workers=1)
+    res3 = pq.read_table(out3).to_pandas().set_index("diaSourceId")
+    at_sample = _check_own_time_rows(res3, path, orbits, ephem)
+    assert at_sample[1] >= 3 and not at_sample[0] and not at_sample[2], at_sample
+
+
+@needs_assist
+def test_rates_of_change_fall_back(tmp_path, synth_own_times, orbits, monkeypatch):
+    """A failing second evaluation (an exception, or non-finite values)
+    loses none of the orbit's rows: their rates of change fall back to 0,
+    so they keep their visit's values, and the run report counts them."""
+    real = B.compute_ephemerides_one
+    out0, _ = _run(tmp_path, (synth_own_times,), orbits, "fb0", workers=1)
+    ref = pq.read_table(out0).to_pandas().set_index("diaSourceId")
+    raise_on, nan_on = "2007 VY347", "2025 PM"
+    calls = Counter()
+
+    def eph(desig, *a, **kw):
+        calls[desig] += 1
+        e = real(desig, *a, **kw)
+        if calls[desig] == 2:                   # (the second evaluation)
+            if desig == raise_on:
+                raise RuntimeError("test: the second evaluation fails")
+            if desig == nan_on:
+                return e._replace(mu_lon=np.full_like(e.mu_lon, np.nan))
+        return e
+
+    monkeypatch.setattr(B, "compute_ephemerides_one", eph)
+    with pytest.warns(UserWarning, match="rates of change failed"):
+        out, rep = _run(tmp_path, (synth_own_times,), orbits, "fb", workers=1)
+    res = pq.read_table(out).to_pandas().set_index("diaSourceId")
+    assert list(res.index) == list(ref.index)
+    fb = rep["source_times"]["rates_of_change_fallback"]
+    assert fb["exception"] > 0 and fb["nonfinite"] > 0
+    assert rep["exceptions"] == {}
+    other = ~res["designation"].isin([raise_on, nan_on])
+    pd.testing.assert_frame_equal(res[other], ref[other])
+    # the failing orbit: no rates of change, so e.g. its ellipse and V at
+    # the visit's time; the NaN one: only ephRateRa's fell back
+    r = res[res["designation"] == raise_on]
+    assert len(r) and (r["ephRateDec"] != ref.loc[r.index, "ephRateDec"]).any()
+    n = res[res["designation"] == nan_on]
+    assert len(n) and (n["ephRateRa"] != ref.loc[n.index, "ephRateRa"]).any()
+    np.testing.assert_array_equal(n["ephRateDec"], ref.loc[n.index, "ephRateDec"])

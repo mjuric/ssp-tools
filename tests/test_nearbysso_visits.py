@@ -210,6 +210,13 @@ def test_build_visits_time_spread():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert V.build_visits(d2)["t_tai_mjd"][0] == np.median(d2["midpointMjdTai"])
+    # (NaN-safe, although read_dia drops non-finite times)
+    d3 = {k: v[10:15].copy() for k, v in dia.items()}
+    d3["midpointMjdTai"][1] = np.nan
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        t3 = V.build_visits(d3)["t_tai_mjd"][0]
+    assert t3 == np.nanmedian(d3["midpointMjdTai"]) and np.isfinite(t3)
 
 
 def test_build_visits_unsorted():
