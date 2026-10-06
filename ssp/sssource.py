@@ -38,9 +38,10 @@ from .ephem_assist import (MJD_J2000, compute_ephemerides_one, open_ephem, tail_
 from .nearbysso import propagate as _propagate
 # (a module attribute, so tests can substitute it)
 from . import sssource_ellipse as _ellipse
+from .delivery_contract import SHUTTER_INPUT_COLUMNS
 from .sssource_contract import (
-    ELLIPSE_COLUMNS, ID_SPLIT, MATCH_METHODS, SSSOURCE_DICTIONARY, SSSOURCE_NONNULL, SSSOURCE_SORT,
-    VIEW_DROPPED, SSSourceDtype,
+    ELLIPSE_COLUMNS, ID_SPLIT, MATCH_METHODS, SHUTTER_INTERNAL, SSSOURCE_DICTIONARY, SSSOURCE_NONNULL,
+    SSSOURCE_SORT, VIEW_DROPPED, SSSourceDtype,
 )
 
 
@@ -57,10 +58,19 @@ LINK_COLUMNS = ("obsid", "trksub", "trkid", "submission_id", "primary")
 MEASURED_ON_COLUMNS = ("measuredOn", "processing", "processingTable")
 #: Block 4: the measurement, copied from dia_sources.parquet.
 MEASUREMENT_COLUMNS = _NAMES[_NAMES.index("visit"):_NAMES.index("glint_trail") + 1]
-#: The shutter-correction flags (docs/design/shutter-timing.md). A
-#: dia_sources.parquet without them predates the correction: its times are
-#: the visits' midpoints, so the flags are written True / False.
+#: The shutter-correction flags (docs/design/shutter-timing.md), copied
+#: with the corrected midpointMjdTai when dia_sources.parquet has the
+#: correction (all of SHUTTER_INPUT_COLUMNS). A dia_sources.parquet without
+#: any of them predates the correction: its times are the visits'
+#: midpoints, so the flags are written True / False.
 SHUTTER_FLAGS = ("midpointMjdTai_flag", "midpointMjdTai_flag_degraded")
+#: With the correction, the observer state and the Sun are evaluated once
+#: per visit time (midpointMjdTaiVisit) and shifted to each row's
+#: midpointMjdTai (see observer_states); rows whose two times differ by more
+#: than this [s] are evaluated at their own time instead.
+MAX_SHIFT_S = 1.0
+#: observer_states' finite-difference step for the observer's acceleration [s].
+OBSERVER_SHIFT_STEP_S = 0.25
 #: Block 6: the ephemeris and geometry, computed here.
 EPHEMERIS_COLUMNS = _NAMES[_NAMES.index("eclLambda"):]
 #: Block 6 columns that are measured (from the observed position and time),
@@ -69,10 +79,12 @@ MEASURED_EPH_COLUMNS = ("elongation", "eclLambda", "eclBeta", "galLon", "galLat"
 
 #: dia_sources.parquet columns not carried into SSSource: the view's query
 #: helpers, the view's ``parentId`` (split into parentDiaSourceId /
-#: parentSourceId), and extract-submitted-sources' match diagnostics (which
-#: stay in dia_sources.parquet).
-DIA_DROPPED = VIEW_DROPPED + ("parentId", "obssubid", "match",
-                              "sep_mas", "dt_ms", "dmag", "band_ok", "n_pass", "ambiguous")
+#: parentSourceId), extract-submitted-sources' match diagnostics (which
+#: stay in dia_sources.parquet), and the shutter correction's internal
+#: columns (SHUTTER_INTERNAL: midpointMjdTaiVisit, obstime_basis). All are
+#: dropped without a warning.
+DIA_DROPPED = VIEW_DROPPED + ("parentId", "obssubid", "match", "sep_mas", "dt_ms", "dmag", "band_ok",
+                              "n_pass", "ambiguous") + SHUTTER_INTERNAL
 
 
 # The SSSource fields compute_sssource_entry fills in (and nothing else):
@@ -567,12 +579,26 @@ def _split_ids(measuredOn, id_, parent_id):
     return out
 
 
+def shutter_corrected(dia_present):
+    """Whether a dia_sources.parquet with columns ``dia_present`` has
+    shutter-corrected times: True with all of SHUTTER_INPUT_COLUMNS, False
+    with none (it predates the correction); raises ValueError for a
+    partial set."""
+    have = [c for c in SHUTTER_INPUT_COLUMNS if c in dia_present]
+    if have and len(have) != len(SHUTTER_INPUT_COLUMNS):
+        raise ValueError(f"dia_sources.parquet has the shutter-correction columns {have} but lacks "
+                         f"{[c for c in SHUTTER_INPUT_COLUMNS if c not in dia_present]}: all of "
+                         f"{SHUTTER_INPUT_COLUMNS} or none")
+    return bool(have)
+
+
 def _dia_read_columns(dia_present):
     """The dia_sources.parquet columns the build copies (block 1, 3 and 4),
-    and whether matchMethod is among them; raises ValueError if some are
+    whether matchMethod is among them, and whether the times are
+    shutter-corrected (shutter_corrected); raises ValueError if some are
     missing."""
     has_match_method = "matchMethod" in dia_present
-    corrected = all(c in dia_present for c in SHUTTER_FLAGS)
+    corrected = shutter_corrected(dia_present)
     need = (list(LINK_COLUMNS) + list(MEASURED_ON_COLUMNS) + ["diaSourceId", "parentId"]
             + [c for c in MEASUREMENT_COLUMNS if corrected or c not in SHUTTER_FLAGS]
             + (["matchMethod"] if has_match_method else ["match", "obssubid"]))
@@ -580,7 +606,65 @@ def _dia_read_columns(dia_present):
     if missing:
         raise ValueError(f"dia_sources.parquet lacks {missing}: SSSource is built from the output of "
                          "extract-submitted-sources")
-    return need, has_match_method
+    return need, has_match_method, corrected
+
+
+def _unique_observer_states(t_mjd_tai):
+    """The X05 barycentric position and velocity (astropy Quantities, each
+    (3, M)) at the M unique TAI MJDs of ``t_mjd_tai``, and the inverse index
+    (N,) back to ``t_mjd_tai``: one vectorized call (the computation costs
+    ~65 us per time plus a large fixed overhead per call)."""
+    tu, inv = np.unique(t_mjd_tai, return_inverse=True)
+    robs, vobs = util.observatory_barycentric_posvel("X05", Time(tu, format="mjd", scale="tai"))
+    return tu, robs, vobs, inv
+
+
+def observer_states(t_mjd_tai, t_visit=None):
+    """The observer's (X05) barycentric ICRF state at each TAI MJD of
+    ``t_mjd_tai``: (obs_pos [AU], obs_vel [km/s]), each of shape (N, 3).
+
+    Without ``t_visit``, it is computed exactly, once per unique time. With
+    ``t_visit`` (each row's visit midpoint, from which its time differs by
+    the shutter-motion correction, dt, |dt| <= 0.24 s), it is computed once
+    per unique visit time, and at that time + OBSERVER_SHIFT_STEP_S, and
+    shifted by dt: position r + v dt + a dt^2 / 2 and velocity v + a dt,
+    with the acceleration a from the two velocities. (Exact evaluation per
+    source costs ~0.2 ms per unique time: ~25 min and GBs for a day's 8M
+    sources.) The shift is accurate to well under a micro-arcsecond as seen
+    from any solar-system distance (see tests/test_sssource_shutter.py).
+    Rows with dt == 0 get exactly their visit time's state; rows with |dt|
+    > MAX_SHIFT_S, or a non-finite dt, are computed exactly at their own
+    time.
+    """
+    t = np.asarray(t_mjd_tai, dtype=np.float64)
+    if t_visit is None:
+        _, robs, vobs, inv = _unique_observer_states(t)
+        return robs.to_value(u.au)[:, inv].T, vobs.to_value(u.km / u.s)[:, inv].T
+
+    pos = np.empty((len(t), 3))
+    vel = np.empty((len(t), 3))
+    tv = np.asarray(t_visit, dtype=np.float64)
+    dt_s = (t - tv) * 86400.0
+    shift = np.abs(dt_s) <= MAX_SHIFT_S       # (False for NaN)
+    if shift.any():
+        tu, robs, vobs, inv = _unique_observer_states(tv[shift])
+        h_day = OBSERVER_SHIFT_STEP_S / 86400.0
+        _, vobs1 = util.observatory_barycentric_posvel(
+            "X05", Time(tu, np.full(len(tu), h_day), format="mjd", scale="tai"))
+        r0 = robs.to_value(u.au)                                        # AU
+        v0 = vobs.to_value(u.au / u.day)                                # AU/day
+        acc = (vobs1.to_value(u.au / u.day) - v0) / h_day               # AU/day^2
+        v0_kms = vobs.to_value(u.km / u.s)
+        acc_kms = (vobs1.to_value(u.km / u.s) - v0_kms) / OBSERVER_SHIFT_STEP_S   # km/s^2
+        d = dt_s[shift]
+        dd = d / 86400.0
+        pos[shift] = (r0[:, inv] + v0[:, inv] * dd + 0.5 * acc[:, inv] * (dd * dd)).T
+        vel[shift] = (v0_kms[:, inv] + acc_kms[:, inv] * d).T
+    if not shift.all():
+        _, robs, vobs, inv = _unique_observer_states(t[~shift])
+        pos[~shift] = robs.to_value(u.au)[:, inv].T
+        vel[~shift] = vobs.to_value(u.km / u.s)[:, inv].T
+    return pos, vel
 
 
 # --------------------------------------------------------------------------
@@ -601,7 +685,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     dia_path = f"{input_dir}/dia_sources.parquet"
     dia_file = pq.ParquetFile(dia_path)
     dia_present = dia_file.schema_arrow.names
-    copy_columns, has_match_method = _dia_read_columns(set(dia_present))
+    copy_columns, has_match_method, corrected = _dia_read_columns(set(dia_present))
     unexpected = sorted(set(dia_present) - set(_NAMES) - set(DIA_DROPPED) - set(copy_columns))
     if unexpected:
         print(f"WARNING: dia_sources.parquet columns not in SSSource, dropped: {unexpected}",
@@ -609,9 +693,13 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
 
     # Read only the columns linking and the ephemerides need here; the rest
     # are copied column by column at the end (the file has ~150).
+    # Every ephemeris column is computed at the row's midpointMjdTai (with the
+    # correction, the shutter-corrected time); midpointMjdTaiVisit only
+    # anchors the shift of the observer state and the Sun (observer_states).
     dia = pd.read_parquet(
         dia_path, engine="pyarrow", dtype_backend="pyarrow",
-        columns=["obsid", "ra", "dec", "midpointMjdTai", "sep_mas", "dt_ms"],
+        columns=["obsid", "ra", "dec", "midpointMjdTai", "sep_mas", "dt_ms"]
+        + (["midpointMjdTaiVisit"] if corrected else []),
     ).reset_index(drop=True)
     if not dia["obsid"].is_unique:
         raise ValueError("dia_sources.parquet: obsid is not unique")
@@ -769,29 +857,41 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     sss["ssObjectId"][:n_orbit] = util.packed_ascii_to_uint64_le(assoc["mpc_packed"].iloc[:n_orbit])
     sss["designation"] = assoc["mpc_provid"].fillna("")
 
-    df = dia[["ra", "dec", "midpointMjdTai"]].iloc[assoc["dia_index"]]
+    df = dia[["ra", "dec", "midpointMjdTai"] + (["midpointMjdTaiVisit"] if corrected else [])
+             ].iloc[assoc["dia_index"]]
     ra, dec, t = (
         df["ra"].to_numpy(),
         df["dec"].to_numpy(),
         Time(df["midpointMjdTai"].to_numpy(), format="mjd", scale="tai"),
     )
+    t_visit = (df["midpointMjdTaiVisit"].to_numpy(dtype=np.float64, na_value=np.nan)
+               if corrected else None)
 
-    sss["elongation"] = util.solar_elongation_ndarray(ra, dec, t)
+    if t_visit is None:
+        sss["elongation"] = util.solar_elongation_ndarray(ra, dec, t)
+    else:
+        # the Sun once per visit time, shifted (as observer_states)
+        dt_s = (t.tai.mjd - t_visit) * 86400.0
+        shift = np.abs(dt_s) <= MAX_SHIFT_S
+        if shift.any():
+            sss["elongation"][shift] = util.solar_elongation_ndarray(
+                ra[shift], dec[shift], Time(t_visit[shift], format="mjd", scale="tai"), dt_s=dt_s[shift])
+        if not shift.all():
+            sss["elongation"][~shift] = util.solar_elongation_ndarray(ra[~shift], dec[~shift], t[~shift])
+        print(f"Shutter-corrected times: |midpointMjdTai - midpointMjdTaiVisit| up to "
+              f"{np.nanmax(np.abs(dt_s), initial=0.0):.3f} s; {int(np.sum(~shift)):,} rows beyond "
+              f"{MAX_SHIFT_S} s (or without a visit time) evaluated at their own time", flush=True)
 
     # Observer barycentric state for every observation, carried per row of
-    # assoc so compute_sssource_entry gets its object's slice. It is
-    # computed once per unique time (all sources from a visit share one
-    # midpointMjdTai) in one vectorized call: the computation costs ~65 us
-    # per time plus a large fixed overhead per call.
-    tu, inv = np.unique(t.tai.mjd, return_inverse=True)
-    robs, vobs = util.observatory_barycentric_posvel("X05", Time(tu, format="mjd", scale="tai"))
+    # assoc so compute_sssource_entry gets its object's slice: once per
+    # unique time (all sources from a visit share one midpointMjdTai), or,
+    # with shutter-corrected times, once per visit time and shifted.
     # (a numpy structured array rather than columns of assoc, as slicing a
     # DataFrame per object cost more than the rest of the bookkeeping)
     obs_state = np.zeros(totalNumObs, dtype=[
         ("dia_index", np.int64), ("obs_pos", np.float64, 3), ("obs_vel", np.float64, 3)])
     obs_state["dia_index"] = assoc["dia_index"].to_numpy()
-    obs_state["obs_pos"] = robs.to_value(u.au)[:, inv].T
-    obs_state["obs_vel"] = vobs.to_value(u.km / u.s)[:, inv].T
+    obs_state["obs_pos"], obs_state["obs_vel"] = observer_states(t.tai.mjd, t_visit)
 
     # FIXME: verify these coordinate transforms replicate IAU76 at JPL
     p = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, distance=1 * u.au, frame="hcrs")
@@ -884,7 +984,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
               "derived it from match and obssubid")
         columns["matchMethod"] = cast_column(
             "matchMethod", _derive_match_method(pending["match"], pending["obssubid"]))
-    if SHUTTER_FLAGS[0] not in copy_columns:
+    if not corrected:
         print("dia_sources.parquet has no shutter-corrected times (it predates them): "
               "midpointMjdTai is the visit midpoint, midpointMjdTai_flag set on every row")
         n = len(src)
