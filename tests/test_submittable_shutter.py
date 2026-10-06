@@ -183,7 +183,7 @@ def test_four_statuses(tmp_path, capsys):
         assert (r["obstime_basis"] == "both") is (corrected and abs(r["dt_corrected_ms"]) <= S.DT_MS)
     n = {s: sum(e["status"] == s for e in ex) for s in range(4)}
     assert rep["status"] == dict(ok=n[0], degraded=n[1], omitted=n[2], not_built=n[3], outside_coverage=0,
-                                 time_mismatch=0)
+                                 time_mismatch=0, large_shift=0, already_corrected=0)
     assert rep["first_night"] == 20250810 and rep["time_mismatch_visits"] == []   # the fixture's
     nb = sorted(e["visit"] for e in ex if e["status"] == 3)
     assert rep["not_built_visits"] == nb
@@ -242,7 +242,7 @@ def test_two_basis_match(tmp_path):
     assert abs(out["o1"]["dt_corrected_ms"]) < 0.01 and out["o1"]["dt_ms"] == pytest.approx(-(tc - tv) / MS)
     assert rep["obstime_basis"] == dict(visit=1, corrected=2, both=1)
     assert rep["status"] == dict(ok=4, degraded=0, omitted=0, not_built=0, outside_coverage=0,
-                                 time_mismatch=0)
+                                 time_mismatch=0, large_shift=0, already_corrected=0)
     assert rep["not_built_visits"] == []
 
 
@@ -252,16 +252,16 @@ def test_position_window_covers_both_times():
     tai = np.array([61046.0 + 1 / 1440 - 0.1 / 86400])        # 0.1 s before a minute boundary
     obs = dict(tai=tai, ra=np.array([10.0]), dec=np.array([1.0]))
     (_, sql0, _, sets0), = S.position_queries(obs, np.array([0]), "ssp")
-    (_, sql1, _, sets1), = S.position_queries(obs, np.array([0]), "ssp", shift_s=S.MAX_SHUTTER_SHIFT_S)
+    (_, sql1, _, sets1), = S.position_queries(obs, np.array([0]), "ssp", shift_s=S.MIN_WINDOW_SHIFT_S)
     m = int(np.floor(tai[0] * 1440))
     assert list(sets0["b"]) == [m] and list(sets1["b"]) == [m, m + 1]
     tai = np.array([61046.0 + 30 / 86400])                       # mid-minute
     obs["tai"] = tai
     (_, sql0, _, sets0), = S.position_queries(obs, np.array([0]), "ssp")
-    (_, sql1, _, sets1), = S.position_queries(obs, np.array([0]), "ssp", shift_s=S.MAX_SHUTTER_SHIFT_S)
+    (_, sql1, _, sets1), = S.position_queries(obs, np.array([0]), "ssp", shift_s=S.MIN_WINDOW_SHIFT_S)
     assert f"{float(tai[0] - S.DT_MS / 1e3 / 86400)!r}" in sql0
-    assert f"{float(tai[0] - (S.DT_MS / 1e3 + S.MAX_SHUTTER_SHIFT_S) / 86400)!r}" in sql1
-    assert f"{float(tai[0] + (S.DT_MS / 1e3 + S.MAX_SHUTTER_SHIFT_S) / 86400)!r}" in sql1
+    assert f"{float(tai[0] - (S.DT_MS / 1e3 + S.MIN_WINDOW_SHIFT_S) / 86400)!r}" in sql1
+    assert f"{float(tai[0] + (S.DT_MS / 1e3 + S.MIN_WINDOW_SHIFT_S) / 86400)!r}" in sql1
 
 
 def test_position_pass_fetches_corrected_match_across_a_minute(tmp_path):
@@ -276,7 +276,7 @@ def test_position_pass_fetches_corrected_match_across_a_minute(tmp_path):
     obs = [dict(obsid="o", obssubid="hand", ra=10.0, dec=1.0, obstime=utc(tc + off), band="Lr", mag=20.0)]
     assert np.floor((tv + off) * 1440) != np.floor((tc + off) * 1440)
     o, _, _ = S.load_obs(obs_table(obs))
-    tasks = S.position_queries(o, np.array([0]), "ssp", shift_s=S.MAX_SHUTTER_SHIFT_S)
+    tasks = S.position_queries(o, np.array([0]), "ssp", shift_s=S.MIN_WINDOW_SHIFT_S)
     (_, got), = fake_fetch(view_table(view))(tasks)
     assert len(got) == 1
     (_, got), = fake_fetch(view_table(view))(S.position_queries(o, np.array([0]), "ssp"))
@@ -380,26 +380,185 @@ def test_empty_table_has_no_coverage(tmp_path):
 def test_warnings_list_at_most_20_visits(capsys):
     corr = S.Corrections(TABLE, max_not_built_visits=1000)
     visits = np.arange(25) + 2026010600001
-    nb, tm = corr.check(visits, np.full(25, S.NOT_BUILT), np.full(25, np.nan))
+    nan = np.full(25, np.nan)
+    nb, tm = corr.check(visits, np.full(25, S.NOT_BUILT), nan, nan)
     assert nb == visits.tolist() and tm == []
     err = capsys.readouterr().err
     assert str(visits[19]) in err and str(visits[20]) not in err and "... and 5 more" in err
-    nb, tm = corr.check(visits, np.full(25, S.TIME_MISMATCH), np.full(25, 0.07))
+    nb, tm = corr.check(visits, np.full(25, S.TIME_MISMATCH), np.full(25, 0.07), nan)
     assert nb == [] and tm == visits.tolist()
     err = capsys.readouterr().err
     assert "+70.0 ms" in err and "... and 5 more" in err and str(visits[20]) not in err
+    nb, tm = corr.check(visits, np.full(25, S.LARGE_SHIFT), nan, np.full(25, -3.5))
+    assert nb == [] and tm == []
+    err = capsys.readouterr().err
+    assert "3.500 s" in err and "applied, marked degraded" in err
+    assert "... and 5 more" in err and str(visits[20]) not in err
 
 
 def test_header_guard_unit():
-    """Within MAX_HEADER_MISMATCH_S of the header midpoint: applied; beyond:
-    rejected; a visit missing from the log (NaN): the table's status stands."""
+    """Header within MAX_HEADER_MISMATCH_S (or not logged): applied, as
+    LARGE_SHIFT if the shift exceeds MAX_CORRECTION_S; otherwise the
+    pipeline time equal to the corrected one: ALREADY_CORRECTED; otherwise
+    TIME_MISMATCH, however large the shift."""
     assert S.VISIT_TIME_GUARD is S.header_guard
-    h = np.array([61046.25, 61046.25, 61046.25, np.nan])
-    t = h + np.array([0.0009, -0.0009, 0.0011, 0.0]) / 86400
-    t[3] = 61046.25
-    reject, d = S.header_guard({"header_mid_mjd_tai": h}, t)
-    assert list(reject) == [False, False, True, False]
-    assert d[:3] == pytest.approx([0.0009, -0.0009, 0.0011], abs=1e-6) and np.isnan(d[3])
+    h0 = 61046.25
+    cases = [  # (pipeline - header [s], header present, corrected - header [s], verdict)
+        (0.0009, True, 0.2, S.GUARD_APPLY),
+        (-0.0009, True, 0.2, S.GUARD_APPLY),
+        (0.0011, True, 0.2, S.TIME_MISMATCH),
+        (0.0, False, 0.2, S.GUARD_APPLY),
+        (0.2, True, 0.2, S.ALREADY_CORRECTED),          # pipeline = corrected
+        (0.2009, True, 0.2, S.ALREADY_CORRECTED),
+        (0.2011, True, 0.2, S.TIME_MISMATCH),           # neither
+        (0.0, True, 3.5, S.LARGE_SHIFT),
+        (0.0, True, -3.5, S.LARGE_SHIFT),
+        (0.0, False, 60.0, S.LARGE_SHIFT),              # not logged: the table's status, large
+        (0.0, True, 2.5, S.GUARD_APPLY),
+        (0.5, True, 3.6, S.TIME_MISMATCH),              # neither, and large
+        (5.0, True, 5.0, S.ALREADY_CORRECTED),          # already corrected after a large shift
+        # a correction under 1 ms on a header-matching (or unlogged) visit
+        # is an ordinary correction, not an already-corrected input
+        (0.0, True, 0.0005, S.GUARD_APPLY),
+        (0.0, False, 0.0005, S.GUARD_APPLY),
+    ]
+    h = np.array([h0 if c[1] else np.nan for c in cases])
+    tp = np.array([h0 + c[0] / 86400 for c in cases])
+    tcorr = np.array([h0 + c[2] / 86400 for c in cases])
+    verdict, dh, shift = S.header_guard({"header_mid_mjd_tai": h}, tp, tcorr)
+    assert list(verdict) == [c[3] for c in cases]
+    assert shift == pytest.approx([c[2] - c[0] for c in cases], abs=1e-5)
+    assert dh[0] == pytest.approx(0.0009, abs=1e-6) and np.isnan(dh[3])
+
+
+def test_correction_cap_boundary(monkeypatch):
+    """|shift| == MAX_CORRECTION_S is an ordinary correction; just beyond
+    it, LARGE_SHIFT."""
+    h0 = 61046.25
+    tcorr = np.array([h0 + 3.0 / 86400, h0 - 3.0 / 86400])
+    tp = np.array([h0, h0])
+    shift = (tcorr - tp) * 86400
+    monkeypatch.setattr(S, "MAX_CORRECTION_S", float(np.abs(shift).min()))
+    verdict, _, _ = S.header_guard({"header_mid_mjd_tai": tp}, tp, tcorr)
+    i = int(np.argmin(np.abs(shift)))
+    assert verdict[i] == S.GUARD_APPLY and verdict[1 - i] in (S.GUARD_APPLY, S.LARGE_SHIFT)
+    monkeypatch.setattr(S, "MAX_CORRECTION_S", float(np.abs(shift).min()) * (1 - 1e-12))
+    verdict, _, _ = S.header_guard({"header_mid_mjd_tai": tp}, tp, tcorr)
+    assert list(verdict) == [S.LARGE_SHIFT] * 2
+
+
+def test_shift_window_covers_the_cap():
+    assert S.MIN_WINDOW_SHIFT_S >= S.MAX_CORRECTION_S
+
+
+def _late(tmp_path, shift_s):
+    """A fixture copy where V0 is a late-readout visit: header midpoint (=
+    pipeline time) ``shift_s`` after the corrected time of (D0, X0, Y0).
+    Returns (table, corrected time, pipeline time)."""
+    table = _copy_table(tmp_path)
+    tc = reference(V0, D0, X0, Y0, table_dir=table).t_mid_mjd_tai[0]
+    tp = tc + shift_s / 86400
+    _set_header(table, V0, tp)
+    return table, tc, tp
+
+
+@pytest.mark.parametrize("shift, expect", [(3.5, "large_shift"), (-3.5, "large_shift"), (2.5, "ok")])
+def test_cap_end_to_end(tmp_path, capsys, shift, expect):
+    """A large shift is applied and marked degraded (not flagged); a
+    shift under the cap is an ordinary correction."""
+    table, tc, tp = _late(tmp_path, shift)
+    view = [dict(id=1, ra=10.0, midpointMjdTai=tp, visit=V0, detector=D0, x=X0, y=Y0)]
+    obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(tp), band="Lr", mag=20.0)]
+    out, _, rep = run(tmp_path, obs, view, table=table)
+    r = out["o"]
+    assert rep["status"][expect] == 1 and sum(rep["status"].values()) == 1
+    assert r["midpointMjdTai"] == tc and not r["midpointMjdTai_flag"]
+    assert r["midpointMjdTai_flag_degraded"] is (expect == "large_shift")
+    assert r["midpointMjdTaiVisit"] == tp
+    err = capsys.readouterr().err
+    assert (f"{V0} ({abs(shift):.3f} s)" in err) is (expect == "large_shift")
+
+
+def test_large_shift_not_matching_header_is_time_mismatch(tmp_path):
+    """A large shift whose pipeline time matches neither the header nor the
+    corrected time: time_mismatch (the visit time, flagged)."""
+    table, tc, tp = _late(tmp_path, 10.0)
+    t_off = tp + 0.5 / 86400
+    view = [dict(id=1, ra=10.0, midpointMjdTai=t_off, visit=V0, detector=D0, x=X0, y=Y0)]
+    obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(t_off), band="Lr", mag=20.0)]
+    out, _, rep = run(tmp_path, obs, view, table=table)
+    assert out["o"]["midpointMjdTai"] == t_off and out["o"]["midpointMjdTai_flag"]
+    assert not out["o"]["midpointMjdTai_flag_degraded"]
+    assert rep["status"]["time_mismatch"] == 1 and rep["status"]["large_shift"] == 0
+
+
+def test_window_shift_per_night(tmp_path):
+    """The window is MIN_WINDOW_SHIFT_S on ordinary nights (and unbuilt
+    ones) and covers a night's largest visit-level shift plus the gradient."""
+    corr = S.Corrections(TABLE)
+    mjd = int(np.floor(VISIT_T[V0]))
+    assert corr.window_shift(mjd) == S.MIN_WINDOW_SHIFT_S
+    assert corr.window_shift(mjd + 30) == S.MIN_WINDOW_SHIFT_S          # no table
+    table, tc, tp = _late(tmp_path, 60.0)
+    corr = S.Corrections(table)
+    vis = S.Corrections(table).exposure_log(np.array([V0]))["t_mid_visit_mjd_tai"][0]
+    want = abs(tp - vis) * 86400 + S.SHUTTER_GRADIENT_MAX_S
+    assert corr.window_shift(mjd) == pytest.approx(want, abs=1e-6) and want > 60
+    assert corr.window_shift(mjd - 1) == pytest.approx(want, abs=1e-6)   # day_obs spans two MJDs
+    assert corr.window_shift(mjd + 1) == S.MIN_WINDOW_SHIFT_S
+    assert corr.window_shift(mjd - 2) == S.MIN_WINDOW_SHIFT_S
+
+
+def test_position_pass_finds_a_60s_correction(tmp_path, monkeypatch):
+    """A hung readout: the pipeline time (= header) is 60 s after the
+    corrected time. An obs_sbn row submitted at the corrected time, without
+    an id, is found by position (the window widened for that night) and
+    gets the corrected time, marked degraded."""
+    table, tc, tp = _late(tmp_path, 60.0)
+    view = [dict(id=1, ra=10.0, midpointMjdTai=tp, visit=V0, detector=D0, x=X0, y=Y0)]
+    obs = [dict(obsid="o", obssubid="hand", ra=10.0, dec=1.0, obstime=utc(tc), band="Lr", mag=20.0)]
+    out, unres, rep = run(tmp_path, obs, view, table=table)
+    r = out["o"]
+    assert (r["match"], r["obstime_basis"], r["diaSourceId"]) == ("position", "corrected", 1)
+    assert r["midpointMjdTai"] == tc and r["midpointMjdTai_flag_degraded"] and not r["midpointMjdTai_flag"]
+    assert rep["status"]["large_shift"] == 1
+    # with the fixed minimum window it would not be found
+    monkeypatch.setattr(S.Corrections, "window_shift", lambda self, n: S.MIN_WINDOW_SHIFT_S)
+    (tmp_path / "again").mkdir()
+    out, unres, _ = run(tmp_path / "again", obs, view, table=table)
+    assert not out and list(unres) == ["o"]
+
+
+@pytest.mark.parametrize("degraded", [False, True])
+def test_already_corrected(tmp_path, degraded):
+    """The pipeline time is the corrected time: it stands, unflagged, with
+    the degraded flag following the correction's status."""
+    v, d, x, y = (V1, D1, X1, Y1) if degraded else (V0, D0, X0, Y0)
+    tc = reference(v, d, x, y).t_mid_mjd_tai[0]
+    tp = tc + 0.0004 / 86400                     # within 1 ms of the corrected time
+    view = [dict(id=1, ra=10.0, midpointMjdTai=tp, visit=v, detector=d, x=x, y=y)]
+    # submitted from the already-corrected time
+    obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(tp), band="Lr", mag=20.0)]
+    out, unres, rep = run(tmp_path, obs, view)
+    r = out["o"]
+    assert r["midpointMjdTai"] == r["midpointMjdTaiVisit"] == tp
+    assert not r["midpointMjdTai_flag"] and r["midpointMjdTai_flag_degraded"] is degraded
+    assert rep["status"]["already_corrected"] == 1 and sum(rep["status"].values()) == 1
+    corr = S.Corrections(TABLE)
+    corr.lookup(view_table(view), np.array([0]))
+    assert list(corr.status) == [S.ALREADY_CORRECTED_DEGRADED if degraded else S.ALREADY_CORRECTED]
+    assert corr.t[0] == tp
+
+
+def test_matching_neither_is_time_mismatch(tmp_path):
+    tc = reference(V0, D0, X0, Y0).t_mid_mjd_tai[0]
+    tp = VISIT_T[V0] + 0.05 / 86400               # 50 ms off the header, ~166 ms off the corrected time
+    assert abs(tc - tp) * 86400 > 0.1
+    view = [dict(id=1, ra=10.0, midpointMjdTai=tp, visit=V0, detector=D0, x=X0, y=Y0)]
+    obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(tp), band="Lr", mag=20.0)]
+    out, _, rep = run(tmp_path, obs, view)
+    assert out["o"]["midpointMjdTai"] == tp and out["o"]["midpointMjdTai_flag"]
+    assert rep["status"]["time_mismatch"] == 1 and rep["time_mismatch_visits"] == [V0]
 
 
 def test_exposure_log():
@@ -686,7 +845,7 @@ def test_corrected_boundary_end_to_end(tmp_path):
 @pytest.mark.parametrize("with_table", [False, True])
 def test_position_window_by_mode(tmp_path, monkeypatch, with_table):
     """Without a table the position query's window is the uncorrected one
-    (shift_s 0); with one, MAX_SHUTTER_SHIFT_S."""
+    (shift_s 0); with one, the per-night window (MIN_WINDOW_SHIFT_S here)."""
     seen = []
     real = S.position_queries
 
@@ -700,7 +859,11 @@ def test_position_window_by_mode(tmp_path, monkeypatch, with_table):
     pq.write_table(obs_table(obs), tmp_path / "obs.parquet")
     assert S.extract(tmp_path / "obs.parquet", tmp_path / "d.parquet", fake_fetch(view),
                      correction_table=TABLE if with_table else None) == 0
-    assert seen == [S.MAX_SHUTTER_SHIFT_S if with_table else 0.0]
+    assert len(seen) == 1
+    if with_table:
+        assert callable(seen[0]) and seen[0](int(np.floor(tv))) == S.MIN_WINDOW_SHIFT_S
+    else:
+        assert seen[0] == 0.0
 
 
 @pytest.mark.parametrize("with_table", [False, True])
