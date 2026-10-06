@@ -41,8 +41,12 @@ SSSourceDtype = np.dtype([
                                     # DiaSource rows.
     ('visit', '<i8'),               # Visit id. DiaSource visit; Source visit.
     ('detector', '<i2'),            # Detector id. DiaSource detector; Source detector.
-    ('midpointMjdTai', '<f8'),      # [d] Exposure midpoint, TAI MJD. DiaSource midpointMjdTai; on Source
-                                    # rows the visit's exposure midpoint (the export's mjd column). Named...
+    ('midpointMjdTai', '<f8'),      # [d] Exposure midpoint of this source, TAI MJD, corrected for the
+                                    # shutter's motion across the focal plane (the corrected time differs...
+    ('midpointMjdTai_flag', '|b1'), # True when midpointMjdTai is the visit's midpoint, not corrected for the
+                                    # shutter's motion (no correction is available for this visit or...
+    ('midpointMjdTai_flag_degraded', '|b1'), # True when midpointMjdTai is corrected for the shutter's
+                                             # motion, but with reduced accuracy.
     ('exposureTime', '<f4'),        # [s] Measured exposure (shutter-open) time of the visit, s: ConsDB
                                     # exposure.shut_time (= Butler visitInfo.exposureTime), looked up by...
     ('ra', '<f8'),                  # [deg] Right ascension of the centroid, degrees. DiaSource ra; Source ra

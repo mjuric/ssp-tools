@@ -57,6 +57,10 @@ LINK_COLUMNS = ("obsid", "trksub", "trkid", "submission_id", "primary")
 MEASURED_ON_COLUMNS = ("measuredOn", "processing", "processingTable")
 #: Block 4: the measurement, copied from dia_sources.parquet.
 MEASUREMENT_COLUMNS = _NAMES[_NAMES.index("visit"):_NAMES.index("glint_trail") + 1]
+#: The shutter-correction flags (docs/design/shutter-timing.md). A
+#: dia_sources.parquet without them predates the correction: its times are
+#: the visits' midpoints, so the flags are written True / False.
+SHUTTER_FLAGS = ("midpointMjdTai_flag", "midpointMjdTai_flag_degraded")
 #: Block 6: the ephemeris and geometry, computed here.
 EPHEMERIS_COLUMNS = _NAMES[_NAMES.index("eclLambda"):]
 #: Block 6 columns that are measured (from the observed position and time),
@@ -568,8 +572,10 @@ def _dia_read_columns(dia_present):
     and whether matchMethod is among them; raises ValueError if some are
     missing."""
     has_match_method = "matchMethod" in dia_present
+    corrected = all(c in dia_present for c in SHUTTER_FLAGS)
     need = (list(LINK_COLUMNS) + list(MEASURED_ON_COLUMNS) + ["diaSourceId", "parentId"]
-            + list(MEASUREMENT_COLUMNS) + (["matchMethod"] if has_match_method else ["match", "obssubid"]))
+            + [c for c in MEASUREMENT_COLUMNS if corrected or c not in SHUTTER_FLAGS]
+            + (["matchMethod"] if has_match_method else ["match", "obssubid"]))
     missing = [c for c in need + ["sep_mas", "dt_ms"] if c not in dia_present]
     if missing:
         raise ValueError(f"dia_sources.parquet lacks {missing}: SSSource is built from the output of "
@@ -878,6 +884,12 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
               "derived it from match and obssubid")
         columns["matchMethod"] = cast_column(
             "matchMethod", _derive_match_method(pending["match"], pending["obssubid"]))
+    if SHUTTER_FLAGS[0] not in copy_columns:
+        print("dia_sources.parquet has no shutter-corrected times (it predates them): "
+              "midpointMjdTai is the visit midpoint, midpointMjdTai_flag set on every row")
+        n = len(src)
+        columns[SHUTTER_FLAGS[0]] = cast_column(SHUTTER_FLAGS[0], pa.array(np.ones(n, dtype=bool)))
+        columns[SHUTTER_FLAGS[1]] = cast_column(SHUTTER_FLAGS[1], pa.array(np.zeros(n, dtype=bool)))
     for name, arr in _split_ids(pending["measuredOn"], pending["diaSourceId"], pending["parentId"]).items():
         columns[name] = cast_column(name, arr)
     del pending

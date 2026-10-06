@@ -133,8 +133,8 @@ def dia_from(t):
 # --------------------------------------------------------------------------
 
 def test_blocks_match_design():
-    assert len(NAMES) == 182
-    assert [len(B[k]) for k in (1, 2, 3, 4, 6)] == [7, 2, 7, 126, 40]
+    assert len(NAMES) == 184
+    assert [len(B[k]) for k in (1, 2, 3, 4, 6)] == [7, 2, 7, 128, 40]
     assert B[4][0] == "visit" and B[4][-1] == "glint_trail"
     assert set(ELLIPSE_COLUMNS) <= set(B[6])
 

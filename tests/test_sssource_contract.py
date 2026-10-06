@@ -15,7 +15,7 @@ def _table(name):
 def test_sssource_columns_match_schema():
     cols = _table("SSSource")["columns"]
     assert list(C.SSSourceDtype.names) == [c["name"] for c in cols]
-    assert len(cols) == 182
+    assert len(cols) == 184
     assert {c["name"] for c in cols if c.get("nullable") is False} == C.SSSOURCE_NONNULL
     assert _table("SSSource")["primaryKey"] == "#SSSource.obsid"
 

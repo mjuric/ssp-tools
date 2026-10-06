@@ -36,7 +36,8 @@ INPUT_FILES = {
                                  "MPC numbered_identifications, every row and column"),
     "dia_sources": ("dia_sources.parquet",
                     "the measurement each obs_sbn X05 row was submitted from: today "
-                    "extract-submitted-sources output (ssp.SubmittableSources)"),
+                    "extract-submitted-sources output (ssp.SubmittableSources), with "
+                    "shutter-corrected times (ssp.sssource_contract, 'Shutter-motion')"),
     "ppdb_dia_sources": ("ppdb_dia_sources.parquet",
                          "PPDB DiaSource: diaSourceId, visit, midpointMjdTai, ra, dec"),
 }
@@ -69,6 +70,29 @@ MANIFEST_FIELDS = {
     "files": "{name: {file, rows, md5, source, extracted_utc}} for every INPUT_FILES name;"
              " the dia_sources entry also has obs_sbn_md5",
 }
+
+#: The manifest field the shutter-motion correction adds (WP S1); it joins
+#: MANIFEST_FIELDS once WP S1 writes it (docs/design/shutter-timing.md).
+SHUTTER_MANIFEST_FIELD = ("shutter_timing",
+                          "{table_dir, table_format, calibration_id, package_version,"
+                          " obstime_basis: {visit, corrected, both}: row counts,"
+                          " status: {ok, degraded, omitted}: row counts}")
+
+#: dia_sources columns added by the shutter-motion correction (WP S1); the
+#: build requires them once WP S2 lands (then they join
+#: REQUIRED_INPUT_COLUMNS["dia_sources"]).
+SHUTTER_INPUT_COLUMNS = ["midpointMjdTaiVisit", "midpointMjdTai_flag",
+                         "midpointMjdTai_flag_degraded", "obstime_basis"]
+
+# Matching an obs_sbn row to its measurement (extract-submitted-sources):
+# with the correction, a candidate's time passes if |obstime - visit time|
+# or |obstime - corrected time| is within DT_MS (10 ms); the minute-bucket
+# position fallback covers both times. The correction is applied before
+# matching. A correction table whose night is missing fails the extract.
+#
+# ssp-sso-daily runs a stage 0 before the extract: shutter-timing-table
+# --out <corrections dir> (resumes; at most 32 workers); a calibration
+# mismatch stops the run with a clear message.
 
 #: dia_sources is derived from obs_sbn: its manifest entry records the md5 of
 #: the obs_sbn it was built from (``obs_sbn_md5``), and every stage refuses

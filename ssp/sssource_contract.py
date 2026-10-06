@@ -19,7 +19,8 @@ from ssp.schema_ppdb import NearbySSODtype, SSSourceDtype  # noqa: F401
 SSSOURCE_NONNULL = frozenset({
     "obsid", "status", "primary", "matchMethod",
     "measuredOn", "processing", "processingTable",
-    "visit", "detector", "midpointMjdTai", "ra", "dec", "band", "psfFlux", "psfFluxErr",
+    "visit", "detector", "midpointMjdTai", "midpointMjdTai_flag", "midpointMjdTai_flag_degraded",
+    "ra", "dec", "band", "psfFlux", "psfFluxErr",
     "eclLambda", "eclBeta", "galLon", "galLat",
 })
 
@@ -53,6 +54,31 @@ ID_SPLIT = {
 #: SubmittableSources columns not carried into SSSource: the view's own
 #: spatial query helpers.
 VIEW_DROPPED = ("hpix29", "cx", "cy", "cz")
+
+# --------------------------------------------------------------------------
+# Shutter-motion-corrected times (docs/design/shutter-timing.md)
+# --------------------------------------------------------------------------
+#
+# dia_sources.parquet (the extract, WP S1) carries, per row:
+#   midpointMjdTai                the source's shutter-corrected exposure
+#                                 midpoint (shutter_timing.corrections.
+#                                 corrected_midpoints(visit, detector, x, y)),
+#                                 or the visit's midpoint where uncorrected
+#   midpointMjdTaiVisit           the visit's midpoint, as the measurement
+#                                 had it
+#   midpointMjdTai_flag           True: midpointMjdTai is the visit's midpoint
+#                                 (the table omits this visit: status 2)
+#   midpointMjdTai_flag_degraded  True: corrected with reduced accuracy
+#                                 (status 1)
+#   obstime_basis                 how the obs_sbn row's time matched: 'visit',
+#                                 'corrected' or 'both' (each within DT_MS)
+# A visit whose night is not in the table (status 3) fails the extract.
+# The flags are non-null for every row (False/False for a status-0 correction).
+#
+# SSSource copies midpointMjdTai and the two flags (block 4) and computes
+# every ephemeris column at that midpointMjdTai. midpointMjdTaiVisit and
+# obstime_basis are internal: not published, dropped without a warning.
+SHUTTER_INTERNAL = ("midpointMjdTaiVisit", "obstime_basis")
 
 #: The predicted position's error ellipse (deg, deg, deg^2): the
 #: NearbySSO convention, i.e. the DiaSource raErr/decErr/ra_dec_Cov one.
