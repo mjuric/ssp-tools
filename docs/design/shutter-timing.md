@@ -74,7 +74,7 @@ The build copies the time and the flags into SSSource. It computes every ephemer
 - the two columns on `tickets/DM-55375` (local commit, validated with Felis);
 - the refreshed `tests/data/sdm_schemas/` and `ssp/schema_ppdb.py`, and the contract tests' counts;
 - the rules in `ssp/sssource_contract.py` (where the time and the flags come from), and the matching and manifest changes in `ssp/delivery_contract.py`;
-- a fixture correction table from the shutter-timing session.
+- a fixture correction table from the shutter-timing session: `/sdf/data/rubin/user/mjuric/shutter-timing/fixtures/correction-table-v1/` (read-only). Its `table/` is a format-1 table directory (4 nights, 3 corrected visits × 189 detectors, plus skipped and failed exposures), its `README.md` lists the visits and the expected statuses (all four, including both NOT_BUILT cases), and `examples.json` gives six lookups with the expected status and time. Tests must not hard-code its calibration id outside fixture-specific assertions.
 
 **Then, once v0.2.0 is tagged, in parallel:**
 
