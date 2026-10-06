@@ -30,10 +30,11 @@ pytestmark = pytest.mark.skipif(not (TABLE / "manifest.json").exists(),
 MAS = 1 / 3.6e6
 MS = 1e-3 / 86400            # one ms in days
 
-# visit midpoints (MJD TAI) of the fixture's corrected visits, as their
-# exposure logs have them; any value for the others
-VISIT_T = {2026010500249: 61046.25468055982, 2026010500250: 61046.25486978367,
-           2026071200100: 61233.98278576869, 2026010500251: 61046.26, 2026010500999: 61046.27,
+# the pipeline's visit times (MJD TAI) of the fixture's corrected visits:
+# their exposure logs' header midpoints (header_mid_mjd_tai), as the
+# visit-time guard requires; any value for the others
+VISIT_T = {2026010500249: 61046.25468065427, 2026010500250: 61046.25486987154,
+           2026071200100: 61233.98278583563, 2026010500251: 61046.26, 2026010500999: 61046.27,
            2026010600001: 61046.9, 2025081000030: 60897.1}
 # a status-0 source 0.216 s after its visit midpoint (the shift exceeds DT_MS)
 V0, D0, X0, Y0 = 2026010500249, 178, 2000.0, 2000.0
@@ -145,7 +146,7 @@ def test_lookup_matches_examples():
 def test_lookup_batches_by_night(monkeypatch):
     ex = examples()["rows"]
     view = view_table([dict(id=i, visit=e["visit"], detector=e["detector"], x=e["x"], y=e["y"], ra=10.0,
-                            midpointMjdTai=0.0) for i, e in enumerate(ex)])
+                            midpointMjdTai=VISIT_T[e["visit"]]) for i, e in enumerate(ex)])
     monkeypatch.setattr(S, "LOOKUP_BATCH_ROWS", 1)
     corr = S.Corrections(TABLE)
     corr.lookup(view, np.arange(len(ex))[::-1])
@@ -181,7 +182,9 @@ def test_four_statuses(tmp_path, capsys):
         assert r["obstime_basis"] in ("visit", "both")
         assert (r["obstime_basis"] == "both") is (corrected and abs(r["dt_corrected_ms"]) <= S.DT_MS)
     n = {s: sum(e["status"] == s for e in ex) for s in range(4)}
-    assert rep["status"] == dict(ok=n[0], degraded=n[1], omitted=n[2], not_built=n[3])
+    assert rep["status"] == dict(ok=n[0], degraded=n[1], omitted=n[2], not_built=n[3], outside_coverage=0,
+                                 time_mismatch=0)
+    assert rep["first_night"] == 20250810 and rep["time_mismatch_visits"] == []   # the fixture's
     nb = sorted(e["visit"] for e in ex if e["status"] == 3)
     assert rep["not_built_visits"] == nb
     assert sum(rep["obstime_basis"].values()) == len(ex)
@@ -207,20 +210,23 @@ def test_two_basis_match(tmp_path):
     tc = reference(V0, D0, X0, Y0).t_mid_mjd_tai[0]
     tv = VISIT_T[V0]
     assert (tc - tv) / MS > 100           # the correction exceeds DT_MS
+    t94 = reference(V0, 94, 2000.0, 2000.0).t_mid_mjd_tai[0]
+    assert 1 < abs(t94 - tv) / MS < S.DT_MS
     src = dict(visit=V0, detector=D0, x=X0, y=Y0)
     view = [
         dict(id=1, ra=10.0, midpointMjdTai=tv, **src),
         dict(id=2, ra=11.0, midpointMjdTai=tv, **src),
         dict(id=3, ra=12.0, midpointMjdTai=tv, **src),
-        dict(id=4, ra=13.0, midpointMjdTai=tc - 3 * MS, **src),       # visit time ~ corrected time
-        dict(id=5, ra=14.0, midpointMjdTai=tc - 100 * MS, **src),     # see o5
+        # a source whose correction is within DT_MS of the visit time
+        dict(id=4, ra=13.0, midpointMjdTai=tv, visit=V0, detector=94, x=2000.0, y=2000.0),
+        dict(id=5, ra=14.0, midpointMjdTai=tv, **src),
     ]
     obs = [
         dict(obsid="o1", obssubid="1", ra=10.0, dec=1.0, obstime=utc(tc), band="Lr", mag=20.0),
         dict(obsid="o2", obssubid="2", ra=11.0, dec=1.0, obstime=utc(tv), band="Lr", mag=20.0),
-        dict(obsid="o4", obssubid="4", ra=13.0, dec=1.0, obstime=utc(tc), band="Lr", mag=20.0),
-        # 50 ms off both the visit time and the corrected time
-        dict(obsid="o5", obssubid="5", ra=14.0, dec=1.0, obstime=utc(tc - 50 * MS), band="Lr", mag=20.0),
+        dict(obsid="o4", obssubid="4", ra=13.0, dec=1.0, obstime=utc(t94), band="Lr", mag=20.0),
+        # 50 ms before the visit time (and so 266 ms before the corrected time)
+        dict(obsid="o5", obssubid="5", ra=14.0, dec=1.0, obstime=utc(tv - 50 * MS), band="Lr", mag=20.0),
         # no id: the position pass, on the corrected time
         dict(obsid="o3", obssubid="hand", ra=12.0, dec=1.0, obstime=utc(tc), band="Lr", mag=20.0),
     ]
@@ -235,7 +241,8 @@ def test_two_basis_match(tmp_path):
         assert not out[k]["midpointMjdTai_flag"] and not out[k]["midpointMjdTai_flag_degraded"]
     assert abs(out["o1"]["dt_corrected_ms"]) < 0.01 and out["o1"]["dt_ms"] == pytest.approx(-(tc - tv) / MS)
     assert rep["obstime_basis"] == dict(visit=1, corrected=2, both=1)
-    assert rep["status"] == dict(ok=4, degraded=0, omitted=0, not_built=0)
+    assert rep["status"] == dict(ok=4, degraded=0, omitted=0, not_built=0, outside_coverage=0,
+                                 time_mismatch=0)
     assert rep["not_built_visits"] == []
 
 
@@ -311,6 +318,174 @@ def test_not_built_counts_written_rows_only(tmp_path):
     obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(VISIT_T[V0]), band="Lr", mag=20.0)]
     out, _, rep = run(tmp_path, obs, view, max_not_built_visits=0)
     assert out["o"]["processing"] == "AP-DS" and rep["not_built_visits"] == []
+
+
+def test_outside_coverage(tmp_path):
+    """Visits on nights before the table's first night (read from the
+    table) get the visit time, flagged, are never looked up, and do not
+    count toward the NOT_BUILT limit."""
+    first = S.Corrections(TABLE).first_night
+    assert first == min(int(p.name[12:20]) for p in TABLE.glob("corrections_*.parquet"))
+    early = [(first // 100 - 1) * 100 + 1 + k for k in range(5)]     # five nights in the month before
+    visits = [d * 100000 + 7 for d in early]
+    t0 = 60800.0
+    view = [dict(id=i, ra=10.0 + i, midpointMjdTai=t0 + i, visit=v, detector=4, x=2000.0, y=2000.0)
+            for i, v in enumerate(visits)]
+    view.append(dict(id=99, ra=30.0, midpointMjdTai=VISIT_T[V0], visit=V0, detector=D0, x=X0, y=Y0))
+    common = dict(dec=1.0, band="Lr", mag=20.0)
+    obs = [dict(obsid=f"o{i}", obssubid=str(i), ra=10.0 + i, obstime=utc(t0 + i), **common)
+           for i in range(len(visits))]
+    obs.append(dict(obsid="c", obssubid="99", ra=30.0, obstime=utc(VISIT_T[V0]), **common))
+    out, _, rep = run(tmp_path, obs, view, max_not_built_visits=0)
+    for i in range(len(visits)):
+        r = out[f"o{i}"]
+        assert r["midpointMjdTai_flag"] and not r["midpointMjdTai_flag_degraded"]
+        assert r["midpointMjdTai"] == r["midpointMjdTaiVisit"] == t0 + i
+        assert r["obstime_basis"] == "visit"
+    assert not out["c"]["midpointMjdTai_flag"]
+    assert rep["status"]["outside_coverage"] == len(visits) and rep["status"]["not_built"] == 0
+    assert rep["first_night"] == first and rep["not_built_visits"] == []
+
+
+def test_outside_coverage_never_looked_up(monkeypatch):
+    import shutter_timing.corrections as C
+    calls = []
+    real = C.corrected_midpoints
+    def spy(v, *a, **k):
+        calls.append(np.asarray(v))
+        return real(v, *a, **k)
+    monkeypatch.setattr(C, "corrected_midpoints", spy)
+    corr = S.Corrections(TABLE)
+    early = (corr.first_night - 1) * 100000 + 1
+    view = view_table([dict(id=1, ra=1.0, midpointMjdTai=0.0, visit=early, detector=1, x=1.0, y=1.0),
+                       dict(id=2, ra=1.0, midpointMjdTai=VISIT_T[V0], visit=V0, detector=D0, x=X0, y=Y0)])
+    corr.lookup(view, np.array([0, 1]))
+    assert list(corr.status) == [S.OUTSIDE_COVERAGE, S.OK]
+    assert len(calls) == 1 and list(calls[0]) == [V0]
+    corr = S.Corrections(TABLE)
+    corr.lookup(view, np.array([0]))        # only outside: no call at all
+    assert len(calls) == 1 and corr.calls == 0
+
+
+def test_empty_table_has_no_coverage(tmp_path):
+    """A table directory without nights: no first night; everything is
+    NOT_BUILT (and the limit applies)."""
+    corr = S.Corrections(tmp_path)
+    assert corr.first_night is None
+    view = view_table([dict(id=1, ra=1.0, midpointMjdTai=0.0, visit=2024112800001, detector=1, x=1.0, y=1.0)])
+    corr.lookup(view, np.array([0]))
+    assert list(corr.status) == [S.NOT_BUILT]
+
+
+def test_warnings_list_at_most_20_visits(capsys):
+    corr = S.Corrections(TABLE, max_not_built_visits=1000)
+    visits = np.arange(25) + 2026010600001
+    nb, tm = corr.check(visits, np.full(25, S.NOT_BUILT), np.full(25, np.nan))
+    assert nb == visits.tolist() and tm == []
+    err = capsys.readouterr().err
+    assert str(visits[19]) in err and str(visits[20]) not in err and "... and 5 more" in err
+    nb, tm = corr.check(visits, np.full(25, S.TIME_MISMATCH), np.full(25, 0.07))
+    assert nb == [] and tm == visits.tolist()
+    err = capsys.readouterr().err
+    assert "+70.0 ms" in err and "... and 5 more" in err and str(visits[20]) not in err
+
+
+def test_header_guard_unit():
+    """Within MAX_HEADER_MISMATCH_S of the header midpoint: applied; beyond:
+    rejected; a visit missing from the log (NaN): the table's status stands."""
+    assert S.VISIT_TIME_GUARD is S.header_guard
+    h = np.array([61046.25, 61046.25, 61046.25, np.nan])
+    t = h + np.array([0.0009, -0.0009, 0.0011, 0.0]) / 86400
+    t[3] = 61046.25
+    reject, d = S.header_guard({"header_mid_mjd_tai": h}, t)
+    assert list(reject) == [False, False, True, False]
+    assert d[:3] == pytest.approx([0.0009, -0.0009, 0.0011], abs=1e-6) and np.isnan(d[3])
+
+
+def test_exposure_log():
+    corr = S.Corrections(TABLE)
+    log = corr.exposure_log(np.array([V0, 2026010500251, 2026010500999, 2026071200100]))
+    assert set(log) == set(S.GUARD_LOG_COLUMNS)
+    h = log["header_mid_mjd_tai"]
+    assert h[0] == VISIT_T[V0] and h[3] == VISIT_T[2026071200100]
+    assert np.isnan(h[1]) and np.isnan(h[2])        # failed (NaN in the log); not in the log
+
+
+def _set_header(table, visit, value):
+    """Set ``visit``'s header_mid_mjd_tai in the exposure log of a table copy,
+    keeping the file's metadata."""
+    p = table / f"exposures_{visit // 100000}.parquet"
+    t = pq.read_table(p)
+    md = t.schema.metadata
+    h = t["header_mid_mjd_tai"].to_numpy().copy()
+    h[t["visit"].to_numpy() == visit] = value
+    i = t.column_names.index("header_mid_mjd_tai")
+    t = t.set_column(i, "header_mid_mjd_tai", pa.array(h))
+    pq.write_table(t.replace_schema_metadata(md), p)
+
+
+def test_time_mismatch(tmp_path, capsys):
+    """A pipeline time that disagrees with the (perturbed) header midpoint:
+    the visit time, flagged, warned about, counted and listed."""
+    table = _copy_table(tmp_path)
+    _set_header(table, V0, VISIT_T[V0] + 0.1 / 86400)
+    tv = VISIT_T[V0]
+    src = dict(visit=V0, detector=D0, x=X0, y=Y0)
+    view = [dict(id=1, ra=10.0, midpointMjdTai=tv, **src),
+            dict(id=2, ra=11.0, midpointMjdTai=VISIT_T[2026071200100], visit=2026071200100, detector=94,
+                 x=2000.0, y=2000.0)]
+    common = dict(dec=1.0, band="Lr", mag=20.0)
+    obs = [dict(obsid="m", obssubid="1", ra=10.0, obstime=utc(tv), **common),
+           dict(obsid="k", obssubid="2", ra=11.0, obstime=utc(VISIT_T[2026071200100]), **common)]
+    out, _, rep = run(tmp_path, obs, view, table=table)
+    m = out["m"]
+    assert m["midpointMjdTai_flag"] and not m["midpointMjdTai_flag_degraded"]
+    assert m["midpointMjdTai"] == m["midpointMjdTaiVisit"] == tv and m["obstime_basis"] == "visit"
+    assert not out["k"]["midpointMjdTai_flag"]
+    assert rep["status"]["time_mismatch"] == 1 and rep["time_mismatch_visits"] == [V0]
+    err = capsys.readouterr().err
+    assert f"{V0} (-100.0 ms)" in err and "header midpoint" in err
+
+
+def test_large_consistent_offset_is_corrected(tmp_path):
+    """A late-readout visit: the pipeline time equals the header midpoint,
+    both 1.5 s after the table's visit midpoint. The correction is applied
+    however large, and the position pass finds a row submitted at the
+    corrected time."""
+    table = _copy_table(tmp_path)
+    late = VISIT_T[V0] + 1.5 / 86400
+    _set_header(table, V0, late)
+    tc = reference(V0, D0, X0, Y0, table_dir=table).t_mid_mjd_tai[0]
+    assert (late - tc) * 86400 > 1.2
+    src = dict(visit=V0, detector=D0, x=X0, y=Y0)
+    view = [dict(id=1, ra=10.0, midpointMjdTai=late, **src), dict(id=2, ra=11.0, midpointMjdTai=late, **src)]
+    common = dict(dec=1.0, band="Lr", mag=20.0)
+    obs = [dict(obsid="v", obssubid="1", ra=10.0, obstime=utc(late), **common),
+           dict(obsid="p", obssubid="hand", ra=11.0, obstime=utc(tc), **common)]
+    out, unres, rep = run(tmp_path, obs, view, table=table)
+    assert not unres
+    for k in ("v", "p"):
+        assert out[k]["midpointMjdTai"] == tc and out[k]["midpointMjdTaiVisit"] == late
+        assert not out[k]["midpointMjdTai_flag"]
+    assert out["v"]["obstime_basis"] == "visit"
+    assert (out["p"]["obstime_basis"], out["p"]["match"]) == ("corrected", "position")
+    assert rep["status"]["time_mismatch"] == 0 and rep["status"]["ok"] == 2
+
+
+def test_no_usable_id(tmp_path):
+    """No obs_sbn row has a usable id: no crash; the position pass runs."""
+    tv = VISIT_T[V0]
+    view = [dict(id=1, ra=10.0, midpointMjdTai=tv, visit=V0, detector=D0, x=X0, y=Y0)]
+    obs = [dict(obsid="o", obssubid="hand", ra=10.0, dec=1.0, obstime=utc(tv), band="Lr", mag=20.0),
+           dict(obsid="u", obssubid=None, ra=50.0, dec=1.0, obstime=utc(tv), band="Lr", mag=20.0)]
+    tasks = S.id_queries(S.load_obs(obs_table(obs))[0], "ssp", 10)
+    assert len(tasks) == 1 and len(tasks[0][3]["q"]) == 0
+    out, unres, _ = run(tmp_path, obs, view)
+    assert (out["o"]["match"], out["o"]["diaSourceId"]) == ("position", 1)
+    assert unres["u"]["reason"] == "no_id"
+    pq.write_table(obs_table(obs), tmp_path / "obs.parquet")       # and without a table
+    assert S.extract(tmp_path / "obs.parquet", tmp_path / "d2.parquet", fake_fetch(view_table(view))) == 0
+    assert pq.read_table(tmp_path / "d2.parquet")["obsid"].to_pylist() == ["o"]
 
 
 #

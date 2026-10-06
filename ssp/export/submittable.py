@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import stat
 import sys
 import threading
@@ -55,7 +56,7 @@ import pyarrow.parquet as pq
 from astropy.time import Time
 
 from ssp.delivery_contract import SHUTTER_INPUT_COLUMNS, SHUTTER_MANIFEST_FIELD
-from ssp.sssource_contract import MATCH_METHODS, MAX_NOT_BUILT_VISITS
+from ssp.sssource_contract import MATCH_METHODS, MAX_HEADER_MISMATCH_S, MAX_NOT_BUILT_VISITS
 
 # The ClickHouse ("River") server has moved more than once (sdfiana035 ->
 # 172.24.10.116 on 2026-10-04 -> sdfiana032 on 2026-10-05). Its operators keep
@@ -82,10 +83,12 @@ DT_MS = 10.0
 # (shutter-timing-table). "none" on the command line disables the correction.
 DEFAULT_CORRECTION_TABLE = "/sdf/data/rubin/user/mjuric/shutter-timing/corrections"
 
-# A bound on |corrected - visit midpoint| that widens the position pass's
-# time window, so that it also fetches candidates whose *corrected* time is
-# within DT_MS. The design's 0.24 s holds for most visits, but a few
-# header-timed (degraded) visits reach ~2 s (seen on the 2026-10-04 inputs).
+# A bound on |corrected - pipeline visit time| that widens the position
+# pass's time window, so that it also fetches candidates whose *corrected*
+# time is within DT_MS. The shutter gradient (corrected - the table's visit
+# midpoint) is within +-0.244 s, but late-readout visits, whose header
+# midpoint (and so the pipeline's time) is late, legitimately reach ~1.7 s
+# (2026-10-04 inputs); there is no cap on the correction itself.
 MAX_SHUTTER_SHIFT_S = 3.0
 
 # How an obs_sbn row's time matched its measurement's (within DT_MS).
@@ -101,10 +104,20 @@ SHUTTER_COLUMNS = ["midpointMjdTaiVisit", "midpointMjdTai_flag", "midpointMjdTai
                    "obstime_basis", "dt_corrected_ms"]
 assert set(SHUTTER_INPUT_COLUMNS) <= set(SHUTTER_COLUMNS)
 
-# corrected_midpoints status codes (shutter_timing.CorrectionStatus), plus
+# corrected_midpoints status codes (shutter_timing.CorrectionStatus); ours:
+# OUTSIDE_COVERAGE (a night before the table's first night, never looked
+# up), TIME_MISMATCH (corrected, but the pipeline's visit time differs from
+# the exposure log's header midpoint by more than MAX_HEADER_MISMATCH_S:
+# not applied), and
 # NOT_LOOKED_UP for candidates that never needed a lookup.
-OK, DEGRADED, OMITTED, NOT_BUILT, NOT_LOOKED_UP = 0, 1, 2, 3, 255
-STATUS_NAMES = {OK: "ok", DEGRADED: "degraded", OMITTED: "omitted", NOT_BUILT: "not_built"}
+OK, DEGRADED, OMITTED, NOT_BUILT, OUTSIDE_COVERAGE, TIME_MISMATCH, NOT_LOOKED_UP = 0, 1, 2, 3, 4, 5, 255
+STATUS_NAMES = {OK: "ok", DEGRADED: "degraded", OMITTED: "omitted", NOT_BUILT: "not_built",
+                OUTSIDE_COVERAGE: "outside_coverage", TIME_MISMATCH: "time_mismatch"}
+#: Statuses whose corrected time is applied; every other one is flagged.
+APPLIED = (OK, DEGRADED)
+
+# Visits listed in a warning at most (the manifest has them all).
+WARN_VISITS = 20
 
 
 class CorrectionError(RuntimeError):
@@ -568,6 +581,10 @@ def id_queries(obs, database, chunk_size):
         for k in range(0, len(ids), chunk_size):
             tasks.append((label, sql, {"label": label} if label is not None else None,
                           dict(q=ids[k:k + chunk_size])))
+    if not tasks:
+        # no usable id at all: one empty query, for the view's schema
+        tasks.append((None, f"SELECT * FROM {database}.{VIEW} WHERE id IN (SELECT q FROM q)", None,
+                      dict(q=np.zeros(0, np.int64))))
     return tasks
 
 
@@ -649,31 +666,96 @@ def run_queries(tasks, host, port, database, user, workers):
 #
 
 
+#: Exposure-log columns (exposures_<day_obs>.parquet) the visit-time guard
+#: sees. (shutter_timing's public API does not return them: read from the
+#: table's files.)
+GUARD_LOG_COLUMNS = ("header_mid_mjd_tai",)
+
+
+def header_guard(log, t_pipe):
+    """The visit-time guard (owner decision 2026-10-06): the correction is
+    applied, however large, only where the pipeline's visit time equals the
+    exposure log's header midpoint ``header_mid_mjd_tai`` ((MJD-BEG +
+    MJD-END)/2) to within MAX_HEADER_MISMATCH_S. ``log``: GUARD_LOG_COLUMNS
+    arrays aligned with ``t_pipe`` (MJD TAI), NaN where the visit is not in
+    the log (then the table's own status stands). Returns
+    ``(reject, delta_s)``, delta = pipeline - header."""
+    delta = (t_pipe - log["header_mid_mjd_tai"]) * 86400
+    with np.errstate(invalid="ignore"):
+        return np.abs(delta) > MAX_HEADER_MISMATCH_S, delta
+
+
+#: The visit-time guard in force (a function like header_guard, or None).
+VISIT_TIME_GUARD = header_guard
+
+
 class Corrections:
     """The shutter-motion correction table, looked up per candidate.
 
-    ``lookup(cand, rows)`` fills ``t`` (corrected MJD TAI, NaN where none)
-    and ``status`` (CorrectionStatus, NOT_LOOKED_UP where not asked) for
-    the given rows of ``cand``; ``extend(n)`` grows them with the candidate
-    table. Lookup errors (a mixed, malformed or inconsistent table, a
-    non-integral visit or detector) raise CorrectionError.
+    ``lookup(cand, rows)`` fills ``t`` (the corrected MJD TAI, NaN where it
+    is not applied), ``status`` (CorrectionStatus, or OUTSIDE_COVERAGE,
+    TIME_MISMATCH, NOT_LOOKED_UP) and ``dvis`` (the guard's time difference,
+    s; NaN where not compared) for the given rows of ``cand``; ``extend(n)``
+    grows them with the candidate table. Lookup errors (a mixed, malformed
+    or inconsistent table, a non-integral visit or detector) raise
+    CorrectionError.
+
+    Nights before the table's first night (``first_night``, its earliest
+    ``corrections_<day_obs>.parquet``) are outside its coverage (e.g.
+    ComCam): OUTSIDE_COVERAGE, never looked up. ``guard`` (default
+    VISIT_TIME_GUARD) is applied to the corrected sources: those it rejects
+    are TIME_MISMATCH, the correction not applied. It sees the visit's row
+    of the night's exposure log (shutter_timing's API does not return it).
     """
 
-    def __init__(self, table_dir, max_not_built_visits=MAX_NOT_BUILT_VISITS):
+    def __init__(self, table_dir, max_not_built_visits=MAX_NOT_BUILT_VISITS, guard=VISIT_TIME_GUARD):
         self.table_dir = Path(table_dir)
         if not self.table_dir.is_dir():
             raise CorrectionError(f"the correction table {self.table_dir} does not exist (stage 0, "
                                   f"shutter-timing-table --out {self.table_dir}, builds it)")
         self.max_not_built_visits = max_not_built_visits
+        self.guard = guard
+        nights = [int(m.group(1)) for p in self.table_dir.iterdir()
+                  if (m := re.fullmatch(r"corrections_(\d{8})\.parquet", p.name))]
+        self.first_night = min(nights) if nights else None
         self.t = np.zeros(0)
+        self.dvis = np.zeros(0)
         self.status = np.zeros(0, np.uint8)
         self.formats, self.calibrations, self.versions = set(), set(), set()
         self.seconds, self.calls = 0.0, 0
+        self._logs = {}      # day_obs -> (sorted visits, {column: values})
 
     def extend(self, n):
         k = n - len(self.t)
         self.t = np.concatenate([self.t, np.full(k, np.nan)])
+        self.dvis = np.concatenate([self.dvis, np.full(k, np.nan)])
         self.status = np.concatenate([self.status, np.full(k, NOT_LOOKED_UP, np.uint8)])
+
+    def exposure_log(self, visits):
+        """GUARD_LOG_COLUMNS of ``visits`` (in built nights) from their
+        nights' exposure logs, as arrays aligned with ``visits`` (NaN where
+        the visit is not logged)."""
+        out = {c: np.full(len(visits), np.nan) for c in GUARD_LOG_COLUMNS}
+        day = visits // 100000
+        for d in np.unique(day).tolist():
+            if d not in self._logs:
+                path = self.table_dir / f"exposures_{d}.parquet"
+                try:
+                    t = pq.read_table(path, columns=["visit", *GUARD_LOG_COLUMNS])
+                except (OSError, KeyError, pa.ArrowInvalid) as e:
+                    raise CorrectionError(f"cannot read the exposure log {path}: {e}") from e
+                v = t["visit"].to_numpy()
+                o = np.argsort(v)
+                self._logs[d] = (v[o], {c: _f64(t, c)[o] for c in GUARD_LOG_COLUMNS})
+            v, cols = self._logs[d]
+            if not len(v):
+                continue
+            sel = np.flatnonzero(day == d)
+            i = np.minimum(np.searchsorted(v, visits[sel]), len(v) - 1)
+            hit = v[i] == visits[sel]
+            for c in GUARD_LOG_COLUMNS:
+                out[c][sel[hit]] = cols[c][i[hit]]
+        return out
 
     def lookup(self, cand, rows):
         """Look up ``rows`` of ``cand`` (not already looked up), in batches
@@ -697,18 +779,26 @@ class Corrections:
         visit = visit.to_numpy()
         detector = detector.to_numpy()
         x, y = (_f64(cand, c)[rows] for c in ("x", "y"))     # null -> NaN -> OMITTED
+        t_pipe = _f64(cand, "midpointMjdTai")[rows]
+
+        # outside the table's coverage: never looked up. (A visit with a
+        # non-integral number fails in corrected_midpoints, below.)
+        day = np.floor_divide(visit, 100000)
+        outside = day < self.first_night if self.first_night is not None else np.zeros(len(rows), bool)
+        self.status[rows[outside]] = OUTSIDE_COVERAGE
 
         # whole nights per call, at most LOOKUP_BATCH_ROWS rows (unless one
         # night has more)
-        order = np.argsort(visit // 100000, kind="stable")
-        day = (visit // 100000)[order]
-        starts = np.flatnonzero(np.r_[True, day[1:] != day[:-1]])
+        inside = np.flatnonzero(~outside)
+        order = inside[np.argsort(day[inside], kind="stable")]
+        dsort = day[order]
         bounds, lo = [], 0
-        for s in starts[1:]:
+        for s in np.flatnonzero(dsort[1:] != dsort[:-1]) + 1:
             if s - lo >= LOOKUP_BATCH_ROWS:
                 bounds.append((lo, s))
                 lo = s
-        bounds.append((lo, len(order)))
+        if len(order):
+            bounds.append((lo, len(order)))
 
         t0 = time.time()
         for lo, hi in bounds:
@@ -720,8 +810,17 @@ class Corrections:
                 raise CorrectionError(f"the correction table {self.table_dir}: "
                                       f"{type(e).__name__}: {e}") from e
             self.calls += 1
-            self.t[rows[sel]] = r.t_mid_mjd_tai
-            self.status[rows[sel]] = r.status
+            t, status = r.t_mid_mjd_tai.copy(), r.status.astype(np.uint8)
+            dvis = np.full(len(sel), np.nan)
+            if self.guard is not None:
+                applied = np.flatnonzero(np.isin(status, APPLIED))
+                va = visit[sel][applied]
+                reject, dvis[applied] = self.guard(self.exposure_log(va), t_pipe[sel][applied])
+                status[applied[reject]] = TIME_MISMATCH
+                t[applied[reject]] = np.nan
+            self.t[rows[sel]] = t
+            self.dvis[rows[sel]] = dvis
+            self.status[rows[sel]] = status
             self.formats.add(int(r.table_format))
             if r.days:      # nights were read: their calibration and version
                 self.calibrations.add(r.calibration_id)
@@ -730,41 +829,62 @@ class Corrections:
 
     def provenance(self):
         """table_dir, table_format, calibration_id, package_version of the
-        nights read (comma-joined if several; "unknown" if none)."""
+        nights read (comma-joined if several; "unknown" if none), and the
+        table's first night."""
         def join(s):
             return ",".join(sorted(s)) if s else "unknown"
         return dict(table_dir=str(self.table_dir), table_format=max(self.formats) if self.formats else None,
-                    calibration_id=join(self.calibrations), package_version=join(self.versions))
+                    calibration_id=join(self.calibrations), package_version=join(self.versions),
+                    first_night=self.first_night)
 
-    def check_not_built(self, visits, status):
-        """Warn about the NOT_BUILT visits of the output rows; fail if there
-        are more than ``max_not_built_visits``. Returns them, sorted."""
-        nb = np.unique(np.asarray(visits)[np.asarray(status) == NOT_BUILT]).tolist()
+    def check(self, visits, status, dvis):
+        """Warn about the NOT_BUILT and TIME_MISMATCH visits of the output
+        rows (at most WARN_VISITS named); fail if more than
+        ``max_not_built_visits`` are NOT_BUILT. Returns both lists of
+        visits, sorted."""
+        visits, status, dvis = np.asarray(visits), np.asarray(status), np.asarray(dvis)
+        nb = np.unique(visits[status == NOT_BUILT]).tolist()
         if len(nb) > self.max_not_built_visits:
             raise CorrectionError(
                 f"{len(nb)} visits are not built in the correction table {self.table_dir} (more than "
                 f"--max-not-built-visits {self.max_not_built_visits}): is stage 0 (shutter-timing-table "
                 f"--out {self.table_dir}) stale, skipped or failing? Nights affected: "
-                f"{sorted({v // 100000 for v in nb})[:50]}")
+                f"{_some(sorted({v // 100000 for v in nb}))}")
         if nb:
             print(f"warning: {len(nb)} visit(s) not built in the correction table (their night has no "
                   f"table, or the visit is not in its exposure log, e.g. a raw that arrived late); "
-                  f"they keep the visit time, flagged: {nb}", file=sys.stderr, flush=True)
-        return nb
+                  f"they keep the visit time, flagged: {_some(nb)}", file=sys.stderr, flush=True)
+        mm = status == TIME_MISMATCH
+        tm = np.unique(visits[mm]).tolist()
+        if tm:
+            dv = {v: float(np.median(dvis[mm & (visits == v)])) for v in tm}
+            print(f"warning: {len(tm)} visit(s) whose visit time differs from the exposure log's header "
+                  f"midpoint by more than {MAX_HEADER_MISMATCH_S * 1e3:g} ms (pipeline - header); not "
+                  f"corrected, they keep the visit time, flagged: "
+                  f"{_some([f'{v} ({dv[v] * 1e3:+.1f} ms)' for v in tm])}", file=sys.stderr, flush=True)
+        return nb, tm
+
+
+def _some(items, n=WARN_VISITS):
+    """At most ``n`` items, then '... and N more'."""
+    items = list(items)
+    head = ", ".join(map(str, items[:n]))
+    return head + (f", ... and {len(items) - n} more" if len(items) > n else "")
 
 
 def shutter_columns(corr, cand, ci, info):
     """The corrected time and the SHUTTER_COLUMNS for winning candidates
     ``ci``: ``(midpointMjdTai, {name: array})``. ``midpointMjdTai`` is the
-    corrected time where the status is OK or DEGRADED, else the visit's."""
+    corrected time where it is applied (OK or DEGRADED), else the visit's,
+    flagged."""
     t_visit = _f64(cand, "midpointMjdTai")[ci]
     t, status = corr.t[ci], corr.status[ci]
     assert not np.any(status == NOT_LOOKED_UP), "a winning candidate was never looked up"
-    corrected = (status == OK) | (status == DEGRADED)
-    assert np.all(np.isfinite(t[corrected]))
+    corrected = np.isin(status, APPLIED)
+    assert np.all(np.isfinite(t[corrected])) and np.all(np.isnan(t[~corrected]))
     cols = dict(
         midpointMjdTaiVisit=t_visit,
-        midpointMjdTai_flag=(status == OMITTED) | (status == NOT_BUILT),
+        midpointMjdTai_flag=~corrected,
         midpointMjdTai_flag_degraded=status == DEGRADED,
         obstime_basis=pa.array(info["obstime_basis"], pa.string()),
         dt_corrected_ms=pa.array(info["dt_corrected_ms"], pa.float64(), from_pandas=True),
@@ -773,13 +893,14 @@ def shutter_columns(corr, cand, ci, info):
     return np.where(corrected, t, t_visit), cols
 
 
-def shutter_report(corr, out, status, not_built):
+def shutter_report(corr, out, status, not_built, time_mismatch):
     """The manifest's SHUTTER_MANIFEST_FIELD entry, from the written rows."""
     basis = out["obstime_basis"].to_numpy(zero_copy_only=False)
     return {**corr.provenance(),
             "obstime_basis": {b: int(np.sum(basis == b)) for b in OBSTIME_BASES},
             "status": {name: int(np.sum(status == code)) for code, name in STATUS_NAMES.items()},
-            "not_built_visits": not_built}
+            "not_built_visits": not_built,
+            "time_mismatch_visits": time_mismatch}
 
 
 def correct(corr, obs, oi, cand, ci):
@@ -989,8 +1110,8 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     out, is_b, src = build_output(obs, tbl, cand, rows_all, np.concatenate([c_id, c_pos]), match, info, corr)
     if corr is not None:
         status = corr.status[src]
-        not_built = corr.check_not_built(cand["visit"].to_numpy()[src], status)
-        shutter = shutter_report(corr, out, status, not_built)
+        not_built, time_mismatch = corr.check(cand["visit"].to_numpy()[src], status, corr.dvis[src])
+        shutter = shutter_report(corr, out, status, not_built, time_mismatch)
         if report is not None:
             report[SHUTTER_MANIFEST_FIELD[0]] = shutter
     # rows the DP2 rule decided, by the processing it picked
