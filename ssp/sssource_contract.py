@@ -72,13 +72,18 @@ VIEW_DROPPED = ("hpix29", "cx", "cy", "cz")
 #                                 (status 1)
 #   obstime_basis                 how the obs_sbn row's time matched: 'visit',
 #                                 'corrected' or 'both' (each within DT_MS)
-# A visit whose night is not in the table (status 3) fails the extract.
+# A NOT_BUILT visit (status 3) gets the visit's time and midpointMjdTai_flag
+# True, with a warning naming it; more than MAX_NOT_BUILT_VISITS distinct
+# NOT_BUILT visits fail the extract (a stale or skipped stage 0).
 # The flags are non-null for every row (False/False for a status-0 correction).
 #
 # SSSource copies midpointMjdTai and the two flags (block 4) and computes
 # every ephemeris column at that midpointMjdTai. midpointMjdTaiVisit and
 # obstime_basis are internal: not published, dropped without a warning.
 SHUTTER_INTERNAL = ("midpointMjdTaiVisit", "obstime_basis")
+
+#: The default limit on NOT_BUILT visits in one extract (configurable).
+MAX_NOT_BUILT_VISITS = 20
 
 #: The predicted position's error ellipse (deg, deg, deg^2): the
 #: NearbySSO convention, i.e. the DiaSource raErr/decErr/ra_dec_Cov one.

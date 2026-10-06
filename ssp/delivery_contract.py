@@ -76,7 +76,8 @@ MANIFEST_FIELDS = {
 SHUTTER_MANIFEST_FIELD = ("shutter_timing",
                           "{table_dir, table_format, calibration_id, package_version,"
                           " obstime_basis: {visit, corrected, both}: row counts,"
-                          " status: {ok, degraded, omitted}: row counts}")
+                          " status: {ok, degraded, omitted, not_built}: row counts,"
+                          " not_built_visits: [visit, ...]}")
 
 #: dia_sources columns added by the shutter-motion correction (WP S1); the
 #: build requires them once WP S2 lands (then they join
@@ -88,7 +89,8 @@ SHUTTER_INPUT_COLUMNS = ["midpointMjdTaiVisit", "midpointMjdTai_flag",
 # with the correction, a candidate's time passes if |obstime - visit time|
 # or |obstime - corrected time| is within DT_MS (10 ms); the minute-bucket
 # position fallback covers both times. The correction is applied before
-# matching. A correction table whose night is missing fails the extract.
+# matching. NOT_BUILT visits: the visit time, flagged, with a warning; more
+# than ssp.sssource_contract.MAX_NOT_BUILT_VISITS of them fail the extract.
 #
 # ssp-sso-daily runs a stage 0 before the extract: shutter-timing-table
 # --out <corrections dir> (resumes; at most 32 workers); a calibration

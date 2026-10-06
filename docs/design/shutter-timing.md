@@ -19,16 +19,16 @@ The plan was agreed in the shutter-timing session, then reviewed and approved he
 | NearbySSO time | Read from the input DiaSource's `midpointMjdTai`, so NearbySSO stays consistent with the `DiaSource` it is joined to. Today that is the visit time; once DiaSource carries corrected times, NearbySSO follows automatically. No NearbySSO schema change. |
 | New SSSource columns | `midpointMjdTai_flag` (the time is the visit midpoint, not corrected) and `midpointMjdTai_flag_degraded` (corrected, with reduced accuracy). Booleans, **computed** for every row, right after `midpointMjdTai`. Added to lsst/sdm_schemas `tickets/DM-55375` (#549) in `sso_base.yaml` and `ppdb.yaml`. No sidecar file. |
 | MPC matching | Correction is applied **before** matching. An `obs_sbn` row matches a measurement if its time is within 10 ms of **either** the visit time or the corrected time; the 1-minute bucket fallback checks both. The basis (`visit`, `corrected`, `both`) is recorded internally per row, with counts in the input manifest. |
-| Missing corrections | Status 3 (`NOT_BUILT`): the visit's night has no table, or the night exists but the visit is missing from its exposure log (a late raw). Both mean a stale table: **the run fails.** A visit the table deliberately omits: the visit time, with `midpointMjdTai_flag` = True. A degraded correction: the corrected time, with `midpointMjdTai_flag_degraded` = True. |
+| Missing corrections | Status 3 (`NOT_BUILT`): see "Visits not built" below. A visit the table deliberately omits: the visit time, with `midpointMjdTai_flag` = True. A degraded correction: the corrected time, with `midpointMjdTai_flag_degraded` = True. |
 | Daily stage 0 | `ssp-sso-daily` first runs `shutter-timing-table --out /sdf/data/rubin/user/mjuric/shutter-timing/corrections --refresh-recent 3` from ssp-tools' venv. It resumes, skips nights already built, re-checks the last 3 nights written and rebuilds any with raws that arrived later (without it, late raws would never be processed), reads only the raw zips under `/sdf/data/rubin/lsstdata/offline/instrument/LSSTCam`, and uses at most 32 workers. A calibration mismatch stops the run with a clear message. |
 | Dependency | `shutter-timing`, tag **`v0.2.1`** (the same code as v0.2.0, whose git-tag install reported a dev version), from its private GitHub repository (`[tool.uv.sources]`), installed over HTTPS with the `gh` credential helper; `requires-python >= 3.11`; re-locked. Left as is although ssp-tools is public: a temporary situation. |
 | Degraded | Defined by shutter-timing (its contract: `CorrectionStatus`, `DEGRADED_QC`, `DEGRADED_RESIDUAL_S`): any source outside the raytrace table's coverage counts as degraded. Expected on about 13% of post-June 2026 sources, and on 99.7% of earlier sources (whose times come from the header). |
-| Raws that never arrive (proposed 2026-10-06, **awaiting the owner**) | A raw that never arrives stays NOT_BUILT for good, so the extract would fail every day. shutter-timing's runbook (`docs/runbooks/release.md`, "A raw that never arrives") puts the remedy on the ssp-tools side: an **override list** of visits accepted with the visit time and `midpointMjdTai_flag` = True. Proposed: a version-controlled `config/shutter-timing/accept-uncorrected.yaml` (visit, reason, date added); a listed visit with status 3 is treated as status 2 (omitted); listing a visit that is not status 3 is an error, so the list can't hide real corrections; the manifest records the visits it accepted. |
+| Visits not built (2026-10-06, replaces the fail-on-status-3 rule) | A NOT_BUILT visit (status 3: its night has no table, or the visit is missing from the night's exposure log) gets the visit time and `midpointMjdTai_flag` = True, with a warning naming the visits; the run goes on. The daily rebuild fixes it once the raw arrives (stage 0's `--refresh-recent`). **Guard:** if more than `MAX_NOT_BUILT_VISITS` = **20** distinct visits are NOT_BUILT (configurable, `--max-not-built-visits`), the extract fails with a message pointing at stage 0. One late raw is a few visits; a skipped or stale stage 0 is hundreds. No override list. Stage 0's own failures (exit 2, 3) still fail the run. The manifest counts omitted and not-built visits separately, and lists the not-built ones. |
 | Provenance | The correction table's `table_format`, `calibration_id` and `package_version` go into the run manifest. |
 | PPDB notice | None needed: the owner owns DM-55678. |
 
 Accepted risks:
-- The daily run fails when the correction tables lag.
+- The daily run fails when the correction tables lag by more than 20 visits (a skipped or broken stage 0); fewer are flagged and fixed by a later rerun.
 - Every SSSource ephemeris column changes for nearly every row, so the regression against the previous delivery is no longer bitwise.
 - The extract's matching rules and the input manifest are in `ssp/delivery_contract.py`, so the contract changes.
 
@@ -62,7 +62,7 @@ Both stop the daily run with the builder's message. `--rebuild-stale` finishes a
 
 **SSSource (extract stage).** `ssp-extract-sso-inputs` corrects the times of the measurements it resolves, before matching them to `obs_sbn`:
 - `dia_sources.parquet` gets the corrected `midpointMjdTai`, `midpointMjdTaiVisit`, the two flags, and the matching basis;
-- status 3 (night not built) fails the run.
+- status 3 (not built) gets the visit time and the flag, with a warning; more than 20 such visits fail the extract.
 
 The build copies the time and the flags into SSSource. It computes every ephemeris column at the corrected time, as it does today for whatever time a row carries.
 
@@ -95,10 +95,10 @@ The build copies the time and the flags into SSSource. It computes every ephemer
 
 | WP | builds | review |
 |---|---|---|
-| **S1 extract** | Correction before matching in `ssp/export/submittable.py` / `ssp/sso_inputs.py`: the two-basis 10 ms match and bucket fallback, the basis column and manifest counts, `midpointMjdTaiVisit`, the flags, the provenance, failure on status 3. | independent |
+| **S1 extract** | Correction before matching in `ssp/export/submittable.py` / `ssp/sso_inputs.py`: the two-basis 10 ms match and bucket fallback, the basis column and manifest counts, `midpointMjdTaiVisit`, the flags, the provenance, the NOT_BUILT warning and the 20-visit guard. | independent |
 | **S2 SSSource build** | Copy the corrected time and flags; the ephemerides at that time; the performance measurement and, if needed, the linear shift. | light |
 | **S3 NearbySSO** | Evaluate each matched row at its own `midpointMjdTai`; bitwise unchanged today; a synthetic per-source-time test. | independent |
-| **S4 stage 0 and checks** | `shutter-timing-table` in `ssp-sso-daily` (the failure modes, the runbook); the consistency checks' time-shift tolerance. | light |
+| **S4 stage 0 and checks** | `shutter-timing-table --refresh-recent 3` in `ssp-sso-daily` (exit codes 2 and 3 stop the run; the runbook, incl. `--rebuild-stale`); the consistency checks' time-shift tolerance. | light |
 
 **Last, the integrator:**
 - the dependency pin and re-lock;
