@@ -113,3 +113,30 @@ The build copies the time and the flags into SSSource. It computes every ephemer
 ## Submitted times (2026-10-06)
 
 The MPC holds the pipeline's visit times, i.e. (MJD-BEG + MJD-END)/2. For the 23 visits whose header midpoint is late by more than 50 ms (the late-readout visits above), 10,291 observations of 7,292 objects in 160 submissions were submitted with times late by 0.05–1.70 s (median 0.44 s). The objects moved slowly (≤ 0.4°/day), so the along-track position error is a median 1.4 mas, 99th percentile 14 mas, max 28 mas; none exceeds 50 mas. Across all 8.07M submitted observations, the shutter correction itself amounts to a median 0.4 mas (99.9th percentile 3.5 mas). Re-submission is an ssp-submit question; SSSource carries the corrected times.
+
+## Results (2026-10-06)
+
+**Work packages merged into `shutter-timing`:**
+
+| WP | PR | what | review |
+|---|---|---|---|
+| S4 | #79 | stage 0 in `ssp-sso-daily`, the runbook, and time-shift allowances in the cross-table checks | light |
+| S2 | #80 | SSSource at the corrected times; the observer and the Sun shifted from the visit time (accuracy ≤ 0.003 µas; exact evaluation would add ~27 min and 3 GB) | light |
+| S1 | #81 | corrections in the extract, before matching; two-basis matching; NOT_BUILT, outside coverage, header guard | independent (5 test gaps and a crash fixed) |
+| S3 | #82 | NearbySSO rows at their own DiaSource time (no effect today) | independent (6 findings fixed) |
+| S1b | #83 | large corrections applied as degraded; already-corrected inputs; header-first guard; per-night position window | (follow-up to S1) |
+
+**End-to-end rerun:** `ssp-sso-daily --skip-stage0 --upload dev --dry-run` from `shutter-timing` 45796b7. It used a fresh MPC snapshot (2026-10-06T07:37:38Z) and the production correction table (385 nights, calibration 506330def138). Output: `/sdf/data/rubin/user/mjuric/shutter-timing-ssp/rerun/2026-10-06/`.
+- **Deliverable:** true; all 8 checks PASS. The extract took 12:36 and the build 12:49.
+- **Corrections:** ok 5,005,387; degraded 3,064,606; omitted 37; outside coverage 2,308 (the ComCam visits); not built, time mismatch, large shift and already corrected all 0. No warnings.
+- **Match basis:** 7,566,939 visit, 505,399 both, 0 corrected only. Submissions still carry visit times.
+- **`tail_angles_validate consistency --dia-sources`:** PASS. 214,882 SSSource/NearbySSO pairs, |Δt| median 69 ms, max 0.265 s; every difference within the time-shift allowance.
+- **NearbySSO** is byte-identical to master's code on the same inputs (md5 `175471f9…`).
+- **SSSource with and without the corrections** (the same inputs, visit times restored, built by the same code):
+  - The along-track residuals move in the predicted direction.
+  - On the late-readout visits the per-visit along-track bias roughly halves: 2025060300095 −36.9 → −22.0 mas, 2025060400183 −26.1 → −13.7, 2025060400375 −13.9 → −8.1, 2025060400422 −17.4 → −12.7.
+  - Over the 20,229 rows corrected by more than 0.25 s, the median along-track residual moves from −3.4 to −1.3 mas.
+  - The scatter is dominated by per-visit astrometric errors of tens of mas, so the robust σ changes little: 52.8 → 52.4 mas on those rows, and 113.8 → 110.3 mas for fast (> 2°/day), bright (SNR > 50) sources.
+  - Over all rows the correction is ~0.4 mas, small next to the ~50 mas scatter.
+
+**Open:** who runs stage 0 against the shared production correction table, and when. Its first run appends every night since 2026-07-14.
