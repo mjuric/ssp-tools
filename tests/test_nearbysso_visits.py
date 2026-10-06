@@ -1,5 +1,7 @@
 """WP3: read_dia, build_visits, DiaIndex.match and VisitIndex.candidates,
 against brute force. No network: the observer's position is stubbed."""
+import warnings
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -187,12 +189,34 @@ def test_blocks_and_threads(monkeypatch):
 
 
 def test_build_visits_time_spread():
+    """Sources with their own times (shutter-corrected): the visit's time is
+    their median, without a warning (docs/design/shutter-timing.md); with a
+    shared time, exactly that time."""
     rng = np.random.default_rng(2)
-    dia = make_dia([7], [(0.0, 0.0)], 5, 0.1, rng)
-    dia["midpointMjdTai"] = np.array([1.0, 1.0, 1.0 + 1e-3, 1.0 + 2e-3, 1.0 + 2e-3]) + 60000
-    with pytest.warns(UserWarning, match="median"):
+    dia = make_dia([7, 8, 9], [(0.0, 0.0), (5.0, 0.0), (10.0, 0.0)], 5, 0.1, rng)
+    t8 = 60002.123456789
+    dia["midpointMjdTai"] = np.r_[np.array([1.0, 1.0, 1.0 + 1e-3, 1.0 + 2e-3, 1.0 + 2e-3]) + 60000,
+                                  np.full(5, t8),
+                                  60003.5 + np.array([-0.24, 0.1, 0.24, 0.0, -0.05]) / 86400.0]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         vis = V.build_visits(dia)
     assert vis["t_tai_mjd"][0] == 60001.001
+    assert vis["t_tai_mjd"][1] == t8
+    assert vis["t_tai_mjd"][2] == np.median(dia["midpointMjdTai"][10:15])
+    assert vis["t_tai_mjd"][2] == 60003.5
+    # (even sizes: the mean of the middle two)
+    d2 = {k: v[:4] for k, v in dia.items()}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert V.build_visits(d2)["t_tai_mjd"][0] == np.median(d2["midpointMjdTai"])
+    # (NaN-safe, although read_dia drops non-finite times)
+    d3 = {k: v[10:15].copy() for k, v in dia.items()}
+    d3["midpointMjdTai"][1] = np.nan
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        t3 = V.build_visits(d3)["t_tai_mjd"][0]
+    assert t3 == np.nanmedian(d3["midpointMjdTai"]) and np.isfinite(t3)
 
 
 def test_build_visits_unsorted():

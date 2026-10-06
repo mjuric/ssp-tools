@@ -310,6 +310,15 @@ NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
 #   smallest separation. It is computed from the matches of each (orbit, visit)
 #   prediction before the nearest-object reduction.
 #
+# Times (docs/design/shutter-timing.md): candidate selection and the match
+#   within the radius use the visit-level prediction; every published
+#   ephemeris column of a row (position, ellipse, ephOffset, rates, ephVmag,
+#   tail angles) is evaluated at that row's own DiaSource midpointMjdTai, as
+#   read from the input (no correction applied here). Today every source of
+#   a visit has the visit's time, so the output is unchanged; it follows
+#   per-source times once DiaSource carries them. build_visits keeps a
+#   visit-level time for the coarse pass (its median, without the warning).
+#
 # Matching (docs/design/comet-radius.md): each prediction matches the
 #   DiaSources within its own object's match_radius. The nearest-object
 #   reduction is unchanged (it compares separations in arcsec, whatever the

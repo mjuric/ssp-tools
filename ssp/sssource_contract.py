@@ -19,7 +19,8 @@ from ssp.schema_ppdb import NearbySSODtype, SSSourceDtype  # noqa: F401
 SSSOURCE_NONNULL = frozenset({
     "obsid", "status", "primary", "matchMethod",
     "measuredOn", "processing", "processingTable",
-    "visit", "detector", "midpointMjdTai", "ra", "dec", "band", "psfFlux", "psfFluxErr",
+    "visit", "detector", "midpointMjdTai", "midpointMjdTai_flag", "midpointMjdTai_flag_degraded",
+    "ra", "dec", "band", "psfFlux", "psfFluxErr",
     "eclLambda", "eclBeta", "galLon", "galLat",
 })
 
@@ -53,6 +54,62 @@ ID_SPLIT = {
 #: SubmittableSources columns not carried into SSSource: the view's own
 #: spatial query helpers.
 VIEW_DROPPED = ("hpix29", "cx", "cy", "cz")
+
+# --------------------------------------------------------------------------
+# Shutter-motion-corrected times (docs/design/shutter-timing.md)
+# --------------------------------------------------------------------------
+#
+# dia_sources.parquet (the extract, WP S1) carries, per row:
+#   midpointMjdTai                the source's shutter-corrected exposure
+#                                 midpoint (shutter_timing.corrections.
+#                                 corrected_midpoints(visit, detector, x, y)),
+#                                 or the visit's midpoint where uncorrected
+#   midpointMjdTaiVisit           the visit's midpoint, as the measurement
+#                                 had it
+#   midpointMjdTai_flag           True: midpointMjdTai is the visit's midpoint
+#                                 (the table omits this visit: status 2)
+#   midpointMjdTai_flag_degraded  True: corrected with reduced accuracy
+#                                 (status 1)
+#   dt_corrected_ms               diagnostic: obstime - corrected time [ms]
+#   obstime_basis                 how the obs_sbn row's time matched: 'visit',
+#                                 'corrected' or 'both' (each within DT_MS)
+# A NOT_BUILT visit (status 3) gets the visit's time and midpointMjdTai_flag
+# True, with a warning naming it; more than MAX_NOT_BUILT_VISITS distinct
+# NOT_BUILT visits fail the extract (a stale or skipped stage 0).
+# The flags are non-null for every row (False/False for a status-0 correction).
+#
+# SSSource copies midpointMjdTai and the two flags (block 4) and computes
+# every ephemeris column at that midpointMjdTai. midpointMjdTaiVisit and
+# obstime_basis are internal: not published, dropped without a warning.
+SHUTTER_INTERNAL = ("midpointMjdTaiVisit", "obstime_basis", "dt_corrected_ms")
+
+#: The default limit on NOT_BUILT visits in one extract (configurable).
+MAX_NOT_BUILT_VISITS = 20
+
+#: Visits on nights before the correction table's first night are outside
+#: its coverage (e.g. ComCam): the visit time, midpointMjdTai_flag True, not
+#: counted toward MAX_NOT_BUILT_VISITS; counted separately in the manifest.
+#: The correction is applied (however large) only where the pipeline's
+#: visit time equals the exposure log's header midpoint header_mid_mjd_tai
+#: ((MJD-BEG + MJD-END)/2, from the table's exposures_<day_obs>.parquet) to
+#: within this [s]; otherwise the visit time, midpointMjdTai_flag True, a
+#: warning, counted in the manifest as time_mismatch (docs/design/
+#: shutter-timing.md, "Visit-time guard").
+MAX_HEADER_MISMATCH_S = 0.001
+#: The guard also passes a pipeline time that equals the corrected time to
+#: within MAX_HEADER_MISMATCH_S (an input whose times are already corrected,
+#: e.g. once AP writes shutter-corrected DiaSource times): the time stands.
+#:
+#: The guard checks the header midpoint first, then the corrected time.
+#:
+#: A correction that moves a time by more than this [s] from the pipeline's
+#: visit time is still applied, but midpointMjdTai_flag_degraded is set and
+#: a warning names the visits; counted in the manifest as large_shift. (Such
+#: shifts are hung end-of-integration readouts, where the table's time is
+#: right and MJD-END is minutes late, or rare exposures whose shutter
+#: profile contradicts the header; the largest late-readout shift in normal
+#: operations is ~1.94 s.)
+MAX_CORRECTION_S = 3.0
 
 #: The predicted position's error ellipse (deg, deg, deg^2): the
 #: NearbySSO convention, i.e. the DiaSource raErr/decErr/ra_dec_Cov one.

@@ -55,6 +55,13 @@ exit 0 on PASS, 1 on FAIL)::
       has any; otherwise noted as not applicable); agreement of
       the matched rows; no S/ objects; no NearbySSO row for an orbit the
       filter drops. ``--table FILE``: the per-row table (Parquet).
+      Time shift (docs/design/shutter-timing.md): SSSource predicts at its
+      own (shutter-corrected) midpointMjdTai, NearbySSO at the DiaSource's
+      (DIA_SOURCES' midpointMjdTai). Where they differ by dt, the
+      agreement tolerances and the offset-radius and nearer-object
+      explanations add bench/time_shift.py's allowances (position and
+      ephOffset: |rate| |dt| plus a margin); where dt = 0 they are
+      unchanged. |dt| > TS.DT_MAX_S (10 s, a sanity limit) fails.
 
   uncertainty MPC_ORBITS [--sssource SSSOURCE] [--objects objects.txt]
           [--n-orbits 10] [--draws 1000] [--times 3] [--workers 8]
@@ -111,6 +118,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from bench.sssource_validate import bitwise_mismatch, to_np  # noqa: E402
+from bench import time_shift as TS  # noqa: E402
 from ssp.nearbysso import _contract as _C  # noqa: E402
 
 # --------------------------------------------------------------------------
@@ -199,6 +207,8 @@ RATE_TOL_DEG_DAY = 1e-6
 VMAG_TOL = 1e-3
 #: ephOffset (float32 in both; the same DiaSource) agrees to this [arcsec].
 OFFSET_TOL_ARCSEC = 1e-3
+#: SSSource columns for the time-shift allowances (bench/time_shift.py).
+SHIFT_COLUMNS = ("topoRange", "topoRangeRate", "helioRange", "helioRangeRate")
 #: "Most" comet rows: at least this fraction of the comet SSSource rows with
 #: an orbit and their DiaSource in the input must be matched (the cuts
 #: legitimately drop some: large offsets of comets without non-gravs,
@@ -767,8 +777,10 @@ def map_to_dia(sss, dia, tol_mas=POSITION_MATCH_MAS):
 
 def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     """The comparison (DataFrames): ``nss`` NearbySSO rows, ``sss`` SSSource
-    rows (designation, diaSourceId, visit, midpointMjdTai, ra, dec, eph*),
-    ``dia`` the NearbySSO input (diaSourceId, visit, ra, dec), ``orbits``
+    rows (designation, diaSourceId, visit, midpointMjdTai, ra, dec, eph*,
+    optionally SHIFT_COLUMNS), ``dia`` the NearbySSO input (diaSourceId,
+    visit, ra, dec, optionally midpointMjdTai: without it the time shift is
+    taken as 0, i.e. strict), ``orbits``
     mpc_orbits rows (designation, q, e, i, node, argperi, peri_time,
     mpc_orb_jsonb), ``cmap`` {designation: class}. ``coarse_sigma(
     designation, tai) -> sigma_major [arcsec]`` (optional) is asked about
@@ -817,7 +829,17 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
         return np.where(has, v.astype(object), None)
 
     def f(c):
-        return s[c].to_numpy(np.float64)
+        return s[c].to_numpy(np.float64) if c in s else np.full(n, np.nan)
+
+    # the time shift: SSSource at its own time, NearbySSO at the DiaSource's
+    if "midpointMjdTai" in dia and len(dia):
+        dtime = dia.drop_duplicates("diaSourceId").set_index("diaSourceId")["midpointMjdTai"]
+        t_dia = dtime.reindex(dsid[in_input]).to_numpy(np.float64)
+    else:
+        t_dia = np.full(n, np.nan)
+    dt = TS.dt_days(f("midpointMjdTai"), t_dia)
+    rate = TS.rate_deg_day(f("ephRateRa"), f("ephRateDec"), col("ephRateRa"), col("ephRateDec"))
+    pos_allow = TS.position_mas(rate, dt)
 
     des = s["designation"].astype(str).to_numpy().astype(object)
     nss_des = col("designation", "s")
@@ -825,11 +847,27 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
                        "dia_id": dsid[in_input], "tai": f("midpointMjdTai"),
                        "sss_offset": f("ephOffset"),
                        "sss_sigma": sigma_major_arcsec(f("ephRaErr"), f("ephDecErr"), f("ephRa_ephDec_Cov")),
-                       "nss_designation": nss_des, "nss_offset": col("ephOffset")})
+                       "nss_designation": nss_des, "nss_offset": col("ephOffset"),
+                       "dt_s": dt * TS.SECONDS_PER_DAY,
+                       "allow_pos_mas": pos_allow,
+                       "allow_rate": TS.rate_allowance(dt, rate, f("topoRange"), f("topoRangeRate"),
+                                                       f("helioRange"), f("ephDec")),
+                       "allow_vmag": TS.vmag_allowance(dt, rate, f("topoRange"), f("topoRangeRate"),
+                                                       f("helioRange"), f("helioRangeRate"))})
     match = has & (nss_des == des)
     with np.errstate(invalid="ignore"):
         df["pos_mas"] = np.where(match, sky_sep_arcsec(f("ephRa"), f("ephDec"), col("ephRa"), col("ephDec"))
                                  * 1000.0, np.nan)
+        # where dt != 0: what's left once the motion over dt is taken out
+        mean_ra = np.where(np.isfinite(col("ephRateRa")), (f("ephRateRa") + col("ephRateRa")) / 2,
+                           f("ephRateRa"))
+        mean_dec = np.where(np.isfinite(col("ephRateDec")), (f("ephRateDec") + col("ephRateDec")) / 2,
+                            f("ephRateDec"))
+        resid = TS.motion_residual_mas(f("ephRa"), f("ephDec"), col("ephRa"), col("ephDec"),
+                                       mean_ra, mean_dec, dt)
+        df["pos_resid_mas"] = np.where(match & (dt != 0), resid, df["pos_mas"].to_numpy())
+        df["allow_pos_margin_mas"] = TS.position_margin_mas(rate, dt, TS.angular_acceleration(
+            rate, f("topoRange"), f("topoRangeRate"), f("helioRange"), f("ephDec")))
         for name, c in (("rate_ra", "ephRateRa"), ("rate_dec", "ephRateDec"), ("vmag", "ephVmag"),
                         ("offset", "ephOffset")):
             df[name] = np.where(match, np.abs(f(c) - col(c)), np.nan)
@@ -840,8 +878,8 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     df["match_radius"] = rad = match_radius(des)
     with np.errstate(invalid="ignore"):
         conds = [match, rsn != "", np.isfinite(q) & (q < SUNGRAZER_Q_AU), ~np.isfinite(sig),
-                 sig * border > SIGMA_MAX_ARCSEC, off * border > rad,
-                 has & (df["nss_offset"].to_numpy() <= off * border)]
+                 sig * border > SIGMA_MAX_ARCSEC, off * border > rad - pos_allow / 1e3,
+                 has & (df["nss_offset"].to_numpy() <= off * border + pos_allow / 1e3)]
     labels = ["match", "orbit filtered", "sungrazer (q < 0.02 au)", "no covariance", "sigma > 10\"",
               "offset > radius", "nearer object"]
     status = np.select(conds, labels, "UNEXPLAINED").astype(object)
@@ -868,12 +906,15 @@ def check_nearbysso(nearbysso, sssource, mpc_orbits, dia_sources, objects=None, 
     rep = rep or Report(f"Non-grav NearbySSO: {nearbysso} vs {sssource}")
     nss = pq.read_table(nearbysso, columns=["diaSourceId", "designation", "ephRa", "ephDec", "ephOffset",
                                             "ephVmag", "ephRateRa", "ephRateDec"]).to_pandas()
+    present = set(pq.read_schema(sssource).names)
     sss = _read_sss(sssource, ["designation", "diaSourceId", "visit", "midpointMjdTai", "ra", "dec", "ephRa",
-                               "ephDec", "ephOffset", "ephVmag", "ephRateRa", "ephRateDec", *ERROR_COLUMNS]
+                               "ephDec", "ephOffset", "ephVmag", "ephRateRa", "ephRateDec", *ERROR_COLUMNS,
+                               *(c for c in SHIFT_COLUMNS if c in present)]
                     ).to_pandas(types_mapper=_INT_MAPPER)
     visits = np.unique(sss["visit"].astype("int64").to_numpy())
     from bench.nearbysso_validate import read_dia_subset
-    dia = read_dia_subset(dia_sources, visits=visits, columns=("diaSourceId", "visit", "ra", "dec"))
+    dia = read_dia_subset(dia_sources, visits=visits,
+                          columns=("diaSourceId", "visit", "ra", "dec", "midpointMjdTai"))
     des = set(sss["designation"].dropna()) | set(nss["designation"].dropna())
     orbits = read_mpc(mpc_orbits, des, columns=("q", "e", "i", "node", "argperi", "peri_time"))
     cmap = classes_for(des, objects=objects, orbits_df=orbits)
@@ -907,15 +948,31 @@ def _nearbysso_gates(df, rep):
                   f"{r.designation} dia {r.dia_id} offset {r.sss_offset:.3f}\" sigma {r.sss_sigma:.3g}\" "
                   f"NearbySSO {r.nss_designation}" for r in un.head(10).itertuples()) if len(un) else ""))
     m = df[df["status"] == "match"]
-    for name, col, tol in (("position", "pos_mas", POS_TOL_MAS), ("ephRateRa", "rate_ra", RATE_TOL_DEG_DAY),
-                           ("ephRateDec", "rate_dec", RATE_TOL_DEG_DAY), ("ephVmag", "vmag", VMAG_TOL),
-                           ("ephOffset", "offset", OFFSET_TOL_ARCSEC)):
+    if "dt_s" in df:
+        dt_s = df["dt_s"].to_numpy(np.float64)
+        big = np.abs(dt_s) > TS.DT_MAX_S
+        nz = np.abs(dt_s[dt_s != 0])
+        rep.check(f"time shift SSSource - DiaSource within {TS.DT_MAX_S} s", not big.any(),
+                  f"{int((dt_s != 0).sum()):,} of {len(df):,} rows shifted"
+                  + (f", max |dt| {nz.max():.3f} s" if len(nz) else "")
+                  + (f"; {int(big.sum())} beyond" if big.any() else "")
+                  + "; shifted rows get bench/time_shift.py's allowances, the others are strict")
+    zero = np.zeros(len(m))
+
+    def allow(c):
+        return m[c].to_numpy(np.float64) if c in m else zero
+    for name, col, tol, extra in (
+            ("position", "pos_resid_mas", POS_TOL_MAS, allow("allow_pos_margin_mas")),
+            ("ephRateRa", "rate_ra", RATE_TOL_DEG_DAY, allow("allow_rate")),
+            ("ephRateDec", "rate_dec", RATE_TOL_DEG_DAY, allow("allow_rate")),
+            ("ephVmag", "vmag", VMAG_TOL, allow("allow_vmag")),
+            ("ephOffset", "offset", OFFSET_TOL_ARCSEC, allow("allow_pos_mas") / 1e3)):
         v = m[col].to_numpy(dtype=np.float64)
-        bad = np.isfinite(v) & (v > tol)
+        bad = np.isfinite(v) & (v > tol + extra)
         worst = m.iloc[int(np.nanargmax(v))] if np.isfinite(v).any() else None
         rep.check(f"matched rows agree: {name}", not bad.any(),
                   f"{len(m):,} rows, max {np.nanmax(v) if np.isfinite(v).any() else float('nan'):.3g} "
-                  f"(tol {tol:g}"
+                  f"(tol {tol:g}" + (" + the time-shift allowance" if np.any(extra) else "")
                   + (f"; {int(bad.sum())} beyond, worst {worst['designation']}" if bad.any() else "") + ")")
     night = df[df["status"].str.contains("within the night", regex=False)]
     if len(night):

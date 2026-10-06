@@ -88,9 +88,14 @@ NAN_COLUMNS = ("snr", "apFlux", "trailRa")
 NAN_ROWS = [0, 6]
 
 
-def make_inputs(path, seed=0, match_method=False, **overrides):
+def make_inputs(path, seed=0, match_method=False, shutter=True, **overrides):
     """Write dia_sources, obs_sbn, the identification tables and mpc_orbits
-    for ROWS to ``path``; ``overrides`` replace dia_sources columns."""
+    for ROWS to ``path``; ``overrides`` replace dia_sources columns.
+
+    With ``shutter`` (the default), dia_sources has shutter-corrected times
+    (all of SHUTTER_INPUT_COLUMNS): midpointMjdTai is the visit's time,
+    midpointMjdTaiVisit, shifted by up to 0.24 s where midpointMjdTai_flag
+    is False. Without, it predates the correction (none of them)."""
     rng = np.random.default_rng(seed)
     n = len(ROWS)
     perm = rng.permutation(n)                     # file order != object order
@@ -130,6 +135,15 @@ def make_inputs(path, seed=0, match_method=False, **overrides):
     if match_method:
         mm = ["position" if r[4] == "position" else "obssubid_trail" if r[3] else "obssubid" for r in rows]
         dia["matchMethod"] = pa.array(mm)
+    if shutter:
+        flag = dia["midpointMjdTai_flag"].to_numpy(zero_copy_only=False)
+        dt = np.where(flag, 0.0, rng.uniform(-0.24, 0.24, n))
+        dia["midpointMjdTaiVisit"] = pa.array(t)
+        dia["midpointMjdTai"] = pa.array(t + dt / 86400)
+        dia["obstime_basis"] = pa.array(rng.choice(["visit", "corrected", "both"], n))
+    else:
+        for c in sssource.SHUTTER_FLAGS:
+            del dia[c]
     dia.update(overrides)
     pq.write_table(pa.table(dia), path / "dia_sources.parquet")
 

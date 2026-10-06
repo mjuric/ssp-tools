@@ -67,7 +67,12 @@ def packed_ascii_to_uint64_le(mpc_packed):
     return np.frombuffer(buf, dtype="<u8")
 
 
-def solar_elongation_ndarray(ra_deg, dec_deg, t):
+#: solar_elongation_ndarray's finite-difference step for the Sun's motion
+#: [s], with ``dt_s``.
+SUN_SHIFT_STEP_S = 1.0
+
+
+def solar_elongation_ndarray(ra_deg, dec_deg, t, dt_s=None):
     """
     Very fast computation of solar elongation (ICRS great-circle separation)
     using astropy.coordinates.angular_separation.
@@ -79,7 +84,15 @@ def solar_elongation_ndarray(ra_deg, dec_deg, t):
     dec_deg : ndarray
         Target Dec in degrees (ICRS).
     t : astropy.time.Time
-        Observation times.
+        Observation times; with ``dt_s``, reference times (e.g. the visit
+        midpoints) that the observation times differ from by ``dt_s``.
+    dt_s : ndarray, optional
+        The observation times minus ``t`` [s] (at most a second or so, e.g.
+        the shutter-motion correction). The Sun is then evaluated once per
+        unique ``t`` (and at ``t`` + SUN_SHIFT_STEP_S, for its motion) and
+        shifted linearly by ``dt_s``: the Sun moves ~0.04"/s, so the error
+        of the linear shift is far below a micro-arcsecond. Where ``dt_s``
+        is 0 the result is bitwise as without it.
 
     Returns
     -------
@@ -100,6 +113,17 @@ def solar_elongation_ndarray(ra_deg, dec_deg, t):
     # Extract Sun RA/Dec arrays (radian floats)
     sun_ra = sun.ra.radian[inv.ravel()].reshape(t.shape)
     sun_dec = sun.dec.radian[inv.ravel()].reshape(t.shape)
+
+    if dt_s is not None:
+        # the Sun's motion per second, at each unique reference time
+        t1 = np.atleast_1d(t)[first] + SUN_SHIFT_STEP_S * u.s
+        sun1 = get_sun(t1).icrs
+        dra = np.angle(np.exp(1j * (sun1.ra.radian - sun.ra.radian)))   # (wrapped to [-pi, pi])
+        rate_ra = (dra / SUN_SHIFT_STEP_S)[inv.ravel()].reshape(t.shape)
+        rate_dec = ((sun1.dec.radian - sun.dec.radian) / SUN_SHIFT_STEP_S)[inv.ravel()].reshape(t.shape)
+        dt_s = np.broadcast_to(np.asarray(dt_s, dtype=np.float64), t.shape)
+        sun_ra = sun_ra + rate_ra * dt_s
+        sun_dec = sun_dec + rate_dec * dt_s
 
     # Convert input to radians
     ra = np.radians(ra_deg)
