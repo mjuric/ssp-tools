@@ -183,7 +183,7 @@ def test_four_statuses(tmp_path, capsys):
         assert (r["obstime_basis"] == "both") is (corrected and abs(r["dt_corrected_ms"]) <= S.DT_MS)
     n = {s: sum(e["status"] == s for e in ex) for s in range(4)}
     assert rep["status"] == dict(ok=n[0], degraded=n[1], omitted=n[2], not_built=n[3], outside_coverage=0,
-                                 time_mismatch=0)
+                                 time_mismatch=0, shift_too_large=0, already_corrected=0)
     assert rep["first_night"] == 20250810 and rep["time_mismatch_visits"] == []   # the fixture's
     nb = sorted(e["visit"] for e in ex if e["status"] == 3)
     assert rep["not_built_visits"] == nb
@@ -242,7 +242,7 @@ def test_two_basis_match(tmp_path):
     assert abs(out["o1"]["dt_corrected_ms"]) < 0.01 and out["o1"]["dt_ms"] == pytest.approx(-(tc - tv) / MS)
     assert rep["obstime_basis"] == dict(visit=1, corrected=2, both=1)
     assert rep["status"] == dict(ok=4, degraded=0, omitted=0, not_built=0, outside_coverage=0,
-                                 time_mismatch=0)
+                                 time_mismatch=0, shift_too_large=0, already_corrected=0)
     assert rep["not_built_visits"] == []
 
 
@@ -380,26 +380,132 @@ def test_empty_table_has_no_coverage(tmp_path):
 def test_warnings_list_at_most_20_visits(capsys):
     corr = S.Corrections(TABLE, max_not_built_visits=1000)
     visits = np.arange(25) + 2026010600001
-    nb, tm = corr.check(visits, np.full(25, S.NOT_BUILT), np.full(25, np.nan))
+    nan = np.full(25, np.nan)
+    nb, tm = corr.check(visits, np.full(25, S.NOT_BUILT), nan, nan)
     assert nb == visits.tolist() and tm == []
     err = capsys.readouterr().err
     assert str(visits[19]) in err and str(visits[20]) not in err and "... and 5 more" in err
-    nb, tm = corr.check(visits, np.full(25, S.TIME_MISMATCH), np.full(25, 0.07))
+    nb, tm = corr.check(visits, np.full(25, S.TIME_MISMATCH), np.full(25, 0.07), nan)
     assert nb == [] and tm == visits.tolist()
     err = capsys.readouterr().err
     assert "+70.0 ms" in err and "... and 5 more" in err and str(visits[20]) not in err
+    nb, tm = corr.check(visits, np.full(25, S.SHIFT_TOO_LARGE), nan, np.full(25, -3.5))
+    assert nb == [] and tm == []
+    err = capsys.readouterr().err
+    assert "3.500 s" in err and "... and 5 more" in err and str(visits[20]) not in err
 
 
 def test_header_guard_unit():
-    """Within MAX_HEADER_MISMATCH_S of the header midpoint: applied; beyond:
-    rejected; a visit missing from the log (NaN): the table's status stands."""
+    """Header within MAX_HEADER_MISMATCH_S: applied; beyond: TIME_MISMATCH;
+    a visit missing from the log (NaN): the table's status stands. The
+    pipeline time equal to the corrected one: ALREADY_CORRECTED. A shift
+    beyond MAX_CORRECTION_S: SHIFT_TOO_LARGE, header match or not."""
     assert S.VISIT_TIME_GUARD is S.header_guard
-    h = np.array([61046.25, 61046.25, 61046.25, np.nan])
-    t = h + np.array([0.0009, -0.0009, 0.0011, 0.0]) / 86400
-    t[3] = 61046.25
-    reject, d = S.header_guard({"header_mid_mjd_tai": h}, t)
-    assert list(reject) == [False, False, True, False]
-    assert d[:3] == pytest.approx([0.0009, -0.0009, 0.0011], abs=1e-6) and np.isnan(d[3])
+    h0 = 61046.25
+    cases = [  # (pipeline - header [s], header present, corrected - header [s], verdict)
+        (0.0009, True, 0.2, S.GUARD_APPLY),
+        (-0.0009, True, 0.2, S.GUARD_APPLY),
+        (0.0011, True, 0.2, S.TIME_MISMATCH),
+        (0.0, False, 0.2, S.GUARD_APPLY),
+        (0.2, True, 0.2, S.ALREADY_CORRECTED),          # pipeline = corrected
+        (0.2009, True, 0.2, S.ALREADY_CORRECTED),
+        (0.2011, True, 0.2, S.TIME_MISMATCH),           # neither
+        (0.0, True, 3.5, S.SHIFT_TOO_LARGE),
+        (0.0, True, -3.5, S.SHIFT_TOO_LARGE),
+        (0.0, True, 2.5, S.GUARD_APPLY),
+        (0.5, True, 3.6, S.SHIFT_TOO_LARGE),            # neither, and too large
+        # a correction under 1 ms on a header-matching (or unlogged) visit
+        # is an ordinary correction, not an already-corrected input
+        (0.0, True, 0.0005, S.GUARD_APPLY),
+        (0.0, False, 0.0005, S.GUARD_APPLY),
+    ]
+    h = np.array([h0 if c[1] else np.nan for c in cases])
+    tp = np.array([h0 + c[0] / 86400 for c in cases])
+    tcorr = np.array([h0 + c[2] / 86400 for c in cases])
+    verdict, dh, shift = S.header_guard({"header_mid_mjd_tai": h}, tp, tcorr)
+    assert list(verdict) == [c[3] for c in cases]
+    assert shift == pytest.approx([c[2] - c[0] for c in cases], abs=1e-5)
+    assert dh[0] == pytest.approx(0.0009, abs=1e-6) and np.isnan(dh[3])
+
+
+def test_correction_cap_boundary(monkeypatch):
+    """|shift| == MAX_CORRECTION_S is applied; just beyond it is not."""
+    h0 = 61046.25
+    tcorr = np.array([h0 + 3.0 / 86400, h0 - 3.0 / 86400])
+    tp = np.array([h0, h0])
+    shift = (tcorr - tp) * 86400
+    monkeypatch.setattr(S, "MAX_CORRECTION_S", float(np.abs(shift).min()))
+    verdict, _, _ = S.header_guard({"header_mid_mjd_tai": tp}, tp, tcorr)
+    i = int(np.argmin(np.abs(shift)))
+    assert verdict[i] == S.GUARD_APPLY and verdict[1 - i] in (S.GUARD_APPLY, S.SHIFT_TOO_LARGE)
+    monkeypatch.setattr(S, "MAX_CORRECTION_S", float(np.abs(shift).min()) * (1 - 1e-12))
+    verdict, _, _ = S.header_guard({"header_mid_mjd_tai": tp}, tp, tcorr)
+    assert list(verdict) == [S.SHIFT_TOO_LARGE] * 2
+
+
+def test_shift_window_covers_the_cap():
+    assert S.MAX_SHUTTER_SHIFT_S >= S.MAX_CORRECTION_S
+
+
+def _late(tmp_path, shift_s):
+    """A fixture copy where V0 is a late-readout visit: header midpoint (=
+    pipeline time) ``shift_s`` after the corrected time of (D0, X0, Y0).
+    Returns (table, corrected time, pipeline time)."""
+    table = _copy_table(tmp_path)
+    tc = reference(V0, D0, X0, Y0, table_dir=table).t_mid_mjd_tai[0]
+    tp = tc + shift_s / 86400
+    _set_header(table, V0, tp)
+    return table, tc, tp
+
+
+@pytest.mark.parametrize("shift, expect", [(3.5, "shift_too_large"), (2.5, "ok")])
+def test_cap_end_to_end(tmp_path, capsys, shift, expect):
+    table, tc, tp = _late(tmp_path, shift)
+    view = [dict(id=1, ra=10.0, midpointMjdTai=tp, visit=V0, detector=D0, x=X0, y=Y0)]
+    obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(tp), band="Lr", mag=20.0)]
+    out, _, rep = run(tmp_path, obs, view, table=table)
+    r = out["o"]
+    assert rep["status"][expect] == 1 and sum(rep["status"].values()) == 1
+    if expect == "ok":
+        assert r["midpointMjdTai"] == tc and not r["midpointMjdTai_flag"]
+    else:
+        assert r["midpointMjdTai"] == tp and r["midpointMjdTai_flag"]
+        assert not r["midpointMjdTai_flag_degraded"]
+        err = capsys.readouterr().err
+        assert f"{V0} ({shift:.3f} s)" in err
+    assert r["midpointMjdTaiVisit"] == tp
+
+
+@pytest.mark.parametrize("degraded", [False, True])
+def test_already_corrected(tmp_path, degraded):
+    """The pipeline time is the corrected time: it stands, unflagged, with
+    the degraded flag following the correction's status."""
+    v, d, x, y = (V1, D1, X1, Y1) if degraded else (V0, D0, X0, Y0)
+    tc = reference(v, d, x, y).t_mid_mjd_tai[0]
+    tp = tc + 0.0004 / 86400                     # within 1 ms of the corrected time
+    view = [dict(id=1, ra=10.0, midpointMjdTai=tp, visit=v, detector=d, x=x, y=y)]
+    # submitted from the already-corrected time
+    obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(tp), band="Lr", mag=20.0)]
+    out, unres, rep = run(tmp_path, obs, view)
+    r = out["o"]
+    assert r["midpointMjdTai"] == r["midpointMjdTaiVisit"] == tp
+    assert not r["midpointMjdTai_flag"] and r["midpointMjdTai_flag_degraded"] is degraded
+    assert rep["status"]["already_corrected"] == 1 and sum(rep["status"].values()) == 1
+    corr = S.Corrections(TABLE)
+    corr.lookup(view_table(view), np.array([0]))
+    assert list(corr.status) == [S.ALREADY_CORRECTED_DEGRADED if degraded else S.ALREADY_CORRECTED]
+    assert corr.t[0] == tp
+
+
+def test_matching_neither_is_time_mismatch(tmp_path):
+    tc = reference(V0, D0, X0, Y0).t_mid_mjd_tai[0]
+    tp = VISIT_T[V0] + 0.05 / 86400               # 50 ms off the header, ~166 ms off the corrected time
+    assert abs(tc - tp) * 86400 > 0.1
+    view = [dict(id=1, ra=10.0, midpointMjdTai=tp, visit=V0, detector=D0, x=X0, y=Y0)]
+    obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(tp), band="Lr", mag=20.0)]
+    out, _, rep = run(tmp_path, obs, view)
+    assert out["o"]["midpointMjdTai"] == tp and out["o"]["midpointMjdTai_flag"]
+    assert rep["status"]["time_mismatch"] == 1 and rep["time_mismatch_visits"] == [V0]
 
 
 def test_exposure_log():
