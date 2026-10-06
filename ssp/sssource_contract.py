@@ -70,6 +70,7 @@ VIEW_DROPPED = ("hpix29", "cx", "cy", "cz")
 #                                 (the table omits this visit: status 2)
 #   midpointMjdTai_flag_degraded  True: corrected with reduced accuracy
 #                                 (status 1)
+#   dt_corrected_ms               diagnostic: obstime - corrected time [ms]
 #   obstime_basis                 how the obs_sbn row's time matched: 'visit',
 #                                 'corrected' or 'both' (each within DT_MS)
 # A NOT_BUILT visit (status 3) gets the visit's time and midpointMjdTai_flag
@@ -80,7 +81,7 @@ VIEW_DROPPED = ("hpix29", "cx", "cy", "cz")
 # SSSource copies midpointMjdTai and the two flags (block 4) and computes
 # every ephemeris column at that midpointMjdTai. midpointMjdTaiVisit and
 # obstime_basis are internal: not published, dropped without a warning.
-SHUTTER_INTERNAL = ("midpointMjdTaiVisit", "obstime_basis")
+SHUTTER_INTERNAL = ("midpointMjdTaiVisit", "obstime_basis", "dt_corrected_ms")
 
 #: The default limit on NOT_BUILT visits in one extract (configurable).
 MAX_NOT_BUILT_VISITS = 20
