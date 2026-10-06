@@ -1,13 +1,14 @@
 # Runbook: the daily PPDB Solar System tables
 
-This builds and delivers the six PPDB Solar System tables (RFC-1188), in three stages that talk only through files:
+This builds and delivers the six PPDB Solar System tables (RFC-1188), in three stages that talk only through files, after a stage 0 that updates the shutter-timing correction table:
 
 | stage | command | touches |
 |---|---|---|
+| 0. corrections | `shutter-timing-table --out CT --refresh-recent 3 --workers 32` | the LSSTCam raw zips (read), the correction table CT |
 | 1. extract | `ssp-extract-sso-inputs INPUTS_DIR` | the MPC replica at USDF, ClickHouse |
 | 2. build | `ssp-build-sso INPUTS_DIR RUN_DIR` | files only |
 | 3. deliver | `ssp-upload-sso CONFIG RUN_DIR [--dry-run]` | GCS, Pub/Sub |
-| all three | `ssp-sso-daily WORK_DIR [--upload CONFIG] [--dry-run]` | runs 1–3 in `WORK_DIR/<UTC date>/` |
+| all of them | `ssp-sso-daily WORK_DIR [--upload CONFIG] [--dry-run]` | runs 0–3 in `WORK_DIR/<UTC date>/` |
 
 The tables: SSSource, SSObject, NearbySSO, `mpc_orbits`, `current_identifications` and `numbered_identifications`, per `sdm_schemas` `ppdb.yaml`/`sso_base.yaml` (tickets/DM-55375, lsst/sdm_schemas#549; copies in `tests/data/sdm_schemas/`).
 
@@ -20,6 +21,7 @@ Design: `docs/design/sso-delivery.md` (the stages), `docs/design/sssource-widene
   - The build stage's SSSource checks need `bench/` from the checkout, and the upload configs live in `config/sso-upload/`. So run from the checkout (an editable install).
   - If a console script is missing after a pull, refresh the entry points: `VIRTUAL_ENV=$PWD/.venv uv pip install --no-deps -e .`
 - **ASSIST data:** `data/assist/linux_p1550p2650.440` and `data/assist/sb441-n16.bsp`. Export `SSP_ASSIST_PLANETS` and `SSP_ASSIST_ASTEROIDS`, and set `OMP_NUM_THREADS=1`.
+- **The correction table** (CT): `/sdf/data/rubin/user/mjuric/shutter-timing/corrections`, built by `shutter-timing-table` (the `shutter-timing` package, pinned in ssp-tools' venv; `docs/design/shutter-timing.md`). `--correction-table DIR` points stage 0 and the extract at another one. Stage 0 reads the raw zips under `/sdf/data/rubin/lsstdata/offline/instrument/LSSTCam`.
 - **The MPC replica:** `mpcorb-db.slac.stanford.edu:5432`, database `mpc_sbn`, user `rubin`, password in `~/.pgpass`. It is exported read-only, in one REPEATABLE READ transaction.
 - **ClickHouse:** the host is read from `~/.clickhouse.host` (a line `river:<host>`, kept current by the server's operators; `sdfiana032.sdf.slac.stanford.edu:8123` since 2026-10-05), port 8123, HTTP only, user `ssp_xmatch`, read-only. `--ch-host` overrides it. The tools keep it out of SDF's HTTP proxy, which refuses it. When the host moves, add a `~/.chpass` line for the new one. It needs `SELECT` on `ssp.*` and `ppdb.DiaSource`. Credentials go in `~/.chpass` (mode 600, `host:port:database:user:password`). The server is shared, so use **at most 8 concurrent queries**; that is the default.
 - **Uploads:** Google application-default credentials for the `sso-uploader` service account, which has object-user access on the bucket and publish access on the topic (`lsst/idf_deploy` `services/sso-uploader.tf`). **Not yet issued to SSP**; ask the DM-55678 owners.
@@ -40,13 +42,57 @@ The run happens in `WORK_DIR/<UTC date>/`. `--stamp NAME` uses a different name,
 
 | path | contents |
 |---|---|
+| `stage0.log` | stage 0: the builder's output (it also appends to `CT/build.log`) |
 | `inputs/` | stage 1: `obs_sbn`, `mpc_orbits`, `current_identifications`, `numbered_identifications` (raw MPC, one snapshot), `dia_sources`, `ppdb_dia_sources` and `manifest.json` |
 | `run/delivery/` | stage 2: `<Table>.parquet` for the six tables |
 | `run/report.json` | the steps (status, time, peak memory of the largest process, commit), the tables (rows, md5), the checks, `deliverable`, and the uploads |
 | `run/checks/`, `run/logs/` | the check reports and each step's log |
-| `daily.log` | the commands run and their exit codes |
+| `daily.log` | the commands run, their durations and exit codes |
 
 `ssp-sso-daily` stops at the first failing stage and exits with its status.
+
+- `--skip-stage0` runs the extract on the correction table as it is (testing).
+- `--reuse-inputs DIR` skips stage 0 too: there is no extract to feed.
+- `--stage0-workers N` (default and maximum 32) sets the builder's worker processes.
+
+## Stage 0: the shutter-timing correction table
+
+`ssp-sso-daily` first runs, from ssp-tools' venv:
+
+```bash
+shutter-timing-table --out /sdf/data/rubin/user/mjuric/shutter-timing/corrections --refresh-recent 3 --workers 32
+```
+
+- It resumes: nights already written are skipped, and only new nights are built.
+- `--refresh-recent 3` re-checks the last 3 nights written, and rebuilds (the whole night) any whose raw directory holds exposures missing from its exposure log: raws that arrived after it was built.
+- It holds `CT/.lock` for the whole run.
+- Its output goes to `DAY/stage0.log`; its duration and exit code to `daily.log`.
+- On a failure, `daily.log` and stderr name the exit code, what it means, and the builder's last lines. The run stops before the extract.
+
+| exit | meaning | what to do |
+|---|---|---|
+| 0 | the table is up to date | nothing |
+| 2 | **refused**, before writing: a calibration mismatch, the lock held, an unknown table format, or an integrity failure. The builder's `ERROR` line names which. | see below |
+| 3 | it finished but **left the table mixed** (nights on more than one calibration); the extract would refuse it | finish the recalibration (below) |
+| other | the builder failed (e.g. a crash, a bad option) | read `stage0.log`; fix; rerun |
+
+**A held lock** (`TableLockedError`): another build is writing the table. The message gives the host, pid and start time recorded in `CT/.lock`; these come from the last build that took the lock, so check that the process is still running (`ssh <host> ps -p <pid>`). If it is, wait for it and rerun the day (`--stamp` another name, or remove the day directory). If it isn't, the lock was released when it exited (POSIX `fcntl` locks die with their process), so a rerun goes through.
+
+**A calibration change** (`CalibrationMismatchError`): the pinned `shutter-timing` computes a different `calibration_id` from the table's (a new package version, or a changed calibration constant), so it refuses to add new nights. Every night must be rebuilt on the new calibration, with:
+
+```bash
+.venv/bin/shutter-timing-table --out /sdf/data/rubin/user/mjuric/shutter-timing/corrections --rebuild-stale --workers 32
+```
+
+- `--rebuild-stale` rebuilds only the nights whose calibration isn't the current one (or that aren't done), so it is resumable: if it is interrupted, run it again.
+- It rebuilds the whole history from the raws (the default `--start` is 20250401): hours. Plan it outside the daily window; the daily run fails until it finishes.
+- Agree the change with the table's owner first: a changed calibration changes every corrected time.
+
+**An interrupted recalibration** (exit 3, `MixedTableError`, or exit 2 on a mixed table): run the same `--rebuild-stale` command to finish it.
+
+**An unknown format or an integrity failure** (`TableFormatError`, `TableIntegrityError`): the table is from another `shutter-timing` version, or a night's files disagree. Don't edit the files. Ask the shutter-timing owners; a night can be rebuilt with `--overwrite --days YYYYMMDD`.
+
+**Visits not built.** A DiaSource whose visit the table doesn't cover yet (its night has no table, or the visit is missing from the night's exposure log, typically a late raw) is NOT_BUILT. The extract gives it the visit time with `midpointMjdTai_flag` = True, logs a warning naming the visits, and goes on; stage 0's `--refresh-recent` fixes it on a later day, once the raw has arrived. **More than 20** distinct NOT_BUILT visits (`MAX_NOT_BUILT_VISITS`, the extract's `--max-not-built-visits`) fail the extract, with a message pointing at stage 0: that many means stage 0 was skipped or is stale, not a few late raws. Run stage 0 (or check why it is behind) and rerun. The input manifest counts the omitted and the not-built visits, and lists the not-built ones.
 
 ## Running the stages separately
 
@@ -133,8 +179,11 @@ Since `docs/design/nongrav.md`, the ephemerides apply the MPC's non-gravitationa
 SSSource and NearbySSO have two new columns, `ephAntiSunPA` and `ephAntiMotionPA` (`docs/design/tail-angles.md`), from sdm_schemas `tickets/DM-55375` f2541a5. Nothing changes in the run itself. To check a delivery's angles:
 
 ```bash
-python -m bench.tail_angles_validate consistency RUN_DIR/delivery/SSSource.parquet RUN_DIR/delivery/NearbySSO.parquet
+python -m bench.tail_angles_validate consistency RUN_DIR/delivery/SSSource.parquet RUN_DIR/delivery/NearbySSO.parquet \
+    --dia-sources INPUTS_DIR/ppdb_dia_sources.parquet
 ```
+
+`--dia-sources` is needed since the shutter-timing correction (below); without it every pair is held to the strict rule.
 
 **2026-10-01 rerun:** deliverable, all checks PASS. The output is in `/sdf/data/rubin/user/mjuric/tail-angles/rerun/2026-10-01/run/`.
 
@@ -143,3 +192,15 @@ python -m bench.tail_angles_validate consistency RUN_DIR/delivery/SSSource.parqu
 NearbySSO matches comets and ISOs (designations C/, P/, D/, I/) within 15″, and every other object within 5″ (`docs/design/comet-radius.md`). Nothing changes in the run itself. The nearbysso log's "comets and ISOs" line counts the rows the larger radius adds.
 
 **2026-10-01 rerun:** deliverable, all checks PASS; 104 comet rows added, 99 of them P/2002 T6. The output is in `/sdf/data/rubin/user/mjuric/comet-radius/rerun/2026-10-01/run/`.
+
+## Shutter-motion-corrected times (2026-10)
+
+SSSource's `midpointMjdTai` is the exposure midpoint corrected for the shutter's motion, with two flags, `midpointMjdTai_flag` and `midpointMjdTai_flag_degraded` (`docs/design/shutter-timing.md`). The run gains stage 0 (above); the extract reads the correction table.
+
+**SSSource vs. NearbySSO.** NearbySSO predicts at each DiaSource's own `midpointMjdTai`, still the visit time until AP corrects DiaSource. So at the same DiaSource the two tables differ by about the rate × Δt, Δt = SSSource's time − the DiaSource's (≤ 0.24 s for most visits, up to ~2 s for header-timed, degraded ones): up to a few tens of mas for fast objects, more on the degraded visits. The checks that compare the two (`bench/tail_angles_validate.py consistency`, `bench/nearbysso_validate.py same-orbits`, `bench/nongrav_validate.py nearbysso`) take Δt from SSSource and the DiaSource input, and allow for it (`bench/time_shift.py`):
+
+- where Δt = 0, the old tolerances, unchanged;
+- positions: the motion over Δt is taken out first, and what's left must be within the old tolerance plus 0.2% of |rate| |Δt|, a bound on the track's curvature over Δt, and 0.05 mas (2% of |rate| |Δt| where SSSource has no ranges);
+- `ephOffset`, and "beyond the match radius" or "a nearer object": |rate| |Δt| × 1.02 + 0.05 mas on top;
+- rates, V and the tail angles: twice a geometric bound on their change over Δt;
+- each row's own Δt is used; only |Δt| > 10 s (not the same exposure) is a failure.
