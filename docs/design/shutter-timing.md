@@ -21,8 +21,9 @@ The plan was agreed in the shutter-timing session, then reviewed and approved he
 | MPC matching | Correction is applied **before** matching. An `obs_sbn` row matches a measurement if its time is within 10 ms of **either** the visit time or the corrected time; the 1-minute bucket fallback checks both. The basis (`visit`, `corrected`, `both`) is recorded internally per row, with counts in the input manifest. |
 | Missing corrections | Status 3 (`NOT_BUILT`): the visit's night has no table, or the night exists but the visit is missing from its exposure log (a late raw). Both mean a stale table: **the run fails.** A visit the table deliberately omits: the visit time, with `midpointMjdTai_flag` = True. A degraded correction: the corrected time, with `midpointMjdTai_flag_degraded` = True. |
 | Daily stage 0 | `ssp-sso-daily` first runs `shutter-timing-table --out /sdf/data/rubin/user/mjuric/shutter-timing/corrections --refresh-recent 3` from ssp-tools' venv. It resumes, skips nights already built, re-checks the last 3 nights written and rebuilds any with raws that arrived later (without it, late raws would never be processed), reads only the raw zips under `/sdf/data/rubin/lsstdata/offline/instrument/LSSTCam`, and uses at most 32 workers. A calibration mismatch stops the run with a clear message. |
-| Dependency | `shutter-timing`, tag `v0.2.0`, from its private GitHub repository (`[tool.uv.sources]`), installed over HTTPS with the `gh` credential helper; `requires-python >= 3.11`; re-locked. Left as is although ssp-tools is public: a temporary situation. |
+| Dependency | `shutter-timing`, tag **`v0.2.1`** (the same code as v0.2.0, whose git-tag install reported a dev version), from its private GitHub repository (`[tool.uv.sources]`), installed over HTTPS with the `gh` credential helper; `requires-python >= 3.11`; re-locked. Left as is although ssp-tools is public: a temporary situation. |
 | Degraded | Defined by shutter-timing (its contract: `CorrectionStatus`, `DEGRADED_QC`, `DEGRADED_RESIDUAL_S`): any source outside the raytrace table's coverage counts as degraded. Expected on about 13% of post-June 2026 sources, and on 99.7% of earlier sources (whose times come from the header). |
+| Raws that never arrive (proposed 2026-10-06, **awaiting the owner**) | A raw that never arrives stays NOT_BUILT for good, so the extract would fail every day. shutter-timing's runbook (`docs/runbooks/release.md`, "A raw that never arrives") puts the remedy on the ssp-tools side: an **override list** of visits accepted with the visit time and `midpointMjdTai_flag` = True. Proposed: a version-controlled `config/shutter-timing/accept-uncorrected.yaml` (visit, reason, date added); a listed visit with status 3 is treated as status 2 (omitted); listing a visit that is not status 3 is an error, so the list can't hide real corrections; the manifest records the visits it accepted. |
 | Provenance | The correction table's `table_format`, `calibration_id` and `package_version` go into the run manifest. |
 | PPDB notice | None needed: the owner owns DM-55678. |
 
@@ -31,17 +32,31 @@ Accepted risks:
 - Every SSSource ephemeris column changes for nearly every row, so the regression against the previous delivery is no longer bitwise.
 - The extract's matching rules and the input manifest are in `ssp/delivery_contract.py`, so the contract changes.
 
-## The shutter-timing interface (v0.2.0)
+## The shutter-timing interface (v0.2.1)
 
 ```python
 from shutter_timing.corrections import corrected_midpoints
-r = corrected_midpoints(visit, detector, x, y, table_dir=..., require_uniform=True)
+r = corrected_midpoints(visit, detector, x, y, table_dir=..., require_uniform=True, allow_legacy=False)
 r.t_mid_mjd_tai   # NaN where not corrected
 r.status          # 0 ok, 1 degraded, 2 omitted, 3 not built (night or visit missing)
 r.flag, r.flag_degraded, r.table_format, r.calibration_id, r.package_version
 ```
 
-`x`, `y` are DiaSource pixel coordinates (LSST convention); visit = `day_obs * 100000 + seq`. Raises `TableFormatError` for an unknown format; under `require_uniform`, a table that mixes calibrations is refused.
+`x`, `y` are DiaSource pixel coordinates (LSST convention); visit = `day_obs * 100000 + seq`.
+
+**Lookup errors and edge cases:**
+- Each call checks the whole table's calibration (~0.4 s uncached, then cached by file mtimes). It raises:
+  - `CalibrationMismatchError` for a mixed table;
+  - `TableFormatError` for an unknown format, or a legacy table without metadata (`allow_legacy=True` is for development only, never in production);
+  - `TableIntegrityError` for an inconsistent night;
+  - `ValueError` for a non-integral visit or detector.
+- **Off-detector positions:** up to 100 px outside → DEGRADED; beyond that, or a NaN/inf x or y → OMITTED (NaN time).
+
+**Stage 0 (the builder):**
+- exit 2 = refused (a calibration mismatch, the lock held, an unknown format, an integrity failure);
+- exit 3 = it left the table mixed.
+
+Both stop the daily run with the builder's message. `--rebuild-stale` finishes an interrupted recalibration (an operator action, in the runbook), `--out` is required, and a lock (`<out>/.lock`) prevents concurrent builds.
 
 ## The approach
 

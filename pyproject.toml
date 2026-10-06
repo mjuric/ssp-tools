@@ -11,7 +11,7 @@ authors = [
 ]
 license = { text = "MIT" }
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
   "psycopg2-binary>=2.9",
   "pyarrow>=14",
@@ -25,6 +25,7 @@ dependencies = [
   "tqdm>=4.0",
   "clickhouse-connect>=0.15.1",
   "cdshealpix>=0.8.1",
+  "shutter-timing",
 ]
 
 [project.optional-dependencies]
@@ -100,3 +101,8 @@ max-doc-length = 79
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
+
+[tool.uv.sources]
+# Shutter-motion corrections (docs/design/shutter-timing.md). A private
+# repository for now: install over HTTPS with the gh credential helper.
+shutter-timing = { git = "https://github.com/mjuric/shutter-timing", tag = "v0.2.1" }
