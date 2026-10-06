@@ -325,8 +325,11 @@ def build_visits(dia, threads=None):
     """One ``VISIT_DTYPE`` row per visit of the visit-sorted ``dia`` (as
     returned by ``read_dia``), sorted by visit.
 
-    - ``t_tai_mjd``: the visit's ``midpointMjdTai``, which all its sources
-      share (to 1e-6 d); if they don't, the median, with a warning.
+    - ``t_tai_mjd``: the visit-level time of the coarse pass, candidate
+      selection and matching: the sources' ``midpointMjdTai`` where they all
+      share it (today), else their median (no warning: sources may carry
+      their own, shutter-corrected, times, and every published value of a
+      row is evaluated at its own time; see ``build.at_source_time``).
     - ``t``: ASSIST time, ``JD_TDB - 2451545.0``, computed as
       ``ssp.ephem_assist`` does (``Time(...).tdb.mjd - MJD_J2000``).
     - ``center``: the normalized mean unit vector of its sources; ``radius``
@@ -357,12 +360,10 @@ def build_visits(dia, threads=None):
     tmin = np.minimum.reduceat(tsrc, starts)
     tmax = np.maximum.reduceat(tsrc, starts)
     t_tai = tmin.copy()
-    bad = np.flatnonzero(~(tmax - tmin <= 1e-6))
-    if bad.size:
-        for v in bad:
-            t_tai[v] = np.nanmedian(tsrc[starts[v]:ends[v]])
-        warnings.warn(f"build_visits: {bad.size} visit(s) whose sources' midpointMjdTai differ by more "
-                      f"than 1e-6 d (e.g. visit {out['visit'][bad[0]]}); using the median", stacklevel=2)
+    # (exactly the shared time where there is one, so that rows at the
+    # visit's time are evaluated exactly as before)
+    for v in np.flatnonzero(tmax != tmin).tolist():
+        t_tai[v] = np.median(tsrc[starts[v]:ends[v]])
     out["t_tai_mjd"] = t_tai
 
     # centre and radius, a block of whole visits at a time

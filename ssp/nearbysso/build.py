@@ -12,9 +12,12 @@ sliced:
    costliest first; see ``orbit_schedule``), per orbit over all nights:
    ``propagate.coarse``, ``VisitIndex.candidates``, the precise
    ``compute_ephemerides_one`` at the candidate visits (as SSSource), the
-   error ellipse there (``propagate.ellipse_at``) and the sigma gate. The
-   eligible predictions (``PRED_DTYPE``, 56 bytes each) come back to the
-   parent, which sorts them by (visit, orbit).
+   error ellipse there (``propagate.ellipse_at``) and the sigma gate; at
+   visits whose sources carry their own times, also the published values'
+   rates of change (``DOT_DTYPE``; see "Times" below). The eligible
+   predictions (``PRED_DTYPE``, 56 bytes each, and 32 more for the rates
+   of change if any visit's sources carry their own times) come back to
+   the parent, which sorts them by (visit, orbit).
 3. **Matching** (``read_workers`` processes, one slice each; the
    predictions shared through fork): read the slice again, index it
    (``DiaIndex``), match the slice's predictions (a contiguous range of the
@@ -22,7 +25,8 @@ sliced:
    comets and ISOs, 5" otherwise), rank each prediction's matches by separation
    (``diaDistanceRank``, ties by diaSourceId) and keep the nearest per
    DiaSource (ties by designation). A slice owns its DiaSources, and so
-   every DiaSource of a visit, so both are exact.
+   every DiaSource of a visit, so both are exact. Each kept row's published
+   values are then moved to its own DiaSource's time (``at_source_time``).
 
 The parent then attaches ``ssObjectId`` from an SSObject table, writes the
 Parquet file (sorted by diaSourceId) and a JSON run report next to it.
@@ -38,6 +42,39 @@ with h = max(half the night's span of visit times, ``MIN_HALF_SPAN_DAYS``),
 so that every visit time is bracketed (``ellipse_at`` clamps outside the
 sampled span) by samples of its own night, and the rate and distance
 changes ``candidates`` estimates for a night come from that night alone.
+
+**Times** (docs/design/shutter-timing.md). Candidate selection, matching,
+``diaDistanceRank`` and the nearest-object reduction use the prediction at
+the visit's time (``build_visits``'s ``t_tai_mjd``: the time its sources
+share, else their median). Every published value of a row is evaluated at
+its own DiaSource's ``midpointMjdTai``, as read (``at_source_time``):
+
+- a row at its visit's time (every row, today) is published exactly as
+  predicted, bitwise;
+- a row at another time (shutter-corrected DiaSources: |dt| <= ~0.25 s,
+  up to ~2 s for header-timed visits) is moved there: its position by dt
+  along the great circle of its rates (at dt/2, so to second order), its
+  ``ephOffset`` measured from there, and its
+  ellipse, rates, ``ephVmag`` and tail angles by their rates of change
+  times dt. The orbit pass computes those rates of change only at visits
+  whose sources' times differ (none, today), by a second, separate precise
+  evaluation ``DOT_STEP_DAYS`` later (``ellipse_at`` with the line of sight
+  moved by the topocentric velocity, for the ellipse); the first one is
+  untouched.
+
+This costs a second ``compute_ephemerides_one`` per orbit with such visits
+(the precise stage is ~2.5% of the orbit pass), where an exact evaluation
+at each row's own time would cost a third pass re-integrating every matched
+orbit (and its coarse track, for the ellipse). Against that exact
+evaluation (``compute_ephemerides_one`` and ``ellipse_at`` at the row's
+time), the moved values agree to float32 rounding, and the positions to
+< 1e-4 mas, for |dt| up to 3 s (``test_rows_at_their_own_time``). The
+neglected terms are of order (third derivative) dt^3 for the position:
+< 1e-4 mas at 3 s even for an NEO at 0.001 AU, whose diurnal parallax
+would put a move with the visit's rates alone ~0.2 mas off. For the other
+values they are of order (second derivative) dt^2. Because the match is
+decided at the visit's time, a row's ``ephOffset`` may exceed its match
+radius by up to |rate x dt|.
 
 The output is byte-identical for any ``workers``, ``read_workers``,
 ``chunk_factor`` and ``slice_days``: the orbit pass sees all nights at
@@ -61,7 +98,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
-from astropy.time import Time
+from astropy.time import Time, TimeDelta
 import astropy.units as u
 
 from .. import util
@@ -81,7 +118,8 @@ MIN_HALF_SPAN_DAYS = 1.0 / 24.0
 #: Exceptions kept per type, for the run report.
 _N_EXAMPLES = 5
 
-#: An eligible prediction: an orbit at a candidate visit (56 bytes).
+#: An eligible prediction: an orbit at a candidate visit, at the visit's
+#: time (56 bytes).
 PRED_DTYPE = np.dtype([
     ("visit", "i4"),         # into the visits (of all nights)
     ("orbit", "i4"),         # into the (designation-sorted) orbits
@@ -91,6 +129,34 @@ PRED_DTYPE = np.dtype([
     ("anti_sun_pa", "f4"), ("anti_motion_pa", "f4"),
 ])
 
+#: The prediction values that rows at their own DiaSource's time move with
+#: their rates of change (``at_source_time``).
+_MOVED = ("vmag", "rate_ra", "rate_dec", "ra_err", "dec_err", "ra_dec_cov", "anti_sun_pa", "anti_motion_pa")
+
+#: The rates of change [per day] of a prediction's ``_MOVED`` values (32
+#: bytes), aligned with the predictions; only computed (``process_orbit``)
+#: when some visit's sources carry their own times, and nonzero only at
+#: those visits (and where finite).
+DOT_DTYPE = np.dtype([(f"{c}_dot", "f4") for c in _MOVED])
+
+#: A row's published values at its DiaSource's own time (``at_source_time``).
+PUB_DTYPE = np.dtype([
+    ("ra", "f8"), ("dec", "f8"),
+    ("sep", "f8"),           # [arcsec] from (ra, dec)
+    ("dt", "f8"),            # [day] the row's time - the visit's
+    *((c, "f4") for c in _MOVED),
+])
+
+#: The step [day] of the rates of change of the published values
+#: (``process_orbit``).
+DOT_STEP_DAYS = 1e-4
+
+#: Rows further than this [s] from their visit's time are counted in the
+#: run report, with a warning: ``at_source_time``'s move is
+#: meant for shutter-timing offsets (<= ~0.25 s; ~2 s for header-timed
+#: visits).
+MAX_SOURCE_DT_S = 10.0
+
 #: Predictions per DiaIndex.match call (it has a fixed cost per call).
 _MATCH_BATCH = 1 << 18
 
@@ -98,7 +164,7 @@ _MATCH_BATCH = 1 << 18
 _COUNTS = ("orbits", "coarse_partial_fail", "coarse_all_fail", "exceptions", "with_candidates",
            "candidate_visits", "eligible", "sigma_rejected", "sigma_gated_nights", "nights_skipped",
            "step_cap_stops")
-_STAGES = ("coarse", "candidates", "precise", "ellipse")
+_STAGES = ("coarse", "candidates", "precise", "ellipse", "dots")
 
 
 # --------------------------------------------------------------------------
@@ -238,9 +304,20 @@ def _peak_rss_gb():
 # Pass 1: visits, per slice
 # --------------------------------------------------------------------------
 
+def own_times(dia, visits):
+    """Per visit of ``build_visits(dia)``: whether its sources' times
+    differ (so that some carry their own, not the visit's)."""
+    if not visits.size:
+        return np.zeros(0, bool)
+    t = np.asarray(dia["midpointMjdTai"], dtype=np.float64)
+    s = visits["dia_start"]
+    return np.minimum.reduceat(t, s) != np.maximum.reduceat(t, s)
+
+
 def _visits_slice(s0, s1):
     """Slices [s0, s1): per slice (its visits, rows read, seconds reading,
-    seconds in build_visits), and the peak RSS."""
+    seconds in build_visits, ``own_times`` of its visits), and the peak
+    RSS."""
     w = _W
     out = []
     for s in range(s0, s1):
@@ -248,9 +325,32 @@ def _visits_slice(s0, s1):
         dia = _read_slice(w["dia_path"], w["slices"][s])
         t1 = time.perf_counter()
         vis = _visits.build_visits(dia, threads=w["threads"])
-        out.append((vis, int(dia["diaSourceId"].size), t1 - t0, time.perf_counter() - t1))
+        out.append((vis, int(dia["diaSourceId"].size), t1 - t0, time.perf_counter() - t1,
+                    own_times(dia, vis)))
         del dia
     return out, _peak_rss_gb()
+
+
+def dot_steps(visits, own, ts):
+    """Per visit, the step [day] of the rates of change of its predictions
+    (``process_orbit``): 0 unless ``own`` (its sources carry their own
+    times), else +-``DOT_STEP_DAYS``, the sign keeping the visit's time and
+    the step's between the same two coarse samples ``ts`` of its night (three
+    per night, as ``sample_times`` gives them), so that ``ellipse_at``
+    blends the same two."""
+    h = np.zeros(visits.size)
+    if not own.any():
+        return h
+    s3 = np.asarray(ts, dtype=np.float64).reshape(-1, 3)
+    nights = np.unique(visits["night"])
+    n = np.searchsorted(nights, visits["night"])
+    t = visits["t"]
+    # the sample above (or at) the visit's time, of its night; a visit on
+    # the night's first sample steps forward
+    upper = np.where(t <= s3[n, 0], s3[n, 1], np.where(t <= s3[n, 1], s3[n, 1], s3[n, 2]))
+    fwd = (t <= s3[n, 0]) | (t + DOT_STEP_DAYS <= upper)
+    h[own] = np.where(fwd, DOT_STEP_DAYS, -DOT_STEP_DAYS)[own]
+    return h
 
 
 # --------------------------------------------------------------------------
@@ -267,7 +367,9 @@ def candidate_margin(designation):
 
 def process_orbit(i, w, ephem, stage_t):
     """Orbit ``i`` of ``w["orbits"]`` over every night: its eligible
-    predictions (``PRED_DTYPE``, or None) and its counters."""
+    predictions (``PRED_DTYPE``, or None), its counters, and the
+    predictions' rates of change (``DOT_DTYPE``; None unless some visit's
+    sources carry their own times)."""
     orbit = w["orbits"][i]
     c = dict.fromkeys(_COUNTS, 0)
     t0 = time.perf_counter()
@@ -283,7 +385,7 @@ def process_orbit(i, w, ephem, stage_t):
     t2 = time.perf_counter()
     stage_t["candidates"] += t2 - t1
     if not cand.size:
-        return None, c
+        return None, c, None
     c["with_candidates"] = 1
     c["candidate_visits"] = int(cand.size)
 
@@ -300,7 +402,7 @@ def process_orbit(i, w, ephem, stage_t):
     c["sigma_rejected"] = int(cand.size - k.size)
     if not k.size:
         stage_t["ellipse"] += time.perf_counter() - t3
-        return None, c
+        return None, c, None
 
     # V exactly as SSSource computes it: from its float32 helio/topo
     # columns (and its float64 phase angle)
@@ -326,15 +428,51 @@ def process_orbit(i, w, ephem, stage_t):
     anti_sun, anti_motion = tail_position_angles(e.helio_pos[:, k], e.helio_vel[:, k], e.topo_pos[:, k])
     p["anti_sun_pa"] = tail_position_angles_f32(anti_sun)
     p["anti_motion_pa"] = tail_position_angles_f32(anti_motion)
-    stage_t["ellipse"] += time.perf_counter() - t3
-    return p, c
+    t4 = time.perf_counter()
+    stage_t["ellipse"] += t4 - t3
+    if not w.get("any_own"):
+        return p, c, None
+
+    # the rates of change of the published values, at the visits whose
+    # sources carry their own times (at_source_time): from a second,
+    # separate evaluation a step (dot_steps) away, so that the first stays
+    # as it is
+    dots = np.zeros(k.size, dtype=DOT_DTYPE)
+    own = w["dot_h"][cand[k]] != 0.0
+    if own.any():
+        kd, vt = k[own], cand[k[own]]
+        h = w["dot_h"][vt]
+        e2 = compute_ephemerides_one(str(orbit["designation"]), w["times_h"][vt], None, ephem, row=orbit,
+                                     obs_pos=w["obs_pos_h"][vt].T, obs_vel=w["obs_vel_h"][vt].T,
+                                     nongrav=_nongrav.from_orbit(orbit))
+        ell2 = propagate.ellipse_at(track, w["t_h"][vt], topo_pos=e2.topo_pos.T)
+
+        def values(e, j, ell):
+            # (V from the float64 vectors here: only differences are taken)
+            vm = hg_V_mag(e.H, e.G, np.linalg.norm(e.helio_pos[:, j], axis=0),
+                          np.linalg.norm(e.topo_pos[:, j], axis=0), e.phase_angle[j])
+            pa = tail_position_angles(e.helio_pos[:, j], e.helio_vel[:, j], e.topo_pos[:, j])
+            return dict(vmag=vm, rate_ra=e.mu_lon[j], rate_dec=e.mu_lat[j], ra_err=ell[0], dec_err=ell[1],
+                        ra_dec_cov=ell[2], anti_sun_pa=pa[0], anti_motion_pa=pa[1])
+        x0 = values(e, kd, (ra_err[kd], dec_err[kd], ra_dec_cov[kd]))
+        x1 = values(e2, slice(None), ell2)
+        with np.errstate(invalid="ignore"):
+            for name in _MOVED:
+                d = x1[name] - x0[name]
+                if name.endswith("_pa"):
+                    d = (d + 180.0) % 360.0 - 180.0
+                dot = d / h
+                dots[f"{name}_dot"][own] = np.where(np.isfinite(dot), dot, 0.0)
+        stage_t["dots"] += time.perf_counter() - t4
+    return p, c, dots
 
 
 def _orbit_chunk(o0, o1):
     """Orbits ``w["order"][o0:o1]``: (predictions, counters, exceptions by
     type, examples, stage times, {"coarse_all", "coarse_partial",
     "exception"}: the orbits whose coarse pass failed entirely or in part,
-    or that raised, peak RSS). One bad orbit doesn't stop the rest."""
+    or that raised, peak RSS, the predictions' rates of change or None).
+    One bad orbit doesn't stop the rest."""
     global _EPHEM
     w = _W
     ephem = w.get("ephem")
@@ -347,10 +485,10 @@ def _orbit_chunk(o0, o1):
     stage_t = dict.fromkeys(_STAGES, 0.0)
     errors, examples = Counter(), {}
     bad = {"coarse_all": [], "coarse_partial": [], "exception": []}
-    out = []
+    out, out_dots = [], []
     for i in w["order"][o0:o1].tolist():
         try:
-            p, c = process_orbit(i, w, ephem, stage_t)
+            p, c, dots = process_orbit(i, w, ephem, stage_t)
         except Exception as ex:     # one bad orbit must not stop a run
             name = type(ex).__name__
             errors[name] += 1
@@ -368,11 +506,15 @@ def _orbit_chunk(o0, o1):
             counts[k] += v
         if p is not None:
             out.append(p)
+            out_dots.append(dots)
     preds = np.concatenate(out) if out else np.zeros(0, dtype=PRED_DTYPE)
+    dots = None
+    if w.get("any_own"):
+        dots = np.concatenate(out_dots) if out_dots else np.zeros(0, dtype=DOT_DTYPE)
     counts["orbits"] = o1 - o0
     counts["step_cap_stops"] = int(propagate.STEP_CAP_STOPS)
     bad = {k: np.array(v, dtype=np.int64) for k, v in bad.items()}
-    return preds, counts, dict(errors), examples, stage_t, bad, _peak_rss_gb()
+    return preds, counts, dict(errors), examples, stage_t, bad, _peak_rss_gb(), dots
 
 
 #: NEOs' (q < NEO_Q_AU) relative cost in the orbit pass: 12x the others,
@@ -401,20 +543,29 @@ def orbit_schedule(weights, n_chunks):
     return order, util.balanced_chunks(np.asarray(weights)[order], n_chunks)
 
 
-def sort_predictions(chunks, nvisits):
+def sort_predictions(chunks, nvisits, dot_chunks=None):
     """Concatenate the chunks' predictions (in any order), sorted by (visit,
-    orbit), emptying ``chunks``. Returns them and the offsets (nvisits + 1,)
-    of each visit's predictions. The peak is about twice the predictions,
-    plus an index."""
+    orbit), emptying ``chunks``. Returns them, the offsets (nvisits + 1,) of
+    each visit's predictions, and, given ``dot_chunks`` (each chunk's rates
+    of change, aligned with it; emptied too), those in the same order (else
+    None). The peak is about twice the predictions, plus an index."""
     p = np.concatenate(chunks) if chunks else np.zeros(0, dtype=PRED_DTYPE)
     chunks.clear()
+    dots = None
+    if dot_chunks is not None:
+        dots = np.concatenate(dot_chunks) if dot_chunks else np.zeros(0, dtype=DOT_DTYPE)
+        dot_chunks.clear()
+        if dots.size != p.size:
+            raise ValueError("sort_predictions: the rates of change aren't aligned with the predictions")
     # (one prediction per orbit and visit, so the key is unique)
     key = (p["visit"].astype(np.int64) << 32) | p["orbit"].astype(np.int64)
     o = np.argsort(key)
     del key
     p = p[o]
+    if dots is not None:
+        dots = dots[o]
     del o
-    return p, np.searchsorted(p["visit"], np.arange(nvisits + 1)).astype(np.int64)
+    return p, np.searchsorted(p["visit"], np.arange(nvisits + 1)).astype(np.int64), dots
 
 
 # --------------------------------------------------------------------------
@@ -442,12 +593,67 @@ def match_per_radius(dindex, visit_idx, ra, dec, radius):
     return k[order], row[order], sep[order]
 
 
+def at_source_time(p, dots, t_visit, t_row, ra_src, dec_src, sep):
+    """The published values (``PUB_DTYPE``) of rows whose predictions ``p``
+    (``PRED_DTYPE``, at their visit's time ``t_visit``, with rates of
+    change ``dots``, ``DOT_DTYPE`` or None for none) matched DiaSources at
+    ``ra_src``, ``dec_src`` [deg] with their own ``midpointMjdTai``
+    ``t_row`` (both TAI MJD), ``sep`` [arcsec] from the prediction.
+
+    A row with ``t_row == t_visit`` gets the prediction and ``sep`` as
+    they are, bitwise. The others, at dt = t_row - t_visit, to first order:
+    the position moved by |rate| dt along the great circle of its rates
+    (``rate_ra``, ``rate_dec``, taken at dt/2), the separation from there,
+    and the ``_MOVED`` values plus their rates of change times dt (the
+    sigmas clipped at 0, the angles wrapped to [0, 360)). (dt is in TAI
+    days and the rates per TDB day: they differ by < 1e-8.)"""
+    n = len(p)
+    out = np.empty(n, dtype=PUB_DTYPE)
+    out["ra"], out["dec"], out["sep"] = p["ra"], p["dec"], sep
+    for c in _MOVED:
+        out[c] = p[c]
+    t_row = np.asarray(t_row, np.float64)
+    t_visit = np.asarray(t_visit, np.float64)
+    out["dt"] = 0.0
+    m = np.flatnonzero(t_row != t_visit)
+    if not m.size:
+        return out
+    q = p[m]
+    qd = np.zeros(m.size, DOT_DTYPE) if dots is None else dots[m]
+    dt = t_row[m] - t_visit[m]
+    out["dt"][m] = dt
+    a, d = np.radians(q["ra"]), np.radians(q["dec"])
+    ca, sa, cd, sd = np.cos(a), np.sin(a), np.cos(d), np.sin(d)
+    pos = np.stack([cd * ca, cd * sa, sd])
+    east = np.stack([-sa, ca, np.zeros_like(a)])
+    north = np.stack([-sd * ca, -sd * sa, cd])
+    # the displacement on the tangent plane [rad], and the point that far
+    # along the great circle in its direction
+    rate_ra = q["rate_ra"].astype(np.float64) + qd["rate_ra_dot"].astype(np.float64) * (dt / 2.0)
+    rate_dec = q["rate_dec"].astype(np.float64) + qd["rate_dec_dot"].astype(np.float64) * (dt / 2.0)
+    w = (east * rate_ra + north * rate_dec) * np.radians(dt)
+    th = np.sqrt(np.sum(w * w, axis=0))
+    x = pos * np.cos(th) + w * np.sinc(th / np.pi)
+    ra = out["ra"][m] = util.wrap_ra_deg(np.degrees(np.arctan2(x[1], x[0])))
+    dec = out["dec"][m] = np.degrees(np.arctan2(x[2], np.hypot(x[0], x[1])))
+    out["sep"][m] = util.sky_separation_arcsec(ra, dec, np.asarray(ra_src)[m], np.asarray(dec_src)[m])
+    for c in _MOVED:
+        v = q[c].astype(np.float64) + qd[c + "_dot"].astype(np.float64) * dt
+        if c in ("ra_err", "dec_err"):
+            v = np.maximum(v, 0.0)
+        elif c.endswith("_pa"):
+            v = tail_position_angles_f32(v % 360.0)
+        out[c][m] = v
+    return out
+
+
 def _match_slice(s0, s1):
     """Slices [s0, s1): per slice, the nearest match of each of its
     DiaSources, as (diaSourceId, prediction index, separation,
     diaDistanceRank), plus the numbers of matches, and of comets' (and
-    ISOs') matches, before that reduction; then (seconds reading, indexing,
-    matching) and the peak RSS."""
+    ISOs') matches, before that reduction, and the published values of
+    each kept row at its DiaSource's own time (``at_source_time``); then
+    (seconds reading, indexing, matching) and the peak RSS."""
     w = _W
     preds, vstart, poff, orbit_radius = w["preds"], w["vstart"], w["poff"], w["orbit_radius"]
     out, tim = [], np.zeros(3)
@@ -458,7 +664,7 @@ def _match_slice(s0, s1):
         vis = w["visits"][v0:v1]
         t1 = time.perf_counter()
         dindex = _visits.DiaIndex(dia, vis, threads=w["threads"])
-        ids = dia["diaSourceId"]
+        ids, t_src = dia["diaSourceId"], dia["midpointMjdTai"]
         del dia
         t2 = time.perf_counter()
         p0, p1 = int(poff[v0]), int(poff[v1])
@@ -487,7 +693,11 @@ def _match_slice(s0, s1):
         # so the lower row wins, deterministically.)
         sel = nearest(row, sep, k)
         n_comet = int((orbit_radius[preds["orbit"][k]] > MATCH_RADIUS_ARCSEC).sum())
-        out.append((ids[row[sel]], k[sel], sep[sel], rank[sel], n_match, n_comet))
+        r, ps = row[sel], preds[k[sel]]
+        pub = at_source_time(ps, None if w.get("dots") is None else w["dots"][k[sel]],
+                             w["visits"]["t_tai_mjd"][ps["visit"]], t_src[r], dindex.ra[r], dindex.dec[r],
+                             sep[sel])
+        out.append((ids[r], k[sel], sep[sel], rank[sel], n_match, n_comet, pub))
         tim += (t1 - t0, t2 - t1, time.perf_counter() - t2)
     return out, tim, _peak_rss_gb()
 
@@ -539,6 +749,25 @@ def nearest(dia_id, sep, orbit):
     d = dia_id[order]
     first = np.r_[True, d[1:] != d[:-1]]
     return order[first]
+
+
+def _source_time_stats(pub, p, orbit_radius):
+    """The run report's ``source_times``: the rows at their own DiaSource
+    time (not their visit's), their largest |dt| [s] and move [arcsec],
+    those further than ``MAX_SOURCE_DT_S`` (with a warning), and the rows
+    whose ephOffset exceeds their match radius (possible by |rate x dt|)."""
+    moved = np.flatnonzero(pub["dt"] != 0.0)
+    abs_dt_s = np.abs(pub["dt"][moved]) * 86400.0
+    move = util.sky_separation_arcsec(p["ra"][moved], p["dec"][moved], pub["ra"][moved], pub["dec"][moved])
+    st = dict(rows_at_own_time=int(moved.size), max_abs_dt_s=float(abs_dt_s.max()) if moved.size else 0.0,
+              rows_beyond_max_dt=int((abs_dt_s > MAX_SOURCE_DT_S).sum()),
+              max_move_arcsec=float(move.max()) if moved.size else 0.0,
+              offset_beyond_radius=int((pub["sep"] > orbit_radius[p["orbit"]]).sum()))
+    if st["rows_beyond_max_dt"]:
+        warnings.warn(f"{st['rows_beyond_max_dt']} NearbySSO rows are more than {MAX_SOURCE_DT_S:g} s from "
+                      f"their visit's time (up to {st['max_abs_dt_s']:.1f} s); their values are moved there "
+                      "to first order only", stacklevel=3)
+    return st
 
 
 def ssobject_ids(path, designations):
@@ -677,6 +906,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     peak["pass1_worker"] = max((r[1] for r in res), default=0.0)
     vis_parts = [r[0] for r in per_slice]
     visits = np.concatenate(vis_parts) if vis_parts else np.zeros(0, VISIT_DTYPE)
+    own = np.concatenate([r[4] for r in per_slice]) if per_slice else np.zeros(0, bool)
     vstart = np.r_[0, np.cumsum([v.size for v in vis_parts])].astype(np.int64)
     n_dia = sum(r[1] for r in per_slice)
     rep["slices"] = [dict(nights=[sl["night_lo"], sl["night_hi"]], dia=r[1], dia_dropped=sl["n"] - r[1],
@@ -687,6 +917,19 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     ts = sample_times(vindex)
     obs_ts = observer_at(ts)
     times = Time(visits["t_tai_mjd"], format="mjd", scale="tai").tdb
+    # (the second evaluation, at the visits whose sources carry their own
+    # times: see process_orbit)
+    dot_h = dot_steps(visits, own, ts)
+    times_h = times + TimeDelta(dot_h, format="jd")
+    t_h = times_h.tdb.mjd - MJD_J2000
+    obs_pos_h = np.full((visits.size, 3), np.nan)
+    obs_vel_h = np.full((visits.size, 3), np.nan)
+    if own.any():
+        r_h, v_h = util.observatory_barycentric_posvel(OBSCODE, times_h[own])
+        obs_pos_h[own] = np.asarray(r_h.to_value(u.au)).reshape(3, -1).T
+        obs_vel_h[own] = np.asarray(v_h.to_value(u.km / u.s)).reshape(3, -1).T
+    rep["visits_own_times"] = int(own.sum())
+    any_own = bool(own.any())
     tim["pass1_visits"] = time.perf_counter() - t
     log(f"pass 1: {visits.size:,} visits in {nights.size} nights, {ts.size} coarse samples "
         f"({tim['pass1_visits']:.1f} s)")
@@ -700,7 +943,8 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     use_pool = _pooled(workers, len(chunks))
     # (workers open their own ephemeris; in this process, reuse ours)
     _W.update(orbits=orbits, ts=ts, obs_ts=obs_ts, visits=visits, times=times, vindex=vindex,
-              order=order, ephem=None if use_pool else ephem)
+              order=order, ephem=None if use_pool else ephem, any_own=any_own, dot_h=dot_h, times_h=times_h,
+              t_h=t_h, obs_pos_h=obs_pos_h, obs_vel_h=obs_vel_h)
     log(f"pass 2: {orbits.size:,} orbits in {len(chunks)} chunks on {workers if use_pool else 1} worker(s)")
     try:
         res = _map(_orbit_chunk, chunks, workers, "pass 2: orbits",
@@ -715,7 +959,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     for k in ("coarse_all", "coarse_partial", "exception"):
         idx = np.sort(np.concatenate([r[5][k] for r in res])) if res else np.zeros(0, np.int64)
         failed[k] = orbits["designation"][idx[:_N_EXAMPLES]].tolist()
-    for _, c, err, exs, stt, _, _ in res:
+    for _, c, err, exs, stt, _, _, _ in res:
         for k, v in c.items():
             counts[k] += v
         for k, v in stt.items():
@@ -726,11 +970,12 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
             lst.extend(v[:_N_EXAMPLES - len(lst)])
     peak["pass2_worker"] = max((r[6] for r in res), default=0.0)
     pchunks = [r[0] for r in res]
+    dchunks = [r[7] for r in res] if any_own else None
     del res
     tim["pass2_orbits"] = time.perf_counter() - t
     t = time.perf_counter()
-    preds, poff = sort_predictions(pchunks, visits.size)
-    del pchunks
+    preds, poff, dots = sort_predictions(pchunks, visits.size, dchunks)
+    del pchunks, dchunks
     tim["sort_predictions"] = time.perf_counter() - t
     log(f"pass 2: {counts['with_candidates']:,} orbits with candidates, {counts['candidate_visits']:,} "
         f"candidate visits, {preds.size:,} eligible predictions ({preds.nbytes / 2**30:.2f} GB); "
@@ -740,7 +985,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     t = time.perf_counter()
     orbit_radius = match_radius(orbits["designation"])
     _W.update(dia_path=dia_path, slices=slices, threads=threads, visits=visits, vstart=vstart, preds=preds,
-              poff=poff, orbit_radius=orbit_radius)
+              poff=poff, orbit_radius=orbit_radius, dots=dots)
     try:
         res = _map(_match_slice, one, rw, "pass 3: matching", weights=[sl["n"] for sl in slices],
                    unit="slices")
@@ -756,6 +1001,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     k = np.concatenate([r[1] for r in per_slice]) if per_slice else np.zeros(0, np.int64)
     sep = np.concatenate([r[2] for r in per_slice]) if per_slice else np.zeros(0)
     rank = np.concatenate([r[3] for r in per_slice]) if per_slice else np.zeros(0, np.int16)
+    pub = np.concatenate([r[6] for r in per_slice]) if per_slice else np.zeros(0, PUB_DTYPE)
     n_matches = int(sum(r[4] for r in per_slice))
     n_comet_matches = int(sum(r[5] for r in per_slice))
     del per_slice
@@ -765,7 +1011,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     # Reduce (a diaSourceId is in one slice, unless the input repeats it) --
     t = time.perf_counter()
     sel = nearest(ids, sep, k)
-    ids, k, sep, rank = ids[sel], k[sel], sep[sel], rank[sel]
+    ids, k, sep, rank, pub = ids[sel], k[sel], sep[sel], rank[sel], pub[sel]
     p = preds[k]
     # (a comet row beyond MATCH_RADIUS_ARCSEC is one the comet radius
     # added: no non-comet matched its DiaSource, since any would be within
@@ -777,18 +1023,20 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     rows = np.zeros(k.size, dtype=NEARBYSSO_DTYPE)
     rows["diaSourceId"] = ids
     rows["designation"] = orbits["designation"][p["orbit"]]
-    rows["ephRa"] = p["ra"]
-    rows["ephDec"] = p["dec"]
-    rows["ephOffset"] = sep
+    # (at the row's own time: see the module docstring)
+    rows["ephRa"] = pub["ra"]
+    rows["ephDec"] = pub["dec"]
+    rows["ephOffset"] = pub["sep"]
     rows["diaDistanceRank"] = rank
-    rows["ephVmag"] = p["vmag"]
-    rows["ephRateRa"] = p["rate_ra"]
-    rows["ephRateDec"] = p["rate_dec"]
-    rows["ephRaErr"] = p["ra_err"]
-    rows["ephDecErr"] = p["dec_err"]
-    rows["ephRa_ephDec_Cov"] = p["ra_dec_cov"]
-    rows["ephAntiSunPA"] = p["anti_sun_pa"]
-    rows["ephAntiMotionPA"] = p["anti_motion_pa"]
+    rows["ephVmag"] = pub["vmag"]
+    rows["ephRateRa"] = pub["rate_ra"]
+    rows["ephRateDec"] = pub["rate_dec"]
+    rows["ephRaErr"] = pub["ra_err"]
+    rows["ephDecErr"] = pub["dec_err"]
+    rows["ephRa_ephDec_Cov"] = pub["ra_dec_cov"]
+    rows["ephAntiSunPA"] = pub["anti_sun_pa"]
+    rows["ephAntiMotionPA"] = pub["anti_motion_pa"]
+    source_times = _source_time_stats(pub, p, orbit_radius)
     sso_id, has_sso = ssobject_ids(ssobject_path, rows["designation"])
     rows["ssObjectId"] = sso_id
     tim["reduce"] = time.perf_counter() - t
@@ -814,7 +1062,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
         exceptions=dict(errors), exception_examples=examples,
         predictions=int(preds.size), predictions_gb=preds.nbytes / 2**30,
         matches_before_nearest=n_matches, output_rows=int(rows.size), with_ssobject=int(has_sso.sum()),
-        comets=comets,
+        comets=comets, source_times=source_times,
     )
     tmp_rep = f"{report_path}.tmp-{os.getpid()}"
     try:
@@ -855,6 +1103,11 @@ def _print_report(rep):
     print(f"comets and ISOs (match radius {MATCH_RADIUS_COMET_ARCSEC:g}\"): {cm['matches_before_nearest']:,} "
           f"matches; {cm['rows']:,} rows of {cm['objects']:,} objects, {cm['rows_beyond_match_radius']:,} "
           f"beyond {MATCH_RADIUS_ARCSEC:g}\" (added by the comet radius)")
+    st = rep["source_times"]
+    print(f"rows at their own DiaSource time (not the visit's): {st['rows_at_own_time']:,}, |dt| up to "
+          f"{st['max_abs_dt_s']:.3f} s ({st['rows_beyond_max_dt']:,} beyond {MAX_SOURCE_DT_S:g} s), moved up "
+          f"to {st['max_move_arcsec']:.4f}\"; {st['offset_beyond_radius']:,} with ephOffset beyond the "
+          "match radius")
     print("timings [s]: " + ", ".join(f"{k} {v:.1f}" for k, v in tim.items() if not isinstance(v, dict))
           + "; pass 2 worker CPU: " + ", ".join(f"{k} {v:.1f}" for k, v in tim["worker_cpu"].items())
           + "; pass 3 worker CPU: " + ", ".join(f"{k} {v:.1f}" for k, v in tim["pass3_cpu"].items()))
