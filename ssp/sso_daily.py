@@ -1,20 +1,35 @@
-"""The daily SSO build and delivery: the three stages in sequence.
+"""The daily SSO build and delivery: the stages in sequence.
 
     ssp-sso-daily WORK_DIR [--upload CONFIG] [--dry-run] [--reuse-inputs DIR]
-                  [--stamp STAMP]
+                  [--stamp STAMP] [--correction-table DIR] [--skip-stage0]
+                  [--stage0-workers N]
 
 runs, in a fresh dated directory DAY = WORK_DIR/<stamp> (default: today's
 UTC date, YYYY-MM-DD):
 
-    ssp-extract-sso-inputs DAY/inputs        (skipped with --reuse-inputs DIR)
+    shutter-timing-table --out CT --refresh-recent 3 --workers N
+                                             (stage 0; skipped with
+                                              --skip-stage0 or --reuse-inputs)
+    ssp-extract-sso-inputs DAY/inputs --correction-table CT
+                                             (skipped with --reuse-inputs DIR)
     ssp-build-sso DAY/inputs DAY/run         (or DIR in place of DAY/inputs)
     ssp-upload-sso CONFIG DAY/run [--dry-run]   (only with --upload)
 
+CT, the shutter-timing correction table, defaults to
+DEFAULT_CORRECTION_TABLE. Stage 0 brings it up to date
+(docs/design/shutter-timing.md): it resumes, skips nights already built,
+re-checks the last 3 nights for raws that arrived late, and holds
+CT/.lock while it runs. Its output goes to DAY/stage0.log. Its exit 2
+(refused: a calibration mismatch, the lock held, an unknown table format,
+an integrity failure) and 3 (it left the table mixed) are explained in
+daily.log and on stderr; see docs/runbooks/sso-daily.md, "Stage 0".
+
 Each stage is its own console script, run as a subprocess and looked up
 first next to the running Python (Path(sys.executable).parent, the venv's
-bin/), then on PATH. The first that fails stops the run, and its exit status
-is the wrapper's (128+N for a stage killed by signal N). Every command and
-its outcome is appended to DAY/daily.log.
+bin/, so stage 0 runs the shutter-timing pinned in ssp-tools' venv), then
+on PATH. The first that fails stops the run, and its exit status is the
+wrapper's (128+N for a stage killed by signal N). Every command, its
+duration and its exit status are appended to DAY/daily.log.
 
 Run it at most once per load window when uploading: the loader silently
 drops an upload made while its previous load is still running (see
@@ -34,9 +49,26 @@ from pathlib import Path
 
 _LOG = logging.getLogger("ssp.sso_daily")
 
+STAGE0 = "shutter-timing-table"
 EXTRACT = "ssp-extract-sso-inputs"
 BUILD = "ssp-build-sso"
 UPLOAD = "ssp-upload-sso"
+
+#: The production correction table (docs/design/shutter-timing.md).
+DEFAULT_CORRECTION_TABLE = "/sdf/data/rubin/user/mjuric/shutter-timing/corrections"
+#: Stage 0 re-checks this many of the last nights written for late raws.
+REFRESH_RECENT = 3
+#: Stage 0's worker processes: the default and the shared-node limit.
+STAGE0_WORKERS = 32
+MAX_STAGE0_WORKERS = 32
+STAGE0_LOG = "stage0.log"
+RUNBOOK = "docs/runbooks/sso-daily.md"
+#: shutter-timing-table's exit codes that stop the run with an explanation.
+STAGE0_EXIT = {
+    2: "the builder refused (a calibration mismatch, its lock held by another build, an unknown "
+       "table format, or an integrity failure)",
+    3: "the builder left the correction table mixed (nights on more than one calibration)",
+}
 
 
 def _local_bin():
@@ -56,13 +88,18 @@ def utc_stamp():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def plan(day, upload=None, dry_run=False, reuse_inputs=None):
+def plan(day, upload=None, dry_run=False, reuse_inputs=None, correction_table=DEFAULT_CORRECTION_TABLE,
+         skip_stage0=False, stage0_workers=STAGE0_WORKERS):
     """The commands to run, as [(stage, argv)]."""
     inputs = Path(reuse_inputs) if reuse_inputs else day / "inputs"
     run_dir = day / "run"
     cmds = []
     if not reuse_inputs:
-        cmds.append(("extract", [EXTRACT, str(inputs)]))
+        if not skip_stage0:
+            cmds.append(("stage0", [STAGE0, "--out", str(correction_table),
+                                    "--refresh-recent", str(REFRESH_RECENT),
+                                    "--workers", str(stage0_workers)]))
+        cmds.append(("extract", [EXTRACT, str(inputs), "--correction-table", str(correction_table)]))
     cmds.append(("build", [BUILD, str(inputs), str(run_dir)]))
     if upload:
         cmds.append(("upload", [UPLOAD, str(upload), str(run_dir)] + (["--dry-run"] if dry_run else [])))
@@ -76,8 +113,29 @@ def _log(day, msg):
         f.write(line + "\n")
 
 
-def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None):
+def _stage0_failure(day, rc, correction_table):
+    """Explain a stage-0 failure in daily.log and on stderr."""
+    what = STAGE0_EXIT.get(rc, "the builder failed")
+    msg = (f"stage0: {STAGE0} exit {rc}: {what}. The correction table {correction_table} was not "
+           f"brought up to date, so the run stops before the extract. See {day / STAGE0_LOG} (and "
+           f"{Path(correction_table) / 'build.log'}) for the builder's message, and {RUNBOOK}, "
+           "\"Stage 0\", for what to do.")
+    _log(day, msg)
+    try:
+        tail = [ln for ln in (day / STAGE0_LOG).read_text(errors="replace").splitlines() if ln.strip()][-5:]
+    except OSError:
+        tail = []
+    for ln in tail:
+        _log(day, f"stage0: | {ln}")
+    print(f"ssp-sso-daily: {msg}", file=sys.stderr)
+
+
+def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None,
+        correction_table=DEFAULT_CORRECTION_TABLE, skip_stage0=False, stage0_workers=STAGE0_WORKERS):
     """Run the stages. Returns the exit status (0, or the first failure's)."""
+    if not 1 <= int(stage0_workers) <= MAX_STAGE0_WORKERS:
+        raise SystemExit(f"ssp-sso-daily: --stage0-workers {stage0_workers}: must be in "
+                         f"1..{MAX_STAGE0_WORKERS} (shared-node limit)")
     if dry_run and not upload:
         raise SystemExit("ssp-sso-daily: --dry-run applies to the upload; give --upload CONFIG")
     if reuse_inputs and not Path(reuse_inputs).is_dir():
@@ -91,12 +149,22 @@ def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None):
     day.mkdir(parents=True, exist_ok=True)
 
     _log(day, f"ssp-sso-daily in {day}" + (f", reusing inputs {reuse_inputs}" if reuse_inputs else ""))
-    for stage, argv in plan(day, upload, dry_run, reuse_inputs):
+    if reuse_inputs:
+        _log(day, "stage0: skipped (--reuse-inputs: no extract)")
+    elif skip_stage0:
+        _log(day, f"stage0: skipped (--skip-stage0); the extract reads {correction_table} as it is")
+    stages = plan(day, upload, dry_run, reuse_inputs, correction_table, skip_stage0, stage0_workers)
+    for stage, argv in stages:
         argv = [resolve_command(argv[0])] + argv[1:]
-        _log(day, f"{stage}: {shlex.join(argv)}")
+        redirect = f" > {day / STAGE0_LOG} 2>&1" if stage == "stage0" else ""
+        _log(day, f"{stage}: {shlex.join(argv)}{redirect}")
         t0 = time.monotonic()
         try:
-            rc = subprocess.run(argv).returncode
+            if stage == "stage0":
+                with open(day / STAGE0_LOG, "ab") as out:
+                    rc = subprocess.run(argv, stdout=out, stderr=subprocess.STDOUT).returncode
+            else:
+                rc = subprocess.run(argv).returncode
         except FileNotFoundError:
             _log(day, f"{stage}: {argv[0]} not found in {_local_bin()} or on PATH")
             return 127
@@ -105,6 +173,8 @@ def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None):
             rc = 128 - rc
         _log(day, f"{stage}: exit {rc} after {time.monotonic() - t0:.1f} s")
         if rc != 0:
+            if stage == "stage0" and rc > 0 and rc < 128:
+                _stage0_failure(day, rc, correction_table)
             _log(day, f"stopping: {stage} failed")
             return rc
     _log(day, "done")
@@ -127,10 +197,19 @@ def main(argv=None):
                         help="skip the extraction and build from this existing INPUTS_DIR")
     parser.add_argument("--stamp", help="name of the run directory under WORK_DIR "
                                         "(default: today's UTC date, YYYY-MM-DD)")
+    parser.add_argument("--correction-table", metavar="DIR", default=DEFAULT_CORRECTION_TABLE,
+                        help="the shutter-timing correction table: stage 0 updates it, the extract "
+                             f"reads it (default: {DEFAULT_CORRECTION_TABLE})")
+    parser.add_argument("--skip-stage0", action="store_true",
+                        help=f"don't run stage 0 ({STAGE0}); the extract reads the table as it is "
+                             "(testing)")
+    parser.add_argument("--stage0-workers", type=int, default=STAGE0_WORKERS, metavar="N",
+                        help=f"stage 0's worker processes (default and maximum {MAX_STAGE0_WORKERS})")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     return run(args.work_dir, upload=args.upload, dry_run=args.dry_run,
-               reuse_inputs=args.reuse_inputs, stamp=args.stamp)
+               reuse_inputs=args.reuse_inputs, stamp=args.stamp, correction_table=args.correction_table,
+               skip_stage0=args.skip_stage0, stage0_workers=args.stage0_workers)
 
 
 if __name__ == "__main__":
