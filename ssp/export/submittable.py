@@ -19,6 +19,19 @@ Matching:
 4. **By position+time**, for the rows the id pass could not resolve,
    following ``ssp-submit/ops/psv_crossmatch.py``.
 
+Shutter-motion correction (docs/design/shutter-timing.md): with a
+correction table (``--correction-table``, on by default), every candidate
+that passes the position test gets its source's corrected exposure midpoint
+(``shutter_timing.corrections.corrected_midpoints``) *before* matching, and
+the time test passes if the obs_sbn time is within ``DT_MS`` of the visit
+time **or** of the corrected time (``obstime_basis``: ``visit``,
+``corrected``, ``both``); the position pass's time window is widened to
+cover both. The output's ``midpointMjdTai`` is then the corrected time
+where there is one, ``midpointMjdTaiVisit`` the visit's, and
+``midpointMjdTai_flag``/``_flag_degraded`` say which (see
+``ssp.sssource_contract``, "Shutter-motion-corrected times"). Without a
+table, the extract is exactly the uncorrected one.
+
 Credentials: ``SSP_CH_USER``/``SSP_CH_PASSWORD`` if set, else ``~/.chpass``
 (pgpass format, mode 0600). There is deliberately no password flag.
 """
@@ -28,6 +41,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import stat
 import sys
 import threading
@@ -41,7 +55,8 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from astropy.time import Time
 
-from ssp.sssource_contract import MATCH_METHODS
+from ssp.delivery_contract import SHUTTER_INPUT_COLUMNS, SHUTTER_MANIFEST_FIELD
+from ssp.sssource_contract import MATCH_METHODS, MAX_HEADER_MISMATCH_S, MAX_NOT_BUILT_VISITS
 
 # The ClickHouse ("River") server has moved more than once (sdfiana035 ->
 # 172.24.10.116 on 2026-10-04 -> sdfiana032 on 2026-10-05). Its operators keep
@@ -63,6 +78,52 @@ MAX_WORKERS = 8
 # rounding per coordinate), hence 3 mas; observed |dt| is <= 6 ms.
 SEP_MAS = 3.0
 DT_MS = 10.0
+
+# The shutter-motion correction table, built daily by stage 0
+# (shutter-timing-table). "none" on the command line disables the correction.
+DEFAULT_CORRECTION_TABLE = "/sdf/data/rubin/user/mjuric/shutter-timing/corrections"
+
+# A bound on |corrected - pipeline visit time| that widens the position
+# pass's time window, so that it also fetches candidates whose *corrected*
+# time is within DT_MS. The shutter gradient (corrected - the table's visit
+# midpoint) is within +-0.244 s, but late-readout visits, whose header
+# midpoint (and so the pipeline's time) is late, legitimately reach ~1.7 s
+# (2026-10-04 inputs); there is no cap on the correction itself.
+MAX_SHUTTER_SHIFT_S = 3.0
+
+# How an obs_sbn row's time matched its measurement's (within DT_MS).
+OBSTIME_BASES = ("visit", "corrected", "both")
+
+# Rows per corrected_midpoints call (whole nights per call; bounds the
+# memory a call needs for its nights' tables).
+LOOKUP_BATCH_ROWS = 4_000_000
+
+# Columns build_output appends with a correction table: the contract's
+# SHUTTER_INPUT_COLUMNS, plus (corrected time - obstime) as a diagnostic.
+SHUTTER_COLUMNS = ["midpointMjdTaiVisit", "midpointMjdTai_flag", "midpointMjdTai_flag_degraded",
+                   "obstime_basis", "dt_corrected_ms"]
+assert set(SHUTTER_INPUT_COLUMNS) <= set(SHUTTER_COLUMNS)
+
+# corrected_midpoints status codes (shutter_timing.CorrectionStatus); ours:
+# OUTSIDE_COVERAGE (a night before the table's first night, never looked
+# up), TIME_MISMATCH (corrected, but the pipeline's visit time differs from
+# the exposure log's header midpoint by more than MAX_HEADER_MISMATCH_S:
+# not applied), and
+# NOT_LOOKED_UP for candidates that never needed a lookup.
+OK, DEGRADED, OMITTED, NOT_BUILT, OUTSIDE_COVERAGE, TIME_MISMATCH, NOT_LOOKED_UP = 0, 1, 2, 3, 4, 5, 255
+STATUS_NAMES = {OK: "ok", DEGRADED: "degraded", OMITTED: "omitted", NOT_BUILT: "not_built",
+                OUTSIDE_COVERAGE: "outside_coverage", TIME_MISMATCH: "time_mismatch"}
+#: Statuses whose corrected time is applied; every other one is flagged.
+APPLIED = (OK, DEGRADED)
+
+# Visits listed in a warning at most (the manifest has them all).
+WARN_VISITS = 20
+
+
+class CorrectionError(RuntimeError):
+    """The shutter-motion correction cannot be applied (the table is
+    missing, mixed, malformed or too stale); the extract writes nothing."""
+
 
 # Two passing candidates closer than this in separation are a tie.
 AMBIGUOUS_MAS = 0.01
@@ -370,18 +431,28 @@ def _f64(tbl, name):
     return pc.fill_null(tbl[name].cast(pa.float64()), np.nan).to_numpy().copy()
 
 
-def score(obs, oi, cand, ci):
-    """Verify obs-row/candidate pairs ``(obs row oi[k], cand row ci[k])``.
-
-    Returns a dict of per-pair arrays: ``sep_mas`` (the closer of the PSF
-    and trail centroids), ``dt_ms`` (view - obs), ``band_ok``, ``dmag``
-    (recorded only) and ``passed``.
-    """
+def pair_sep(obs, oi, cand, ci):
+    """Per pair: the separation (mas) of the closer of the PSF and trail
+    centroids from the submitted position."""
     ra, dec = obs["ra"][oi], obs["dec"][oi]
     with np.errstate(invalid="ignore"):
         s_psf = sep_mas(ra, dec, _f64(cand, "ra")[ci], _f64(cand, "dec")[ci])
         s_trail = sep_mas(ra, dec, _f64(cand, "trailRa")[ci], _f64(cand, "trailDec")[ci])
-    sep = np.fmin(s_psf, s_trail)
+    return np.fmin(s_psf, s_trail)
+
+
+def score(obs, oi, cand, ci, t_corr=None):
+    """Verify obs-row/candidate pairs ``(obs row oi[k], cand row ci[k])``.
+
+    Returns a dict of per-pair arrays: ``sep_mas`` (the closer of the PSF
+    and trail centroids), ``dt_ms`` (view - obs), ``band_ok``, ``dmag``
+    (recorded only) and ``passed``. With ``t_corr`` (per cand row, the
+    corrected time, NaN where there is none) the time test also passes on
+    the corrected time, and the dict has ``dt_corrected_ms`` (corrected -
+    obs) and ``obstime_basis`` (per pair: "visit", "corrected", "both", or
+    None where the time test fails).
+    """
+    sep = pair_sep(obs, oi, cand, ci)
     dt = (_f64(cand, "midpointMjdTai")[ci] - obs["tai"][oi]) * 86400e3
 
     band = cand["band"].to_numpy(zero_copy_only=False)[ci]
@@ -392,8 +463,19 @@ def score(obs, oi, cand, ci):
         dmag = np.where(flux > 0, obs["mag"][oi] - (31.4 - 2.5 * np.log10(flux)), np.nan)
 
     with np.errstate(invalid="ignore"):
-        passed = (sep <= SEP_MAS) & (np.abs(dt) <= DT_MS)
-    return dict(sep_mas=sep, dt_ms=dt, band_ok=band_ok, dmag=dmag, passed=passed)
+        on_visit = np.abs(dt) <= DT_MS
+        if t_corr is None:
+            passed = (sep <= SEP_MAS) & on_visit
+            return dict(sep_mas=sep, dt_ms=dt, band_ok=band_ok, dmag=dmag, passed=passed)
+        dtc = (np.asarray(t_corr)[ci] - obs["tai"][oi]) * 86400e3
+        on_corr = np.abs(dtc) <= DT_MS
+        passed = (sep <= SEP_MAS) & (on_visit | on_corr)
+    basis = np.full(len(dt), None, dtype=object)
+    basis[on_visit] = "visit"
+    basis[on_corr] = "corrected"
+    basis[on_visit & on_corr] = "both"
+    return dict(sep_mas=sep, dt_ms=dt, band_ok=band_ok, dmag=dmag, passed=passed,
+                dt_corrected_ms=dtc, obstime_basis=basis)
 
 
 def dp2_demoted(oi, processing, early):
@@ -439,11 +521,12 @@ def rank(oi, processing, ids, sep, band_ok, demoted=None):
     return win, n_pass, ambiguous
 
 
-def resolve(obs, oi, cand, ci):
+def resolve(obs, oi, cand, ci, t_corr=None):
     """Score and rank pairs; returns (obs rows, winning cand rows, per-row
     info dict) for resolved rows, and (rows, best sep, best dt) for rows
-    that had candidates but none passing."""
-    sc = score(obs, oi, cand, ci)
+    that had candidates but none passing. ``t_corr``: see ``score``; with
+    it, the info dict also has ``dt_corrected_ms`` and ``obstime_basis``."""
+    sc = score(obs, oi, cand, ci, t_corr)
     p = sc["passed"]
     processing = cand["processing"].to_numpy(zero_copy_only=False)[ci]
     ids = cand["id"].to_numpy()[ci]
@@ -455,6 +538,8 @@ def resolve(obs, oi, cand, ci):
     win = np.flatnonzero(p)[win]
     info = dict(sep_mas=sc["sep_mas"][win], dt_ms=sc["dt_ms"][win], dmag=sc["dmag"][win],
                 band_ok=sc["band_ok"][win], n_pass=n_pass, ambiguous=ambiguous, dp2_rule=dp2_rule)
+    if t_corr is not None:
+        info.update(dt_corrected_ms=sc["dt_corrected_ms"][win], obstime_basis=sc["obstime_basis"][win])
 
     # Best (closest) failing candidate, for the unresolved report.
     fail = np.setdiff1d(np.unique(oi), oi[win])
@@ -496,6 +581,10 @@ def id_queries(obs, database, chunk_size):
         for k in range(0, len(ids), chunk_size):
             tasks.append((label, sql, {"label": label} if label is not None else None,
                           dict(q=ids[k:k + chunk_size])))
+    if not tasks:
+        # no usable id at all: one empty query, for the view's schema
+        tasks.append((None, f"SELECT * FROM {database}.{VIEW} WHERE id IN (SELECT q FROM q)", None,
+                      dict(q=np.zeros(0, np.int64))))
     return tasks
 
 
@@ -519,12 +608,16 @@ def time_buckets(tai, tol_s):
     return np.unique(b[b <= np.tile(hi, len(steps))])
 
 
-def position_queries(obs, rows, database):
+def position_queries(obs, rows, database, shift_s=0.0):
     """Position+time queries for ``rows``, one per night:
     ``[(rows of that night, sql, None, ext sets)]``. The predicates follow
     psv_crossmatch.build_query; the bucket expression must be written
-    exactly so for ClickHouse's skip indexes to apply."""
-    tol_d = DT_MS / 1e3 / 86400
+    exactly so for ClickHouse's skip indexes to apply. The view's (visit)
+    time must be within DT_MS + ``shift_s`` seconds of the obs_sbn time
+    (``shift_s`` > 0 also fetches the candidates whose corrected time,
+    within ``shift_s`` of the visit time, may match)."""
+    tol_s = DT_MS / 1e3 + shift_s
+    tol_d = tol_s / 86400
     night = np.floor(obs["tai"][rows])
     tasks = []
     for n in np.unique(night):
@@ -538,7 +631,7 @@ def position_queries(obs, rows, database):
             f"  AND hpix29 IS NOT NULL\n"
             f"  AND bitShiftRight(hpix29, {CELL_SHIFT}) IN (SELECT c FROM c)"
         )
-        tasks.append((r, sql, None, dict(b=time_buckets(tai, DT_MS / 1e3), c=np.unique(cells[cells >= 0]))))
+        tasks.append((r, sql, None, dict(b=time_buckets(tai, tol_s), c=np.unique(cells[cells >= 0]))))
     return tasks
 
 
@@ -569,20 +662,278 @@ def run_queries(tasks, host, port, database, user, workers):
 
 
 #
+# Shutter-motion correction
+#
+
+
+#: Exposure-log columns (exposures_<day_obs>.parquet) the visit-time guard
+#: sees. (shutter_timing's public API does not return them: read from the
+#: table's files.)
+GUARD_LOG_COLUMNS = ("header_mid_mjd_tai",)
+
+
+def header_guard(log, t_pipe):
+    """The visit-time guard (owner decision 2026-10-06): the correction is
+    applied, however large, only where the pipeline's visit time equals the
+    exposure log's header midpoint ``header_mid_mjd_tai`` ((MJD-BEG +
+    MJD-END)/2) to within MAX_HEADER_MISMATCH_S. ``log``: GUARD_LOG_COLUMNS
+    arrays aligned with ``t_pipe`` (MJD TAI), NaN where the visit is not in
+    the log (then the table's own status stands). Returns
+    ``(reject, delta_s)``, delta = pipeline - header."""
+    delta = (t_pipe - log["header_mid_mjd_tai"]) * 86400
+    with np.errstate(invalid="ignore"):
+        return np.abs(delta) > MAX_HEADER_MISMATCH_S, delta
+
+
+#: The visit-time guard in force (a function like header_guard, or None).
+VISIT_TIME_GUARD = header_guard
+
+
+class Corrections:
+    """The shutter-motion correction table, looked up per candidate.
+
+    ``lookup(cand, rows)`` fills ``t`` (the corrected MJD TAI, NaN where it
+    is not applied), ``status`` (CorrectionStatus, or OUTSIDE_COVERAGE,
+    TIME_MISMATCH, NOT_LOOKED_UP) and ``dvis`` (the guard's time difference,
+    s; NaN where not compared) for the given rows of ``cand``; ``extend(n)``
+    grows them with the candidate table. Lookup errors (a mixed, malformed
+    or inconsistent table, a non-integral visit or detector) raise
+    CorrectionError.
+
+    Nights before the table's first night (``first_night``, its earliest
+    ``corrections_<day_obs>.parquet``) are outside its coverage (e.g.
+    ComCam): OUTSIDE_COVERAGE, never looked up. ``guard`` (default
+    VISIT_TIME_GUARD) is applied to the corrected sources: those it rejects
+    are TIME_MISMATCH, the correction not applied. It sees the visit's row
+    of the night's exposure log (shutter_timing's API does not return it).
+    """
+
+    def __init__(self, table_dir, max_not_built_visits=MAX_NOT_BUILT_VISITS, guard=VISIT_TIME_GUARD):
+        self.table_dir = Path(table_dir)
+        if not self.table_dir.is_dir():
+            raise CorrectionError(f"the correction table {self.table_dir} does not exist (stage 0, "
+                                  f"shutter-timing-table --out {self.table_dir}, builds it)")
+        self.max_not_built_visits = max_not_built_visits
+        self.guard = guard
+        nights = [int(m.group(1)) for p in self.table_dir.iterdir()
+                  if (m := re.fullmatch(r"corrections_(\d{8})\.parquet", p.name))]
+        self.first_night = min(nights) if nights else None
+        self.t = np.zeros(0)
+        self.dvis = np.zeros(0)
+        self.status = np.zeros(0, np.uint8)
+        self.formats, self.calibrations, self.versions = set(), set(), set()
+        self.seconds, self.calls = 0.0, 0
+        self._logs = {}      # day_obs -> (sorted visits, {column: values})
+
+    def extend(self, n):
+        k = n - len(self.t)
+        self.t = np.concatenate([self.t, np.full(k, np.nan)])
+        self.dvis = np.concatenate([self.dvis, np.full(k, np.nan)])
+        self.status = np.concatenate([self.status, np.full(k, NOT_LOOKED_UP, np.uint8)])
+
+    def exposure_log(self, visits):
+        """GUARD_LOG_COLUMNS of ``visits`` (in built nights) from their
+        nights' exposure logs, as arrays aligned with ``visits`` (NaN where
+        the visit is not logged)."""
+        out = {c: np.full(len(visits), np.nan) for c in GUARD_LOG_COLUMNS}
+        day = visits // 100000
+        for d in np.unique(day).tolist():
+            if d not in self._logs:
+                path = self.table_dir / f"exposures_{d}.parquet"
+                try:
+                    t = pq.read_table(path, columns=["visit", *GUARD_LOG_COLUMNS])
+                except (OSError, KeyError, pa.ArrowInvalid) as e:
+                    raise CorrectionError(f"cannot read the exposure log {path}: {e}") from e
+                v = t["visit"].to_numpy()
+                o = np.argsort(v)
+                self._logs[d] = (v[o], {c: _f64(t, c)[o] for c in GUARD_LOG_COLUMNS})
+            v, cols = self._logs[d]
+            if not len(v):
+                continue
+            sel = np.flatnonzero(day == d)
+            i = np.minimum(np.searchsorted(v, visits[sel]), len(v) - 1)
+            hit = v[i] == visits[sel]
+            for c in GUARD_LOG_COLUMNS:
+                out[c][sel[hit]] = cols[c][i[hit]]
+        return out
+
+    def lookup(self, cand, rows):
+        """Look up ``rows`` of ``cand`` (not already looked up), in batches
+        of whole nights."""
+        from shutter_timing import CalibrationMismatchError, TableFormatError, TableIntegrityError
+        from shutter_timing.corrections import corrected_midpoints
+
+        self.extend(len(cand))
+        rows = np.unique(rows)
+        rows = rows[self.status[rows] == NOT_LOOKED_UP]
+        if not len(rows):
+            return
+        missing = [c for c in ("visit", "detector", "x", "y") if c not in cand.column_names]
+        if missing:
+            raise CorrectionError(f"the view lacks the columns {missing} the shutter-motion correction needs")
+        idx = pa.array(rows, pa.int64())
+        visit, detector = (cand[c].take(idx) for c in ("visit", "detector"))
+        if visit.null_count or detector.null_count:
+            raise CorrectionError(f"{visit.null_count + detector.null_count} candidate(s) have a null visit "
+                                  "or detector; cannot look up their corrected times")
+        visit = visit.to_numpy()
+        detector = detector.to_numpy()
+        x, y = (_f64(cand, c)[rows] for c in ("x", "y"))     # null -> NaN -> OMITTED
+        t_pipe = _f64(cand, "midpointMjdTai")[rows]
+
+        # outside the table's coverage: never looked up. (A visit with a
+        # non-integral number fails in corrected_midpoints, below.)
+        day = np.floor_divide(visit, 100000)
+        outside = day < self.first_night if self.first_night is not None else np.zeros(len(rows), bool)
+        self.status[rows[outside]] = OUTSIDE_COVERAGE
+
+        # whole nights per call, at most LOOKUP_BATCH_ROWS rows (unless one
+        # night has more)
+        inside = np.flatnonzero(~outside)
+        order = inside[np.argsort(day[inside], kind="stable")]
+        dsort = day[order]
+        bounds, lo = [], 0
+        for s in np.flatnonzero(dsort[1:] != dsort[:-1]) + 1:
+            if s - lo >= LOOKUP_BATCH_ROWS:
+                bounds.append((lo, s))
+                lo = s
+        if len(order):
+            bounds.append((lo, len(order)))
+
+        t0 = time.time()
+        for lo, hi in bounds:
+            sel = order[lo:hi]
+            try:
+                r = corrected_midpoints(visit[sel], detector[sel], x[sel], y[sel], table_dir=self.table_dir,
+                                        require_uniform=True)
+            except (CalibrationMismatchError, TableFormatError, TableIntegrityError, ValueError) as e:
+                raise CorrectionError(f"the correction table {self.table_dir}: "
+                                      f"{type(e).__name__}: {e}") from e
+            self.calls += 1
+            t, status = r.t_mid_mjd_tai.copy(), r.status.astype(np.uint8)
+            dvis = np.full(len(sel), np.nan)
+            if self.guard is not None:
+                applied = np.flatnonzero(np.isin(status, APPLIED))
+                va = visit[sel][applied]
+                reject, dvis[applied] = self.guard(self.exposure_log(va), t_pipe[sel][applied])
+                status[applied[reject]] = TIME_MISMATCH
+                t[applied[reject]] = np.nan
+            self.t[rows[sel]] = t
+            self.dvis[rows[sel]] = dvis
+            self.status[rows[sel]] = status
+            self.formats.add(int(r.table_format))
+            if r.days:      # nights were read: their calibration and version
+                self.calibrations.add(r.calibration_id)
+                self.versions.add(r.package_version)
+        self.seconds += time.time() - t0
+
+    def provenance(self):
+        """table_dir, table_format, calibration_id, package_version of the
+        nights read (comma-joined if several; "unknown" if none), and the
+        table's first night."""
+        def join(s):
+            return ",".join(sorted(s)) if s else "unknown"
+        return dict(table_dir=str(self.table_dir), table_format=max(self.formats) if self.formats else None,
+                    calibration_id=join(self.calibrations), package_version=join(self.versions),
+                    first_night=self.first_night)
+
+    def check(self, visits, status, dvis):
+        """Warn about the NOT_BUILT and TIME_MISMATCH visits of the output
+        rows (at most WARN_VISITS named); fail if more than
+        ``max_not_built_visits`` are NOT_BUILT. Returns both lists of
+        visits, sorted."""
+        visits, status, dvis = np.asarray(visits), np.asarray(status), np.asarray(dvis)
+        nb = np.unique(visits[status == NOT_BUILT]).tolist()
+        if len(nb) > self.max_not_built_visits:
+            raise CorrectionError(
+                f"{len(nb)} visits are not built in the correction table {self.table_dir} (more than "
+                f"--max-not-built-visits {self.max_not_built_visits}): is stage 0 (shutter-timing-table "
+                f"--out {self.table_dir}) stale, skipped or failing? Nights affected: "
+                f"{_some(sorted({v // 100000 for v in nb}))}")
+        if nb:
+            print(f"warning: {len(nb)} visit(s) not built in the correction table (their night has no "
+                  f"table, or the visit is not in its exposure log, e.g. a raw that arrived late); "
+                  f"they keep the visit time, flagged: {_some(nb)}", file=sys.stderr, flush=True)
+        mm = status == TIME_MISMATCH
+        tm = np.unique(visits[mm]).tolist()
+        if tm:
+            dv = {v: float(np.median(dvis[mm & (visits == v)])) for v in tm}
+            print(f"warning: {len(tm)} visit(s) whose visit time differs from the exposure log's header "
+                  f"midpoint by more than {MAX_HEADER_MISMATCH_S * 1e3:g} ms (pipeline - header); not "
+                  f"corrected, they keep the visit time, flagged: "
+                  f"{_some([f'{v} ({dv[v] * 1e3:+.1f} ms)' for v in tm])}", file=sys.stderr, flush=True)
+        return nb, tm
+
+
+def _some(items, n=WARN_VISITS):
+    """At most ``n`` items, then '... and N more'."""
+    items = list(items)
+    head = ", ".join(map(str, items[:n]))
+    return head + (f", ... and {len(items) - n} more" if len(items) > n else "")
+
+
+def shutter_columns(corr, cand, ci, info):
+    """The corrected time and the SHUTTER_COLUMNS for winning candidates
+    ``ci``: ``(midpointMjdTai, {name: array})``. ``midpointMjdTai`` is the
+    corrected time where it is applied (OK or DEGRADED), else the visit's,
+    flagged."""
+    t_visit = _f64(cand, "midpointMjdTai")[ci]
+    t, status = corr.t[ci], corr.status[ci]
+    assert not np.any(status == NOT_LOOKED_UP), "a winning candidate was never looked up"
+    corrected = np.isin(status, APPLIED)
+    assert np.all(np.isfinite(t[corrected])) and np.all(np.isnan(t[~corrected]))
+    cols = dict(
+        midpointMjdTaiVisit=t_visit,
+        midpointMjdTai_flag=~corrected,
+        midpointMjdTai_flag_degraded=status == DEGRADED,
+        obstime_basis=pa.array(info["obstime_basis"], pa.string()),
+        dt_corrected_ms=pa.array(info["dt_corrected_ms"], pa.float64(), from_pandas=True),
+    )
+    assert list(cols) == SHUTTER_COLUMNS
+    return np.where(corrected, t, t_visit), cols
+
+
+def shutter_report(corr, out, status, not_built, time_mismatch):
+    """The manifest's SHUTTER_MANIFEST_FIELD entry, from the written rows."""
+    basis = out["obstime_basis"].to_numpy(zero_copy_only=False)
+    return {**corr.provenance(),
+            "obstime_basis": {b: int(np.sum(basis == b)) for b in OBSTIME_BASES},
+            "status": {name: int(np.sum(status == code)) for code, name in STATUS_NAMES.items()},
+            "not_built_visits": not_built,
+            "time_mismatch_visits": time_mismatch}
+
+
+def correct(corr, obs, oi, cand, ci):
+    """Look up the corrected times of the candidates of pairs ``(oi, ci)``
+    that pass the position test; returns ``corr.t`` (per cand row), or None
+    without a correction table."""
+    if corr is None:
+        return None
+    with np.errstate(invalid="ignore"):
+        near = pair_sep(obs, oi, cand, ci) <= SEP_MAS
+    corr.lookup(cand, ci[near])
+    return corr.t
+
+
+#
 # Output
 #
 
 
-def build_output(obs, tbl, cand, rows, ci, match, info):
+def build_output(obs, tbl, cand, rows, ci, match, info, corr=None):
     """The dia_sources table, one row per resolved obs_sbn row (of
     ``tbl``): the winning view rows (all columns, renamed), required
     columns null-filled, plus linkage and match diagnostics. ``match`` is
     "id"/"position" per row of ``rows``; ``matchMethod`` refines "id" to
     "obssubid_trail" for a merged -A/-B pair, else "obssubid" (see
     MATCH_METHODS). The -B row of a trail pair repeats its -A row's match.
-    Returns ``(table, is_b)``."""
+    With ``corr`` (a looked-up Corrections), ``midpointMjdTai`` is the
+    corrected time and SHUTTER_COLUMNS follow EXTRA_COLUMNS (see
+    shutter_columns). Returns ``(table, is_b, src)``, ``src`` the cand row
+    of each output row."""
     names = [RENAMES.get(c, c) for c in cand.column_names]
-    clash = sorted({c for c in names if names.count(c) > 1} | (set(names) & set(EXTRA_COLUMNS)))
+    added = set(EXTRA_COLUMNS) | (set(SHUTTER_COLUMNS) if corr is not None else set())
+    clash = sorted({c for c in names if names.count(c) > 1} | (set(names) & added))
     if clash:
         raise ValueError(f"view columns {clash} clash (after renaming {RENAMES}) with each other "
                          f"or with the columns this tool adds; refusing to write duplicate names")
@@ -619,9 +970,15 @@ def build_output(obs, tbl, cand, rows, ci, match, info):
         ambiguous=info["ambiguous"][k],
     )
     assert list(extra) == EXTRA_COLUMNS
+    if corr is not None:
+        t, cols = shutter_columns(corr, cand, ci[k], {c: info[c][k] for c in ("obstime_basis",
+                                                                                  "dt_corrected_ms")})
+        out = out.set_column(out.column_names.index("midpointMjdTai"), "midpointMjdTai",
+                             pa.array(t, pa.float64()))
+        extra.update(cols)
     for name, col in extra.items():
         out = out.append_column(name, col if isinstance(col, (pa.Array, pa.ChunkedArray)) else pa.array(col))
-    return out, is_b
+    return out, is_b, ci[k]
 
 
 def _codes(values):
@@ -638,6 +995,8 @@ def primary_flags(processing, ids, is_b, submission_id, obsid):
     (submission_id starts with its ISO timestamp), tie-broken on obsid.
     """
     code, ids = _codes(processing), np.asarray(ids)
+    if len(ids) == 0:
+        return np.zeros(0, dtype=bool)
     order = np.lexsort((_codes(obsid), _codes(submission_id), is_b, ids, code))
     first = np.r_[True, (code[order][1:] != code[order][:-1]) | (ids[order][1:] != ids[order][:-1])]
     primary = np.zeros(len(ids), dtype=bool)
@@ -667,11 +1026,20 @@ def _counts(values):
     return ", ".join(f"{k}: {n:,}" for k, n in sorted(zip(u, c), key=lambda x: -x[1])) or "-"
 
 
-def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250_000):
+def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250_000, correction_table=None,
+            max_not_built_visits=MAX_NOT_BUILT_VISITS, report=None):
     """Resolve the X05 rows of ``obs_path`` against the view and write
     ``out_path`` and ``<stem>.unresolved.parquet``. ``fetch`` runs a list
-    of query tasks (see ``run_queries``). Returns the exit code."""
+    of query tasks (see ``run_queries``). Returns the exit code.
+
+    ``correction_table``: the shutter-motion correction table directory
+    (None: no correction, the uncorrected extract). With it, the extract
+    raises CorrectionError (writing nothing) if the table cannot be used or
+    more than ``max_not_built_visits`` of the written rows' visits are not
+    built in it, and fills ``report`` (a dict, if given) with the
+    manifest's SHUTTER_MANIFEST_FIELD entry."""
     timings = {}
+    corr = Corrections(correction_table, max_not_built_visits) if correction_table is not None else None
     t0 = time.time()
 
     tbl = pq.read_table(obs_path, columns=OBS_COLUMNS)
@@ -701,7 +1069,8 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
         offset += len(t)
     cand = pa.concat_tables(parts)
     oi, ci = np.concatenate(oi), np.concatenate(ci)
-    (r_id, c_id, i_id), best = resolve(obs, oi, cand, ci)
+    t_corr = correct(corr, obs, oi, cand, ci)
+    (r_id, c_id, i_id), best = resolve(obs, oi, cand, ci, t_corr)
     reason = obs["reason"]
     todo = np.ones(n, dtype=bool)
     todo[r_id] = False
@@ -715,7 +1084,8 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     rows = np.flatnonzero(todo & np.isfinite(obs["ra"]) & np.isfinite(obs["dec"]) & np.isfinite(obs["tai"]))
     r_pos, c_pos, i_pos = np.zeros(0, int), np.zeros(0, int), None
     if len(rows):
-        results = fetch(position_queries(obs, rows, database))
+        results = fetch(position_queries(obs, rows, database,
+                                         shift_s=MAX_SHUTTER_SHIFT_S if corr is not None else 0.0))
         oi, ci, poff = [], [], len(cand)
         for r, t in results:
             cells = cell_block(obs["ra"][r], obs["dec"][r])
@@ -727,7 +1097,8 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
             poff += len(t)
         cand = pa.concat_tables([cand] + [t for _, t in results])
         oi, ci = np.concatenate(oi), np.concatenate(ci)
-        (r_pos, c_pos, i_pos), best_pos = resolve(obs, oi, cand, ci)
+        t_corr = correct(corr, obs, oi, cand, ci)
+        (r_pos, c_pos, i_pos), best_pos = resolve(obs, oi, cand, ci, t_corr)
         # A row's best failing candidate from the id pass is the one to report.
         keep = ~np.isin(best_pos[0], best[0])
         best = tuple(np.concatenate([x, y[keep]]) for x, y in zip(best, best_pos))
@@ -738,7 +1109,13 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     rows_all = np.concatenate([r_id, r_pos])
     info = i_id if i_pos is None else {k: np.concatenate([i_id[k], i_pos[k]]) for k in i_id}
     match = np.array(["id"] * len(r_id) + ["position"] * len(r_pos), dtype=object)
-    out, is_b = build_output(obs, tbl, cand, rows_all, np.concatenate([c_id, c_pos]), match, info)
+    out, is_b, src = build_output(obs, tbl, cand, rows_all, np.concatenate([c_id, c_pos]), match, info, corr)
+    if corr is not None:
+        status = corr.status[src]
+        not_built, time_mismatch = corr.check(cand["visit"].to_numpy()[src], status, corr.dvis[src])
+        shutter = shutter_report(corr, out, status, not_built, time_mismatch)
+        if report is not None:
+            report[SHUTTER_MANIFEST_FIELD[0]] = shutter
     # rows the DP2 rule decided, by the processing it picked
     won = cand["processing"].to_numpy(zero_copy_only=False)[np.concatenate([c_id, c_pos])]
     dp2_won = won[info["dp2_rule"]]
@@ -747,7 +1124,7 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     key = ["processing", "diaSourceId"]
     assert pc.count_distinct(out["obsid"]).as_py() == len(out)
     g = out.select(key + ["primary"]).group_by(key).aggregate([("primary", "sum")])
-    assert pc.all(pc.equal(g["primary_sum"], 1)).as_py()
+    assert len(g) == 0 or pc.all(pc.equal(g["primary_sum"], 1)).as_py()
     n_sources = len(g)
     # sources claimed by more than one submission (not counting -B rows)
     nb = out.select(key + ["primary", "obsid", "submission_id", "trksub"]).filter(pa.array(~is_b))
@@ -782,10 +1159,33 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
           f"pDP2-DS if submitted before {DP2_CUTOFF})")
     print(f"band_ok = false:                  {pc.sum(pc.invert(out['band_ok'])).as_py() or 0:,}")
     print(f"per processing:                   {_counts(out['processing'].to_numpy(False))}")
+    if corr is not None:
+        print(f"shutter correction:               {shutter['table_dir']} (format {shutter['table_format']}, "
+              f"calibration {shutter['calibration_id']}, built by {shutter['package_version']})")
+        print(f"  correction status:              {shutter['status']}")
+        print(f"  obstime basis:                  {shutter['obstime_basis']}")
+        print(f"  not built visits:               {len(not_built):,}")
+        timings["correction lookup"] = corr.seconds
     print(f"wrote {out_path} and {stem}.unresolved.parquet")
     for k, v in timings.items():
         print(f"  {k:20s} {v:8.1f} s")
     return 0
+
+
+def add_correction_args(parser):
+    """--correction-table and --max-not-built-visits (shared with
+    ssp-extract-sso-inputs)."""
+    parser.add_argument("--correction-table", default=DEFAULT_CORRECTION_TABLE, metavar="DIR",
+                        help="The shutter-motion correction table (shutter-timing-table's --out); "
+                             "'none' for no correction (default: %(default)s)")
+    parser.add_argument("--max-not-built-visits", type=int, default=MAX_NOT_BUILT_VISITS, metavar="N",
+                        help="Fail if more than N visits of the extracted rows are not built in the "
+                             "correction table (default: %(default)s)")
+
+
+def correction_table(args):
+    """The --correction-table directory, or None for 'none'."""
+    return None if args.correction_table.strip().lower() in ("", "none") else args.correction_table
 
 
 def main():
@@ -808,6 +1208,7 @@ def main():
                         help=f"Concurrent queries, at most {MAX_WORKERS} (default: %(default)s)")
     parser.add_argument("--chunk-size", type=int, default=250_000,
                         help="Ids per query (default: %(default)s)")
+    add_correction_args(parser)
     args = parser.parse_args()
     if not 1 <= args.workers <= MAX_WORKERS:
         parser.error(f"--workers must be between 1 and {MAX_WORKERS} (the server is shared)")
@@ -817,7 +1218,13 @@ def main():
     def fetch(tasks):
         return run_queries(tasks, args.host, args.port, args.database, args.user, args.workers)
 
-    rc = extract(args.obs_sbn, args.output, fetch, database=args.database, chunk_size=args.chunk_size)
+    try:
+        rc = extract(args.obs_sbn, args.output, fetch, database=args.database, chunk_size=args.chunk_size,
+                     correction_table=correction_table(args), max_not_built_visits=args.max_not_built_visits)
+    except CorrectionError as e:
+        print(f"extract-submitted-sources: error: shutter-motion correction: {e}; nothing written",
+              file=sys.stderr)
+        sys.exit(1)
     print(f"total wall time: {time.time() - t0:.1f} s")
     sys.exit(rc)
 

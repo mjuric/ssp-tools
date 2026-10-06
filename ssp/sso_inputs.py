@@ -13,7 +13,11 @@ extract"). The steps:
     The transaction's start is the manifest's ``mpc_snapshot_utc``.
 ``dia_sources``
     ``extract-submitted-sources`` on that ``obs_sbn`` (ClickHouse
-    ``ssp.SubmittableSources``, at most 8 concurrent queries). It also
+    ``ssp.SubmittableSources``, at most 8 concurrent queries), with the
+    shutter-motion correction (``--correction-table``; the manifest's
+    ``shutter_timing`` entry records the table and the counts, and is
+    carried over or taken from a reused file's manifest like the file's
+    entry, else null). It also
     leaves ``dia_sources.unresolved.parquet``, which is not an input. Its
     manifest entry carries ``obs_sbn_md5``, the md5 of the ``obs_sbn`` it
     was built from; a manifest whose ``obs_sbn_md5`` differs from
@@ -70,6 +74,7 @@ from ssp.delivery_contract import (
     MANIFEST_FILE,
     MPC_SNAPSHOT,
     REQUIRED_INPUT_COLUMNS,
+    SHUTTER_MANIFEST_FIELD,
 )
 
 PROG = "ssp-extract-sso-inputs"
@@ -192,16 +197,24 @@ def export_mpc(tmp, args):
 
 
 def extract_dia_sources(obs_path, out_path, args):
-    """``extract-submitted-sources`` on ``obs_path``, as a library call."""
+    """``extract-submitted-sources`` on ``obs_path``, as a library call.
+    Returns the manifest's SHUTTER_MANIFEST_FIELD entry (None without a
+    correction table)."""
     from ssp.export import submittable as S
 
     def fetch(tasks):
         return S.run_queries(tasks, args.ch_host, args.ch_port, S.DEFAULT_DATABASE, args.ch_user,
                              args.workers)
 
-    rc = S.extract(obs_path, out_path, fetch)
+    report = {}
+    try:
+        rc = S.extract(obs_path, out_path, fetch, correction_table=S.correction_table(args),
+                       max_not_built_visits=args.max_not_built_visits, report=report)
+    except S.CorrectionError as e:
+        raise ExtractError(f"dia_sources: shutter-motion correction: {e}") from None
     if rc != 0:
         raise ExtractError(f"extract-submitted-sources returned {rc}")
+    return report.get(SHUTTER_MANIFEST_FIELD[0])
 
 
 def export_ppdb(out_path, args):
@@ -330,6 +343,7 @@ class Reused:
         e = (side.get("files") or {}).get(name)
         self.side_entry = e if isinstance(e, dict) and e.get("md5") == self.md5 else None
         self.side_snapshot = side.get("mpc_snapshot_utc") if self.side_entry else None
+        self.side_shutter = side.get(SHUTTER_MANIFEST_FIELD[0]) if self.side_entry else None
 
     def entry(self):
         e = self.side_entry
@@ -395,6 +409,8 @@ def _run(args, out):
     steps = plan(args, reuse, recorded_obs_md5(carry_dia))
 
     files, snapshot = {}, None
+    # the shutter_timing entry of a carried-over dia_sources (checked below)
+    shutter = (previous or {}).get(SHUTTER_MANIFEST_FIELD[0])
     for step, names in STEPS.items():
         for name in names:
             if name in reuse or step in steps:
@@ -419,6 +435,7 @@ def _run(args, out):
         files[name] = r.entry()
     if "dia_sources" in reuse:
         r = reuse["dia_sources"]
+        shutter = r.side_shutter
         obs_md5 = recorded_obs_md5(r.side_entry)
         if obs_md5 is None and "obs_sbn" in reuse and reuse["obs_sbn"].path.parent == r.path.parent:
             obs_md5 = reuse["obs_sbn"].md5      # reused together, from one directory
@@ -458,12 +475,13 @@ def _run(args, out):
                 files[name] = describe(name, staged[name], f"{mpc_source(args)}: {MPC_SQL[name]}", snapshot)
         elif step == "dia_sources":
             staged["dia_sources"] = tmp / INPUT_FILES["dia_sources"][0]
-            extract_dia_sources(path_of("obs_sbn"), staged["dia_sources"], args)
+            shutter = extract_dia_sources(path_of("obs_sbn"), staged["dia_sources"], args)
             obs_md5 = files["obs_sbn"]["md5"]
             files["dia_sources"] = describe(
                 "dia_sources", staged["dia_sources"],
                 f"extract-submitted-sources --workers {args.workers} on obs_sbn (md5 {obs_md5}), "
-                f"against {ch_source(args)} ssp.SubmittableSources", iso(started))
+                f"against {ch_source(args)} ssp.SubmittableSources, correction table "
+                f"{args.correction_table}", iso(started))
             files["dia_sources"]["obs_sbn_md5"] = obs_md5
         elif step == "ppdb_dia_sources":
             staged["ppdb_dia_sources"] = tmp / INPUT_FILES["ppdb_dia_sources"][0]
@@ -482,7 +500,10 @@ def _run(args, out):
         "mpc_snapshot_utc": snapshot,
         "files": {name: files[name] for name in INPUT_FILES},
     }
-    assert list(manifest) == list(MANIFEST_FIELDS)
+    # SHUTTER_MANIFEST_FIELD joins MANIFEST_FIELDS when the build requires it
+    manifest.setdefault(SHUTTER_MANIFEST_FIELD[0], shutter)
+    assert [k for k in manifest if k in MANIFEST_FIELDS] == list(MANIFEST_FIELDS)
+    assert set(manifest) <= set(MANIFEST_FIELDS) | {SHUTTER_MANIFEST_FIELD[0]}
 
     # Commit: the old manifest aside, the files into place, the new manifest.
     if manifest_path.exists():
@@ -514,7 +535,7 @@ def check_pairing(files, obs_entry, early=False):
 
 
 def build_parser():
-    from ssp.export.submittable import MAX_WORKERS
+    from ssp.export.submittable import MAX_WORKERS, add_correction_args
 
     p = argparse.ArgumentParser(
         prog=PROG,
@@ -547,6 +568,7 @@ def build_parser():
     g.add_argument("--workers", type=int, default=MAX_WORKERS,
                    help=f"Concurrent extract-submitted-sources queries, at most {MAX_WORKERS} "
                         "(the server is shared; default: %(default)s)")
+    add_correction_args(p.add_argument_group("Shutter-motion correction (dia_sources)"))
     return p
 
 

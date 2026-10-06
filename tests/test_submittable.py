@@ -372,7 +372,7 @@ def test_build_output_name_clash():
     o, tbl, _ = S.load_obs(obs)
     info = dict(sep_mas=[0.0], dt_ms=[0.0], dmag=[0.0], band_ok=[True], n_pass=[1], ambiguous=[False])
     info = {k: np.array(v) for k, v in info.items()}
-    ok, _ = S.build_output(o, tbl, view, np.array([0]), np.array([0]), ["id"], info)
+    ok, _, _ = S.build_output(o, tbl, view, np.array([0]), np.array([0]), ["id"], info)
     assert len(set(ok.column_names)) == len(ok.column_names)
     for bad in (view.append_column("sep_mas", view["ra"]), view.append_column("diaSourceId", view["id"]),
                 view.append_column("trkid", view["band"])):

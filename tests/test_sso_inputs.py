@@ -57,6 +57,8 @@ def stubs(monkeypatch):
         pq.write_table(table("dia_sources", n, drop=calls["drop"].get("dia_sources", ())), out_path)
         pq.write_table(pa.table({"obsid": pa.array([], pa.string())}),
                        str(out_path)[:-8] + ".unresolved.parquet")
+        calls["correction_table"] = args.correction_table
+        return calls.get("shutter")
 
     def export_ppdb(out_path, args):
         calls["ppdb_dia_sources"] += 1
@@ -81,7 +83,8 @@ def manifest(tmp_path, d="inputs"):
 def test_full_run_manifest(tmp_path, stubs):
     m = run(tmp_path)
     assert m == manifest(tmp_path)
-    assert list(m) == list(MANIFEST_FIELDS)
+    assert list(m) == list(MANIFEST_FIELDS) + ["shutter_timing"]
+    assert m["shutter_timing"] is None     # the stub extracts without a correction table
     assert m["mpc_snapshot_utc"] == "2026-10-01T06:25:03Z"
     assert m["producer"].startswith("ssp-extract-sso-inputs ")
     assert "(" in m["producer"] and m["producer"].endswith(")")
@@ -480,3 +483,57 @@ def test_export_query_tmp_csv(tmp_path):
         P.export_query_to_parquet(FakeCursor(log, fail=True), "SELECT x", str(tmp_path / "y.parquet"),
                                   tmp_dir=tmpd)
     assert not list(tmpd.iterdir())
+
+
+#
+# The shutter-motion correction's manifest entry (WP S1)
+#
+
+SHUTTER = {"table_dir": "/t", "table_format": 1, "calibration_id": "c", "package_version": "v",
+           "obstime_basis": {"visit": 4, "corrected": 1, "both": 0},
+           "status": {"ok": 2, "degraded": 2, "omitted": 0, "not_built": 1}, "not_built_visits": [7]}
+
+
+def test_shutter_entry_written_and_carried(tmp_path, stubs):
+    stubs["shutter"] = SHUTTER
+    m = run(tmp_path, "--correction-table", "/t")
+    assert stubs["correction_table"] == "/t"
+    assert m["shutter_timing"] == SHUTTER and manifest(tmp_path)["shutter_timing"] == SHUTTER
+    assert "correction table /t" in m["files"]["dia_sources"]["source"]
+    # dia_sources not rerun: its entry is carried over with it
+    stubs["shutter"] = None
+    m = run(tmp_path, "--force", "--only", "ppdb_dia_sources")
+    assert stubs["dia_sources"] == 1 and m["shutter_timing"] == SHUTTER
+    # rerun: replaced
+    m = run(tmp_path, "--force", "--only", "dia_sources")
+    assert stubs["dia_sources"] == 2 and m["shutter_timing"] is None
+
+
+def test_shutter_entry_from_reused_dia_sources(tmp_path, stubs):
+    stubs["shutter"] = SHUTTER
+    run(tmp_path, d="old")
+    stubs["shutter"] = None
+    old = tmp_path / "old"
+    reuse = [a for n in MPC_SNAPSHOT + ("dia_sources",)
+             for a in ("--reuse", f"{n}={old / INPUT_FILES[n][0]}")]
+    m = run(tmp_path, *reuse)
+    assert stubs["dia_sources"] == 1 and m["shutter_timing"] == SHUTTER
+
+
+def test_correction_defaults():
+    from ssp.export.submittable import DEFAULT_CORRECTION_TABLE
+    from ssp.sssource_contract import MAX_NOT_BUILT_VISITS
+    a = M.build_parser().parse_args(["x"])
+    assert (a.correction_table, a.max_not_built_visits) == (DEFAULT_CORRECTION_TABLE, MAX_NOT_BUILT_VISITS)
+
+
+def test_correction_error_is_extract_error(tmp_path, monkeypatch):
+    from ssp.export import submittable as S
+
+    def boom(*a, **kw):
+        raise S.CorrectionError("12 visits are not built")
+    monkeypatch.setattr(S, "extract", boom)
+    args = M.build_parser().parse_args([str(tmp_path), "--max-not-built-visits", "3"])
+    args.ch_host = "h"
+    with pytest.raises(M.ExtractError, match="shutter-motion correction: 12 visits"):
+        M.extract_dia_sources(tmp_path / "obs.parquet", tmp_path / "dia.parquet", args)
