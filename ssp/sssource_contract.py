@@ -85,6 +85,14 @@ SHUTTER_INTERNAL = ("midpointMjdTaiVisit", "obstime_basis")
 #: The default limit on NOT_BUILT visits in one extract (configurable).
 MAX_NOT_BUILT_VISITS = 20
 
+#: Visits on nights before the correction table's first night are outside
+#: its coverage (e.g. ComCam): the visit time, midpointMjdTai_flag True, not
+#: counted toward MAX_NOT_BUILT_VISITS; counted separately in the manifest.
+#: A visit whose table midpoint (t_mid_visit_mjd_tai) differs from the
+#: pipeline's visit time by more than this [s] is not corrected: the visit
+#: time, midpointMjdTai_flag True, a warning; counted in the manifest.
+MAX_VISIT_TIME_MISMATCH_S = 0.050
+
 #: The predicted position's error ellipse (deg, deg, deg^2): the
 #: NearbySSO convention, i.e. the DiaSource raErr/decErr/ra_dec_Cov one.
 ELLIPSE_COLUMNS = ("ephRaErr", "ephDecErr", "ephRa_ephDec_Cov")
