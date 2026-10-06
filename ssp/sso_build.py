@@ -60,6 +60,7 @@ from .delivery_contract import (
     MANIFEST_FILE,
     REPORT_FILE,
     REQUIRED_INPUT_COLUMNS,
+    SHUTTER_INPUT_COLUMNS,
     delivery_schema,
 )
 
@@ -251,6 +252,11 @@ def _validate_manifest(inputs_dir, workers):
         lacking = [c for c in REQUIRED_INPUT_COLUMNS[name] if c not in cols]
         if lacking:
             problems.append(f"{name}: lacks required columns {lacking}")
+        if name == "dia_sources":
+            # the shutter correction's columns: all or none
+            shutter = [c for c in SHUTTER_INPUT_COLUMNS if c not in cols]
+            if 0 < len(shutter) < len(SHUTTER_INPUT_COLUMNS):
+                problems.append(f"{name}: has some of the shutter-correction columns, but lacks {shutter}")
         todo.append((name, path, entry["md5"]))
 
     with ThreadPoolExecutor(max(1, min(workers, len(todo) or 1))) as pool:

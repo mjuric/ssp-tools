@@ -28,6 +28,7 @@ from ssp.delivery_contract import (
     INPUT_FILES,
     REPORT_FIELDS,
     REQUIRED_INPUT_COLUMNS,
+    SHUTTER_INPUT_COLUMNS,
     delivery_schema,
 )
 
@@ -129,6 +130,18 @@ def test_manifest_required_columns(tmp_path):
     write_inputs(tmp_path, dia_sources=t)
     with pytest.raises(B.ManifestError, match=r"dia_sources: lacks required columns \['measuredOn'\]"):
         B.validate_manifest(tmp_path)
+
+
+def test_manifest_partial_shutter_columns(tmp_path):
+    # the shutter correction's columns: all or none (shutter-timing.md)
+    cols = REQUIRED_INPUT_COLUMNS["dia_sources"] + ["midpointMjdTaiVisit", "midpointMjdTai_flag"]
+    write_inputs(tmp_path, dia_sources=pa.table({c: pa.array([1, 2]) for c in cols}))
+    with pytest.raises(B.ManifestError, match=r"dia_sources: has some of the shutter-correction columns, but "
+                                              r"lacks \['midpointMjdTai_flag_degraded', 'obstime_basis'\]"):
+        B.validate_manifest(tmp_path)
+    cols = REQUIRED_INPUT_COLUMNS["dia_sources"] + list(SHUTTER_INPUT_COLUMNS)
+    write_inputs(tmp_path, dia_sources=pa.table({c: pa.array(np.arange(4)) for c in cols}))
+    B.validate_manifest(tmp_path)
 
 
 def test_manifest_every_problem_listed(tmp_path):
