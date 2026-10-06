@@ -245,6 +245,19 @@ run the April 2026 submissions were made from) if submitted before
 2026-06-04, else `DP2-DS`. Rows that cannot be resolved by
 id are searched for by position and time, with the same acceptance rule.
 
+Shutter-motion correction (`docs/design/shutter-timing.md`): each candidate's
+corrected exposure midpoint is looked up in the correction table
+(`--correction-table DIR`, default
+`/sdf/data/rubin/user/mjuric/shutter-timing/corrections`; `none` turns it
+off) before matching, and the time test passes within 10 ms of either the
+visit time or the corrected time. The output's `midpointMjdTai` is the
+corrected time (the visit's is kept as `midpointMjdTaiVisit`), with
+`midpointMjdTai_flag` (not corrected: the table omits the visit, or hasn't
+built it yet), `midpointMjdTai_flag_degraded`, `obstime_basis` (`visit`,
+`corrected`, `both`) and `dt_corrected_ms`. Visits the table hasn't built
+are warned about; more than `--max-not-built-visits` (default 20) fail the
+extract.
+
 Outputs:
 - `dia_sources.parquet` – one row per resolved obs_sbn row (`obsid` is the
   key): all of the view's columns (`id` renamed to `diaSourceId`; DiaSource
