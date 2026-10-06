@@ -139,4 +139,4 @@ The MPC holds the pipeline's visit times, i.e. (MJD-BEG + MJD-END)/2. For the 23
   - The scatter is dominated by per-visit astrometric errors of tens of mas, so the robust σ changes little: 52.8 → 52.4 mas on those rows, and 113.8 → 110.3 mas for fast (> 2°/day), bright (SNR > 50) sources.
   - Over all rows the correction is ~0.4 mas, small next to the ~50 mas scatter.
 
-**Open:** who runs stage 0 against the shared production correction table, and when. Its first run appends every night since 2026-07-14.
+**Stage 0 ownership (owner decision, 2026-10-06):** the SSP daily run (`ssp-sso-daily`'s stage 0) owns the production correction table `/sdf/data/rubin/user/mjuric/shutter-timing/corrections` for now. Other builds should go through the shutter-timing session, coordinated with the daily run; the builder's lock prevents concurrent builds. The released raws end on 2026-07-14 (the telescope was shut down by a storm), so the table is current, and the first stage 0 run should find nothing to add. The embargo/LFA path of v0.3.0 will first be exercised when observing resumes; check that run.
