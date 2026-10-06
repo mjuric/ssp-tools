@@ -995,6 +995,8 @@ def primary_flags(processing, ids, is_b, submission_id, obsid):
     (submission_id starts with its ISO timestamp), tie-broken on obsid.
     """
     code, ids = _codes(processing), np.asarray(ids)
+    if len(ids) == 0:
+        return np.zeros(0, dtype=bool)
     order = np.lexsort((_codes(obsid), _codes(submission_id), is_b, ids, code))
     first = np.r_[True, (code[order][1:] != code[order][:-1]) | (ids[order][1:] != ids[order][:-1])]
     primary = np.zeros(len(ids), dtype=bool)
@@ -1122,7 +1124,7 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
     key = ["processing", "diaSourceId"]
     assert pc.count_distinct(out["obsid"]).as_py() == len(out)
     g = out.select(key + ["primary"]).group_by(key).aggregate([("primary", "sum")])
-    assert pc.all(pc.equal(g["primary_sum"], 1)).as_py()
+    assert len(g) == 0 or pc.all(pc.equal(g["primary_sum"], 1)).as_py()
     n_sources = len(g)
     # sources claimed by more than one submission (not counting -B rows)
     nb = out.select(key + ["primary", "obsid", "submission_id", "trksub"]).filter(pa.array(~is_b))

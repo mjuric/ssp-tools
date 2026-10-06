@@ -592,3 +592,132 @@ def test_without_table_unchanged(tmp_path):
     for name in p.column_names:
         if name != "midpointMjdTai":
             assert c[name].equals(p[name]), name
+
+
+#
+# Review round: boundaries and edge cases
+#
+
+V1, D1, X1, Y1 = 2026010500250, 0, 100.0, 100.0         # the fixture's DEGRADED example
+
+
+def test_time_mismatch_on_degraded(tmp_path):
+    """The guard applies to DEGRADED corrections too, not only OK ones."""
+    view = view_table([dict(id=1, ra=1.0, midpointMjdTai=VISIT_T[V1], visit=V1, detector=D1, x=X1, y=Y1)])
+    corr = S.Corrections(TABLE)
+    corr.lookup(view, np.array([0]))
+    assert list(corr.status) == [S.DEGRADED]
+    table = _copy_table(tmp_path)
+    _set_header(table, V1, VISIT_T[V1] + 0.1 / 86400)
+    corr = S.Corrections(table)
+    corr.lookup(view, np.array([0]))
+    assert list(corr.status) == [S.TIME_MISMATCH] and np.isnan(corr.t[0])
+    assert corr.dvis[0] == pytest.approx(-0.1, abs=1e-5)
+
+
+def test_first_night_is_in_coverage():
+    """The table's first night itself is covered: its visits are looked up
+    (OMITTED / NOT_BUILT), not OUTSIDE_COVERAGE."""
+    corr = S.Corrections(TABLE)
+    first = corr.first_night
+    assert first == 20250810            # fixture-specific
+    v_logged, v_absent = first * 100000 + 30, first * 100000 + 999
+    view = view_table([dict(id=i, ra=1.0, midpointMjdTai=60897.1, visit=v, detector=94, x=2000.0, y=2000.0)
+                       for i, v in enumerate((v_logged, v_absent, (first - 1) * 100000 + 30))])
+    corr.lookup(view, np.arange(3))
+    assert list(corr.status) == [S.OMITTED, S.NOT_BUILT, S.OUTSIDE_COVERAGE]
+
+
+def test_not_built_loser_within_3_mas_does_not_count(tmp_path):
+    """NOT_BUILT candidates that pass the position test (so are looked up)
+    but lose -- on time, or on rank -- do not count toward the limit."""
+    tv = VISIT_T[V0]
+    nb = dict(visit=2026010600001, detector=94, x=2000.0, y=2000.0)
+    view = [dict(id=1, ra=10.0, midpointMjdTai=tv, visit=V0, detector=D0, x=X0, y=Y0),
+            # same position, 1 s off: fails the time test
+            dict(id=1, processing="NV-S", ra=10.0, midpointMjdTai=tv + 1 / 86400, **nb),
+            # same position and time, wrong band: passes but loses the rank
+            dict(id=1, processing="DP2-DS", ra=10.0, band="z", midpointMjdTai=tv, **nb)]
+    obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(tv), band="Lr", mag=20.0)]
+    out, _, rep = run(tmp_path, obs, view, max_not_built_visits=0)
+    assert out["o"]["processing"] == "AP-DS" and out["o"]["n_pass"] == 2
+    assert rep["not_built_visits"] == [] and rep["status"]["not_built"] == 0
+    # and both losers were indeed looked up (NOT_BUILT)
+    v = view_table(view)
+    c = S.Corrections(TABLE)
+    o, _, _ = S.load_obs(obs_table(obs))
+    S.correct(c, o, np.zeros(3, int), v, np.arange(3))
+    assert list(c.status) == [S.OK, S.NOT_BUILT, S.NOT_BUILT]
+
+
+def test_corrected_time_boundary(monkeypatch):
+    """The time test on the corrected time: |dt| <= DT_MS passes (the
+    boundary included), 10.001 ms and 20 ms fail; the visit time is far."""
+    tai = 61046.25
+    obs = dict(ra=np.full(3, 10.0), dec=np.full(3, 1.0), tai=np.full(3, tai),
+               band_stripped=np.array(["r"] * 3, dtype=object), mag=np.full(3, 20.0))
+    cand = view_table([dict(id=1, ra=10.0, midpointMjdTai=tai - 0.2 / 86400)])
+    k = np.zeros(1, int)
+    for off_ms, passes in ((10.0, True), (10.001, False), (20.0, False), (-10.001, False)):
+        t_corr = np.array([tai + off_ms / 86400e3])
+        dtc = (t_corr[0] - tai) * 86400e3
+        if off_ms == 10.0:      # make the boundary exact: DT_MS == |dt|
+            monkeypatch.setattr(S, "DT_MS", abs(dtc))
+        else:
+            monkeypatch.setattr(S, "DT_MS", 10.0)
+        sc = S.score({k_: v[:1] for k_, v in obs.items()}, k, cand, k, t_corr)
+        assert bool(sc["passed"][0]) is passes, off_ms
+        assert sc["obstime_basis"][0] == ("corrected" if passes else None)
+
+
+def test_corrected_boundary_end_to_end(tmp_path):
+    tc = reference(V0, D0, X0, Y0).t_mid_mjd_tai[0]
+    tv = VISIT_T[V0]
+    src = dict(visit=V0, detector=D0, x=X0, y=Y0)
+    view = [dict(id=i, ra=10.0 + i, midpointMjdTai=tv, **src) for i in (1, 2, 3)]
+    common = dict(dec=1.0, band="Lr", mag=20.0)
+    obs = [dict(obsid="a", obssubid="1", ra=11.0, obstime=utc(tc + 9.99 * MS), **common),
+           dict(obsid="b", obssubid="2", ra=12.0, obstime=utc(tc + 10.01 * MS), **common),
+           dict(obsid="c", obssubid="3", ra=13.0, obstime=utc(tc - 20 * MS), **common)]
+    out, unres, _ = run(tmp_path, obs, view)
+    assert sorted(out) == ["a"] and sorted(unres) == ["b", "c"]
+
+
+@pytest.mark.parametrize("with_table", [False, True])
+def test_position_window_by_mode(tmp_path, monkeypatch, with_table):
+    """Without a table the position query's window is the uncorrected one
+    (shift_s 0); with one, MAX_SHUTTER_SHIFT_S."""
+    seen = []
+    real = S.position_queries
+
+    def spy(*a, **kw):
+        seen.append(kw.get("shift_s", 0.0) if len(a) < 4 else a[3])
+        return real(*a, **kw)
+    monkeypatch.setattr(S, "position_queries", spy)
+    tv = VISIT_T[V0]
+    view = view_table([dict(id=1, ra=10.0, midpointMjdTai=tv, visit=V0, detector=D0, x=X0, y=Y0)])
+    obs = [dict(obsid="o", obssubid="hand", ra=10.0, dec=1.0, obstime=utc(tv), band="Lr", mag=20.0)]
+    pq.write_table(obs_table(obs), tmp_path / "obs.parquet")
+    assert S.extract(tmp_path / "obs.parquet", tmp_path / "d.parquet", fake_fetch(view),
+                     correction_table=TABLE if with_table else None) == 0
+    assert seen == [S.MAX_SHUTTER_SHIFT_S if with_table else 0.0]
+
+
+@pytest.mark.parametrize("with_table", [False, True])
+def test_nothing_resolves(tmp_path, with_table):
+    """No obs_sbn row resolves: empty outputs, no crash (predates S1)."""
+    tv = VISIT_T[V0]
+    view = [dict(id=1, ra=50.0, midpointMjdTai=tv, visit=V0, detector=D0, x=X0, y=Y0)]
+    obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(tv), band="Lr", mag=20.0),
+           dict(obsid="h", obssubid="hand", ra=20.0, dec=1.0, obstime=utc(tv), band="Lr", mag=20.0)]
+    pq.write_table(obs_table(obs), tmp_path / "obs.parquet")
+    report = {}
+    assert S.extract(tmp_path / "obs.parquet", tmp_path / "d.parquet", fake_fetch(view_table(view)),
+                     correction_table=TABLE if with_table else None, report=report) == 0
+    out = pq.read_table(tmp_path / "d.parquet")
+    assert out.num_rows == 0 and "primary" in out.column_names
+    assert sorted(pq.read_table(tmp_path / "d.unresolved.parquet")["obsid"].to_pylist()) == ["h", "o"]
+    if with_table:
+        rep = report[SHUTTER_MANIFEST_FIELD[0]]
+        assert set(S.SHUTTER_COLUMNS) <= set(out.column_names)
+        assert sum(rep["status"].values()) == 0 and rep["not_built_visits"] == []
