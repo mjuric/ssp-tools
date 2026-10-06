@@ -100,10 +100,15 @@ MAX_HEADER_MISMATCH_S = 0.001
 #: within MAX_HEADER_MISMATCH_S (an input whose times are already corrected,
 #: e.g. once AP writes shutter-corrected DiaSource times): the time stands.
 #:
+#: The guard checks the header midpoint first, then the corrected time.
+#:
 #: A correction that moves a time by more than this [s] from the pipeline's
-#: visit time is not applied: the visit time, midpointMjdTai_flag True, a
-#: warning; counted in the manifest as shift_too_large. (The largest
-#: understood shift, the late-readout visits, is ~1.94 s.)
+#: visit time is still applied, but midpointMjdTai_flag_degraded is set and
+#: a warning names the visits; counted in the manifest as large_shift. (Such
+#: shifts are hung end-of-integration readouts, where the table's time is
+#: right and MJD-END is minutes late, or rare exposures whose shutter
+#: profile contradicts the header; the largest late-readout shift in normal
+#: operations is ~1.94 s.)
 MAX_CORRECTION_S = 3.0
 
 #: The predicted position's error ellipse (deg, deg, deg^2): the
