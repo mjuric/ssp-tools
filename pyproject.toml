@@ -105,4 +105,4 @@ convention = "numpy"
 [tool.uv.sources]
 # Shutter-motion corrections (docs/design/shutter-timing.md). A private
 # repository for now: install over HTTPS with the gh credential helper.
-shutter-timing = { git = "https://github.com/mjuric/shutter-timing", tag = "v0.3.0" }
+shutter-timing = { git = "https://github.com/mjuric/shutter-timing", tag = "v0.4.0" }
