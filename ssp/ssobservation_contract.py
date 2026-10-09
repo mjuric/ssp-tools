@@ -53,6 +53,14 @@ ID_SPLIT = {
     "science": ("sourceId", "parentSourceId"),
 }
 
+#: obs_sbn rows with status 'I' (the Isolated Tracklet File: unidentified)
+#: that nevertheless carry a provid or permid, as the MPC has written for a
+#: few rows (2015 GF54, 2026-10-07): the status is trusted, and they are
+#: kept as unidentified (NULL ssObjectId and designation), with a warning
+#: naming their obsids; more than this many fail the build (owner decision,
+#: 2026-10-08).
+MAX_DESIGNATED_I_ROWS = 100
+
 #: SubmittableSources columns not carried into SSObservation: the view's own
 #: spatial query helpers.
 VIEW_DROPPED = ("hpix29", "cx", "cy", "cz")

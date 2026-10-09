@@ -45,11 +45,11 @@ from .nearbysso import propagate as _propagate
 from . import ssobservation_ellipse as _ellipse
 from .delivery_contract import SHUTTER_INPUT_COLUMNS
 from .ssobservation_contract import (
-    ELLIPSE_COLUMNS, ID_SPLIT, MANIFEST_FORMAT_VERSION, MATCH_METHODS, PART_FILE_FORMAT,
-    PART_ROWS_DEFAULT, SHUTTER_INTERNAL, SIDECAR_FILE, SIDECAR_KEY, SSOBSERVATION_DICTIONARY,
-    SSOBSERVATION_INTERNAL_DEFAULT, SSOBSERVATION_INTERNAL_DTYPE, SSOBSERVATION_INTERNAL_NONNULL,
-    SSOBSERVATION_MANIFEST_FILE, SSOBSERVATION_NONNULL, SSOBSERVATION_SORT, VIEW_DROPPED,
-    SSObservationDtype,
+    ELLIPSE_COLUMNS, ID_SPLIT, MANIFEST_FORMAT_VERSION, MATCH_METHODS, MAX_DESIGNATED_I_ROWS,
+    PART_FILE_FORMAT, PART_ROWS_DEFAULT, SHUTTER_INTERNAL, SIDECAR_FILE, SIDECAR_KEY,
+    SSOBSERVATION_DICTIONARY, SSOBSERVATION_INTERNAL_DEFAULT, SSOBSERVATION_INTERNAL_DTYPE,
+    SSOBSERVATION_INTERNAL_NONNULL, SSOBSERVATION_MANIFEST_FILE, SSOBSERVATION_NONNULL,
+    SSOBSERVATION_SORT, VIEW_DROPPED, SSObservationDtype,
 )
 
 
@@ -970,10 +970,24 @@ def build_ssobservation(input_dir, output_dir, max_objects=None, dia_sample_frac
     # designation, and NULL orbit-derived columns. Set them aside while
     # resolving the designations of the rest.
     undesignated = assoc["mpc_provid"].isna() & assoc["mpc_permid"].isna()
-    # (status 'I', the Isolated Tracklet File, is unidentified by definition)
-    n_bad = int(((assoc["mpc_status"] == "I").fillna(False) & ~undesignated).sum())
+    # (status 'I', the Isolated Tracklet File, is unidentified by definition:
+    # an I row with a provid or permid is kept as unidentified, the status
+    # trusted; a few are tolerated, see MAX_DESIGNATED_I_ROWS)
+    designated_i = (assoc["mpc_status"] == "I").fillna(False) & ~undesignated
+    n_bad = int(designated_i.sum())
+    if n_bad > MAX_DESIGNATED_I_ROWS:
+        raise ValueError(f"obs_sbn: {n_bad:,} status 'I' rows have a provid or permid "
+                         f"(more than MAX_DESIGNATED_I_ROWS = {MAX_DESIGNATED_I_ROWS})")
     if n_bad:
-        raise ValueError(f"obs_sbn: {n_bad:,} status 'I' rows have a provid or permid")
+        bad = assoc[designated_i]
+        print(f"WARNING: obs_sbn: {n_bad:,} status 'I' rows have a provid or permid; kept as "
+              f"unidentified (NULL ssObjectId and designation): "
+              f"{sorted(bad['mpc_obsid'].astype(str))[:20]} "
+              f"(designations {sorted(set(bad['mpc_provid'].dropna().astype(str)))[:10]})",
+              file=sys.stderr)
+        # (the designation is taken from the provid below: not for these)
+        assoc.loc[designated_i, ["mpc_provid", "mpc_permid"]] = None
+        undesignated = undesignated | designated_i
     und = assoc[undesignated].reset_index(drop=True)
     assoc = assoc[~undesignated].reset_index(drop=True)
 
