@@ -578,13 +578,32 @@ def test_orphan_dia_sources_row_fails(tmp_path, offline):
         build_ssobservation(tmp_path, tmp_path)
 
 
-def test_designated_status_i_fails(tmp_path, offline):
+def _designated_status_i(tmp_path):
+    """Inputs with one status 'I' obs_sbn row that has a provid; its obsid."""
     _, obs_sbn = make_inputs(tmp_path)
     status = obs_sbn["status"].to_pylist()
     k = obs_sbn["provid"].to_pylist().index("2025 AA1")
     status[k] = "I"
     obs_sbn = obs_sbn.set_column(obs_sbn.schema.get_field_index("status"), "status", pa.array(status))
     pq.write_table(obs_sbn, tmp_path / "obs_sbn.parquet")
+    return obs_sbn["obsid"][k].as_py()
+
+
+def test_designated_status_i_kept_unidentified(tmp_path, offline, capsys):
+    # (the status is trusted: NULL ssObjectId and designation, with a warning)
+    obsid = _designated_status_i(tmp_path)
+    build_ssobservation(tmp_path, tmp_path)
+    assert "1 status 'I' rows have a provid or permid" in capsys.readouterr().err
+    t = read_output(tmp_path)
+    row = t.filter(pc.equal(t["obsid"], obsid)).to_pylist()
+    assert len(row) == 1
+    assert row[0]["status"] == "I" and row[0]["ssObjectId"] is None and row[0]["designation"] is None
+    assert row[0]["ephRa"] is None
+
+
+def test_designated_status_i_limit(tmp_path, offline, monkeypatch):
+    _designated_status_i(tmp_path)
+    monkeypatch.setattr(ssobservation, "MAX_DESIGNATED_I_ROWS", 0)
     with pytest.raises(ValueError, match="status 'I' rows have a provid or permid"):
         build_ssobservation(tmp_path, tmp_path)
 
