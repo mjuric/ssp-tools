@@ -14,6 +14,7 @@ from functools import partial
 from . import photfit
 from . import util
 from . import schema
+from . import ssobservation_parts
 from .moid import MOIDSolver, earth_orbit
 import argparse
 import os
@@ -61,6 +62,16 @@ FIT_COLUMNS = ["psfMag", "psfMagErr", "phaseAngle", "topoRange", "helioRange"]
 SSS_COLUMNS = ["ssObjectId", "designation", "primary", "ephRa",
                "midpointMjdTai", "band", "psfFlux", "psfFluxErr", "extendedness",
                "phaseAngle", "topoRange", "helioRange"]
+
+
+def read_ssobservation_columns(path, columns=SSS_COLUMNS):
+    """SSObservation's ``columns`` (default: those compute_ssobject uses) as
+    a pyarrow-backed DataFrame, as pd.read_parquet(..., dtype_backend=
+    "pyarrow") gives them. ``path``: the partitioned SSObservation (its
+    directory or manifest), or a single Parquet file
+    (ssp.ssobservation_parts.read_table)."""
+    t = ssobservation_parts.read_table(path, columns=list(columns))
+    return t.to_pandas(types_mapper=pd.ArrowDtype).reset_index(drop=True)
 
 
 def _entry_columns(sss):
@@ -514,16 +525,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  ssp-build-ssobject delivery/ mpc_orbits.parquet --output ssobject.parquet
+  ssp-build-ssobject delivery/SSObservation.manifest.json mpc_orbits.parquet -o ssobject.parquet
   ssp-build-ssobject ssobservation.parquet mpc_orbits.parquet --output ssobject.parquet
 
-The photometry comes from SSObservation. The older form, with dia_sources.parquet
-between the two, is still accepted; that file is not read.
+SSObservation is the partitioned delivery (the directory holding
+SSObservation.manifest.json, or the manifest), or a single Parquet file (the
+layout before the partitioned delivery). The photometry comes from
+SSObservation. The older form, with dia_sources.parquet between the two, is
+still accepted; that file is not read.
         """
     )
 
     parser.add_argument(
-        "ssobservation_parquet",
-        help="Path to SSObservation Parquet file"
+        "ssobservation",
+        help="SSObservation: the directory holding SSObservation.manifest.json, the manifest, "
+             "or a single SSObservation Parquet file"
     )
     parser.add_argument(
         "inputs", nargs="+", metavar="mpcorb_parquet",
@@ -612,7 +629,7 @@ between the two, is still accepted; that file is not read.
 
     args = parser.parse_args()
     if len(args.inputs) > 2:
-        parser.error("expected: ssobservation_parquet [diasource_parquet] mpcorb_parquet")
+        parser.error("expected: ssobservation [diasource_parquet] mpcorb_parquet")
     if len(args.inputs) == 2:
         print(f"Note: {args.inputs[0]} is not read; the photometry comes from SSObservation.")
     args.mpcorb_parquet = args.inputs[-1]
@@ -624,9 +641,8 @@ between the two, is still accepted; that file is not read.
     try:
         # Load SSObservation: only the columns compute_ssobject uses (the
         # SSObservation has ~180)
-        print(f"Loading SSObservation from {args.ssobservation_parquet}...")
-        sss = pd.read_parquet(args.ssobservation_parquet, engine="pyarrow", dtype_backend="pyarrow",
-                              columns=SSS_COLUMNS).reset_index(drop=True)
+        print(f"Loading SSObservation from {args.ssobservation}...")
+        sss = read_ssobservation_columns(args.ssobservation)
         num = len(sss)
         print(f"Loaded {num:,} SSObservation rows")
 
@@ -676,9 +692,7 @@ if __name__ == "__main__":
     #
 
     # load SSObservation
-    sss = pd.read_parquet(f'{output_dir}/ssobservation.parquet',
-                          engine="pyarrow", dtype_backend="pyarrow",
-                          columns=SSS_COLUMNS).reset_index(drop=True)
+    sss = read_ssobservation_columns(output_dir)
 
     # Load mpcorb
     mpcorb = pd.read_parquet(f'{input_dir}/mpc_orbits.parquet',

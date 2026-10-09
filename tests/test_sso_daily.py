@@ -86,6 +86,24 @@ def test_upload_failure_is_the_exit_status(stubs, tmp_path, monkeypatch):
     assert [c.split()[0] for c in stubs()] == [D.STAGE0, D.EXTRACT, D.BUILD, D.UPLOAD]
 
 
+def test_ssobservation_options_passed_to_build(stubs, tmp_path):
+    """--part-rows and --internal-columns go to ssp-build-sso as given
+    (an empty --internal-columns too); without them, nothing is added, so
+    ssp-build-sso's defaults apply."""
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    w = tmp_path / "w"
+    assert D.main([str(w), "--reuse-inputs", str(inputs), "--stamp", "a", "--part-rows", "500000",
+                   "--internal-columns", "matchMethod"]) == 0
+    assert D.main([str(w), "--reuse-inputs", str(inputs), "--stamp", "b", "--internal-columns", ""]) == 0
+    assert stubs() == [f"ssp-build-sso {inputs} {w}/a/run --part-rows 500000 --internal-columns matchMethod",
+                       f"ssp-build-sso {inputs} {w}/b/run --internal-columns "]
+    assert "--part-rows 500000 --internal-columns matchMethod" in (w / "a" / "daily.log").read_text()
+    assert D.plan(w / "c")[-1] == ("build", [D.BUILD, str(w / "c" / "inputs"), str(w / "c" / "run")])
+    with pytest.raises(SystemExit, match="--part-rows 0"):
+        D.main([str(w), "--reuse-inputs", str(inputs), "--stamp", "d", "--part-rows", "0"])
+
+
 def test_reuse_inputs(stubs, tmp_path):
     inputs = tmp_path / "old" / "inputs"
     inputs.mkdir(parents=True)

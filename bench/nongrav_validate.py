@@ -123,6 +123,7 @@ if _ROOT not in sys.path:
 from bench.ssobservation_validate import bitwise_mismatch, to_np  # noqa: E402
 from bench import time_shift as TS  # noqa: E402
 from ssp.nearbysso import _contract as _C  # noqa: E402
+from ssp import ssobservation_parts as SP  # noqa: E402
 
 # --------------------------------------------------------------------------
 # Constants
@@ -483,8 +484,11 @@ def eph_columns(names):
 
 
 def _read_sss(path, columns):
-    have = pq.read_schema(path).names
-    return pq.read_table(path, columns=[c for c in columns if c in have])
+    """The ``columns`` present in the SSObservation at ``path``: the
+    partitioned SSObservation's directory or manifest, or a single Parquet
+    file."""
+    have = SP.read_schema(path).names
+    return SP.read_table(path, columns=[c for c in columns if c in have])
 
 
 def per_object_offsets(des, cls, off_new, off_ref):
@@ -527,8 +531,8 @@ def class_summary(obj, rows):
 
 def check_offsets(new, ref, mpc_orbits=None, objects=None, ng_errors="any", rep=None, orbits_df=None):
     rep = rep or Report(f"Non-grav offsets: {new} vs {ref}")
-    ref_names = pq.read_schema(ref).names
-    new_names = pq.read_schema(new).names
+    ref_names = SP.read_schema(ref).names
+    new_names = SP.read_schema(new).names
     cols = eph_columns(ref_names)
     missing = [c for c in cols if c not in new_names]
     rep.check("every reference ephemeris/geometry/error column present", not missing,
@@ -910,7 +914,7 @@ def check_nearbysso(nearbysso, ssobservation, mpc_orbits, dia_sources, objects=N
     rep = rep or Report(f"Non-grav NearbySSO: {nearbysso} vs {ssobservation}")
     nss = pq.read_table(nearbysso, columns=["diaSourceId", "designation", "ephRa", "ephDec", "ephOffset",
                                             "ephVmag", "ephRateRa", "ephRateDec"]).to_pandas()
-    present = set(pq.read_schema(ssobservation).names)
+    present = set(SP.read_schema(ssobservation).names)
     sss = _read_sss(ssobservation, ["designation", "diaSourceId", "visit", "midpointMjdTai", "ra", "dec",
                                "ephRa", "ephDec", "ephOffset", "ephVmag", "ephRateRa", "ephRateDec",
                                *ERROR_COLUMNS, *(c for c in SHIFT_COLUMNS if c in present)]
@@ -1350,14 +1354,15 @@ def main(argv=None):
         return p
 
     p = add("offsets", "SSObservation with non-gravs vs a gravity-only reference")
-    p.add_argument("new")
-    p.add_argument("ref")
+    sss_help = "SSObservation: the delivery directory, its manifest, or a single Parquet file"
+    p.add_argument("new", help=sss_help)
+    p.add_argument("ref", help=sss_help)
     p.add_argument("mpc_orbits")
     p.add_argument("--ng-errors", choices=("any", "unchanged", "changed"), default="any",
                    help="what the non-grav objects' error columns must do (default: only report)")
     p = add("nearbysso", "NearbySSO vs SSObservation for the same DiaSources")
     p.add_argument("nearbysso")
-    p.add_argument("ssobservation")
+    p.add_argument("ssobservation", help=sss_help)
     p.add_argument("mpc_orbits")
     p.add_argument("dia_sources", help="the NearbySSO input DiaSources")
     p.add_argument("--table", default=None, help="also write the per-row table (Parquet)")

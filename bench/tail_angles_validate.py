@@ -243,10 +243,12 @@ def header_model_pars(meta):
 
 def rubin_times_tt(designations, ssobservation=REF_SSOBSERVATION):
     """{designation: TT MJDs as sent}: the unique midpointMjdTai of each
-    object's rows with an orbit, + 32.184 s, rounded as sent."""
-    import pyarrow.parquet as pq
+    object's rows with an orbit, + 32.184 s, rounded as sent.
+    ``ssobservation``: the partitioned SSObservation's directory or
+    manifest, or a single Parquet file."""
+    from ssp import ssobservation_parts as SP
 
-    df = pq.read_table(
+    df = SP.read_table(
         ssobservation,
         columns=["designation", "midpointMjdTai", "ephRa"],
         filters=[("designation", "in", list(designations))],
@@ -600,19 +602,23 @@ def _dia_times(dia_sources, ids):
 def consistency(ssobservation, nearbysso, dia_sources=None):
     """(passed, report lines) of the SSObservation/NearbySSO angle checks.
     ``dia_sources``: the NearbySSO input, for the time-shift allowance
-    (bench/time_shift.py); None holds every pair to the strict rule."""
+    (bench/time_shift.py); None holds every pair to the strict rule.
+    ``ssobservation``: the partitioned SSObservation's directory or
+    manifest, or a single Parquet file."""
     import pyarrow as pa
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
+
+    from ssp import ssobservation_parts as SP
 
     from bench import time_shift as TS
 
     L, checks = [], []
     cols = ["designation", "diaSourceId", "ephRa", "ephDec", "phaseAngle", *PA_COLS]
     cols += [f"helio_{c}" for c in ("x", "y", "z", "vx", "vy", "vz")] + [f"topo_{c}" for c in "xyz"]
-    present = set(pq.read_schema(ssobservation).names)
+    present = set(SP.read_schema(ssobservation).names)
     cols += [c for c in ("midpointMjdTai", "ephRate", "ephRateRa", "ephRateDec") if c in present]
-    s = pq.read_table(ssobservation, columns=cols)
+    s = SP.read_table(ssobservation, columns=cols)
     s = s.append_column("_row", pa.array(np.arange(s.num_rows, dtype=np.int64)))
     n = pq.read_table(nearbysso, columns=["designation", "diaSourceId", "ephRa", *PA_COLS])
     for name, t in (("ssobservation", s), ("nearbysso", n)):
@@ -829,7 +835,8 @@ def main(argv=None):
     sub.add_parser("status")
     sub.add_parser("jpl")
     c = sub.add_parser("consistency", help="SSObservation vs NearbySSO angles, no network")
-    c.add_argument("ssobservation_file")
+    c.add_argument("ssobservation_file", help="SSObservation: the delivery directory, its manifest, or a "
+                                              "single Parquet file")
     c.add_argument("nearbysso_file")
     c.add_argument("--report", help="also write the report to this file")
     c.add_argument("--dia-sources", help="the NearbySSO input (ppdb_dia_sources.parquet): the DiaSource "

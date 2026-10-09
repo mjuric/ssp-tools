@@ -72,6 +72,7 @@ if _ROOT not in sys.path:
 
 from bench.ephem_bench import horizons_observer, horizons_request  # noqa: E402
 from ssp import util  # noqa: E402
+from ssp import ssobservation_parts as SP  # noqa: E402
 from ssp.ephem_assist import (  # noqa: E402
     ASSIST_SUN,
     C_AU_PER_DAY,
@@ -1002,14 +1003,16 @@ def _read_sss(path, extra=(), processing=SSS_PROCESSING):
     comparisons join on it, diaSourceId are unique. Read through Arrow, so
     the 64-bit ids stay exact (default pandas would make a NULL-containing
     integer column float64); integer columns with NULLs become pandas Int64.
-    An earlier-layout SSObservation is read as is.
+    An earlier-layout SSObservation is read as is. ``path``: the
+    partitioned SSObservation's directory or manifest, or a single Parquet
+    file.
     """
-    present = set(pq.read_schema(path).names)
+    present = set(SP.read_schema(path).names)
     cols = [c for c in ["diaSourceId", "designation", "ssObjectId"] + EPH_COMPARED + ["ephOffset"]
             + list(extra) + ["midpointMjdTai"] + SHIFT_COLUMNS if c in present]
     widened = "measuredOn" in present
     key = ["processing", "measuredOn", "primary"] if widened else []
-    t = pq.read_table(path, columns=list(dict.fromkeys(cols + key)))
+    t = SP.read_table(path, columns=list(dict.fromkeys(cols + key)))
     if widened:
         keep = pc.and_(pc.equal(t["measuredOn"].cast(pa.string()), "difference"), t["primary"])
         if processing not in (None, "all"):
@@ -2253,7 +2256,8 @@ def main(argv=None):
 
     p = sub.add_parser("same-orbits", help="vs SSObservation from the same mpc_orbits")
     common(p)
-    p.add_argument("--ssobservation", required=True)
+    p.add_argument("--ssobservation", required=True,
+                   help="SSObservation: the delivery directory, its manifest, or a single Parquet file")
     p.add_argument("--no-sigma", action="store_true", help="don't compute sigma (classify as unknown)")
     p.add_argument("--pos-tol-mas", type=float, default=TOL["pos_mas"])
     p.add_argument("--rate-tol", type=float, default=TOL["rate_deg_day"], help="deg/day")

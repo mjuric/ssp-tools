@@ -720,7 +720,9 @@ def sbdb_sstr(des, permid):
 
 
 def ssobservation_rows(path=SSOBSERVATION, designations=None):
-    import pyarrow.parquet as pq
+    """SSObservation rows (the partitioned SSObservation's directory or
+    manifest, or a single Parquet file), optionally only ``designations``."""
+    from ssp import ssobservation_parts as SP
 
     cols = [
         "designation",
@@ -736,7 +738,7 @@ def ssobservation_rows(path=SSOBSERVATION, designations=None):
         "obsid",
     ]
     filt = [("designation", "in", list(designations))] if designations is not None else None
-    return pq.read_table(path, columns=cols, filters=filt).to_pandas()
+    return SP.read_table(path, columns=cols, filters=filt).to_pandas()
 
 
 def rubin_times_tai(df, des):

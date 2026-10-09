@@ -8,6 +8,7 @@ import pytest
 
 from ssp import delivery_contract as C
 from ssp import sso_upload as U
+from ssp.ssobservation_contract import PART_FILE_FORMAT, SIDECAR_FILE, SSOBSERVATION_MANIFEST_FILE
 
 TOPIC_PATH = "projects/ppdb-dev-5c07/topics/load-sso-topic"
 FIVE = ("SSObservation", "SSObject", "mpc_orbits", "current_identifications", "numbered_identifications")
@@ -99,11 +100,59 @@ def no_remote(monkeypatch):
     monkeypatch.setattr(U, "_publisher_client", boom)
 
 
+#: SSObservation's parts in make_run.
+N_PARTS = 2
+
+
+def make_partitioned(run, n_parts=N_PARTS):
+    """A stand-in partitioned SSObservation (parts, sidecar, manifest) in
+    RUN_DIR/delivery; returns its report entry."""
+    d = run / C.DELIVERY_DIR
+    parts = []
+    for k in range(n_parts):
+        p = d / PART_FILE_FORMAT.format(k)
+        p.write_bytes(f"PAR1 SSObservation part {k} PAR1".encode())
+        parts.append(dict(file=p.name, rows=10 + k, ssObjectId_min=k, ssObjectId_max=k, null_ssObjectId=False,
+                          bytes=p.stat().st_size, md5=U.md5_file(p)))
+    side = d / SIDECAR_FILE
+    side.write_bytes(b"PAR1 sidecar PAR1")
+    m = dict(table="SSObservation", format_version=1, rows=sum(p["rows"] for p in parts), parts=parts,
+             sidecar=dict(file=SIDECAR_FILE, key="obsid", columns=["matchMethod"], rows=1,
+                          bytes=side.stat().st_size, md5=U.md5_file(side)))
+    (d / SSOBSERVATION_MANIFEST_FILE).write_text(json.dumps(m))
+    return {"manifest": f"{C.DELIVERY_DIR}/{SSOBSERVATION_MANIFEST_FILE}",
+            "manifest_md5": U.md5_file(d / SSOBSERVATION_MANIFEST_FILE),
+            "parts": [f"{C.DELIVERY_DIR}/{p['file']}" for p in parts],
+            "sidecar": f"{C.DELIVERY_DIR}/{SIDECAR_FILE}", "rows": m["rows"],
+            "bytes": sum(p["bytes"] for p in parts)}
+
+
+def files_of(table, n_parts=N_PARTS):
+    """The object names (relative to the prefix) of ``table``, in upload
+    order."""
+    if table == "SSObservation":
+        return [PART_FILE_FORMAT.format(k) for k in range(n_parts)] + [SSOBSERVATION_MANIFEST_FILE]
+    return [f"{table}.parquet"]
+
+
+def objects_of(tables, prefix=None):
+    names = [n for t in tables for n in files_of(t)]
+    return [f"{prefix}/{n}" for n in names] if prefix else names
+
+
+def message(prefix, tables):
+    return json.dumps({"bucket": "ppdb-dev-sso-ingest", "object_prefix": prefix,
+                       "uploaded_tables": list(tables), "files": {t: files_of(t) for t in tables}})
+
+
 def make_run(tmp_path, deliverable=True, tables=C.DELIVERY_TABLES):
     run = tmp_path / "run"
     (run / C.DELIVERY_DIR).mkdir(parents=True)
     rec = {}
     for t in tables:
+        if t == "SSObservation":
+            rec[t] = make_partitioned(run)
+            continue
         p = run / C.DELIVERY_DIR / f"{t}.parquet"
         p.write_bytes(f"PAR1 {t} PAR1".encode())
         rec[t] = {"file": f"{C.DELIVERY_DIR}/{t}.parquet", "rows": 1, "md5": U.md5_file(p),
@@ -257,13 +306,18 @@ def test_upload_success_and_message(fakes, tmp_path):
     prefix = rec["object_prefix"]
     assert re.fullmatch(r"\d{8}T\d{9}", prefix)
     assert st.buckets == ["ppdb-dev-sso-ingest"]
-    assert sorted(st.objects) == sorted(f"{prefix}/{t}.parquet" for t in FIVE)
+    # SSObservation as its parts in order, then its manifest; no sidecar
+    assert [c[1] for c in st.calls if c[0] == "upload"] == objects_of(ordered(FIVE), prefix)
+    assert not any(SIDECAR_FILE in name for name in st.objects)
     assert all(c[2] == 0 for c in st.calls if c[0] == "upload")    # if_generation_match=0
+    for k in range(N_PARTS):
+        name = PART_FILE_FORMAT.format(k)
+        assert st.objects[f"{prefix}/{name}"] == (run / C.DELIVERY_DIR / name).read_bytes()
     assert len(pub.published) == 1
     topic, data = pub.published[0]
     assert topic == TOPIC_PATH
-    assert data == json.dumps({"bucket": "ppdb-dev-sso-ingest", "object_prefix": prefix,
-                               "uploaded_tables": ordered(FIVE)}).encode("utf-8")
+    assert data == message(prefix, ordered(FIVE)).encode("utf-8")
+    assert list(json.loads(data)) == list(C.UPLOAD_MESSAGE_FIELDS)
     assert pub.futures[0].timeouts == [U.PUBLISH_TIMEOUT_S]
     r = report(run)
     assert r["upload"] == rec and r["uploads"] == [rec]
@@ -281,7 +335,7 @@ def test_precondition_failure_aborts_and_cleans_up(fakes, tmp_path, fixed_prefix
         U.run("dev", run)
     # the pre-existing object is untouched, ours are deleted, nothing published
     assert st.objects == {f"{PREFIX}/{tabs[2]}.parquet": b"someone else's"}
-    assert [c[1] for c in st.calls if c[0] == "delete"] == [f"{PREFIX}/{t}.parquet" for t in tabs[:2]]
+    assert [c[1] for c in st.calls if c[0] == "delete"] == objects_of(tabs[:2], PREFIX)
     assert pub.published == []
     assert "upload" not in report(run)
 
@@ -294,9 +348,32 @@ def test_mid_upload_failure_cleans_up(fakes, tmp_path, fixed_prefix):
     with pytest.raises(U.SSOUploadError, match="failed to upload"):
         U.run("dev", run)
     assert st.objects == {}
-    assert len([c for c in st.calls if c[0] == "delete"]) == 3
+    assert len([c for c in st.calls if c[0] == "delete"]) == len(objects_of(ordered(FIVE)[:3]))
     assert pub.published == []
     assert "upload" not in report(run)
+
+
+def test_failure_on_a_later_part_cleans_up_the_earlier(fakes, tmp_path, fixed_prefix):
+    from google.api_core.exceptions import ServiceUnavailable
+    st, pub = fakes
+    run = make_run(tmp_path)
+    st.fail_on[f"{PREFIX}/{PART_FILE_FORMAT.format(1)}"] = ServiceUnavailable("injected")
+    with pytest.raises(U.SSOUploadError, match="failed to upload"):
+        U.run("dev", run)
+    assert st.objects == {} and pub.published == []
+    assert [c[1] for c in st.calls if c[0] == "delete"] == [f"{PREFIX}/{PART_FILE_FORMAT.format(0)}"]
+
+
+def test_failure_on_the_manifest_cleans_up_the_parts(fakes, tmp_path, fixed_prefix):
+    from google.api_core.exceptions import ServiceUnavailable
+    st, pub = fakes
+    run = make_run(tmp_path)
+    st.fail_on[f"{PREFIX}/{SSOBSERVATION_MANIFEST_FILE}"] = ServiceUnavailable("injected")
+    with pytest.raises(U.SSOUploadError, match="failed to upload"):
+        U.run("dev", run)
+    assert st.objects == {} and pub.published == []
+    assert [c[1] for c in st.calls if c[0] == "delete"] == [
+        f"{PREFIX}/{PART_FILE_FORMAT.format(k)}" for k in range(N_PARTS)]
 
 
 @pytest.mark.parametrize("exc", ["auth", "other"])
@@ -330,12 +407,13 @@ def test_cleanup_keeps_going_and_reraises_the_original(fakes, tmp_path, fixed_pr
     run = make_run(tmp_path)
     tabs = ordered(FIVE)
     st.fail_on[f"{PREFIX}/{tabs[3]}.parquet"] = ServiceUnavailable("injected")
-    st.fail_delete.add(f"{PREFIX}/{tabs[0]}.parquet")
+    stuck = f"{PREFIX}/{PART_FILE_FORMAT.format(0)}"
+    st.fail_delete.add(stuck)
     with pytest.raises(U.SSOUploadError, match="failed to upload") as ei:
         U.run("dev", run)
     assert isinstance(ei.value.__cause__, ServiceUnavailable)
-    assert [c[1] for c in st.calls if c[0] == "delete"] == [f"{PREFIX}/{t}.parquet" for t in tabs[:3]]
-    assert set(st.objects) == {f"{PREFIX}/{tabs[0]}.parquet"}     # the one that wouldn't delete
+    assert [c[1] for c in st.calls if c[0] == "delete"] == objects_of(tabs[:3], PREFIX)
+    assert set(st.objects) == {stuck}     # the one that wouldn't delete
 
 
 def test_publish_failure_cleans_up(fakes, tmp_path, monkeypatch):
@@ -348,7 +426,7 @@ def test_publish_failure_cleans_up(fakes, tmp_path, monkeypatch):
         U.run("dev", run)
     assert len(pub.published) == 1
     assert st.objects == {}
-    assert len([c for c in st.calls if c[0] == "delete"]) == len(FIVE)
+    assert len([c for c in st.calls if c[0] == "delete"]) == len(objects_of(FIVE))
 
 
 def test_publish_timeout_keeps_objects(fakes, tmp_path, monkeypatch, fixed_prefix):
@@ -358,7 +436,7 @@ def test_publish_timeout_keeps_objects(fakes, tmp_path, monkeypatch, fixed_prefi
     run = make_run(tmp_path)
     with pytest.raises(U.PublishUnconfirmedError, match="KEPT"):
         U.run("dev", run)
-    assert len(st.objects) == len(FIVE)
+    assert sorted(st.objects) == sorted(objects_of(FIVE, PREFIX))
     assert not [c for c in st.calls if c[0] == "delete"]
     r = report(run)
     assert r["upload"]["object_prefix"] == PREFIX and r["upload"]["message_id"] is None
@@ -377,12 +455,11 @@ def test_dry_run_touches_nothing(no_remote, tmp_path, capsys):
     rec = U.run("dev", run, dry_run=True)
     out = capsys.readouterr().out
     prefix = rec["object_prefix"]
-    for t in FIVE:
-        assert f"gs://ppdb-dev-sso-ingest/{prefix}/{t}.parquet" in out
-    assert "NearbySSO" not in out
+    for name in objects_of(FIVE):
+        assert f"{run / C.DELIVERY_DIR / name} -> gs://ppdb-dev-sso-ingest/{prefix}/{name}" in out
+    assert "NearbySSO" not in out and SIDECAR_FILE not in out
     assert TOPIC_PATH in out
-    assert json.dumps({"bucket": "ppdb-dev-sso-ingest", "object_prefix": prefix,
-                       "uploaded_tables": ordered(FIVE)}) in out
+    assert message(prefix, ordered(FIVE)) in out
     up = report(run)["upload"]
     assert up["dry_run"] is True and up["message_id"] is None
     assert U.main(["dev", str(run), "--dry-run"]) == 0
@@ -434,8 +511,100 @@ def test_refuses_missing_file_or_record(no_remote, tmp_path):
     r = report(run)
     del r["tables"]["SSObservation"]
     (run / C.REPORT_FILE).write_text(json.dumps(r))
-    with pytest.raises(U.SSOUploadError, match="SSObservation: no md5"):
+    with pytest.raises(U.SSOUploadError, match="SSObservation: no parts in the report"):
         U.run("dev", run, dry_run=True, tables=["SSObservation"], allow_partial=True)
+
+
+def _set_report_manifest_md5(run):
+    """Make the report's manifest_md5 the manifest's as it is now (to reach
+    the checks behind it)."""
+    r = report(run)
+    mpath = run / C.DELIVERY_DIR / SSOBSERVATION_MANIFEST_FILE
+    r["tables"]["SSObservation"]["manifest_md5"] = U.md5_file(mpath)
+    (run / C.REPORT_FILE).write_text(json.dumps(r))
+
+
+def _edit_manifest(run, fn, report_too=True):
+    """Edit the manifest; with ``report_too``, also the report's
+    manifest_md5, so that the manifest's contents are what is checked."""
+    p = run / C.DELIVERY_DIR / SSOBSERVATION_MANIFEST_FILE
+    m = json.loads(p.read_text())
+    fn(m)
+    p.write_text(json.dumps(m))
+    if report_too:
+        _set_report_manifest_md5(run)
+
+
+def _corrupt_part(run, k=1):
+    p = run / C.DELIVERY_DIR / PART_FILE_FORMAT.format(k)
+    p.write_bytes(p.read_bytes().replace(b"PAR1", b"PARX"))      # same size, other content
+    return p
+
+
+def _unreadable_manifest(run):
+    (run / C.DELIVERY_DIR / SSOBSERVATION_MANIFEST_FILE).write_text("{")
+    _set_report_manifest_md5(run)
+
+
+@pytest.mark.parametrize("damage, match", [
+    (_corrupt_part, r"SSObservation\.part0001\.parquet has md5 [0-9a-f]{32}, the manifest says"),
+    (lambda run: (run / C.DELIVERY_DIR / PART_FILE_FORMAT.format(0)).unlink(), "part0000.parquet is missing"),
+    (lambda run: (run / C.DELIVERY_DIR / PART_FILE_FORMAT.format(0)).write_bytes(b"x"),
+     "part0000.parquet is 1 bytes, the manifest says"),
+    (lambda run: (run / C.DELIVERY_DIR / SSOBSERVATION_MANIFEST_FILE).unlink(), "manifest.json is missing"),
+    (_unreadable_manifest, "cannot read"),
+    (lambda run: _edit_manifest(run, lambda m: m["parts"].pop()), "the manifest lists the parts"),
+    (lambda run: _edit_manifest(run, lambda m: m.update(rows=1)), "the manifest says 1 rows"),
+    (lambda run: _edit_manifest(run, lambda m: m["parts"][0].update(file=SIDECAR_FILE)), "lists the parts"),
+])
+def test_refuses_bad_parts(no_remote, tmp_path, damage, match):
+    """Each part is checked against the manifest, and the manifest against
+    the report."""
+    run = make_run(tmp_path)
+    damage(run)
+    with pytest.raises(U.SSOUploadError, match=match):
+        U.run("dev", run, dry_run=True)
+    assert "upload" not in report(run)
+
+
+MANIFEST_MD5_MISMATCH = (r"SSObservation: .*SSObservation\.manifest\.json has md5 [0-9a-f]{32}, the report "
+                         r"says [0-9a-f]{32}")
+
+
+def test_refuses_manifest_edited_with_a_part(no_remote, tmp_path):
+    """A part changed and the manifest edited to stay consistent with it
+    (its md5, bytes): refused by the report's manifest_md5."""
+    run = make_run(tmp_path)
+    p = _corrupt_part(run, 0)
+    _edit_manifest(run, lambda m: m["parts"][0].update(md5=U.md5_file(p), bytes=p.stat().st_size),
+                   report_too=False)
+    with pytest.raises(U.SSOUploadError, match=MANIFEST_MD5_MISMATCH):
+        U.run("dev", run, dry_run=True)
+    assert "upload" not in report(run)
+
+
+def test_refuses_manifest_edited_alone(no_remote, tmp_path):
+    """The manifest alone edited (a field nothing else checks): refused."""
+    run = make_run(tmp_path)
+    _edit_manifest(run, lambda m: m.update(created_utc="2000-01-01T00:00:00Z"), report_too=False)
+    with pytest.raises(U.SSOUploadError, match=MANIFEST_MD5_MISMATCH):
+        U.run("dev", run, dry_run=True)
+    r = report(run)
+    del r["tables"]["SSObservation"]["manifest_md5"]
+    (run / C.REPORT_FILE).write_text(json.dumps(r))
+    with pytest.raises(U.SSOUploadError, match="no manifest_md5 in the report"):
+        U.run("dev", run, dry_run=True)
+
+
+def test_sidecar_never_uploaded(fakes, tmp_path):
+    st, pub = fakes
+    run = make_run(tmp_path)
+    side = run / C.DELIVERY_DIR / SIDECAR_FILE
+    with pytest.raises(U.SSOUploadError, match="never uploaded"):
+        U.upload(U.load_config("dev")[1], {"SSObservation": [side]})
+    assert st.calls == [] and pub.published == []
+    file_map = U.verify_delivery(run, report(run), ["SSObservation"])
+    assert file_map == {"SSObservation": [run / C.DELIVERY_DIR / n for n in files_of("SSObservation")]}
 
 
 def test_nearbysso_not_needed_by_default(no_remote, tmp_path):
