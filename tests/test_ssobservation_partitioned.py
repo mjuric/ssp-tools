@@ -240,8 +240,9 @@ def test_rebuild_removes_stale_parts(tmp_path, offline):  # noqa: F811
 # The manifest
 # --------------------------------------------------------------------------
 
-def test_manifest(tmp_path, offline):  # noqa: F811
-    m = _built(tmp_path, part_rows=3)
+@pytest.mark.parametrize("part_rows,n_ranged", [(3, 3), (6, 2)])
+def test_manifest(tmp_path, offline, part_rows, n_ranged):  # noqa: F811
+    m = _built(tmp_path, part_rows=part_rows)
     on_disk = json.loads((tmp_path / SSOBSERVATION_MANIFEST_FILE).read_text())
     assert on_disk == m
     assert list(m) == list(SSOBSERVATION_MANIFEST_FIELDS)
@@ -249,7 +250,7 @@ def test_manifest(tmp_path, offline):  # noqa: F811
     assert m["format_version"] == MANIFEST_FORMAT_VERSION
     assert m["partition_key"] == "ssObjectId"
     assert m["sort"] == list(SSOBSERVATION_SORT)
-    assert m["part_rows"] == 3
+    assert m["part_rows"] == part_rows
     assert m["rows"] == N_ROWS == sum(p["rows"] for p in m["parts"])
 
     schema_file = ssobservation.REPO_ROOT / "tests" / "data" / "sdm_schemas" / "sso_base.yaml"
@@ -276,7 +277,10 @@ def test_manifest(tmp_path, offline):  # noqa: F811
             assert p["ssObjectId_min"] == pc.min(ids).as_py()
             assert p["ssObjectId_max"] == pc.max(ids).as_py()
             assert isinstance(p["ssObjectId_min"], int)
-    assert [p["null_ssObjectId"] for p in m["parts"]] == [False] * 3 + [True] * 2
+    n_null = -(-N_NULL // part_rows)
+    assert [p["null_ssObjectId"] for p in m["parts"]] == [False] * n_ranged + [True] * n_null
+    # (with part_rows 6, a part holds two objects)
+    assert any(p["ssObjectId_min"] < p["ssObjectId_max"] for p in m["parts"][:n_ranged]) == (part_rows == 6)
 
     s = m["sidecar"]
     assert list(s) == list(SIDECAR_FIELDS)
