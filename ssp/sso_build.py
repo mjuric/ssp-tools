@@ -842,7 +842,7 @@ def table_entry(run_dir, table):
     if table == PARTITIONED:
         names = ssobservation_files(d)
         parts = [d / n for n in names[:-2]]
-        return dict(manifest=str((d / names[-1]).relative_to(run_dir)),
+        return dict(manifest=str((d / names[-1]).relative_to(run_dir)), manifest_md5=_md5(d / names[-1]),
                     parts=[str(p.relative_to(run_dir)) for p in parts],
                     sidecar=str((d / names[-2]).relative_to(run_dir)),
                     rows=sum(pq.ParquetFile(p).metadata.num_rows for p in parts),
@@ -1090,14 +1090,20 @@ def _check_from(previous, manifest, run_dir, from_step, commit, allow_mixed_comm
 
 
 def _check_kept_ssobservation(previous, run_dir, from_step, step, table):
-    """The kept partitioned SSObservation is complete, each part and the
-    sidecar has its manifest md5, and it is what the report recorded."""
+    """The kept partitioned SSObservation is complete, its manifest has the
+    md5 the report recorded (manifest_md5), each part and the sidecar has
+    its manifest md5, and it is what the report recorded."""
     d = run_dir / DELIVERY_DIR
     try:
         ssobservation_files(d)
     except ValueError as e:
         raise ValueError(f"--from {from_step}: {table}, from step {step}, is missing: {e}") from e
-    with open(d / SSOBSERVATION_MANIFEST_FILE) as f:
+    mpath = d / SSOBSERVATION_MANIFEST_FILE
+    want_md5 = ((previous.get("tables") or {}).get(table) or {}).get("manifest_md5")
+    if _md5(mpath) != want_md5:
+        raise ValueError(f"--from {from_step}: {mpath} has changed since step {step} wrote it "
+                         f"(manifest_md5 {want_md5} in the report)")
+    with open(mpath) as f:
         m = json.load(f)
     for entry in [*m["parts"], m["sidecar"]]:
         path = d / entry["file"]

@@ -45,7 +45,7 @@ The run happens in `WORK_DIR/<UTC date>/`. `--stamp NAME` uses a different name,
 | `stage0.log` | stage 0: the builder's output (it also appends to `CT/build.log`) |
 | `inputs/` | stage 1: `obs_sbn`, `mpc_orbits`, `current_identifications`, `numbered_identifications` (raw MPC, one snapshot), `dia_sources`, `ppdb_dia_sources` and `manifest.json` |
 | `run/delivery/` | stage 2: `<Table>.parquet` for five of the six tables; SSObservation as parts, a manifest and a sidecar (below) |
-| `run/report.json` | the steps (status, time, peak memory of the largest process, commit; for `ssobservation` also `part_rows` and `internal_columns`), the tables (rows, md5; for SSObservation the manifest, the parts, the sidecar and the total rows and bytes), the checks, `deliverable`, and the uploads |
+| `run/report.json` | the steps (status, time, peak memory of the largest process, commit; for `ssobservation` also `part_rows` and `internal_columns`), the tables (rows, md5; for SSObservation the manifest and its md5, the parts, the sidecar and the total rows and bytes), the checks, `deliverable`, and the uploads |
 | `run/checks/`, `run/logs/` | the check reports and each step's log |
 | `daily.log` | the commands run, their durations and exit codes |
 
@@ -134,7 +134,7 @@ ssp-build-ssobject RUN_DIR/delivery RUN_DIR/delivery/mpc_orbits.parquet -o ssobj
   - It re-hashes the inputs before checking.
   - `deliverable` is true only if every step and every expected check passed.
   - It refuses to rebuild a run that has been uploaded, unless `--force-rebuild`.
-- **Stage 3 refuses** unless `report.json` is deliverable and every file matches its md5: for SSObservation, the manifest must list the parts, rows and bytes the report recorded, and every part must have the manifest's size and md5.
+- **Stage 3 refuses** unless `report.json` is deliverable and every file matches its md5: for SSObservation, the manifest must have the md5 the report recorded (`manifest_md5`) and list the parts, rows and bytes the report recorded, and every part must have the manifest's size and md5.
   - It never overwrites an object, and removes its own uploads on any failure.
   - It refuses a second real upload of a run unless `--force`, and a partial table set unless `--allow-partial`.
   - Inputs from another source (not ClickHouse or the MPC replica) can replace stage 1, provided they honour `ssp/delivery_contract.py`'s `INPUT_FILES` and `MANIFEST_FIELDS`.

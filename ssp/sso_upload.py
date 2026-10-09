@@ -11,9 +11,9 @@ lsst/dax_ppdb python/lsst/dax/ppdb/bigquery/sso_uploader.py:
    table to upload, RUN_DIR/delivery/<Table>.parquet, has the md5 (and
    size) the report recorded. SSObservation is partitioned
    (ssp.ssobservation_contract, "The partitioned delivery"): its manifest,
-   SSObservation.manifest.json, must list the parts the report recorded,
-   with the report's total rows and bytes, and each part must have the
-   size and md5 the manifest gives.
+   SSObservation.manifest.json, must have the report's manifest_md5 and
+   list the parts the report recorded, with the report's total rows and
+   bytes, and each part must have the size and md5 the manifest gives.
 2. Upload each table to gs://<bucket>/<prefix>/<Table>.parquet, where the
    prefix is the UTC time to the millisecond, with if_generation_match=0
    so nothing is ever overwritten; SSObservation as its parts, in part
@@ -242,6 +242,11 @@ def _verify_partitioned(run_dir, table, rec):
         return [f"{table}: no parts in the report"], []
     if not mpath.is_file():
         return [f"{table}: {mpath} is missing"], []
+    if not rec.get("manifest_md5"):
+        return [f"{table}: no manifest_md5 in the report"], []
+    got = md5_file(mpath)
+    if got != rec["manifest_md5"]:
+        return [f"{table}: {mpath} has md5 {got}, the report says {rec['manifest_md5']}"], []
     try:
         with open(mpath) as f:
             m = json.load(f)

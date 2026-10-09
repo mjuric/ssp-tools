@@ -121,6 +121,7 @@ def make_partitioned(run, n_parts=N_PARTS):
                           bytes=side.stat().st_size, md5=U.md5_file(side)))
     (d / SSOBSERVATION_MANIFEST_FILE).write_text(json.dumps(m))
     return {"manifest": f"{C.DELIVERY_DIR}/{SSOBSERVATION_MANIFEST_FILE}",
+            "manifest_md5": U.md5_file(d / SSOBSERVATION_MANIFEST_FILE),
             "parts": [f"{C.DELIVERY_DIR}/{p['file']}" for p in parts],
             "sidecar": f"{C.DELIVERY_DIR}/{SIDECAR_FILE}", "rows": m["rows"],
             "bytes": sum(p["bytes"] for p in parts)}
@@ -514,16 +515,35 @@ def test_refuses_missing_file_or_record(no_remote, tmp_path):
         U.run("dev", run, dry_run=True, tables=["SSObservation"], allow_partial=True)
 
 
-def _edit_manifest(run, fn):
+def _set_report_manifest_md5(run):
+    """Make the report's manifest_md5 the manifest's as it is now (to reach
+    the checks behind it)."""
+    r = report(run)
+    mpath = run / C.DELIVERY_DIR / SSOBSERVATION_MANIFEST_FILE
+    r["tables"]["SSObservation"]["manifest_md5"] = U.md5_file(mpath)
+    (run / C.REPORT_FILE).write_text(json.dumps(r))
+
+
+def _edit_manifest(run, fn, report_too=True):
+    """Edit the manifest; with ``report_too``, also the report's
+    manifest_md5, so that the manifest's contents are what is checked."""
     p = run / C.DELIVERY_DIR / SSOBSERVATION_MANIFEST_FILE
     m = json.loads(p.read_text())
     fn(m)
     p.write_text(json.dumps(m))
+    if report_too:
+        _set_report_manifest_md5(run)
 
 
-def _corrupt_part(run):
-    p = run / C.DELIVERY_DIR / PART_FILE_FORMAT.format(1)
+def _corrupt_part(run, k=1):
+    p = run / C.DELIVERY_DIR / PART_FILE_FORMAT.format(k)
     p.write_bytes(p.read_bytes().replace(b"PAR1", b"PARX"))      # same size, other content
+    return p
+
+
+def _unreadable_manifest(run):
+    (run / C.DELIVERY_DIR / SSOBSERVATION_MANIFEST_FILE).write_text("{")
+    _set_report_manifest_md5(run)
 
 
 @pytest.mark.parametrize("damage, match", [
@@ -532,7 +552,7 @@ def _corrupt_part(run):
     (lambda run: (run / C.DELIVERY_DIR / PART_FILE_FORMAT.format(0)).write_bytes(b"x"),
      "part0000.parquet is 1 bytes, the manifest says"),
     (lambda run: (run / C.DELIVERY_DIR / SSOBSERVATION_MANIFEST_FILE).unlink(), "manifest.json is missing"),
-    (lambda run: (run / C.DELIVERY_DIR / SSOBSERVATION_MANIFEST_FILE).write_text("{"), "cannot read"),
+    (_unreadable_manifest, "cannot read"),
     (lambda run: _edit_manifest(run, lambda m: m["parts"].pop()), "the manifest lists the parts"),
     (lambda run: _edit_manifest(run, lambda m: m.update(rows=1)), "the manifest says 1 rows"),
     (lambda run: _edit_manifest(run, lambda m: m["parts"][0].update(file=SIDECAR_FILE)), "lists the parts"),
@@ -545,6 +565,35 @@ def test_refuses_bad_parts(no_remote, tmp_path, damage, match):
     with pytest.raises(U.SSOUploadError, match=match):
         U.run("dev", run, dry_run=True)
     assert "upload" not in report(run)
+
+
+MANIFEST_MD5_MISMATCH = (r"SSObservation: .*SSObservation\.manifest\.json has md5 [0-9a-f]{32}, the report "
+                         r"says [0-9a-f]{32}")
+
+
+def test_refuses_manifest_edited_with_a_part(no_remote, tmp_path):
+    """A part changed and the manifest edited to stay consistent with it
+    (its md5, bytes): refused by the report's manifest_md5."""
+    run = make_run(tmp_path)
+    p = _corrupt_part(run, 0)
+    _edit_manifest(run, lambda m: m["parts"][0].update(md5=U.md5_file(p), bytes=p.stat().st_size),
+                   report_too=False)
+    with pytest.raises(U.SSOUploadError, match=MANIFEST_MD5_MISMATCH):
+        U.run("dev", run, dry_run=True)
+    assert "upload" not in report(run)
+
+
+def test_refuses_manifest_edited_alone(no_remote, tmp_path):
+    """The manifest alone edited (a field nothing else checks): refused."""
+    run = make_run(tmp_path)
+    _edit_manifest(run, lambda m: m.update(created_utc="2000-01-01T00:00:00Z"), report_too=False)
+    with pytest.raises(U.SSOUploadError, match=MANIFEST_MD5_MISMATCH):
+        U.run("dev", run, dry_run=True)
+    r = report(run)
+    del r["tables"]["SSObservation"]["manifest_md5"]
+    (run / C.REPORT_FILE).write_text(json.dumps(r))
+    with pytest.raises(U.SSOUploadError, match="no manifest_md5 in the report"):
+        U.run("dev", run, dry_run=True)
 
 
 def test_sidecar_never_uploaded(fakes, tmp_path):

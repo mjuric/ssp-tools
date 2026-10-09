@@ -453,6 +453,7 @@ def test_report_all_ok(tmp_path, fake_steps):
     # SSObservation: {manifest, parts, sidecar, rows, bytes} (REPORT_FIELDS)
     e = rep["tables"]["SSObservation"]
     assert e == dict(manifest=f"delivery/{SSOBSERVATION_MANIFEST_FILE}",
+                     manifest_md5=B._md5(tmp_path / "run" / "delivery" / SSOBSERVATION_MANIFEST_FILE),
                      parts=[f"delivery/{PART_FILE_FORMAT.format(0)}"], sidecar=f"delivery/{SIDECAR_FILE}",
                      rows=3, bytes=(tmp_path / "run" / e["parts"][0]).stat().st_size)
     assert rep["tables"]["mpc_orbits"]["rows"] == 4
@@ -659,9 +660,13 @@ def test_from_refuses_changed_kept_table(tmp_path, fake_steps):
         B.build(tmp_path / "in", run, from_step="check", log=_quiet)
 
 
+MANIFEST_CHANGED = (r"SSObservation\.manifest\.json has changed since step ssobservation wrote it "
+                    r"\(manifest_md5 [0-9a-f]{32} in the report\)")
+
+
 def test_from_refuses_changed_kept_manifest(tmp_path, fake_steps):
-    """A manifest edited to match a changed part still differs from the
-    report's record."""
+    """A manifest edited to stay consistent with a changed part: refused by
+    the report's manifest_md5."""
     write_inputs(tmp_path / "in")
     run = tmp_path / "run"
     B.build(tmp_path / "in", run, log=_quiet)
@@ -672,8 +677,25 @@ def test_from_refuses_changed_kept_manifest(tmp_path, fake_steps):
     m["parts"][0].update(md5=B._md5(part), bytes=part.stat().st_size, rows=4)
     m["rows"] = 4
     mp.write_text(json.dumps(m))
-    with pytest.raises(ValueError, match="SSObservation has changed since step ssobservation"):
+    with pytest.raises(ValueError, match=MANIFEST_CHANGED):
         B.build(tmp_path / "in", run, from_step="ssobject", log=_quiet)
+
+
+def test_from_refuses_manifest_edited_alone(tmp_path, fake_steps):
+    """The manifest alone edited (a field nothing else checks): refused;
+    the same field restored, accepted."""
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    B.build(tmp_path / "in", run, log=_quiet)
+    mp = run / "delivery" / SSOBSERVATION_MANIFEST_FILE
+    orig = mp.read_text()
+    m = json.loads(orig)
+    m["created_utc"] = "2000-01-01T00:00:00Z"
+    mp.write_text(json.dumps(m))
+    with pytest.raises(ValueError, match=MANIFEST_CHANGED):
+        B.build(tmp_path / "in", run, from_step="check", log=_quiet)
+    mp.write_text(orig)
+    assert B.build(tmp_path / "in", run, from_step="check", log=_quiet)["deliverable"] is True
 
 
 def test_from_mixed_commits(tmp_path, fake_steps, monkeypatch):
