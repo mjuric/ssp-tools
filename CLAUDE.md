@@ -23,7 +23,7 @@ The rules here are for development in ssp-tools, by Claude sessions and their su
 - Break the work into **work packages (WPs)** that subagents can build independently.
 - Group them into waves by what each needs from the others. A project may have two waves or many; there is no fixed set of phases.
 - Typical work for the integrating session itself, before the WPs that depend on it:
-  - **the contract:** a module of shared dtypes, function signatures and rules, e.g. `ssp/sssource_contract.py`, `ssp/delivery_contract.py`, `ssp/nearbysso/_contract.py`;
+  - **the contract:** a module of shared dtypes, function signatures and rules, e.g. `ssp/ssobservation_contract.py`, `ssp/delivery_contract.py`, `ssp/nearbysso/_contract.py`;
   - **schema changes;**
   - **fixtures:** read-only, with a README of facts.
 - **Work packages must not change the contract.** A needed change goes back to the integrator, who applies it for everyone and tells the affected agents.

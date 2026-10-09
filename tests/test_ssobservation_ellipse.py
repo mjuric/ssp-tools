@@ -1,4 +1,4 @@
-"""WP3 of the widened SSSource: ``ssp.sssource_ellipse``.
+"""WP3 of SSObservation: ``ssp.ssobservation_ellipse``.
 
 The loader tests run offline on synthetic mpc_orbits rows (as
 tests/test_nearbysso_orbits.py builds them). The ellipse tests use the
@@ -16,7 +16,7 @@ from test_nearbysso_propagate import (AU_KM, MB_LONG, MB_SHORT, NEO_CA, NEO_LONG
                                       needs_assist, nights, x05_state)
 
 from ssp import ephem_assist as ea
-from ssp import sssource_ellipse as se
+from ssp import ssobservation_ellipse as se
 from ssp.nearbysso import orbits as O
 from ssp.nearbysso import propagate
 from ssp.nearbysso._contract import ORBIT_DTYPE, CoarseTrack

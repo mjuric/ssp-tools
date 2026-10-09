@@ -1,5 +1,7 @@
 # Design: building the NearbySSO table
 
+> **Renamed (2026-10-08):** the PPDB table called SSSource here is now **SSObservation**, and the code names follow it (`ssp.ssobservation`, `ssp-build-ssobservation`, `SSOBSERVATION_*`); see `docs/design/ssobservation-delivery.md`. This document keeps the names it was written with.
+
 Status: **implemented** (`ssp/nearbysso/`, `ssp-build-nearbysso`); validated on the fixtures (below), a full year of PPDB data pending.
 
 ## Context

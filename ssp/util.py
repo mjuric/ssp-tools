@@ -570,7 +570,7 @@ def argjoin(a, v):
 
 
 #
-# Forked process pools over contiguous chunks (ssobject and sssource
+# Forked process pools over contiguous chunks (ssobject and ssobservation
 # --workers N > 1)
 #
 def fork_context():

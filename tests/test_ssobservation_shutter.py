@@ -1,10 +1,11 @@
-"""SSSource with shutter-motion-corrected times (docs/design/shutter-timing.md,
-WP S2): the copy and drop rules, the all-or-none input columns, the
-ephemerides at each row's own time, and the observer state and Sun shifted
-from the visit time (ssp.sssource.observer_states,
-ssp.util.solar_elongation_ndarray's dt_s) against exact evaluation.
+"""SSObservation with shutter-motion-corrected times
+(docs/design/shutter-timing.md, WP S2): the copy and drop rules, the
+all-or-none input columns, the ephemerides at each row's own time, and the
+observer state and Sun shifted from the visit time
+(ssp.ssobservation.observer_states, ssp.util.solar_elongation_ndarray's dt_s)
+against exact evaluation.
 
-The build tests use test_sssource_widened's synthetic inputs and stand-ins
+The build tests use test_ssobservation_widened's synthetic inputs and stand-ins
 (no ASSIST, no network). The ASSIST test is skipped without SSP_ASSIST_*;
 the test against astropy's real observer state is skipped unless DE440 is
 in the astropy cache (it never downloads)."""
@@ -22,17 +23,19 @@ import pytest
 from astropy.coordinates import EarthLocation
 from astropy.time import Time
 
-from ssp import sssource, util
+from ssp import ssobservation, util
 from ssp.delivery_contract import SHUTTER_INPUT_COLUMNS
-from ssp.sssource import build_sssource, observer_states
-from ssp.sssource_contract import SHUTTER_INTERNAL, SSSourceDtype
+from ssp.ssobservation import build_ssobservation, observer_states
+from ssp.ssobservation_contract import SHUTTER_INTERNAL, SSObservationDtype
 
-from test_sssource_widened import _by_obsid, _fake_ephemerides, _FakeEllipse, _same, make_inputs
+from test_ssobservation_widened import (
+    _by_obsid, _fake_ephemerides, _FakeEllipse, _same, make_inputs, read_output,
+)
 
 HAVE_ASSIST = bool(os.environ.get("SSP_ASSIST_PLANETS") and os.environ.get("SSP_ASSIST_ASTEROIDS"))
 
 #: An Earth-like circular orbit, inclined like the ecliptic (AU, AU/day);
-#: unlike test_sssource_widened's stand-in, its velocity is its position's
+#: unlike test_ssobservation_widened's stand-in, its velocity is its position's
 #: derivative, so shifting along it is meaningful.
 _OMEGA = 2 * np.pi / 365.25
 
@@ -52,18 +55,18 @@ def offline(monkeypatch):
         calls.append((provID, ephTimes.tai.mjd.copy(), kw["obs_pos"].copy()))
         return _fake_ephemerides(provID, ephTimes, mpcorb, ephem, **kw)
 
-    monkeypatch.setattr(sssource, "compute_ephemerides_one", spy)
-    monkeypatch.setattr(sssource, "open_ephem", lambda: None)
-    monkeypatch.setattr(sssource.util, "observatory_barycentric_posvel", _circular_observatory)
-    monkeypatch.setattr(sssource, "_ellipse", _FakeEllipse())
+    monkeypatch.setattr(ssobservation, "compute_ephemerides_one", spy)
+    monkeypatch.setattr(ssobservation, "open_ephem", lambda: None)
+    monkeypatch.setattr(ssobservation.util, "observatory_barycentric_posvel", _circular_observatory)
+    monkeypatch.setattr(ssobservation, "_ellipse", _FakeEllipse())
     return calls
 
 
 def _build(path, **kw):
     path.mkdir(exist_ok=True)
     dia, _ = make_inputs(path, **kw)
-    build_sssource(path, path)
-    return pq.read_table(path / "sssource.parquet"), dia
+    build_ssobservation(path, path)
+    return read_output(path), dia
 
 
 # --------------------------------------------------------------------------
@@ -75,19 +78,19 @@ def test_copies_corrected_time_and_flags(tmp_path, offline, capsys):
     err = capsys.readouterr().err
     s = _by_obsid(sss, dia["obsid"])
     # the corrected time and both flags, as dia_sources.parquet has them
-    for c in ("midpointMjdTai", *sssource.SHUTTER_FLAGS):
+    for c in ("midpointMjdTai", *ssobservation.SHUTTER_FLAGS):
         assert _same(s[c].combine_chunks(), dia[c].combine_chunks()), c
     assert not np.array_equal(dia["midpointMjdTai"].to_numpy(), dia["midpointMjdTaiVisit"].to_numpy())
     # the internal columns are dropped, silently
     for c in SHUTTER_INTERNAL:
         assert c not in sss.column_names
     assert "dropped" not in err
-    assert sss.column_names == list(SSSourceDtype.names)
+    assert pq.read_table(tmp_path / "ssobservation.parquet").column_names == list(SSObservationDtype.names)
 
 
 def test_unknown_column_still_warned(tmp_path, offline, capsys):
     make_inputs(tmp_path, extra_column=pa.array(np.arange(14)))
-    build_sssource(tmp_path, tmp_path)
+    build_ssobservation(tmp_path, tmp_path)
     assert "dropped: ['extra_column']" in capsys.readouterr().err
 
 
@@ -106,14 +109,14 @@ def test_partial_shutter_columns_refused(tmp_path, offline, k):
     for drop in itertools.combinations(SHUTTER_INPUT_COLUMNS, k):
         pq.write_table(dia.drop_columns(list(drop)), tmp_path / "dia_sources.parquet")
         with pytest.raises(ValueError, match="shutter-correction columns"):
-            build_sssource(tmp_path, tmp_path)
+            build_ssobservation(tmp_path, tmp_path)
 
 
 def test_shutter_corrected():
-    assert sssource.shutter_corrected(set(SHUTTER_INPUT_COLUMNS) | {"x"})
-    assert not sssource.shutter_corrected({"x", "midpointMjdTai"})
+    assert ssobservation.shutter_corrected(set(SHUTTER_INPUT_COLUMNS) | {"x"})
+    assert not ssobservation.shutter_corrected({"x", "midpointMjdTai"})
     with pytest.raises(ValueError, match=r"lacks \['obstime_basis'\]"):
-        sssource.shutter_corrected(set(SHUTTER_INPUT_COLUMNS[:-1]))
+        ssobservation.shutter_corrected(set(SHUTTER_INPUT_COLUMNS[:-1]))
 
 
 # --------------------------------------------------------------------------
@@ -159,8 +162,8 @@ def test_interim_equals_unshifted_correction(tmp_path, offline):
     (tmp_path / "b").mkdir()
     make_inputs(tmp_path / "b")
     pq.write_table(dia, tmp_path / "b" / "dia_sources.parquet")
-    build_sssource(tmp_path / "b", tmp_path / "b")
-    b = pq.read_table(tmp_path / "b" / "sssource.parquet")
+    build_ssobservation(tmp_path / "b", tmp_path / "b")
+    b = read_output(tmp_path / "b")
     assert a.schema.equals(b.schema)
     for c in a.column_names:
         assert _same(a[c].combine_chunks(), b[c].combine_chunks()), c
@@ -265,7 +268,7 @@ def test_solar_elongation_shift_vs_exact():
 @pytest.mark.skipif(not HAVE_ASSIST, reason="SSP_ASSIST_PLANETS / SSP_ASSIST_ASTEROIDS not set")
 def test_along_track_shift_assist(monkeypatch):
     from ssp.ephem_assist import open_ephem
-    from ssp.sssource import WORK_DTYPE, compute_sssource_entry
+    from ssp.ssobservation import WORK_DTYPE, compute_ssobservation_entry
     monkeypatch.setattr(util, "observatory_barycentric_posvel", _circular_observatory)
     ephem = open_ephem()
     desig = "2026 ZZ1"
@@ -287,7 +290,7 @@ def test_along_track_shift_assist(monkeypatch):
         assoc["obs_pos"], assoc["obs_vel"] = observer_states(times, tv)
         if ra is not None:
             de["ra"], de["dec"] = ra, dec
-        compute_sssource_entry(sss, assoc, mpcorb, de, ephem)
+        compute_ssobservation_entry(sss, assoc, mpcorb, de, ephem)
         return sss
 
     at_visit = run(tv)

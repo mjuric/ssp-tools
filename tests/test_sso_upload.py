@@ -10,7 +10,7 @@ from ssp import delivery_contract as C
 from ssp import sso_upload as U
 
 TOPIC_PATH = "projects/ppdb-dev-5c07/topics/load-sso-topic"
-FIVE = ("SSSource", "SSObject", "mpc_orbits", "current_identifications", "numbered_identifications")
+FIVE = ("SSObservation", "SSObject", "mpc_orbits", "current_identifications", "numbered_identifications")
 
 
 # --------------------------------------------------------------------------
@@ -166,7 +166,7 @@ def test_dev_config_and_templates():
     _, cfg = U.load_config("dev")
     assert cfg == {"bucket_name": "ppdb-dev-sso-ingest", "topic": "load-sso-topic",
                    "project": "ppdb-dev-5c07",
-                   "tables": ["SSSource", "SSObject", "numbered_identifications",
+                   "tables": ["SSObservation", "SSObject", "numbered_identifications",
                               "current_identifications", "mpc_orbits"]}
     assert set(cfg["tables"]) == set(FIVE)
     for env in ("int", "prod"):
@@ -198,8 +198,8 @@ def test_config_validation(tmp_path):
     p.write_text("bucket_name: b\ntopic: t\nproject: p\nbukcet: x\n")
     with pytest.raises(U.SSOUploadError, match="unknown"):
         U.load_config(str(p))
-    p.write_text("bucket_name: b\ntopic: t\nproject: p\ntables: [SSSource]\n")
-    assert U.load_config(str(p))[1]["tables"] == ["SSSource"]
+    p.write_text("bucket_name: b\ntopic: t\nproject: p\ntables: [SSObservation]\n")
+    assert U.load_config(str(p))[1]["tables"] == ["SSObservation"]
 
 
 def test_nearbysso_refused_without_include_unsupported(no_remote, tmp_path):
@@ -208,7 +208,7 @@ def test_nearbysso_refused_without_include_unsupported(no_remote, tmp_path):
         U.run("dev", run, dry_run=True, tables=list(FIVE) + ["NearbySSO"])
     # a config listing it is refused too
     cfg = tmp_path / "c.yaml"
-    cfg.write_text("bucket_name: b\ntopic: t\nproject: p\ntables: [SSSource, NearbySSO]\n")
+    cfg.write_text("bucket_name: b\ntopic: t\nproject: p\ntables: [SSObservation, NearbySSO]\n")
     with pytest.raises(U.SSOUploadError, match="--include-unsupported"):
         U.run(str(cfg), run, dry_run=True)
     assert "upload" not in report(run)
@@ -236,9 +236,9 @@ def test_default_holds_nearbysso_back(no_remote, tmp_path, caplog):
 def test_partial_upload_refused_without_allow_partial(no_remote, tmp_path):
     run = make_run(tmp_path)
     with pytest.raises(U.SSOUploadError, match="WRITE_TRUNCATE.*--allow-partial"):
-        U.run("dev", run, dry_run=True, tables=["SSObject", "SSSource"])
-    rec = U.run("dev", run, dry_run=True, tables=["SSObject", "SSSource"], allow_partial=True)
-    assert rec["tables"] == ["SSSource", "SSObject"]       # the contract's order
+        U.run("dev", run, dry_run=True, tables=["SSObject", "SSObservation"])
+    rec = U.run("dev", run, dry_run=True, tables=["SSObject", "SSObservation"], allow_partial=True)
+    assert rec["tables"] == ["SSObservation", "SSObject"]       # the contract's order
     # the config's five in any order count as complete
     rec = U.run("dev", run, dry_run=True, tables=list(reversed(FIVE)))
     assert rec["tables"] == ordered(FIVE)
@@ -432,10 +432,10 @@ def test_refuses_missing_file_or_record(no_remote, tmp_path):
     with pytest.raises(U.SSOUploadError, match="SSObject.*missing"):
         U.run("dev", run, dry_run=True)
     r = report(run)
-    del r["tables"]["SSSource"]
+    del r["tables"]["SSObservation"]
     (run / C.REPORT_FILE).write_text(json.dumps(r))
-    with pytest.raises(U.SSOUploadError, match="SSSource: no md5"):
-        U.run("dev", run, dry_run=True, tables=["SSSource"], allow_partial=True)
+    with pytest.raises(U.SSOUploadError, match="SSObservation: no md5"):
+        U.run("dev", run, dry_run=True, tables=["SSObservation"], allow_partial=True)
 
 
 def test_nearbysso_not_needed_by_default(no_remote, tmp_path):

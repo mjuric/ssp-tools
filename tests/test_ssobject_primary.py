@@ -1,5 +1,6 @@
-"""SSObject counts each detection once: non-primary SSSource rows (a trail's
--B endpoint, repeated submissions) and undesignated rows are ignored."""
+"""SSObject counts each detection once: non-primary SSObservation rows (a
+trail's -B endpoint, repeated submissions) and undesignated rows are
+ignored."""
 
 import numpy as np
 import pandas as pd

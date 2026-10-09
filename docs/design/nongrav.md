@@ -1,5 +1,7 @@
 # Design: non-gravitational forces (comets and Yarkovsky asteroids)
 
+> **Renamed (2026-10-08):** the PPDB table called SSSource here is now **SSObservation**, and the code names follow it (`ssp.ssobservation`, `ssp-build-ssobservation`, `SSOBSERVATION_*`); see `docs/design/ssobservation-delivery.md`. This document keeps the names it was written with.
+
 Status: **proposed.** The scope is decided and the units check done (2026-10-01); the implementation plan is below, for approval.
 
 ## Context

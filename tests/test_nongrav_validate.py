@@ -180,7 +180,7 @@ def test_offsets_row_sets(tmp_path):
 # --------------------------------------------------------------------------
 
 def _nss_case():
-    """SSSource rows of three objects, the NearbySSO input, a clean
+    """SSObservation rows of three objects, the NearbySSO input, a clean
     NearbySSO, and orbits."""
     rng = np.random.default_rng(3)
     des = ["P/2000 A1"] * 4 + ["C/2000 G1"] * 3 + ["2000 CA"] * 3
@@ -274,7 +274,7 @@ def test_nearbysso_comet_missing_at_10_unexplained():
 
 def test_nearbysso_asteroid_row_at_10_flagged():
     """An asteroid's NearbySSO row at 10" (beyond its 5" radius) is wrong;
-    its SSSource row at 10" without a NearbySSO row is explained."""
+    its SSObservation row at 10" without a NearbySSO row is explained."""
     sss, dia, nss, orbits, cmap = _nss_case()
     sss.loc[7, "ephOffset"] = 10.0
     nss.loc[7, "ephOffset"] = 10.0
@@ -326,7 +326,7 @@ def test_nearbysso_defects(defect, failed):
 
 
 def test_nearbysso_no_comets_in_input():
-    """No comet SSSource row's DiaSource in the NearbySSO input: the comet
+    """No comet SSObservation row's DiaSource in the NearbySSO input: the comet
     gate is not applicable, not a failure."""
     sss, dia, nss, orbits, cmap = _nss_case()
     keep = (sss["designation"] == "2000 CA").to_numpy()

@@ -29,7 +29,7 @@ time **or** of the corrected time (``obstime_basis``: ``visit``,
 cover both. The output's ``midpointMjdTai`` is then the corrected time
 where there is one, ``midpointMjdTaiVisit`` the visit's, and
 ``midpointMjdTai_flag``/``_flag_degraded`` say which (see
-``ssp.sssource_contract``, "Shutter-motion-corrected times"). Without a
+``ssp.ssobservation_contract``, "Shutter-motion-corrected times"). Without a
 table, the extract is exactly the uncorrected one.
 
 Credentials: ``SSP_CH_USER``/``SSP_CH_PASSWORD`` if set, else ``~/.chpass``
@@ -56,7 +56,8 @@ import pyarrow.parquet as pq
 from astropy.time import Time
 
 from ssp.delivery_contract import SHUTTER_INPUT_COLUMNS, SHUTTER_MANIFEST_FIELD
-from ssp.sssource_contract import MATCH_METHODS, MAX_CORRECTION_S, MAX_HEADER_MISMATCH_S, MAX_NOT_BUILT_VISITS
+from ssp.ssobservation_contract import (MATCH_METHODS, MAX_CORRECTION_S, MAX_HEADER_MISMATCH_S,
+                                        MAX_NOT_BUILT_VISITS)
 
 # The ClickHouse ("River") server has moved more than once (sdfiana035 ->
 # 172.24.10.116 on 2026-10-04 -> sdfiana032 on 2026-10-05). Its operators keep
@@ -190,7 +191,7 @@ CELL_SHIFT = 2 * (29 - CELL_ORDER)
 # View columns renamed to their DiaSource names on output.
 RENAMES = {"id": "diaSourceId"}
 
-# DiaSource columns that SSSource/SSObject read. Any missing from the view
+# DiaSource columns that SSObservation/SSObject read. Any missing from the view
 # is added as an all-null column of this type (today: extendedness).
 REQUIRED_COLUMNS = {
     "diaSourceId": pa.int64(),

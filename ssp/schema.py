@@ -90,8 +90,8 @@ SSObjectDtype = np.dtype([
     ('y_slope_fit_failed', '|b1'),  # G12 fit failed in y band. G12 contains a fiducial value used to fit H.
 ])
 
-# SSSource: LSST-computed per-source quantities. 1::1 relationship with DiaSource.
-SSSourceDtype = np.dtype([
+# SSObservation: LSST-computed per-source quantities. 1::1 relationship with DiaSource.
+SSObservationDtype = np.dtype([
     ('diaSourceId', '<i8'),         # Unique identifier of the observation (matching DiaSource.diaSourceId).
     ('ssObjectId', '<i8'),          # Unique LSST identifier of the Solar System object.
     ('designation', '<U16'),        # The unpacked primary provisional designation for this object.

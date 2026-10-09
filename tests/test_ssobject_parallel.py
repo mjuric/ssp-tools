@@ -12,8 +12,9 @@ from ssp.util import balanced_chunks as _balanced_chunks
 
 def widen(sss, dia):
     """``sss`` with the measurement columns SSObject reads from the widened
-    SSSource (as ssp-build-sssource copies them from dia_sources.parquet,
-    float32 where SSSourceDtype has it), joined on obsid."""
+    SSObservation (as ssp-build-ssobservation copies them from
+    dia_sources.parquet, float32 where SSObservationDtype has it), joined on
+    obsid."""
     m = dia[["obsid", "midpointMjdTai", "band", "psfFlux", "psfFluxErr", "extendedness"]]
     m = m.astype({"psfFlux": np.float32, "psfFluxErr": np.float32, "extendedness": np.float32})
     out = sss.merge(m, on="obsid", how="left", validate="one_to_one")

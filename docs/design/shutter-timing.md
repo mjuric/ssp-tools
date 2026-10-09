@@ -1,5 +1,7 @@
 # Design: shutter-motion-corrected times in SSSource
 
+> **Renamed (2026-10-08):** the PPDB table called SSSource here is now **SSObservation**, and the code names follow it (`ssp.ssobservation`, `ssp-build-ssobservation`, `SSOBSERVATION_*`); see `docs/design/ssobservation-delivery.md`. This document keeps the names it was written with.
+
 ## Context
 
 A DiaSource's `midpointMjdTai` is the visit's midpoint. LSSTCam's shutter blades take a finite time to cross the focal plane, so each source's actual exposure midpoint differs from it by up to 0.24 s, depending on where on the focal plane it lies. For a fast-moving object, that time error becomes an along-track position error.

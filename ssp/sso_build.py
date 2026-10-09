@@ -13,12 +13,12 @@ ssp/delivery_contract.py. Files in, files out: no database access.
    report:
 
    - ``mpc``: shape the three MPC tables to delivery_schema();
-   - ``sssource``, ``ssobject``, ``nearbysso``: the existing builders,
+   - ``ssobservation``, ``ssobject``, ``nearbysso``: the existing builders,
      reading the shaped MPC tables (as delivered) and the other inputs
      as given;
    - ``check``: the delivery check (ssp.delivery_check) of all six tables,
-     plus SSSource's ``conformance`` and ``offsets``
-     (bench/sssource_validate.py), into ``RUN_DIR/checks/``.
+     plus SSObservation's ``conformance`` and ``offsets``
+     (bench/ssobservation_validate.py), into ``RUN_DIR/checks/``.
 
    The delivered tables are ``RUN_DIR/delivery/<Table>.parquet``; the
    builders' other outputs stay in ``RUN_DIR/work/``.
@@ -63,6 +63,7 @@ from .delivery_contract import (
     SHUTTER_INPUT_COLUMNS,
     delivery_schema,
 )
+from .ssobservation_contract import SIDECAR_FILE
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -76,7 +77,7 @@ MPC_DERIVED = {("mpc_orbits", "designation"): "unpacked_primary_provisional_desi
 #: The delivered tables each step writes (``check`` writes RUN_DIR/checks).
 STEP_TABLES = {
     "mpc": MPC_TABLES,
-    "sssource": ("SSSource",),
+    "ssobservation": ("SSObservation",),
     "ssobject": ("SSObject",),
     "nearbysso": ("NearbySSO",),
     "check": (),
@@ -92,12 +93,13 @@ LOGS_DIR = "logs"
 WORK_DIR = "work"
 CHECK_RESULTS = "results.json"
 
-#: The SSSource content checks of bench/sssource_validate.py run by ``check``.
-SSSOURCE_CHECKS = ("conformance", "offsets")
+#: The SSObservation content checks of bench/ssobservation_validate.py run by
+#: ``check``.
+SSOBSERVATION_CHECKS = ("conformance", "offsets")
 
 #: The checks a deliverable run must have passed, by name.
 EXPECTED_CHECKS = (tuple(f"delivery:{t}" for t in DELIVERY_TABLES)
-                   + tuple(f"sssource:{c}" for c in SSSOURCE_CHECKS))
+                   + tuple(f"ssobservation:{c}" for c in SSOBSERVATION_CHECKS))
 
 MPC_BATCH_ROWS = 131_072
 
@@ -563,15 +565,15 @@ def step_mpc(inputs_dir, run_dir, workers=1):
 # Step check
 # --------------------------------------------------------------------------
 
-def have_sssource_validate():
-    return (REPO_ROOT / "bench" / "sssource_validate.py").is_file()
+def have_ssobservation_validate():
+    return (REPO_ROOT / "bench" / "ssobservation_validate.py").is_file()
 
 
 def step_check(run_dir, log=_log):
-    """The delivery check of every delivered table, and SSSource's content
+    """The delivery check of every delivered table, and SSObservation's content
     checks; writes ``RUN_DIR/checks/<check>.txt`` and ``results.json``
     ({check: {status, report}}). Returns True if every check passed. The
-    SSSource checks need bench/ (a source checkout): without it they FAIL,
+    SSObservation checks need bench/ (a source checkout): without it they FAIL,
     as not available."""
     run_dir = Path(run_dir)
     delivery = run_dir / DELIVERY_DIR
@@ -584,24 +586,25 @@ def step_check(run_dir, log=_log):
         log(f"{name}: {results[name]['status']} ({report_file})")
         _write_json(results, checks / CHECK_RESULTS)
 
-    # SSSource's content checks (bench/sssource_validate.py, when present)
-    if have_sssource_validate():
-        for name in SSSOURCE_CHECKS:
-            rep = checks / f"sssource-{name}.txt"
-            cmd = [sys.executable, "-m", "bench.sssource_validate", name, str(delivery / "SSSource.parquet"),
-                   "--out", str(rep)]
+    # SSObservation's content checks (bench/ssobservation_validate.py, when
+    # present)
+    if have_ssobservation_validate():
+        for name in SSOBSERVATION_CHECKS:
+            rep = checks / f"ssobservation-{name}.txt"
+            cmd = [sys.executable, "-m", "bench.ssobservation_validate", name,
+                   str(delivery / "SSObservation.parquet"), "--out", str(rep)]
             log("$ " + " ".join(cmd))
             sys.stdout.flush()
             r = subprocess.run(cmd, cwd=REPO_ROOT, stdout=sys.stdout, stderr=sys.stderr)
             if not rep.exists():
                 rep.write_text(f"{' '.join(cmd)} exited {r.returncode} without a report\n")
-            record(f"sssource:{name}", r.returncode == 0, rep)
+            record(f"ssobservation:{name}", r.returncode == 0, rep)
     else:
-        for name in SSSOURCE_CHECKS:
-            rep = checks / f"sssource-{name}.txt"
-            rep.write_text(f"FAIL: not available: {REPO_ROOT / 'bench' / 'sssource_validate.py'} not "
+        for name in SSOBSERVATION_CHECKS:
+            rep = checks / f"ssobservation-{name}.txt"
+            rep.write_text(f"FAIL: not available: {REPO_ROOT / 'bench' / 'ssobservation_validate.py'} not "
                            "found; run from a source checkout\n")
-            record(f"sssource:{name}", False, rep)
+            record(f"ssobservation:{name}", False, rep)
 
     # The delivery check (ssp.delivery_check, WP H)
     per_table = check_delivery(delivery)
@@ -633,10 +636,10 @@ def builder_input(inputs_dir, run_dir, manifest, name):
     return input_path(inputs_dir, manifest, name).resolve()
 
 
-def _sssource_input_dir(inputs_dir, run_dir, manifest):
-    """RUN_DIR/work/sssource/in: symlinks to the builder inputs
-    (builder_input), with the names ssp-build-sssource expects."""
-    d = Path(run_dir) / WORK_DIR / "sssource" / "in"
+def _ssobservation_input_dir(inputs_dir, run_dir, manifest):
+    """RUN_DIR/work/ssobservation/in: symlinks to the builder inputs
+    (builder_input), with the names ssp-build-ssobservation expects."""
+    d = Path(run_dir) / WORK_DIR / "ssobservation" / "in"
     d.mkdir(parents=True, exist_ok=True)
     for name in ("dia_sources", "obs_sbn", "mpc_orbits", "current_identifications",
                  "numbered_identifications"):
@@ -662,15 +665,17 @@ def step_command(step, inputs_dir, run_dir, manifest, workers):
           "--run-step"]
     if step in ("mpc", "check"):
         return me + [step], {}
-    if step == "sssource":
-        d = _sssource_input_dir(inputs_dir, run_dir, manifest)
+    if step == "ssobservation":
+        d = _ssobservation_input_dir(inputs_dir, run_dir, manifest)
         out = work / "out"
         out.mkdir(parents=True, exist_ok=True)
-        return ([*_entry_point("ssp.sssource"), "--input-dir", str(d), "--output-dir", str(out),
-                 "--workers", str(workers)], {out / "sssource.parquet": delivery / "SSSource.parquet"})
+        return ([*_entry_point("ssp.ssobservation"), "--input-dir", str(d), "--output-dir", str(out),
+                 "--workers", str(workers)],
+                {out / "ssobservation.parquet": delivery / "SSObservation.parquet",
+                  out / SIDECAR_FILE: delivery / SIDECAR_FILE})
     if step == "ssobject":
         out = work / "ssobject.parquet"
-        return ([*_entry_point("ssp.ssobject"), str(delivery / "SSSource.parquet"),
+        return ([*_entry_point("ssp.ssobject"), str(delivery / "SSObservation.parquet"),
                  str(builder_input(inputs_dir, run_dir, manifest, "mpc_orbits")), "--output", str(out),
                  "--workers", str(workers)], {out: delivery / "SSObject.parquet"})
     if step == "nearbysso":
@@ -959,7 +964,7 @@ def main(argv=None):
                     "(stage 1's, or any source honouring ssp/delivery_contract.py).",
         epilog=f"Steps: {', '.join(BUILD_STEPS)}. Writes RUN_DIR/{DELIVERY_DIR}/<Table>.parquet, "
                f"RUN_DIR/{LOGS_DIR}/<step>.log, RUN_DIR/{CHECKS_DIR}/ and RUN_DIR/{REPORT_FILE}. "
-               "Needs SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS for the sssource and nearbysso "
+               "Needs SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS for the ssobservation and nearbysso "
                "steps. Exits 0 only if the delivery is deliverable.",
     )
     parser.add_argument("inputs_dir", metavar="INPUTS_DIR")

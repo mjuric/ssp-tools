@@ -27,13 +27,13 @@ def _mags(flux, flux_err):
 
 def _case(flux, flux_err, phase, topo, helio):
     mag, err = _mags(flux, flux_err)
-    f32 = lambda x: np.asarray(x, np.float32)   # noqa: E731  (as SSSource has them)
+    f32 = lambda x: np.asarray(x, np.float32)   # noqa: E731  (as SSObservation has them)
     return mag, err, f32(phase), f32(topo), f32(helio)
 
 
 # y band of ssObjectId 5635187669466106656: 10 points all at one phase angle
 # (28.9724 deg, to 2e-6 deg), so G12 is unconstrained. In dia_sources and
-# in SSSource order the fit gave G12 = 0.99999934 with H_err = 8.2e5, and
+# in SSObservation order the fit gave G12 = 0.99999934 with H_err = 8.2e5, and
 # G12 = 1.0 (a bound) with H_err = 0.057.
 SINGLE_PHASE = _case(
     [9652.6171875, 10478.6591796875, 10221.1103515625, 13354.4423828125, 14548.0302734375,
@@ -47,7 +47,7 @@ SINGLE_PHASE = _case(
     [2.08851957321167, 2.088515043258667, 2.0885214805603027, 2.0885372161865234, 2.088536024093628,
      2.088545799255371, 2.0885298252105713, 2.0885210037231445, 2.088520050048828, 2.088543653488159],
 )
-# SSSource's order of those rows (by time)
+# SSObservation's order of those rows (by time)
 SINGLE_PHASE_SSS = [1, 0, 8, 7, 2, 6, 4, 3, 9, 5]
 
 # g band of ssObjectId 5492494137040128800: 2 points (no degrees of freedom)
@@ -86,7 +86,7 @@ def _orders(n, seed=0, k=6):
     (SINGLE_PHASE, SINGLE_PHASE_SSS), (TWO_POINTS, [1, 0]), (FLAT, [1, 0])])
 def test_regression_cases_were_order_sensitive(monkeypatch, case, order):
     """Without the canonical order (the inputs taken as given), these fits
-    differ between the dia_sources and SSSource orders; with it, they
+    differ between the dia_sources and SSObservation orders; with it, they
     don't."""
     n = len(case[0])
     monkeypatch.setattr(photfit, "_canonical_order", lambda *a: np.arange(len(a[0])))

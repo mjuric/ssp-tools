@@ -1,4 +1,4 @@
-"""The widened SSSource (docs/design/sssource-widened.md): build_sssource on
+"""The SSObservation (docs/design/sssource-widened.md): build_ssobservation on
 small synthetic inputs (with a stand-in for ASSIST and the observatory
 state, so no network nor ephemeris files), and the writer's casts and
 checks."""
@@ -12,13 +12,14 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
-from ssp import sssource
-from ssp.sssource import (
-    EPHEMERIS_COLUMNS, MEASUREMENT_COLUMNS, along_cross_track, build_sssource, cast_column, sort_indices,
-    sssource_schema, sssource_table,
+from ssp import ssobservation
+from ssp.ssobservation import (
+    EPHEMERIS_COLUMNS, MEASUREMENT_COLUMNS, along_cross_track, build_ssobservation, cast_column, sort_indices,
+    ssobservation_schema, ssobservation_table,
 )
-from ssp.sssource_contract import (
-    ID_SPLIT, MATCH_METHODS, SSSOURCE_DICTIONARY, SSSOURCE_NONNULL, SSSourceDtype,
+from ssp.ssobservation_contract import (
+    ID_SPLIT, MATCH_METHODS, SIDECAR_FILE, SIDECAR_KEY, SSOBSERVATION_DICTIONARY,
+    SSOBSERVATION_INTERNAL_DEFAULT, SSOBSERVATION_NONNULL, SSObservationDtype,
 )
 
 # --------------------------------------------------------------------------
@@ -56,7 +57,7 @@ ROWS = [
 def _measurement(name, n, rng, measured_on):
     """A block-4 column as extract-submitted-sources writes it (the view's
     widened types: double, int64/int32, bool, string)."""
-    dt = SSSourceDtype[name]
+    dt = SSObservationDtype[name]
     if name == "band":
         return pa.array(rng.choice(list("gri"), n))
     if name == "reliabilityVersion":
@@ -67,7 +68,7 @@ def _measurement(name, n, rng, measured_on):
         v = rng.integers(0, 1000, n)
         if name == "visit":
             v = v + 2025_0601_00000
-        mask = None if name in SSSOURCE_NONNULL else (np.arange(n) % 4 == 1)
+        mask = None if name in SSOBSERVATION_NONNULL else (np.arange(n) % 4 == 1)
         return pa.array(v, type=pa.int32() if name == "detector" else pa.int64(), mask=mask)
     v = rng.normal(100, 30, n)
     if name in ("psfFlux", "psfFluxErr"):
@@ -79,7 +80,7 @@ def _measurement(name, n, rng, measured_on):
     mask = np.arange(n) % 5 == 2
     if name.startswith("ap0") or name.startswith("ap25"):
         mask = measured_on == "difference"
-    return pa.array(v, mask=None if name in SSSOURCE_NONNULL else mask)
+    return pa.array(v, mask=None if name in SSOBSERVATION_NONNULL else mask)
 
 
 #: Block-4 float columns with NaN values (at NAN_ROWS; their NULLs are at
@@ -141,9 +142,10 @@ def make_inputs(path, seed=0, match_method=False, shutter=True, **overrides):
         dia["midpointMjdTaiVisit"] = pa.array(t)
         dia["midpointMjdTai"] = pa.array(t + dt / 86400)
         dia["obstime_basis"] = pa.array(rng.choice(["visit", "corrected", "both"], n))
+        dia["midpointMjdTai_flag_degraded"] = pa.array(~flag & (rng.random(n) < 0.3))
     else:
-        for c in sssource.SHUTTER_FLAGS:
-            del dia[c]
+        for c in ssobservation.SHUTTER_FLAGS:
+            dia.pop(c, None)
     dia.update(overrides)
     pq.write_table(pa.table(dia), path / "dia_sources.parquet")
 
@@ -208,7 +210,7 @@ NO_COV = "2024 BB2"
 
 
 class _FakeEllipse:
-    """A stand-in for ssp.sssource_ellipse: a covariance for every
+    """A stand-in for ssp.ssobservation_ellipse: a covariance for every
     requested designation but NO_COV."""
 
     loaded = None
@@ -225,16 +227,28 @@ class _FakeEllipse:
 @pytest.fixture
 def offline(monkeypatch):
     # (inherited by forked workers)
-    monkeypatch.setattr(sssource, "compute_ephemerides_one", _fake_ephemerides)
-    monkeypatch.setattr(sssource, "open_ephem", lambda: None)
-    monkeypatch.setattr(sssource.util, "observatory_barycentric_posvel", _fake_observatory)
-    monkeypatch.setattr(sssource, "_ellipse", _FakeEllipse())
+    monkeypatch.setattr(ssobservation, "compute_ephemerides_one", _fake_ephemerides)
+    monkeypatch.setattr(ssobservation, "open_ephem", lambda: None)
+    monkeypatch.setattr(ssobservation.util, "observatory_barycentric_posvel", _fake_observatory)
+    monkeypatch.setattr(ssobservation, "_ellipse", _FakeEllipse())
+
+
+def read_output(path):
+    """ssobservation.parquet in ``path`` with the sidecar's internal columns
+    appended (the sidecar has the same obsid sequence)."""
+    t = pq.read_table(path / "ssobservation.parquet")
+    side = pq.read_table(path / SIDECAR_FILE)
+    assert side.column_names == [SIDECAR_KEY, *SSOBSERVATION_INTERNAL_DEFAULT]
+    assert side[SIDECAR_KEY].equals(t[SIDECAR_KEY])
+    for c in SSOBSERVATION_INTERNAL_DEFAULT:
+        t = t.append_column(c, side[c])
+    return t
 
 
 def _build(tmp_path, workers=1, **kw):
     dia, obs_sbn = make_inputs(tmp_path, **kw)
-    build_sssource(tmp_path, tmp_path, workers=workers)
-    return pq.read_table(tmp_path / "sssource.parquet"), dia, obs_sbn
+    build_ssobservation(tmp_path, tmp_path, workers=workers)
+    return read_output(tmp_path), dia, obs_sbn
 
 
 def _same(a, b):
@@ -253,26 +267,26 @@ def _by_obsid(table, obsid):
 
 
 # --------------------------------------------------------------------------
-# build_sssource
+# build_ssobservation
 # --------------------------------------------------------------------------
 
 def test_conformance(tmp_path, offline):
     sss, dia, _ = _build(tmp_path)
-    schema = pq.read_schema(tmp_path / "sssource.parquet")
-    assert schema.names == list(SSSourceDtype.names)
-    assert schema.equals(sssource_schema())
+    schema = pq.read_schema(tmp_path / "ssobservation.parquet")
+    assert schema.names == list(SSObservationDtype.names)
+    assert schema.equals(ssobservation_schema())
     for f in schema:
-        assert f.nullable == (f.name not in SSSOURCE_NONNULL), f.name
-        assert pa.types.is_dictionary(f.type) == (f.name in SSSOURCE_DICTIONARY
-                                                  and SSSourceDtype[f.name].kind == "U"), f.name
-        if SSSourceDtype[f.name].kind == "U":
+        assert f.nullable == (f.name not in SSOBSERVATION_NONNULL), f.name
+        assert pa.types.is_dictionary(f.type) == (f.name in SSOBSERVATION_DICTIONARY
+                                                  and SSObservationDtype[f.name].kind == "U"), f.name
+        if SSObservationDtype[f.name].kind == "U":
             vt = f.type.value_type if pa.types.is_dictionary(f.type) else f.type
             assert vt == pa.string(), f.name
         else:
-            assert f.type == pa.from_numpy_dtype(SSSourceDtype[f.name]), f.name
-    for c in SSSOURCE_NONNULL:
+            assert f.type == pa.from_numpy_dtype(SSObservationDtype[f.name]), f.name
+    for c in SSOBSERVATION_NONNULL:
         assert sss[c].null_count == 0, c
-    md = pq.ParquetFile(tmp_path / "sssource.parquet").metadata
+    md = pq.ParquetFile(tmp_path / "ssobservation.parquet").metadata
     assert md.row_group(0).column(0).compression == "ZSTD"
     # one row per dia_sources row, obsid unique
     assert sss.num_rows == dia.num_rows == len(ROWS)
@@ -313,15 +327,15 @@ def test_identification(tmp_path, offline):
             expect = int(np.frombuffer(packed[obj].rjust(8).encode(), dtype="<u8")[0])
             assert r["ssObjectId"] == expect and r["designation"] == OBJECTS[obj][0]
     # no orbit: NULL orbit-derived columns, but the measured ones are filled
-    # (SSSource no longer has diaDistanceRank; it is on NearbySSO)
+    # (SSObservation no longer has diaDistanceRank; it is on NearbySSO)
     assert "diaDistanceRank" not in sss.column_names
     for c in EPHEMERIS_COLUMNS:
         col = s[c].to_pylist()
         for ob, v in zip(dia["obsid"].to_pylist(), col):
-            if rows[ob][0] in (None, "C") and c not in sssource.MEASURED_EPH_COLUMNS:
+            if rows[ob][0] in (None, "C") and c not in ssobservation.MEASURED_EPH_COLUMNS:
                 assert v is None, (c, ob)
-            if c in sssource.MEASURED_EPH_COLUMNS or rows[ob][0] not in (None, "C"):
-                if c in sssource.ELLIPSE_COLUMNS and OBJECTS[rows[ob][0]][0] == NO_COV:
+            if c in ssobservation.MEASURED_EPH_COLUMNS or rows[ob][0] not in (None, "C"):
+                if c in ssobservation.ELLIPSE_COLUMNS and OBJECTS[rows[ob][0]][0] == NO_COV:
                     assert v is None, (c, ob)     # (no usable covariance)
                 else:
                     assert v is not None, (c, ob)
@@ -330,7 +344,7 @@ def test_identification(tmp_path, offline):
 
 
 # --------------------------------------------------------------------------
-# Along/cross-track offsets (ssp.sssource_contract, block 6)
+# Along/cross-track offsets (ssp.ssobservation_contract, block 6)
 # --------------------------------------------------------------------------
 
 #: pipe_tasks' worked example, 2003 YF26 (tests/test_ssoAssociation.py,
@@ -394,7 +408,7 @@ def test_along_cross_track_null():
     assert a[4] == pytest.approx(0.1) and c[4] == pytest.approx(0.05)
 
 
-def test_along_cross_track_in_sssource(tmp_path, offline):
+def test_along_cross_track_in_ssobservation(tmp_path, offline):
     sss, _, _ = _build(tmp_path)
     for c in ("ephOffsetAlongTrack", "ephOffsetCrossTrack"):
         assert sss.schema.field(c).type == pa.float32()
@@ -411,7 +425,7 @@ def test_along_cross_track_in_sssource(tmp_path, offline):
     np.testing.assert_allclose(along**2 + cross**2, off2, rtol=1e-12)
 
 
-def test_tail_angles_in_sssource(tmp_path, offline):
+def test_tail_angles_in_ssobservation(tmp_path, offline):
     """ephAntiSunPA/ephAntiMotionPA: float32, NULL exactly without an orbit,
     in [0, 360), from the published helio_*/topo_* vectors (here to their
     float32 precision)."""
@@ -439,7 +453,7 @@ def test_along_cross_track_zero_rate(tmp_path, offline, monkeypatch):
         e = _fake_ephemerides(*args, **kw)
         e.mu_lon, e.mu_lat, e.mu_total = (np.zeros_like(e.mu_lon) for _ in range(3))
         return e
-    monkeypatch.setattr(sssource, "compute_ephemerides_one", still)
+    monkeypatch.setattr(ssobservation, "compute_ephemerides_one", still)
     sss, _, _ = _build(tmp_path)
     has = sss["ephRa"].is_valid()
     assert pc.any(has).as_py()
@@ -477,7 +491,7 @@ def test_match_method_passthrough_is_checked(tmp_path, offline):
     mm[0] = "telepathy"
     make_inputs(tmp_path, match_method=True, matchMethod=pa.array(mm))
     with pytest.raises(ValueError, match="telepathy"):
-        build_sssource(tmp_path, tmp_path)
+        build_ssobservation(tmp_path, tmp_path)
 
 
 def test_match_method_passthrough_wins(tmp_path, offline):
@@ -485,20 +499,20 @@ def test_match_method_passthrough_wins(tmp_path, offline):
     dia, _ = make_inputs(tmp_path, match_method=True)
     mm = ["position"] * dia.num_rows
     make_inputs(tmp_path, match_method=True, matchMethod=pa.array(mm))
-    build_sssource(tmp_path, tmp_path)
-    assert set(pq.read_table(tmp_path / "sssource.parquet")["matchMethod"].to_pylist()) == {"position"}
+    build_ssobservation(tmp_path, tmp_path)
+    assert set(read_output(tmp_path)["matchMethod"].to_pylist()) == {"position"}
 
 
 def test_copied_columns(tmp_path, offline):
     sss, dia, _ = _build(tmp_path)
     s = _by_obsid(sss, dia["obsid"])
-    for c in MEASUREMENT_COLUMNS + sssource.LINK_COLUMNS + sssource.MEASURED_ON_COLUMNS:
+    for c in MEASUREMENT_COLUMNS + ssobservation.LINK_COLUMNS + ssobservation.MEASURED_ON_COLUMNS:
         got = s[c].combine_chunks()
         if pa.types.is_dictionary(got.type):
             got = got.cast(pa.string())
         assert _same(got, pc.cast(dia[c], got.type, safe=False).combine_chunks()), c
-    # what isn't in SSSourceDtype is dropped
-    for c in sssource.DIA_DROPPED:
+    # what isn't in SSObservationDtype is dropped
+    for c in ssobservation.DIA_DROPPED:
         assert c not in sss.column_names
 
 
@@ -530,7 +544,7 @@ def test_non_null_failure(tmp_path, offline):
     ra[3] = None
     make_inputs(tmp_path, psfFluxErr=pa.array(ra))
     with pytest.raises(ValueError, match="'psfFluxErr' is non-null"):
-        build_sssource(tmp_path, tmp_path)
+        build_ssobservation(tmp_path, tmp_path)
 
 
 def test_overflow_failure(tmp_path, offline):
@@ -538,21 +552,21 @@ def test_overflow_failure(tmp_path, offline):
     det[5] = 40_000                                 # detector is a short
     make_inputs(tmp_path, detector=pa.array(det))
     with pytest.raises(ValueError, match="'detector'"):
-        build_sssource(tmp_path, tmp_path)
+        build_ssobservation(tmp_path, tmp_path)
 
 
 def test_duplicate_obs_sbn_obsid_fails(tmp_path, offline):
     _, obs_sbn = make_inputs(tmp_path)
     pq.write_table(pa.concat_tables([obs_sbn, obs_sbn.slice(3, 1)]), tmp_path / "obs_sbn.parquet")
     with pytest.raises(ValueError, match="obs_sbn.parquet: obsid is not unique"):
-        build_sssource(tmp_path, tmp_path)
+        build_ssobservation(tmp_path, tmp_path)
 
 
 def test_duplicate_dia_obsid_fails(tmp_path, offline):
     dia, _ = make_inputs(tmp_path)
     pq.write_table(pa.concat_tables([dia, dia.slice(3, 1)]), tmp_path / "dia_sources.parquet")
     with pytest.raises(ValueError, match="dia_sources.parquet: obsid is not unique"):
-        build_sssource(tmp_path, tmp_path)
+        build_ssobservation(tmp_path, tmp_path)
 
 
 def test_orphan_dia_sources_row_fails(tmp_path, offline):
@@ -561,7 +575,7 @@ def test_orphan_dia_sources_row_fails(tmp_path, offline):
     keep = pc.not_equal(obs_sbn["obsid"], orphan)
     pq.write_table(obs_sbn.filter(keep), tmp_path / "obs_sbn.parquet")
     with pytest.raises(ValueError, match="1 dia_sources.parquet rows have no obs_sbn row"):
-        build_sssource(tmp_path, tmp_path)
+        build_ssobservation(tmp_path, tmp_path)
 
 
 def test_designated_status_i_fails(tmp_path, offline):
@@ -572,14 +586,14 @@ def test_designated_status_i_fails(tmp_path, offline):
     obs_sbn = obs_sbn.set_column(obs_sbn.schema.get_field_index("status"), "status", pa.array(status))
     pq.write_table(obs_sbn, tmp_path / "obs_sbn.parquet")
     with pytest.raises(ValueError, match="status 'I' rows have a provid or permid"):
-        build_sssource(tmp_path, tmp_path)
+        build_ssobservation(tmp_path, tmp_path)
 
 
 def test_requires_extractor_output(tmp_path, offline):
     dia, _ = make_inputs(tmp_path)
     pq.write_table(dia.drop_columns(["measuredOn"]), tmp_path / "dia_sources.parquet")
     with pytest.raises(ValueError, match="measuredOn"):
-        build_sssource(tmp_path, tmp_path)
+        build_ssobservation(tmp_path, tmp_path)
 
 
 # --------------------------------------------------------------------------
@@ -626,9 +640,9 @@ def test_cast_strings():
     assert cast_column("band", out).equals(out)
 
 
-def test_sssource_table_columns():
+def test_ssobservation_table_columns():
     with pytest.raises(ValueError, match="missing"):
-        sssource_table({"obsid": pa.array(["a"])})
+        ssobservation_table({"obsid": pa.array(["a"])})
 
 
 def test_sort_indices_nulls_last():
@@ -641,10 +655,11 @@ def test_sort_indices_nulls_last():
 def test_derive_match_method():
     match = pa.array(["id", "id", "id", "position", "position", "id"])
     obssubid = pa.array(["LSST-DP2-DS-1", "LSST-DP2-DS-2-A", "LSST-DP2-DS-2-B", "x-A", None, "9"])
-    assert sssource._derive_match_method(match, obssubid).to_pylist() == [
+    assert ssobservation._derive_match_method(match, obssubid).to_pylist() == [
         "obssubid", "obssubid_trail", "obssubid_trail", "position", "position", "obssubid"]
     # (surrounding whitespace doesn't hide the suffix)
-    assert sssource._derive_match_method(pa.array(["id"]), pa.array(["LSST-DP2-DS-2-B "])).to_pylist() == [
+    assert ssobservation._derive_match_method(pa.array(["id"]),
+                                              pa.array(["LSST-DP2-DS-2-B "])).to_pylist() == [
         "obssubid_trail"]
     # an unknown match value gives NULL (which the non-null check then rejects)
-    assert sssource._derive_match_method(pa.array(["huh"]), pa.array(["1"])).to_pylist() == [None]
+    assert ssobservation._derive_match_method(pa.array(["huh"]), pa.array(["1"])).to_pylist() == [None]

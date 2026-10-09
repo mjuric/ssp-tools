@@ -1,6 +1,6 @@
-"""The parallel SSSource ephemerides (workers > 1) are identical to the
+"""The parallel SSObservation ephemerides (workers > 1) are identical to the
 serial ones, bit for bit, and EPH_FIELDS lists exactly the fields
-compute_sssource_entry writes."""
+compute_ssobservation_entry writes."""
 
 import os
 from types import SimpleNamespace
@@ -9,10 +9,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ssp import sssource
-from ssp.sssource import EPH_FIELDS, WORK_DTYPE, compute_ephemerides, compute_sssource_entry
+from ssp import ssobservation
+from ssp.ssobservation import EPH_FIELDS, WORK_DTYPE, compute_ephemerides, compute_ssobservation_entry
 
-# (as build_sssource makes it: the object key and the ephemeris columns)
+# (as build_ssobservation makes it: the object key and the ephemeris columns)
 SSS_DTYPE = WORK_DTYPE
 OBS_DTYPE = [("dia_index", np.int64), ("obs_pos", np.float64, 3), ("obs_vel", np.float64, 3)]
 
@@ -71,8 +71,8 @@ def _tables(n_obj=40, seed=2, epoch=60800.0):
 @pytest.fixture
 def fake_ephem(monkeypatch):
     # (inherited by the forked workers)
-    monkeypatch.setattr(sssource, "compute_ephemerides_one", _fake_ephemerides)
-    monkeypatch.setattr(sssource, "open_ephem", lambda: None)
+    monkeypatch.setattr(ssobservation, "compute_ephemerides_one", _fake_ephemerides)
+    monkeypatch.setattr(ssobservation, "open_ephem", lambda: None)
 
 
 def _run(workers, chunk_factor=8, covs=None, **kw):
@@ -113,15 +113,15 @@ def test_ungrouped_input_fails(fake_ephem):
 def test_worker_exception_fails_the_build(monkeypatch):
     def boom(provID, *args, **kwargs):
         raise RuntimeError(f"ephemeris exploded for {provID}")
-    monkeypatch.setattr(sssource, "compute_ephemerides_one", boom)
-    monkeypatch.setattr(sssource, "open_ephem", lambda: None)
+    monkeypatch.setattr(ssobservation, "compute_ephemerides_one", boom)
+    monkeypatch.setattr(ssobservation, "open_ephem", lambda: None)
     sss, obs_state, dia_eph, mpcorb = _tables(n_obj=10, seed=5)
     with pytest.raises(RuntimeError, match="ephemeris exploded"):
         compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=2)
-    assert sssource._PARALLEL == {}
+    assert ssobservation._PARALLEL == {}
 
 
-def test_eph_fields_are_what_compute_sssource_entry_writes(fake_ephem):
+def test_eph_fields_are_what_compute_ssobservation_entry_writes(fake_ephem):
     sss, obs_state, dia_eph, mpcorb = _tables(n_obj=1, seed=6)
     # fill every field with a sentinel, then see which ones change
     for f in sss.dtype.names:
@@ -130,7 +130,7 @@ def test_eph_fields_are_what_compute_sssource_entry_writes(fake_ephem):
         elif sss.dtype[f].kind in "iu":
             sss[f] = sss[f] if f == "ssObjectId" else 12345
     before = sss.copy()
-    compute_sssource_entry(sss, obs_state, mpcorb, dia_eph, None)
+    compute_ssobservation_entry(sss, obs_state, mpcorb, dia_eph, None)
     changed = [f for f in sss.dtype.names
                if sss.dtype[f].kind != "O" and sss[f].tobytes() != before[f].tobytes()]
     assert sorted(changed) == sorted(EPH_FIELDS)
@@ -144,7 +144,7 @@ def test_tail_angles_from_the_ephresult(fake_ephem):
     from ssp.ephem_assist import tail_position_angles, tail_position_angles_f32
     from astropy.time import Time
     sss, obs_state, dia_eph, mpcorb = _tables(n_obj=1, seed=6)
-    compute_sssource_entry(sss, obs_state, mpcorb, dia_eph, None)
+    compute_ssobservation_entry(sss, obs_state, mpcorb, dia_eph, None)
     row = mpcorb.loc[sss["designation"][0]]
     dia = dia_eph[obs_state["dia_index"]]
     e = _fake_ephemerides(None, Time(dia["midpointMjdTai"], format="mjd", scale="tai"), None, None, row=row,
@@ -156,7 +156,7 @@ def test_tail_angles_from_the_ephresult(fake_ephem):
 
 
 class _FakeEllipse:
-    """A stand-in for ssp.sssource_ellipse: records the inputs it gets
+    """A stand-in for ssp.ssobservation_ellipse: records the inputs it gets
     (serial runs only: forked workers record in their own copy), counts one
     step-cap stop per call, and returns values made from its inputs."""
 
@@ -168,7 +168,7 @@ class _FakeEllipse:
 
     def ephemeris_ellipse(self, orbit, t_assist, obs_pos, topo_pos, ephem):
         self.calls.append(dict(orbit=orbit, t_assist=t_assist, obs_pos=obs_pos, topo_pos=topo_pos))
-        sssource._propagate.STEP_CAP_STOPS += 1
+        ssobservation._propagate.STEP_CAP_STOPS += 1
         rng = np.linalg.norm(topo_pos, axis=1)
         return orbit["k"] * rng, 2 * orbit["k"] * rng, -orbit["k"] * t_assist * 1e-6
 
@@ -176,7 +176,7 @@ class _FakeEllipse:
 @pytest.fixture
 def fake_ellipse(monkeypatch):
     fake = _FakeEllipse()
-    monkeypatch.setattr(sssource, "_ellipse", fake)
+    monkeypatch.setattr(ssobservation, "_ellipse", fake)
     return fake
 
 
@@ -190,8 +190,8 @@ def recorded_ephem(monkeypatch):
         e = _fake_ephemerides(provID, ephTimes, mpcorb, ephem, row=row, obs_pos=obs_pos, obs_vel=obs_vel)
         rec[provID] = dict(obs_pos=np.array(obs_pos), topo_pos=np.array(e.topo_pos))
         return e
-    monkeypatch.setattr(sssource, "compute_ephemerides_one", fake)
-    monkeypatch.setattr(sssource, "open_ephem", lambda: None)
+    monkeypatch.setattr(ssobservation, "compute_ephemerides_one", fake)
+    monkeypatch.setattr(ssobservation, "open_ephem", lambda: None)
     return rec
 
 
@@ -208,7 +208,7 @@ def test_ellipse_columns(fake_ephem, fake_ellipse):
     sss = _run(workers=1, covs=covs)
     has = np.isin(sss["designation"], list(covs))
     assert has.any() and (~has).any()
-    for c in sssource.ELLIPSE_COLUMNS:
+    for c in ssobservation.ELLIPSE_COLUMNS:
         assert np.all(np.isfinite(sss[c][has])) and np.all(np.isnan(sss[c][~has])), c
     # one call per object with a covariance, with its orbit
     assert len(fake_ellipse.calls) == len(set(sss["designation"][has]))
@@ -249,12 +249,12 @@ def test_step_cap_stops_reset_and_summed(fake_ephem, fake_ellipse, workers):
     covs = _covs()
     sss, obs_state, dia_eph, mpcorb = _tables()
     n = len(set(sss["designation"]) & set(covs))        # (one stop per call)
-    sssource._propagate.STEP_CAP_STOPS = 1000           # (stale: must be reset)
+    ssobservation._propagate.STEP_CAP_STOPS = 1000           # (stale: must be reset)
     try:
         stops = compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=workers, chunk_factor=4,
                                     covs=covs)
     finally:
-        sssource._propagate.STEP_CAP_STOPS = 0
+        ssobservation._propagate.STEP_CAP_STOPS = 0
     assert stops == n
 
 
@@ -266,7 +266,7 @@ def test_ellipse_parallel_identical_to_serial(fake_ephem, fake_ellipse):
 def test_no_covariances_no_ellipse_call(fake_ephem, fake_ellipse):
     sss = _run(workers=1, covs=None)
     assert fake_ellipse.calls == []
-    for c in sssource.ELLIPSE_COLUMNS:
+    for c in ssobservation.ELLIPSE_COLUMNS:
         assert np.all(np.isnan(sss[c])), c
 
 

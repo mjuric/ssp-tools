@@ -94,7 +94,7 @@ def test_dynamical_class():
 # --------------------------------------------------------------------------
 
 def _case():
-    """Synthetic SSSource / NearbySSO / DiaSource rows, one per status."""
+    """Synthetic SSObservation / NearbySSO / DiaSource rows, one per status."""
     ra0, dec0 = 150.0, 10.0
     arc = 1 / 3600.0
     # (diaSourceId, designation, dRA", present in nss as, note)
@@ -139,9 +139,9 @@ def _case():
     return nss, sss, dia, lookup, sigma_fn
 
 
-def test_compare_to_sssource_statuses():
+def test_compare_to_ssobservation_statuses():
     nss, sss, dia, lookup, sigma_fn = _case()
-    rows, summ = V.compare_to_sssource(nss, sss, dia, lookup, sigma_fn)
+    rows, summ = V.compare_to_ssobservation(nss, sss, dia, lookup, sigma_fn)
     st = dict(zip(rows["diaSourceId"], rows["status"]))
     assert st == {1: "match", 2: "value_mismatch", 3: "filtered:satellite", 4: "separation",
                   5: "nearer_object", 6: "sigma", 7: "unexplained", 8: "wrong_nearest",
@@ -161,7 +161,7 @@ def test_compare_sigma_only_for_unexplained():
     def sigma_fn(des, t):
         seen.extend(des)
         return np.ones(len(des))
-    V.compare_to_sssource(nss, sss, dia, lookup, sigma_fn)
+    V.compare_to_ssobservation(nss, sss, dia, lookup, sigma_fn)
     assert sorted(seen) == ["F", "G", "H", "I"]
 
 
@@ -172,15 +172,15 @@ def test_compare_nearer_tie_by_designation():
     for other, expect in (("0", "nearer_object"), ("ZZ", "wrong_nearest")):
         n = nss[nss["diaSourceId"] == 5].assign(designation=other, ephOffset=np.float32(3.0))
         lookup[other] = ""
-        rows, _ = V.compare_to_sssource(n, sss, dia, lookup, sigma_fn)
+        rows, _ = V.compare_to_ssobservation(n, sss, dia, lookup, sigma_fn)
         assert rows["status"].iloc[0] == expect
 
 
 def test_mock_injects_detectable_faults():
     nss, sss, dia, lookup, sigma_fn = _case()
-    mock, faults = V.mock_from_sssource(sss, dia, lookup, rng=1, n_drop=1, n_perturb=1)
+    mock, faults = V.mock_from_ssobservation(sss, dia, lookup, rng=1, n_drop=1, n_perturb=1)
     assert set(mock.columns) == set(V.NSS_COLUMNS)
-    rows, summ = V.compare_to_sssource(mock, sss, dia, lookup, lambda d, t: np.ones(len(d)))
+    rows, summ = V.compare_to_ssobservation(mock, sss, dia, lookup, lambda d, t: np.ones(len(d)))
     st = dict(zip(rows["diaSourceId"], rows["status"]))
     for kind, i in faults.itertuples(index=False):
         assert st[i] == ("unexplained" if kind == "drop" else "value_mismatch")
@@ -586,7 +586,7 @@ def _write_case(tmp_path):
 def test_cli_same_orbits(tmp_path):
     _write_case(tmp_path)
     rc = V.main(["same-orbits", "--nearbysso", str(tmp_path / "nss.parquet"),
-                 "--sssource", str(tmp_path / "sss.parquet"), "--dia", str(tmp_path / "dia.parquet"),
+                 "--ssobservation", str(tmp_path / "sss.parquet"), "--dia", str(tmp_path / "dia.parquet"),
                  "--orbits", str(tmp_path / "orbits.parquet"), "--out", str(tmp_path / "r"), "--no-sigma"])
     assert rc == 1
     rows = pd.read_parquet(tmp_path / "r" / "same-orbits.parquet")
@@ -613,7 +613,7 @@ def test_cli_dp2_intersection(tmp_path):
     })
     ident.to_parquet(tmp_path / "ident.parquet")
     rc = V.main(["dp2-intersection", "--nearbysso", str(tmp_path / "nss.parquet"),
-                 "--sssource", str(tmp_path / "dp2.parquet"), "--dia", str(tmp_path / "dia.parquet"),
+                 "--ssobservation", str(tmp_path / "dp2.parquet"), "--dia", str(tmp_path / "dia.parquet"),
                  "--orbits", str(tmp_path / "orbits.parquet"), "--identifications",
                  str(tmp_path / "ident.parquet"), "--out", str(tmp_path / "r")])
     assert rc == 0                                   # reported, never gated
@@ -652,7 +652,7 @@ def test_pluto_is_a_known_exception(tmp_path, monkeypatch):
 
 
 def _sss_table():
-    """The columns _read_sss reads of a widened SSSource: DiaSource and
+    """The columns _read_sss reads of an SSObservation: DiaSource and
     Source rows of several processings, a non-primary repeat, 64-bit ids
     beyond float64's exact range, and NULL diaSourceIds (Source rows)."""
     import pyarrow as pa
@@ -883,7 +883,7 @@ COMET, ROCK = "P/2002 T6", "2020 AB"
 
 
 def _radius_case(offsets):
-    """One SSSource row per (diaSourceId, designation, offset ["]) in
+    """One SSObservation row per (diaSourceId, designation, offset ["]) in
     ``offsets``, each with its own DiaSource; a NearbySSO row for each
     (same ephemeris)."""
     ra0, dec0 = 150.0, 10.0
@@ -908,25 +908,25 @@ def test_radius_of():
 
 
 def test_same_orbits_comet_at_10_accepted():
-    rows, summ = V.compare_to_sssource(*_radius_case([(1, COMET, 10.0)]))
+    rows, summ = V.compare_to_ssobservation(*_radius_case([(1, COMET, 10.0)]))
     assert rows["status"].tolist() == ["match"] and summ["n_fail"] == 0
     assert rows["match_radius"].tolist() == [15.0]
 
 
 def test_same_orbits_comet_missing_at_10_unexplained():
     nss, sss, dia, lookup, sigma_fn = _radius_case([(1, COMET, 10.0), (2, ROCK, 10.0)])
-    rows, summ = V.compare_to_sssource(nss[:0], sss, dia, lookup, sigma_fn)
+    rows, summ = V.compare_to_ssobservation(nss[:0], sss, dia, lookup, sigma_fn)
     st = dict(zip(rows["diaSourceId"], rows["status"]))
     assert st == {1: "unexplained", 2: "separation"}       # the asteroid's 10" is beyond its 5"
     assert summ["n_fail"] == 1
     # with the old single radius, the comet would have been explained away
-    rows, _ = V.compare_to_sssource(nss[:0], sss, dia, lookup, sigma_fn, radius=5.0)
+    rows, _ = V.compare_to_ssobservation(nss[:0], sss, dia, lookup, sigma_fn, radius=5.0)
     assert rows["status"].tolist() == ["separation", "separation"]
 
 
 def test_same_orbits_asteroid_row_at_10_flagged():
     nss, sss, dia, lookup, sigma_fn = _radius_case([(1, ROCK, 10.0), (2, COMET, 10.0)])
-    rows, summ = V.compare_to_sssource(nss, sss, dia, lookup, sigma_fn)
+    rows, summ = V.compare_to_ssobservation(nss, sss, dia, lookup, sigma_fn)
     assert summ["n_nearbysso_beyond_radius"] == 1 and summ["nearbysso_beyond_radius"] == [1]
     assert summ["n_fail"] == 1
     assert V.beyond_radius(nss).tolist() == [True, False]
@@ -934,9 +934,9 @@ def test_same_orbits_asteroid_row_at_10_flagged():
 
 def test_same_orbits_comet_at_20_beyond_radius():
     nss, sss, dia, lookup, sigma_fn = _radius_case([(1, COMET, 20.0)])
-    rows, summ = V.compare_to_sssource(nss[:0], sss, dia, lookup, sigma_fn)
+    rows, summ = V.compare_to_ssobservation(nss[:0], sss, dia, lookup, sigma_fn)
     assert rows["status"].tolist() == ["separation"] and summ["n_fail"] == 0
-    rows, summ = V.compare_to_sssource(nss, sss, dia, lookup, sigma_fn)     # a row would be wrong
+    rows, summ = V.compare_to_ssobservation(nss, sss, dia, lookup, sigma_fn)     # a row would be wrong
     assert summ["n_nearbysso_beyond_radius"] == 1 and summ["n_fail"] == 1
 
 
@@ -944,9 +944,9 @@ def test_same_orbits_nearest_in_arcsec_across_radii():
     """A DiaSource 4" from an asteroid and 10" from a comet stays with the
     asteroid; a comet nearer than the asteroid takes it."""
     nss, sss, dia, lookup, sigma_fn = _radius_case([(1, COMET, 10.0), (1, ROCK, 4.0)])
-    rows, summ = V.compare_to_sssource(nss[nss["designation"] == ROCK], sss, dia, lookup, sigma_fn)
+    rows, summ = V.compare_to_ssobservation(nss[nss["designation"] == ROCK], sss, dia, lookup, sigma_fn)
     assert dict(zip(rows["designation"], rows["status"])) == {COMET: "nearer_object", ROCK: "match"}
-    rows, _ = V.compare_to_sssource(nss[nss["designation"] == COMET], sss, dia, lookup, sigma_fn)
+    rows, _ = V.compare_to_ssobservation(nss[nss["designation"] == COMET], sss, dia, lookup, sigma_fn)
     assert dict(zip(rows["designation"], rows["status"])) == {COMET: "match", ROCK: "wrong_nearest"}
 
 
@@ -1027,14 +1027,14 @@ def test_rank_comet_radius(tmp_path):
 
 def test_mock_keeps_comet_at_10():
     nss, sss, dia, lookup, _ = _radius_case([(1, COMET, 10.0), (2, ROCK, 10.0), (3, COMET, 20.0)])
-    mock, _ = V.mock_from_sssource(sss, dia, lookup)
+    mock, _ = V.mock_from_ssobservation(sss, dia, lookup)
     assert mock["diaSourceId"].tolist() == [1]
 
 
 def test_same_orbits_null_designation():
-    """SSSource rows with a NULL designation (no known object) are
+    """SSObservation rows with a NULL designation (no known object) are
     'filtered:not_in_orbits', also under pandas 3's string dtype."""
     nss, sss, dia, lookup, sigma_fn = _radius_case([(1, ROCK, 1.0), (2, ROCK, 1.0)])
     sss["designation"] = pd.array([ROCK, None], dtype="str")
-    rows, summ = V.compare_to_sssource(nss[:1], sss, dia, lookup, sigma_fn)
+    rows, summ = V.compare_to_ssobservation(nss[:1], sss, dia, lookup, sigma_fn)
     assert rows["status"].tolist() == ["match", "filtered:not_in_orbits"] and summ["n_fail"] == 0

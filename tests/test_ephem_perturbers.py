@@ -86,7 +86,7 @@ def test_detection(ephem, perturbers, ordinary):
 
 
 def test_precise_pass(ephem, perturbers):
-    """compute_ephemerides_one (the SSSource path) is within 0.1" of the
+    """compute_ephemerides_one (the SSObservation path) is within 0.1" of the
     ephemeris body; it used to be 16-152 deg off (the particle was slung
     off its own point mass). Pluto's is the ephemeris itself: DE440's body
     10 is the Pluto-system barycentre, which is what MPC's 1930 BM orbit

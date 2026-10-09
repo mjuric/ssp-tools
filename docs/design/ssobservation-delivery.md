@@ -55,7 +55,7 @@ On the 2026-10-01 build (8,070,610 rows, 63,868 with NULL `ssObjectId`, 3.13 GB)
 {
   "table": "SSObservation",
   "format_version": 1,
-  "schema": {"source": "lsst/sdm_schemas tickets/DM-55375", "commit": "<sha>"},
+  "schema": {"source": "lsst/sdm_schemas tickets/DM-55375", "file": "sso_base.yaml", "md5": "..."},
   "ssp_tools_commit": "<sha>",
   "created_utc": "2026-10-08T12:00:00Z",
   "partition_key": "ssObjectId",
@@ -99,6 +99,8 @@ Behaviour is unchanged: the full suite passes, and a rebuild from the same input
 
 ### A1. Internal columns and the sidecar (WP)
 
+*Amended 2026-10-08, during A0:* dropping the two columns from the schema made 38 tests fail, since they check the columns' values. Rather than leave the suite red until W1, A0 writes the sidecar itself (the default columns, a single file next to `ssobservation.parquet`, carried into the delivery by `ssp-build-sso`). The bench reads the internal columns from the sidecar next to the file it checks. W1 keeps the rest: the configurable set and its checks.
+
 - The contract gets `SSOBSERVATION_INTERNAL_DEFAULT = ("matchMethod", "midpointMjdTai_flag_degraded")` and the internal columns' types (from today's schema), plus a rule: an internal column must be one the builder computes; the delivered table is the Felis table, the sidecar is `obsid` + the internal set.
 - Configurable through `ssp-build-ssobservation --internal-columns` and the matching `ssp-build-sso`/`ssp-sso-daily` option (and its config). A column moved back from internal requires it to be in Felis again: the build refuses a configuration where a column is in neither, or in both.
 - `SSOBSERVATION_NONNULL` loses the two columns; the sidecar keeps their non-null rule.
@@ -131,7 +133,7 @@ An end-to-end daily run, with every check, writing a partitioned delivery under 
 | Wave | Work | Who |
 |---|---|---|
 | 0 | This design; owner approval | integrator |
-| 1 | **A0** the rename: schema (#549, copies, generated dtypes), code, tests, bench, docs; contract additions for A1/A2 (internal set, manifest fields, part naming) | integrator |
+| 1 | **A0** the rename: schema (#549, copies, generated dtypes), code, tests, bench, docs; contract additions for A1/A2 (internal set, manifest fields, part naming); the sidecar with the default internal columns | integrator |
 | 2 | Three WPs in parallel, each in its own worktree and its own files, all working from the contract's manifest and internal-column rules: **W1** the builder (`ssp/ssobservation.py`): internal columns, sidecar, partitioned writer, manifest (A1 + A2's writing); **W2** the delivery check (`ssp/delivery_check.py`) and the bench, written as a black box from this design and the contract; **W3** the readers (SSObject, NearbySSO), `ssp-build-sso`/`ssp-sso-daily` options and `ssp-upload-sso` (dry run) | WP agents |
 | 3 | Independent review of A1/A2 (the black-box comparison with master above) | review agent |
 | 4 | **A3** docs and RFC drafts; **A4** end-to-end run and delivery; results recorded here | integrator |

@@ -1,41 +1,42 @@
-"""Validation harness for the widened SSSource table (WP4 of
+"""Validation harness for SSObservation table (WP4 of
 docs/design/sssource-widened.md, "Validation").
 
-Black-box checks of ``sssource.parquet``, written from the design, the
-contract (``ssp/sssource_contract.py``) and ``sso_base.yaml`` only. The YAML
-is read directly (not through ``ssp/schema_ppdb.py``), and none of the
-writer's code (``ssp.sssource``, ``ssp.sssource_ellipse``) is used.
+Black-box checks of ``ssobservation.parquet``, written from the design, the
+contract (``ssp/ssobservation_contract.py``) and ``sso_base.yaml`` only. The
+YAML is read directly (not through ``ssp/schema_ppdb.py``), and none of the
+writer's code (``ssp.ssobservation``, ``ssp.ssobservation_ellipse``) is used.
 
 Subcommands (each prints a text report, optionally also to ``--out FILE``)::
 
-  conformance SSSOURCE [--schema sso_base.yaml]
+  conformance SSOBSERVATION [--schema sso_base.yaml]
       names, order, Felis -> Arrow types, char lengths, NULLs, obsid
       uniqueness, sort order, matchMethod/measuredOn values, the id split,
       the ssObjectId NULL rule, the ellipse NULL rule, one primary row per
       measurement, zstd + dictionary encoding
-  copied SSSOURCE DIA_SOURCES
+  copied SSOBSERVATION DIA_SOURCES
       blocks 1 (the copied part), 3 and 4 against dia_sources.parquet, on obsid
-  clickhouse SSSOURCE [--n 10000]
+  clickhouse SSOBSERVATION [--n 10000]
       a sample stratified by processing, re-fetched from ssp.SubmittableSources
       by (processing, id); blocks 3 and 4 compared
-  offsets SSSOURCE
+  offsets SSOBSERVATION
       ephOffsetAlongTrack/CrossTrack recomputed from ephOffsetRa/Dec and
       ephRateRa/Dec by the contract's formula (also run by conformance)
-  regression NEW_SSSOURCE REF_SSSOURCE
-      the ephemeris/geometry columns bitwise equal to today's SSSource
+  regression NEW_SSOBSERVATION REF_SSOBSERVATION
+      the ephemeris/geometry columns bitwise equal to today's SSObservation
       (except the computed ellipse and along/cross-track columns)
-  ssobject-permutation SSSOURCE [DIA] MPCORB [--max-objects N]
-      ssp-build-ssobject, run as a black box on copies of SSSource with
+  ssobject-permutation SSOBSERVATION [DIA] MPCORB [--max-objects N]
+      ssp-build-ssobject, run as a black box on copies of SSObservation with
       the rows of each object permuted, must write byte-identical SSObject
-      files. SSObject reads its photometry from SSSource; DIA (passed on to
-      the builder, which ignores it) is needed only for --permute-dia
-  ellipse SSSOURCE NEARBYSSO --orbits-a A --orbits-b B
+      files. SSObject reads its photometry from SSObservation; DIA (passed on
+      to the builder, which ignores it) is needed only for --permute-dia
+  ellipse SSOBSERVATION NEARBYSSO --orbits-a A --orbits-b B
       the error ellipse against NearbySSO's, for rows in both whose orbit is
       identical in the two mpc_orbits snapshots
-  counts SSSOURCE OBS_SBN [--dia-sources DIA]
+  counts SSOBSERVATION OBS_SBN [--dia-sources DIA]
       rows against obs_sbn X05, status, and the I / #7 / non-primary counts
-  mock REF_SSSOURCE DIA_SOURCES OBS_SBN OUT [--nearbysso N] [--fault F ...]
-      (development) a widened SSSource faked from today's SSSource and
+  mock REF_SSOBSERVATION DIA_SOURCES OBS_SBN OUT [--nearbysso N]
+       [--fault F ...]
+      (development) an SSObservation faked from sdm_schemas main's SSSource and
       dia_sources.parquet, optionally with injected faults
 
 Comparison rules (copied, clickhouse):
@@ -70,12 +71,14 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from ssp.sssource_contract import (  # noqa: E402
+from ssp.ssobservation_contract import (  # noqa: E402
     ELLIPSE_COLUMNS,
     ID_SPLIT,
     MATCH_METHODS,
-    SSSOURCE_DICTIONARY,
-    SSSOURCE_SORT,
+    SIDECAR_FILE,
+    SIDECAR_KEY,
+    SSOBSERVATION_DICTIONARY,
+    SSOBSERVATION_SORT,
     VIEW_DROPPED,
 )
 
@@ -97,10 +100,10 @@ FELIS_ARROW = {
 }
 FELIS_STRING = ("char", "string", "unicode", "text")
 
-#: Columns in the reference (today's SSSource) that must be bitwise equal:
+#: Columns in the reference (today's SSObservation) that must be bitwise equal:
 #: everything ephemeris and geometry except the ellipse and the along/cross-
 #: track offsets, which are new computations. (diaDistanceRank is no longer
-#: in SSSource; it moved to NearbySSO.)
+#: in SSObservation; it moved to NearbySSO.)
 REGRESSION_PREFIXES = ("ecl", "gal", "topo", "helio", "eph")
 REGRESSION_EXACT = ("elongation", "phaseAngle")
 
@@ -202,7 +205,7 @@ def _py(x):
 # The schema, straight from the YAML
 # --------------------------------------------------------------------------
 
-def schema_columns(path=DEFAULT_SCHEMA, table="SSSource"):
+def schema_columns(path=DEFAULT_SCHEMA, table="SSObservation"):
     """The YAML's column dicts for ``table``, in order."""
     with open(path) as f:
         doc = yaml.safe_load(f)
@@ -267,7 +270,7 @@ def to_np(col):
 
 
 def compare(actual, expected):
-    """Boolean mismatch mask of ``actual`` (the SSSource column) against
+    """Boolean mismatch mask of ``actual`` (the SSObservation column) against
     ``expected`` (its source). Floats narrowed to a smaller width are
     compared after casting ``expected`` to it; floats treat NULL == NaN;
     everything else compares values and NULL masks exactly."""
@@ -314,6 +317,29 @@ def bitwise_mismatch(actual, expected):
     return compare(actual, expected), 0
 
 
+def sidecar_of(path):
+    """The sidecar of internal columns next to SSObservation file ``path``
+    (ssp.ssobservation_contract.SIDECAR_FILE), or None if there is none."""
+    p = os.path.join(os.path.dirname(os.path.abspath(path)), SIDECAR_FILE)
+    return p if os.path.exists(p) else None
+
+
+def with_sidecar(t, path):
+    """``t`` (read from ``path``, all its rows in order) with the sidecar's
+    columns that ``t`` lacks appended; the sidecar must have the same obsid
+    sequence."""
+    side = sidecar_of(path)
+    if side is None:
+        return t
+    st = pq.read_table(side)
+    if "obsid" in t.column_names and not st[SIDECAR_KEY].equals(t["obsid"]):
+        raise ValueError(f"{side}: obsid differs from {path}'s")
+    for c in st.column_names:
+        if c != SIDECAR_KEY and c not in t.column_names:
+            t = t.append_column(c, st[c])
+    return t
+
+
 def _read(path, columns):
     """Read those of ``columns`` that ``path`` has."""
     have = set(pq.read_schema(path).names)
@@ -334,14 +360,14 @@ def _obsid_index(ref_obsid, query_obsid):
 # --------------------------------------------------------------------------
 
 def check_conformance(path, schema=DEFAULT_SCHEMA, rep=None):
-    rep = rep or Report(f"SSSource conformance: {path}")
+    rep = rep or Report(f"SSObservation conformance: {path}")
     cols = schema_columns(schema)
     names = [c["name"] for c in cols]
     spec = {c["name"]: c for c in cols}
     pf = pq.ParquetFile(path)
     arrow = pf.schema_arrow
     n = pf.metadata.num_rows
-    rep.info(f"schema: {schema} ({len(names)} SSSource columns); file: {n:,} rows, {len(arrow)} columns")
+    rep.info(f"schema: {schema} ({len(names)} SSObservation columns); file: {n:,} rows, {len(arrow)} columns")
 
     # names and order
     got = arrow.names
@@ -387,7 +413,10 @@ def check_conformance(path, schema=DEFAULT_SCHEMA, rep=None):
     need = ["obsid", "ssObjectId", "midpointMjdTai", "matchMethod", "measuredOn", "processing",
             "designation", "status", "primary", *ID_COLUMNS, *ELLIPSE_COLUMNS,
             *[c for c in names if c.startswith("eph")]]
-    t = pf.read(columns=[c for c in dict.fromkeys(need) if c in got])
+    t = with_sidecar(pf.read(columns=[c for c in dict.fromkeys(need) if c in got or c == "obsid"]), path)
+    if "matchMethod" not in t.column_names:
+        rep.info("matchMethod is in neither the table nor a sidecar: not checked")
+        need.remove("matchMethod")
 
     def has(*cs):
         miss = [c for c in cs if c not in t.column_names]
@@ -405,11 +434,11 @@ def check_conformance(path, schema=DEFAULT_SCHEMA, rep=None):
             f", e.g. {sorted(set(obsid[dup]))[:5]}" if nd != n else ""))
 
     # sort order
-    if has(*SSSOURCE_SORT):
+    if has(*SSOBSERVATION_SORT):
         check_sort(t, rep)
 
     # categorical values
-    if has("matchMethod"):
+    if "matchMethod" in need and has("matchMethod"):
         v, valid, _ = to_np(t["matchMethod"])
         bad = sorted(set(v[valid]) - set(MATCH_METHODS))
         rep.check("matchMethod values in MATCH_METHODS", not bad,
@@ -439,17 +468,17 @@ def check_conformance(path, schema=DEFAULT_SCHEMA, rep=None):
             cc = g.column(k)
             comp.add(cc.compression)
             name = cc.path_in_schema
-            if name in SSSOURCE_DICTIONARY and not any("DICT" in e for e in cc.encodings):
+            if name in SSOBSERVATION_DICTIONARY and not any("DICT" in e for e in cc.encodings):
                 nodict.add(name)
     rep.check("zstd compression", comp == {"ZSTD"}, ", ".join(sorted(comp)))
-    rep.check("SSSOURCE_DICTIONARY columns dictionary-encoded", not nodict,
-              f"not dictionary-encoded: {sorted(nodict)}" if nodict else ", ".join(SSSOURCE_DICTIONARY))
+    rep.check("SSOBSERVATION_DICTIONARY columns dictionary-encoded", not nodict,
+              f"not dictionary-encoded: {sorted(nodict)}" if nodict else ", ".join(SSOBSERVATION_DICTIONARY))
     return rep
 
 
 def check_sort(t, rep):
-    """Ascending SSSOURCE_SORT, NULL ssObjectId last."""
-    key0, *rest = SSSOURCE_SORT
+    """Ascending SSOBSERVATION_SORT, NULL ssObjectId last."""
+    key0, *rest = SSOBSERVATION_SORT
     sid, valid, _ = to_np(t[key0])
     keys = [np.where(valid, sid, 0), ~valid]          # NULL rows last
     for c in rest:
@@ -460,7 +489,7 @@ def check_sort(t, rep):
             keys.insert(0, to_np(col)[0])
     order = np.lexsort(keys)
     out = np.flatnonzero(order != np.arange(len(order)))
-    detail = f"by {SSSOURCE_SORT}, NULL {key0} last"
+    detail = f"by {SSOBSERVATION_SORT}, NULL {key0} last"
     if len(out):
         i = out[0]
         first = _py(to_np(t["obsid"])[0][i])
@@ -666,7 +695,7 @@ def check_offsets_table(t, rep, eps=TRACK_EPS, sep_gate=TRACK_SEP_GATE_ARCSEC, s
 
 def check_offsets(path, rep=None, **kw):
     """The along/cross-track checks alone (only the columns they need)."""
-    rep = rep or Report(f"SSSource along/cross-track offsets: {path}")
+    rep = rep or Report(f"SSObservation along/cross-track offsets: {path}")
     have = pq.read_schema(path).names
     need = ["obsid", "ephRa", "ephOffset", *TRACK_INPUTS, *TRACK_COLUMNS]
     miss = [c for c in need if c not in have]
@@ -732,7 +761,7 @@ def compare_columns(rep, ss, src, columns, keys, label, src_missing="fail"):
         detail += f"; {len(bad)} columns differ:\n" + "\n".join(bad)
     rep.check(label, not bad, detail)
     if absent:
-        msg = f"absent from SSSource or the source: {absent}"
+        msg = f"absent from SSObservation or the source: {absent}"
         if src_missing == "fail":
             rep.check(f"{label}: source has every column", False, msg)
         else:
@@ -761,33 +790,40 @@ class _Columns:
     def __init__(self, path, rows):
         self.pf, self.rows = pq.ParquetFile(path), pa.array(rows)
         self.column_names = self.pf.schema_arrow.names
+        # (an SSObservation file's internal columns, from its sidecar)
+        side = sidecar_of(path) if os.path.basename(path) != SIDECAR_FILE else None
+        self.side = pq.ParquetFile(side) if side and "obsid" in self.column_names else None
+        if self.side is not None:
+            self.column_names = self.column_names + [c for c in self.side.schema_arrow.names
+                                                     if c not in self.column_names]
 
     def __getitem__(self, c):
-        return self.pf.read(columns=[c])[c].take(self.rows)
+        pf = self.pf if c in self.pf.schema_arrow.names else self.side
+        return pf.read(columns=[c])[c].take(self.rows)
 
 
-def check_copied(sssource, dia_sources, schema=DEFAULT_SCHEMA, rep=None):
-    rep = rep or Report(f"SSSource copied columns: {sssource} vs {dia_sources}")
+def check_copied(ssobservation, dia_sources, schema=DEFAULT_SCHEMA, rep=None):
+    rep = rep or Report(f"SSObservation copied columns: {ssobservation} vs {dia_sources}")
     names = [c["name"] for c in schema_columns(schema)]
     b = blocks(names)
     block3 = [c for c in b[3] if c not in ID_COLUMNS]
 
-    ss_obsid = to_np(pq.read_table(sssource, columns=["obsid"])["obsid"])[0]
+    ss_obsid = to_np(pq.read_table(ssobservation, columns=["obsid"])["obsid"])[0]
     dia_obsid = to_np(pq.read_table(dia_sources, columns=["obsid"])["obsid"])[0]
     idx = _obsid_index(dia_obsid, ss_obsid)
     n_extra = int(np.sum(idx < 0))
     n_unused = len(dia_obsid) - len(np.unique(idx[idx >= 0]))
     rep.check("same obsid set as dia_sources",
               n_extra == 0 and n_unused == 0 and len(ss_obsid) == len(dia_obsid),
-              f"SSSource {len(ss_obsid):,} rows, dia_sources {len(dia_obsid):,}; "
+              f"SSObservation {len(ss_obsid):,} rows, dia_sources {len(dia_obsid):,}; "
               f"{n_extra:,} not in dia_sources, "
-              f"{n_unused:,} dia_sources rows without an SSSource row")
+              f"{n_unused:,} dia_sources rows without an SSObservation row")
     keep = idx >= 0
-    ss = _Columns(sssource, np.flatnonzero(keep))
+    ss = _Columns(ssobservation, np.flatnonzero(keep))
     src = _Columns(dia_sources, idx[keep])
     keys = ss_obsid[keep]
 
-    b1 = [c for c in COPIED_BLOCK1 if c in src.column_names]
+    b1 = [c for c in COPIED_BLOCK1 if c in src.column_names and (c != "matchMethod" or c in ss.column_names)]
     if "matchMethod" not in src.column_names:
         rep.info("dia_sources has no matchMethod (pre-WP1 extractor): not compared")
     compare_columns(rep, ss, src, b1, keys, "block 1 (copied) equal")
@@ -853,14 +889,14 @@ def ch_fetch(keys, host=None, port=CH_PORT, database=CH_DATABASE, user=None, wor
     return pa.concat_tables(parts, promote_options="permissive") if parts else None
 
 
-def check_clickhouse(sssource, n=10_000, seed=1, fetch=ch_fetch, schema=DEFAULT_SCHEMA, rep=None):
-    rep = rep or Report(f"SSSource vs ClickHouse {CH_DATABASE}.{CH_VIEW}: {sssource}")
+def check_clickhouse(ssobservation, n=10_000, seed=1, fetch=ch_fetch, schema=DEFAULT_SCHEMA, rep=None):
+    rep = rep or Report(f"SSObservation vs ClickHouse {CH_DATABASE}.{CH_VIEW}: {ssobservation}")
     if n > CH_MAX_ROWS:
         raise SystemExit(f"--n at most {CH_MAX_ROWS:,} (the server is shared)")
     names = [c["name"] for c in schema_columns(schema)]
     b = blocks(names)
     block3 = [c for c in b[3] if c not in ID_COLUMNS and c != "processing"]
-    ss_all = _read(sssource, ["obsid", "processing", *block3, *b[4], *ID_COLUMNS])
+    ss_all = _read(ssobservation, ["obsid", "processing", *block3, *b[4], *ID_COLUMNS])
     proc_all = to_np(ss_all["processing"])[0]
     rows = stratified_sample(proc_all, n, np.random.default_rng(seed))
     ss = ss_all.take(pa.array(rows))
@@ -904,7 +940,7 @@ def check_clickhouse(sssource, n=10_000, seed=1, fetch=ch_fetch, schema=DEFAULT_
 
 
 # --------------------------------------------------------------------------
-# 4. regression: against today's SSSource
+# 4. regression: against today's SSObservation
 # --------------------------------------------------------------------------
 
 def regression_columns(names):
@@ -913,7 +949,7 @@ def regression_columns(names):
 
 
 def check_regression(new, ref, rep=None):
-    rep = rep or Report(f"SSSource regression: {new} vs {ref}")
+    rep = rep or Report(f"SSObservation regression: {new} vs {ref}")
     ref_names = pq.read_schema(ref).names
     new_names = pq.read_schema(new).names
     cols = regression_columns(ref_names)
@@ -1037,10 +1073,10 @@ def ellipse_metrics(a, b):
     return rel_ra, rel_dec, drho
 
 
-def check_ellipse(sssource, nearbysso, orbits_a, orbits_b, processing="AP-DS", rtol=1e-2, rho_tol=1e-2,
+def check_ellipse(ssobservation, nearbysso, orbits_a, orbits_b, processing="AP-DS", rtol=1e-2, rho_tol=1e-2,
                   rep=None, worst=10):
-    rep = rep or Report(f"SSSource ellipse vs NearbySSO: {sssource} vs {nearbysso}")
-    ss = _read(sssource, ["obsid", "diaSourceId", "designation", "processing", "midpointMjdTai",
+    rep = rep or Report(f"SSObservation ellipse vs NearbySSO: {ssobservation} vs {nearbysso}")
+    ss = _read(ssobservation, ["obsid", "diaSourceId", "designation", "processing", "midpointMjdTai",
                           *ELLIPSE_COLUMNS])
     # filter in Arrow: a nullable int64 column goes to pandas as float64,
     # which loses ids > 2^53
@@ -1050,7 +1086,7 @@ def check_ellipse(sssource, nearbysso, orbits_a, orbits_b, processing="AP-DS", r
         ss = ss[ss["processing"] == processing]
     nss = pq.read_table(nearbysso, columns=["diaSourceId", "designation", *ELLIPSE_COLUMNS])
     nss = nss.filter(pc.is_valid(nss["diaSourceId"])).to_pandas()
-    rep.info(f"SSSource rows with a diaSourceId and designation ({processing or 'all'}): {len(ss):,}; "
+    rep.info(f"SSObservation rows with a diaSourceId and designation ({processing or 'all'}): {len(ss):,}; "
              f"NearbySSO rows: {len(nss):,}")
     j = ss.merge(nss, on=["diaSourceId", "designation"], suffixes=("", "_nss"))
     rep.info(f"present in both (diaSourceId and designation): {len(j):,} rows, "
@@ -1067,9 +1103,9 @@ def check_ellipse(sssource, nearbysso, orbits_a, orbits_b, processing="AP-DS", r
     a = [j[c].to_numpy(dtype=np.float64) for c in ELLIPSE_COLUMNS]
     b = [j[c + "_nss"].to_numpy(dtype=np.float64) for c in ELLIPSE_COLUMNS]
     pa_, pb = np.isfinite(a[0]), np.isfinite(b[0])
-    rep.check("ellipse present in SSSource wherever NearbySSO has one", not np.any(pb & ~pa_),
+    rep.check("ellipse present in SSObservation wherever NearbySSO has one", not np.any(pb & ~pa_),
               f"both {int(np.sum(pa_ & pb)):,}; NearbySSO only {int(np.sum(pb & ~pa_)):,}; "
-              f"SSSource only {int(np.sum(pa_ & ~pb)):,}; neither {int(np.sum(~pa_ & ~pb)):,}")
+              f"SSObservation only {int(np.sum(pa_ & ~pb)):,}; neither {int(np.sum(~pa_ & ~pb)):,}")
     both = pa_ & pb
     if not both.any():
         return rep
@@ -1084,7 +1120,7 @@ def check_ellipse(sssource, nearbysso, orbits_a, orbits_b, processing="AP-DS", r
     jb = j[both].assign(rel_ra=rel_ra, rel_dec=rel_dec, drho=drho, score=score)
     w = jb.sort_values("score", ascending=False).head(worst)
     rep.info("worst cases (diaSourceId, designation, "
-             "SSSource raErr/decErr/cov vs NearbySSO's [deg], metrics):")
+             "SSObservation raErr/decErr/cov vs NearbySSO's [deg], metrics):")
     for r in w.itertuples():
         rep.info(f"  {r.diaSourceId} {r.designation!s:14s} "
                  f"{r.ephRaErr:.4g}/{r.ephDecErr:.4g}/{r.ephRa_ephDec_Cov:.3g} vs "
@@ -1100,18 +1136,18 @@ def check_ellipse(sssource, nearbysso, orbits_a, orbits_b, processing="AP-DS", r
 # 6. counts: against obs_sbn
 # --------------------------------------------------------------------------
 
-def check_counts(sssource, obs_sbn, dia_sources=None, station="X05", rep=None):
-    rep = rep or Report(f"SSSource counts: {sssource} vs {obs_sbn}")
-    ss = _read(sssource, ["obsid", "status", "ssObjectId", "designation", "primary", "processing",
+def check_counts(ssobservation, obs_sbn, dia_sources=None, station="X05", rep=None):
+    rep = rep or Report(f"SSObservation counts: {ssobservation} vs {obs_sbn}")
+    ss = _read(ssobservation, ["obsid", "status", "ssObjectId", "designation", "primary", "processing",
                           "measuredOn", "matchMethod"])
     ob = pq.read_table(obs_sbn, columns=["obsid", "stn", "status"])
     stn = to_np(ob["stn"])[0]
     x05 = ob.filter(pa.array(stn == station))
-    rep.info(f"obs_sbn: {len(ob):,} rows, {len(x05):,} {station}; SSSource: {len(ss):,} rows")
+    rep.info(f"obs_sbn: {len(ob):,} rows, {len(x05):,} {station}; SSObservation: {len(ss):,} rows")
     ss_obsid, x_obsid = to_np(ss["obsid"])[0], to_np(x05["obsid"])[0]
     idx = _obsid_index(x_obsid, ss_obsid)
     n_not_x05 = int(np.sum(idx < 0))
-    rep.check(f"every SSSource row is an obs_sbn {station} row", n_not_x05 == 0,
+    rep.check(f"every SSObservation row is an obs_sbn {station} row", n_not_x05 == 0,
               f"{n_not_x05:,} are not" + (f", e.g. {list(ss_obsid[idx < 0][:3])}" if n_not_x05 else ""))
 
     if dia_sources:
@@ -1126,7 +1162,7 @@ def check_counts(sssource, obs_sbn, dia_sources=None, station="X05", rep=None):
                   f"{len(ss_set - dia_set):,} extra")
     else:
         n_left = len(x_obsid) - len(set(idx[idx >= 0]))
-        rep.info(f"(no --dia-sources) {station} rows without an SSSource row: {n_left:,}")
+        rep.info(f"(no --dia-sources) {station} rows without an SSObservation row: {n_left:,}")
 
     keep = idx >= 0
     st, sv, _ = to_np(ss["status"])
@@ -1159,7 +1195,8 @@ def check_counts(sssource, obs_sbn, dia_sources=None, station="X05", rep=None):
 
 
 # --------------------------------------------------------------------------
-# 7. ssobject-permutation: SSObject must not depend on SSSource's row order
+# 7. ssobject-permutation: SSObject must not depend on SSObservation's
+#    row order
 # --------------------------------------------------------------------------
 
 def default_ssobject_cmd():
@@ -1168,15 +1205,15 @@ def default_ssobject_cmd():
     return [exe] if os.path.exists(exe) else ["ssp-build-ssobject"]
 
 
-def sssource_subset(sssource, max_objects=None, seed=0):
-    """SSSource, or the rows of ``max_objects`` objects drawn at random
+def ssobservation_subset(ssobservation, max_objects=None, seed=0):
+    """SSObservation, or the rows of ``max_objects`` objects drawn at random
     (``seed``) from those with an ssObjectId."""
     if not max_objects:
-        return pq.read_table(sssource)
-    sid = pc.unique(pq.read_table(sssource, columns=["ssObjectId"])["ssObjectId"].drop_null()).to_numpy()
+        return pq.read_table(ssobservation)
+    sid = pc.unique(pq.read_table(ssobservation, columns=["ssObjectId"])["ssObjectId"].drop_null()).to_numpy()
     if max_objects < len(sid):
         sid = np.sort(np.random.default_rng(seed).choice(sid, max_objects, replace=False))
-    return pq.read_table(sssource, filters=[("ssObjectId", "in", sid.tolist())])
+    return pq.read_table(ssobservation, filters=[("ssObjectId", "in", sid.tolist())])
 
 
 def _sha256(path):
@@ -1236,10 +1273,10 @@ def diff_tables(a, b, key="ssObjectId"):
 
 
 def permutation(sid, seed, shuffle_objects=False):
-    """Row order of a permuted SSSource copy: the rows of each object (and
+    """Row order of a permuted SSObservation copy: the rows of each object (and
     the NULL-ssObjectId rows, as one group) shuffled among themselves, the
     groups kept together, in their order in the file (the builder requires
-    SSSource grouped by ssObjectId) or, with ``shuffle_objects``, shuffled
+    SSObservation grouped by ssObjectId) or, with ``shuffle_objects``, shuffled
     too. ``sid``: the ssObjectId column (Arrow)."""
     v, valid, _ = to_np(sid)
     group = pd.factorize(pd.Series(np.where(valid, v, -1)), sort=False)[0]
@@ -1249,21 +1286,22 @@ def permutation(sid, seed, shuffle_objects=False):
     return np.lexsort((rng.random(len(group)), group))
 
 
-def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=None, object_seed=0,
+def check_ssobject_permutation(ssobservation, dia, mpcorb, seeds=(1, 2), max_objects=None, object_seed=0,
                                workdir=None, cmd=None, extra_args=(), include_original=False,
                                shuffle_objects=False, permute_dia=False, rep=None):
     """Run ssp-build-ssobject (a black box, via its CLI) on permuted copies
-    of SSSource (one per seed: see ``permutation``; also the file's own
+    of SSObservation (one per seed: see ``permutation``; also the file's own
     order with ``include_original``) and require byte-identical outputs.
-    ``dia`` (None for none) is passed to the builder between SSSource and
+    ``dia`` (None for none) is passed to the builder between SSObservation and
     the orbits, as its older 3-argument form had it; today's builder
     ignores it. With ``permute_dia``, the DiaSource file is also given a
-    random row order per seed (restricted to the SSSource rows' obsids)."""
+    random row order per seed (restricted to the SSObservation rows'
+    obsids)."""
     import shlex
     import subprocess
     import tempfile
 
-    rep = rep or Report(f"SSObject permutation invariance: {sssource}")
+    rep = rep or Report(f"SSObject permutation invariance: {ssobservation}")
     if permute_dia and dia is None:
         raise ValueError("--permute-dia needs a DiaSource file")
     cmd = shlex.split(cmd) if isinstance(cmd, str) else list(cmd or default_ssobject_cmd())
@@ -1273,9 +1311,9 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
         workdir = tmp.name
     os.makedirs(workdir, exist_ok=True)
     try:
-        t = sssource_subset(sssource, max_objects, object_seed)
+        t = ssobservation_subset(ssobservation, max_objects, object_seed)
         n_obj = len(pc.unique(t["ssObjectId"].drop_null())) if "ssObjectId" in t.column_names else 0
-        rep.info(f"SSSource: {len(t):,} rows, {n_obj:,} objects"
+        rep.info(f"SSObservation: {len(t):,} rows, {n_obj:,} objects"
                  + (f" (a random {max_objects:,}, seed {object_seed})" if max_objects else " (all)"))
         rep.info("permutation: rows within each object" + (", and the objects' order" if shuffle_objects
                                                             else " (objects kept in the file's order)"))
@@ -1286,14 +1324,14 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
                 keep = pc.is_in(dia_t["obsid"], value_set=pc.unique(t["obsid"]))
                 dia_t = dia_t.filter(keep)
             rep.info(f"DiaSource: {len(dia_t):,} rows, permuted per seed")
-        rep.info(f"builder: {shlex.join(cmd)} SSSOURCE {dia + ' ' if dia else ''}{mpcorb} --output OUT "
+        rep.info(f"builder: {shlex.join(cmd)} SSOBSERVATION {dia + ' ' if dia else ''}{mpcorb} --output OUT "
                  f"{shlex.join(extra_args)}")
         runs = [("original", None)] if include_original else []
         runs += [(f"seed {s}", s) for s in seeds]
         outs = []
         for name, s in runs:
             tag = "original" if s is None else f"seed{s}"
-            src = os.path.join(workdir, f"sssource.{tag}.parquet")
+            src = os.path.join(workdir, f"ssobservation.{tag}.parquet")
             out = os.path.join(workdir, f"ssobject.{tag}.parquet")
             perm = np.arange(len(t)) if s is None else permutation(t["ssObjectId"], s, shuffle_objects)
             pq.write_table(t.take(pa.array(perm)), src, compression="zstd")
@@ -1339,7 +1377,7 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
 
 
 # --------------------------------------------------------------------------
-# mock: a widened SSSource faked from today's (development)
+# mock: an SSObservation faked from sdm_schemas main's SSSource (development)
 # --------------------------------------------------------------------------
 
 FAULTS = {
@@ -1389,9 +1427,10 @@ def match_method_from_dia(match, obssubid):
 
 
 def build_mock(ref, dia_sources, obs_sbn, out, nearbysso=None, faults=(), schema=DEFAULT_SCHEMA, seed=2):
-    """Write a widened SSSource made from today's SSSource (blocks 2, 6),
-    dia_sources (blocks 1, 3, 4) and obs_sbn (status), following the design.
-    The ellipse comes from NearbySSO where it has the row, else made up."""
+    """Write an SSObservation made from sdm_schemas main's SSSource
+    (blocks 2, 6), dia_sources (blocks 1, 3, 4) and obs_sbn (status),
+    following the design. The ellipse comes from NearbySSO where it has the
+    row, else made up."""
     cols = schema_columns(schema)
     names = [c["name"] for c in cols]
     b = blocks(names)
@@ -1460,7 +1499,7 @@ def build_mock(ref, dia_sources, obs_sbn, out, nearbysso=None, faults=(), schema
 
     fields, arrays = [], []
     for c in cols:
-        typ = felis_arrow_type(c["datatype"], c["name"] in SSSOURCE_DICTIONARY)
+        typ = felis_arrow_type(c["datatype"], c["name"] in SSOBSERVATION_DICTIONARY)
         if "type" in faults and c["name"] == "detector":
             typ = pa.int32()
         arr = _flat(data[c["name"]])
@@ -1497,7 +1536,7 @@ def _replace(t, name, i, value):
 
 
 def apply_faults(t, faults, from_nss=None):
-    """Inject ``faults`` (names from FAULTS) into a widened SSSource table;
+    """Inject ``faults`` (names from FAULTS) into an SSObservation table;
     ``from_nss`` marks the rows whose ellipse came from NearbySSO."""
     for f in faults:
         if f not in FAULTS:
@@ -1582,8 +1621,8 @@ def apply_faults(t, faults, from_nss=None):
 # --------------------------------------------------------------------------
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="python -m bench.sssource_validate",
-                                 description="Black-box validation of the widened SSSource table.")
+    ap = argparse.ArgumentParser(prog="python -m bench.ssobservation_validate",
+                                 description="Black-box validation of SSObservation table.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add(name, help_):
@@ -1592,14 +1631,14 @@ def main(argv=None):
         return p
 
     p = add("conformance", "schema and content rules, from sso_base.yaml")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("--schema", default=DEFAULT_SCHEMA)
     p = add("copied", "blocks 1/3/4 against dia_sources.parquet")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("dia_sources")
     p.add_argument("--schema", default=DEFAULT_SCHEMA)
     p = add("clickhouse", "a stratified sample re-fetched from ssp.SubmittableSources")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("--n", type=int, default=10_000, help=f"sample size (<= {CH_MAX_ROWS:,})")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--workers", type=int, default=CH_MAX_WORKERS,
@@ -1609,28 +1648,30 @@ def main(argv=None):
     p.add_argument("--user", default=None)
     p.add_argument("--schema", default=DEFAULT_SCHEMA)
     p = add("offsets", "along/cross-track offsets against the contract's formula")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("--eps", type=float, default=TRACK_EPS, help="tolerance in float32 eps x |offset|")
     p.add_argument("--sep-gate", type=float, default=TRACK_SEP_GATE_ARCSEC,
                    help="gate along^2+cross^2 ~ ephOffset^2 on rows with ephOffset <= this [arcsec]")
     p.add_argument("--sep-rtol", type=float, default=TRACK_SEP_RTOL)
-    p = add("regression", "ephemeris/geometry bitwise equal to today's SSSource")
+    p = add("regression", "ephemeris/geometry bitwise equal to today's SSObservation")
     p.add_argument("new")
     p.add_argument("ref")
     p = add("ellipse", "the error ellipse against NearbySSO")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("nearbysso")
-    p.add_argument("--orbits-a", required=True, help="mpc_orbits the SSSource was built from")
+    p.add_argument("--orbits-a", required=True, help="mpc_orbits the SSObservation was built from")
     p.add_argument("--orbits-b", required=True, help="mpc_orbits the NearbySSO was built from")
-    p.add_argument("--processing", default="AP-DS", help="SSSource processing to compare ('all' for any)")
+    p.add_argument("--processing", default="AP-DS",
+                   help="SSObservation processing to compare ('all' for any)")
     p.add_argument("--rtol", type=float, default=1e-2)
     p.add_argument("--rho-tol", type=float, default=1e-2)
     p = add("counts", "rows and status against obs_sbn")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("obs_sbn")
     p.add_argument("--dia-sources", default=None)
-    p = add("ssobject-permutation", "ssp-build-ssobject on row-permuted SSSource copies: identical output")
-    p.add_argument("sssource")
+    p = add("ssobject-permutation",
+            "ssp-build-ssobject on row-permuted SSObservation copies: identical output")
+    p.add_argument("ssobservation")
     p.add_argument("inputs", nargs="+", metavar="[DIA] MPCORB",
                    help="the MPC orbits; optionally a DiaSource file before them (passed to the builder, "
                         "which ignores it; needed for --permute-dia)")
@@ -1648,7 +1689,7 @@ def main(argv=None):
     p.add_argument("--builder", default=None, help="the builder command (default: ssp-build-ssobject)")
     p.add_argument("--workers", type=int, default=None, help="passed to the builder as --workers")
     p.add_argument("--builder-args", default="", help="more arguments for the builder (one string)")
-    p = sub.add_parser("mock", help="(development) a widened SSSource faked from today's")
+    p = sub.add_parser("mock", help="(development) an SSObservation faked from today's")
     p.add_argument("ref")
     p.add_argument("dia_sources")
     p.add_argument("obs_sbn")
@@ -1659,9 +1700,9 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     if a.cmd == "conformance":
-        rep = check_conformance(a.sssource, a.schema)
+        rep = check_conformance(a.ssobservation, a.schema)
     elif a.cmd == "copied":
-        rep = check_copied(a.sssource, a.dia_sources, a.schema)
+        rep = check_copied(a.ssobservation, a.dia_sources, a.schema)
     elif a.cmd == "clickhouse":
         if not 1 <= a.workers <= CH_MAX_WORKERS:
             ap.error(f"--workers must be 1..{CH_MAX_WORKERS} (the server is shared)")
@@ -1670,23 +1711,24 @@ def main(argv=None):
 
         def fetch(keys):
             return ch_fetch(keys, a.host, a.port, CH_DATABASE, a.user, a.workers)
-        rep = check_clickhouse(a.sssource, a.n, a.seed, fetch, a.schema)
+        rep = check_clickhouse(a.ssobservation, a.n, a.seed, fetch, a.schema)
     elif a.cmd == "offsets":
-        rep = check_offsets(a.sssource, eps=a.eps, sep_gate=a.sep_gate, sep_rtol=a.sep_rtol)
+        rep = check_offsets(a.ssobservation, eps=a.eps, sep_gate=a.sep_gate, sep_rtol=a.sep_rtol)
     elif a.cmd == "regression":
         rep = check_regression(a.new, a.ref)
     elif a.cmd == "ellipse":
-        rep = check_ellipse(a.sssource, a.nearbysso, a.orbits_a, a.orbits_b, a.processing, a.rtol, a.rho_tol)
+        rep = check_ellipse(a.ssobservation, a.nearbysso, a.orbits_a, a.orbits_b, a.processing, a.rtol,
+                            a.rho_tol)
     elif a.cmd == "counts":
-        rep = check_counts(a.sssource, a.obs_sbn, a.dia_sources)
+        rep = check_counts(a.ssobservation, a.obs_sbn, a.dia_sources)
     elif a.cmd == "ssobject-permutation":
         import shlex
         extra = shlex.split(a.builder_args) + (["--workers", str(a.workers)] if a.workers else [])
         seeds = [int(x) for x in a.seeds.split(",") if x.strip()]
         if len(a.inputs) > 2:
-            ap.error("ssobject-permutation: expected SSSOURCE [DIA] MPCORB")
+            ap.error("ssobject-permutation: expected SSOBSERVATION [DIA] MPCORB")
         dia, mpcorb = (a.inputs if len(a.inputs) == 2 else (None, a.inputs[0]))
-        rep = check_ssobject_permutation(a.sssource, dia, mpcorb, seeds, a.max_objects,
+        rep = check_ssobject_permutation(a.ssobservation, dia, mpcorb, seeds, a.max_objects,
                                          a.object_seed, a.workdir, a.builder, extra, a.include_original,
                                          a.shuffle_objects, a.permute_dia)
     elif a.cmd == "mock":

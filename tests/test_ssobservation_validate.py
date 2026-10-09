@@ -1,4 +1,4 @@
-"""The widened-SSSource validation harness (bench/sssource_validate), on
+"""The SSObservation validation harness (bench/ssobservation_validate), on
 small synthetic tables. No network, no fixtures."""
 import os
 import sys
@@ -11,8 +11,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bench import sssource_validate as V
-from ssp.sssource_contract import ELLIPSE_COLUMNS, SSSOURCE_DICTIONARY
+from bench import ssobservation_validate as V
+from ssp.ssobservation_contract import ELLIPSE_COLUMNS, SSOBSERVATION_DICTIONARY
 
 COLS = V.schema_columns()
 NAMES = [c["name"] for c in COLS]
@@ -84,7 +84,7 @@ def table(d=None, **overrides):
     for c in COLS:
         if c["name"] not in d:
             continue
-        typ = V.felis_arrow_type(c["datatype"], c["name"] in SSSOURCE_DICTIONARY)
+        typ = V.felis_arrow_type(c["datatype"], c["name"] in SSOBSERVATION_DICTIONARY)
         arr = pa.array(d[c["name"]], typ.value_type if pa.types.is_dictionary(typ) else typ)
         if pa.types.is_dictionary(typ):
             arr = arr.dictionary_encode()
@@ -105,7 +105,7 @@ def failed(rep):
 
 @pytest.fixture
 def good(tmp_path):
-    return write(table(), tmp_path / "sssource.parquet")
+    return write(table(), tmp_path / "ssobservation.parquet")
 
 
 def dia_from(t):
@@ -133,8 +133,8 @@ def dia_from(t):
 # --------------------------------------------------------------------------
 
 def test_blocks_match_design():
-    assert len(NAMES) == 184
-    assert [len(B[k]) for k in (1, 2, 3, 4, 6)] == [7, 2, 7, 128, 40]
+    assert len(NAMES) == 182
+    assert [len(B[k]) for k in (1, 2, 3, 4, 6)] == [6, 2, 7, 127, 40]
     assert B[4][0] == "visit" and B[4][-1] == "glint_trail"
     assert set(ELLIPSE_COLUMNS) <= set(B[6])
 
@@ -250,9 +250,12 @@ def test_conformance_sort(tmp_path):
 
 
 def test_conformance_categories(tmp_path):
+    # (matchMethod is internal: read from the sidecar next to the file)
     d = _values()
-    d["matchMethod"] = ["id"] + d["matchMethod"][1:]
+    pq.write_table(pa.table({"obsid": d["obsid"], "matchMethod": ["id"] + d["matchMethod"][1:]}),
+                   tmp_path / V.SIDECAR_FILE)
     assert "matchMethod values in MATCH_METHODS" in _conf(tmp_path, table(d))
+    (tmp_path / V.SIDECAR_FILE).unlink()
     d = _values()
     d["measuredOn"] = ["direct"] + d["measuredOn"][1:]
     assert "measuredOn values in ID_SPLIT" in _conf(tmp_path, table(d))
@@ -316,7 +319,8 @@ def test_conformance_primary(tmp_path):
 
 def test_conformance_parquet_layout(tmp_path):
     assert "zstd compression" in _conf(tmp_path, table(), compression="snappy")
-    assert "SSSOURCE_DICTIONARY columns dictionary-encoded" in _conf(tmp_path, table(), use_dictionary=False)
+    assert "SSOBSERVATION_DICTIONARY columns dictionary-encoded" in _conf(tmp_path, table(),
+                                                                          use_dictionary=False)
 
 
 # --------------------------------------------------------------------------
@@ -403,8 +407,8 @@ def test_clickhouse_limits(good):
 # --------------------------------------------------------------------------
 
 def ref_from(t):
-    """Today's SSSource layout: ssObjectId 0 when unmatched, '' designation,
-    NaN (not NULL) ephemerides, no ellipse."""
+    """Today's SSObservation layout: ssObjectId 0 when unmatched, ''
+    designation, NaN (not NULL) ephemerides, no ellipse."""
     cols = {"diaSourceId": pa.array(V._measurement_id(t)[0], pa.int64()),
             "ssObjectId": pc.fill_null(t["ssObjectId"], 0),
             "designation": pc.fill_null(t["designation"], "")}
@@ -497,12 +501,12 @@ def test_ellipse_fail(tmp_path, good):
     ob3 = _orbits(tmp_path / "b3.parquet", ["2020 AB", "2021 CD", "2022 EF"], a=(2.0, 2.6, 3.0))
     rep = V.check_ellipse(good, write(_nss(t, 1.1), tmp_path / "n.parquet"), oa, ob3)
     assert "ellipses agree (rel. err <= 0.01, |d rho| <= 0.01)" in failed(rep)
-    # NearbySSO has an ellipse where SSSource has none
+    # NearbySSO has an ellipse where SSObservation has none
     d = _values()
     d["ephRaErr"][0] = d["ephDecErr"][0] = d["ephRa_ephDec_Cov"][0] = None
     ss = write(table(d), tmp_path / "ss.parquet")
     rep = V.check_ellipse(ss, write(_nss(t), tmp_path / "n.parquet"), oa, ob)
-    assert "ellipse present in SSSource wherever NearbySSO has one" in failed(rep)
+    assert "ellipse present in SSObservation wherever NearbySSO has one" in failed(rep)
 
 
 def test_identical_orbits(tmp_path):
@@ -542,7 +546,7 @@ def test_counts_fail(tmp_path, good):
     bad = obs.set_column(2, "status", pa.array(st))
     assert "status agrees with obs_sbn" in failed(V.check_counts(good, write(bad, tmp_path / "o1.parquet")))
     bad = obs.filter(pa.array([o != "obs002" for o in obs["obsid"].to_pylist()]))
-    assert "every SSSource row is an obs_sbn X05 row" in failed(
+    assert "every SSObservation row is an obs_sbn X05 row" in failed(
         V.check_counts(good, write(bad, tmp_path / "o2.parquet")))
     ob = write(obs, tmp_path / "o3.parquet")
     dia = write(dia_from(t).slice(1), tmp_path / "dia.parquet")
@@ -652,7 +656,8 @@ def test_offsets_missing_columns(tmp_path):
 
 
 def test_regression_skips_track_and_rank(tmp_path, good):
-    # today's SSSource: zero along/cross-track and a diaDistanceRank column
+    # today's SSObservation: zero along/cross-track and a diaDistanceRank
+    # column
     ref = ref_from(table())
     assert "ephOffsetAlongTrack" not in ref.column_names
     ref = (ref.append_column("ephOffsetAlongTrack", pa.array([0.0] * N, pa.float32()))
@@ -678,7 +683,7 @@ t = pq.read_table(args[0], columns=["ssObjectId", "midpointMjdTai", "psfFlux"]).
 sid = t["ssObjectId"].fillna(-1).to_numpy()
 starts = sid[1:] != sid[:-1]
 if len(set(sid[1:][starts])) != starts.sum() or (len(sid) and sid[0] in set(sid[1:][starts])):
-    sys.exit(4)               # as the real builder: SSSource must be grouped by ssObjectId
+    sys.exit(4)               # as the real builder: SSObservation must be grouped by ssObjectId
 t = t[t["ssObjectId"].notna()]
 if mode == "fail":
     sys.exit(3)
@@ -702,7 +707,7 @@ def builder(tmp_path):
 
 
 def _many(tmp_path, n_obj=30, per=7):
-    """A larger synthetic SSSource: n_obj objects x per rows."""
+    """A larger synthetic SSObservation: n_obj objects x per rows."""
     d = {"ssObjectId": np.repeat(np.arange(1, n_obj + 1), per),
          "midpointMjdTai": np.tile(np.arange(per, dtype=float), n_obj) + 61000,
          "psfFlux": np.arange(n_obj * per, dtype=np.float32) + 1.5}
@@ -764,7 +769,8 @@ def test_ssobject_permutation_cli(tmp_path, builder):
                    "--mode sorted", "--max-objects", "3"]) == 0
     assert V.main(["ssobject-permutation", ss, "d", "m", "--builder", builder, "--builder-args",
                    "--mode first"]) == 1
-    # without the (ignored) DiaSource file: the builder gets SSSOURCE MPCORB
+    # without the (ignored) DiaSource file: the builder gets
+    # SSOBSERVATION MPCORB
     work = tmp_path / "nodia"
     assert V.main(["ssobject-permutation", ss, "m", "--builder", builder, "--builder-args",
                    "--mode sorted", "--workdir", str(work)]) == 0
@@ -779,7 +785,7 @@ def test_ssobject_permutation_without_dia_passes_two_inputs(tmp_path):
                    ".write(repr(args[:args.index('--output')]).replace(args[0], 'SSS'))\n")
     rep = V.check_ssobject_permutation(ss, None, "mpc.parquet", seeds=(1, 2), cmd=f"{sys.executable} {spy}")
     assert rep.ok, rep.text()
-    assert "SSSOURCE mpc.parquet --output OUT" in rep.text()
+    assert "SSOBSERVATION mpc.parquet --output OUT" in rep.text()
 
 
 def test_permutation():

@@ -1,5 +1,5 @@
 """util.wrap_ra_deg and util.sky_separation_arcsec, the numpy replacements for
-SkyCoord in the SSSource build, must be bitwise identical to astropy."""
+SkyCoord in the SSObservation build, must be bitwise identical to astropy."""
 
 import numpy as np
 from astropy.coordinates import SkyCoord
@@ -41,7 +41,8 @@ def test_wrap_ra_random():
 
 def random_pairs(rng, n):
     """Pairs of points: across the sky, near the poles, across the RA wrap,
-    and at small (SSSource-like) separations, some with RA outside [0, 360)."""
+    and at small (SSObservation-like) separations, some with RA outside
+    [0, 360)."""
     ra1 = rng.uniform(0, 360, n)
     dec1 = np.degrees(np.arcsin(rng.uniform(-1, 1, n)))
     far = [ra1, dec1, rng.uniform(0, 360, n), np.degrees(np.arcsin(rng.uniform(-1, 1, n)))]

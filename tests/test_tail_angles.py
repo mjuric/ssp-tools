@@ -1,6 +1,6 @@
 """ssp.ephem_assist.tail_position_angles (docs/design/tail-angles.md; the
-contract in ssp/sssource_contract.py, "Tail position angles"), on synthetic
-geometry with known answers."""
+contract in ssp/ssobservation_contract.py, "Tail position angles"), on
+synthetic geometry with known answers."""
 
 import numpy as np
 import pytest

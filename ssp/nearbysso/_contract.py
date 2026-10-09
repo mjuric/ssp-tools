@@ -13,7 +13,7 @@ Conventions used throughout:
   are converted with astropy.
 - **Angles** are in degrees at interfaces, **separations** in arcsec, and
   **on-sky rates** in deg/day with ``ephRateRa`` including the cos(dec)
-  factor, as in SSSource.
+  factor, as in SSObservation.
 - **Error ellipses** use the DiaSource convention: ``raErr`` (the RA error
   *on the sky*, i.e. including cos(dec)), ``decErr`` (deg), and
   ``ra_dec_Cov`` (deg^2).
@@ -134,7 +134,7 @@ ORBIT_DTYPE = np.dtype([
 #   ssp.nongrav.apply(extras, nongrav) right after the Extras is attached.
 #   With NONE the result is bitwise what it was before. The self-perturber
 #   paths (bodies 11-26, Pluto) ignore nongrav (none of them has one).
-#   Callers pass the NonGrav explicitly: SSSource from the object's
+#   Callers pass the NonGrav explicitly: SSObservation from the object's
 #   mpc_orb_jsonb, NearbySSO's precise pass ssp.nongrav.from_orbit(orbit).
 
 # --------------------------------------------------------------------------
@@ -293,12 +293,12 @@ NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
     ("ephRateRa", "f4"),         # [deg/day]
     ("ephRateDec", "f4"),
     ("ephAntiSunPA", "f4"),      # [deg] tail position angles (docs/design/tail-angles.md;
-    ("ephAntiMotionPA", "f4"),   #   ssp/sssource_contract.py "Tail position angles")
+    ("ephAntiMotionPA", "f4"),   #   ssp/ssobservation_contract.py "Tail position angles")
 ])
 
 # ephAntiSunPA, ephAntiMotionPA: from the precise pass's EphResult, with
-#   ssp.ephem_assist.tail_position_angles, exactly as SSSource computes them,
-#   so that the two tables agree bitwise at the same (object, DiaSource).
+#   ssp.ephem_assist.tail_position_angles, exactly as SSObservation computes
+#   them, so that the two tables agree bitwise at the same (object, DiaSource).
 
 # diaDistanceRank: the 1-based rank of the row's DiaSource by its separation
 #   from the row's object's prediction in that visit, among ALL of that

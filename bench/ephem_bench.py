@@ -584,8 +584,8 @@ def main():
                 summary["geometry"][k] = {"median": float(np.median(x)), "max": float(np.max(x))}
 
             # Gates: an order of magnitude below the float32 storage
-            # precision of the SSSource columns (~1e-7 relative), and within
-            # Horizons' printed precision where that is coarser.
+            # precision of the SSObservation columns (~1e-7 relative), and
+            # within Horizons' printed precision where that is coarser.
             gates = [
                 ("initial state |dX| < 1 km", np.max(g["state_pos_km"]) < 1.0),
                 ("r, delta < 1 km", max(np.max(g["r_km"]), np.max(g["delta_km"])) < 1.0),

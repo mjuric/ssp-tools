@@ -1,9 +1,9 @@
 """The comparison with JPL (WP N5 of docs/design/nongrav.md).
 
 Three checks, on the non-grav fixture (``/sdf/data/rubin/user/mjuric/nongrav/
-fixtures/2026-10-01/``) and an SSSource built from it:
+fixtures/2026-10-01/``) and an SSObservation built from it:
 
-  orbits      (a report) the MPC orbits, through our SSSource, against
+  orbits      (a report) the MPC orbits, through our SSObservation, against
               JPL's own orbits, through Horizons, at the Rubin observation
               times: the separation, in arcsec and in combined sigma; which
               orbit fits Rubin's positions better; JPL's 3-sigma against our
@@ -16,7 +16,7 @@ fixtures/2026-10-01/``) and an SSSource built from it:
               The initial elements are those Horizons integrates from (its
               header, at the solution epoch; SBDB's for comets).
   user        (check 2b) the MPC's own elements and A's sent to Horizons as
-              user elements (COMMAND=';'), against our SSSource.
+              user elements (COMMAND=';'), against our SSObservation.
 
 Subcommands::
 
@@ -39,7 +39,7 @@ serial (one process, holding a lock on the cache) and at least
 request (service + sorted parameters), and every request is logged (time,
 URL, bytes). Never run ``fetch`` from tests or CI. Never contact the MPC.
 
-Time scales: SSSource times are ``midpointMjdTai``. Horizons observer
+Time scales: SSObservation times are ``midpointMjdTai``. Horizons observer
 tables are requested in TT (TT = TAI + 32.184 s exactly, so no conversion
 model is involved) and vector tables in TDB (astropy's TT -> TDB). The times
 are sent as MJD with 10 decimals (~9 us), and our side uses exactly the
@@ -70,7 +70,7 @@ import numpy as np
 FIXTURE = "/sdf/data/rubin/user/mjuric/nongrav/fixtures/2026-10-01"
 WORK = "/sdf/data/rubin/user/mjuric/nongrav/work/n5"
 CACHE = os.path.join(WORK, "cache")
-SSSOURCE = os.path.join(WORK, "sssource", "sssource.parquet")
+SSOBSERVATION = os.path.join(WORK, "ssobservation", "ssobservation.parquet")
 
 HORIZONS_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
 SBDB_URL = "https://ssd-api.jpl.nasa.gov/sbdb.api"
@@ -119,8 +119,8 @@ CHECK2_CONTROL = ("2007 GK33", "2016 PR243", "6120 P-L")
 
 # Check 2b (added on N4's reading of the Horizons API: COMMAND=';' takes
 # user elements with A1-A3 and the g(r) constants): the MPC's own elements
-# and A's sent to Horizons, against our SSSource at the Rubin times. Three
-# comets where the non-gravs move SSSource most, 2025 QH138 (the largest
+# and A's sent to Horizons, against our SSObservation at the Rubin times. Three
+# comets where the non-gravs move SSObservation most, 2025 QH138 (the largest
 # Yarkovsky A2) and 2008 NP3; and one comet again without its A's, to see
 # that Horizons applies them.
 CHECK2B_OBJECTS = ("P/2003 K2", "P/1973 S1", "P/2005 N3", "2025 QH138", "2008 NP3")
@@ -719,7 +719,7 @@ def sbdb_sstr(des, permid):
     return permid if permid else des
 
 
-def sssource_rows(path=SSSOURCE, designations=None):
+def ssobservation_rows(path=SSOBSERVATION, designations=None):
     import pyarrow.parquet as pq
 
     cols = [
@@ -787,14 +787,14 @@ class Plan:
     only; Horizons requests need the SBDB answers (the JPL designation and,
     for check 2, the epoch and perihelion)."""
 
-    def __init__(self, client, fixture=FIXTURE, sssource=SSSOURCE):
+    def __init__(self, client, fixture=FIXTURE, ssobservation=SSOBSERVATION):
         self.client = client
         self.fixture = fixture
         self.objects = check1_objects(fixture)
         self.cls = dict(self.objects)
         des = [d for d, _ in self.objects]
         self.permid = permids(des, fixture)
-        self.df = sssource_rows(sssource, des)
+        self.df = ssobservation_rows(ssobservation, des)
         self.comets = [d for d in des if is_comet_des(d)]
         self.asteroids = [d for d in des if not is_comet_des(d)]
 
@@ -941,7 +941,7 @@ class Plan:
 
 def cmd_fetch(args):
     client = JPLClient(args.cache, offline=args.dry_run)
-    plan = Plan(client, args.fixture, args.sssource)
+    plan = Plan(client, args.fixture, args.ssobservation)
     stages = ["sbdb", "horizons", "user"] if args.stage == "all" else [args.stage]
     for st in stages:
         reqs = {"sbdb": plan.sbdb_requests, "horizons": plan.horizons_requests, "user": plan.user_requests}[
@@ -979,7 +979,7 @@ def cmd_status(args):
 
 
 # ---------------------------------------------------------------------------
-# Check 1: orbits (MPC through SSSource against JPL through Horizons)
+# Check 1: orbits (MPC through SSObservation against JPL through Horizons)
 # ---------------------------------------------------------------------------
 
 #: The ways Horizons' 3-sigma quantities could be meant: Theta measured
@@ -1100,7 +1100,7 @@ def orbit_flags(d, cls, mpc_ng, jpl_mp, source):
 
 
 def check1_rows(plan, d):
-    """(SSSource rows with an orbit, the Horizons observer arrays on those
+    """(SSObservation rows with an orbit, the Horizons observer arrays on those
     rows) of one object."""
     df = plan.df[(plan.df.designation == d) & plan.df.ephRa.notna()].sort_values("midpointMjdTai")
     o = plan.observer(d)
@@ -1108,7 +1108,7 @@ def check1_rows(plan, d):
     tt_rows = roundtrip(tai_to_tt(df.midpointMjdTai.to_numpy()))
     idx = np.searchsorted(tt, tt_rows)
     if not np.all(np.abs(tt[np.clip(idx, 0, len(tt) - 1)] - tt_rows) < 1e-9):
-        raise RuntimeError(f"{d}: SSSource times missing from the Horizons table")
+        raise RuntimeError(f"{d}: SSObservation times missing from the Horizons table")
     for k in ("ra", "dec", "ra3s", "dec3s", "smaa3s", "smia3s", "theta"):
         o[k] = o[k][idx]
     return df, o
@@ -1206,7 +1206,7 @@ def cmd_orbits(args):
     import pandas as pd
 
     client = JPLClient(args.cache)
-    plan = Plan(client, args.fixture, args.sssource)
+    plan = Plan(client, args.fixture, args.ssobservation)
     des = [d for d, _ in plan.objects]
     mng = mpc_nongravs(des, args.fixture)
     pairs = []
@@ -1235,8 +1235,8 @@ def cmd_orbits(args):
 
 def orbits_report(objs, rows, convention, conv_rms, sense, n_req, args):
     L = [
-        "# Check 1 (orbits): MPC orbits (our SSSource) against JPL orbits (Horizons), X05",
-        f"SSSource: {args.sssource}",
+        "# Check 1 (orbits): MPC orbits (our SSObservation) against JPL orbits (Horizons), X05",
+        f"SSObservation: {args.ssobservation}",
         f"JPL requests so far (all of WP N5): {n_req}",
         "Horizons times: midpointMjdTai + 32.184 s, requested as TT MJD; astrometric RA/Dec (quantity 1),",
         "  3-sigma RA/Dec (36) and plane-of-sky ellipse (37).",
@@ -1573,7 +1573,7 @@ def cmd_integrator(args):
     from ssp.ephem_assist import open_ephem
 
     client = JPLClient(args.cache)
-    plan = Plan(client, args.fixture, args.sssource)
+    plan = Plan(client, args.fixture, args.ssobservation)
     ephem = open_ephem()
     summ, rows = [], []
     for d in plan.check2():
@@ -1649,12 +1649,12 @@ def integrator_report(summ, rows, n_req, rate_thr):
 
 
 # ---------------------------------------------------------------------------
-# Check 2b: the MPC's elements and A's in Horizons, against our SSSource
+# Check 2b: the MPC's elements and A's in Horizons, against our SSObservation
 # ---------------------------------------------------------------------------
 
 
 def check2b_object(plan, d, mng, ephem):
-    """Check-2b rows of one object: SSSource ephRa/ephDec against Horizons
+    """Check-2b rows of one object: SSObservation ephRa/ephDec against Horizons
     run on the MPC's own elements and A's; for CHECK2B_NOGRAV objects also
     the Horizons gravity-only run, and our own with and without the A's."""
     import pandas as pd
@@ -1716,7 +1716,7 @@ def cmd_user(args):
     from ssp.ephem_assist import open_ephem
 
     client = JPLClient(args.cache)
-    plan = Plan(client, args.fixture, args.sssource)
+    plan = Plan(client, args.fixture, args.ssobservation)
     mng = mpc_nongravs(CHECK2B_OBJECTS, args.fixture)
     ephem = open_ephem()
     summ, rows = [], []
@@ -1733,11 +1733,12 @@ def cmd_user(args):
     summ.to_csv(os.path.join(args.out, "user_elements_objects.csv"), index=False)
     pd.concat(rows, ignore_index=True).to_csv(os.path.join(args.out, "user_elements_rows.csv"), index=False)
     L = [
-        "# Check 2b: the MPC's own elements and A's sent to Horizons (COMMAND=';'), against our SSSource",
+        "# Check 2b: the MPC's own elements and A's sent to Horizons (COMMAND=';'), "
+        "against our SSObservation",
         f"JPL requests so far (all of WP N5): {client.n_logged()}",
         "Elements: mpc_orbits q, e, i, node, argperi, peri_time, epoch (TT, sent as TDB JD), ECLIP=J2000;",
         "  A1-A3 and the g(r) constants of ssp.nongrav (Marsden for comets, 1/r^2 for Yarkovsky).",
-        "sep: SSSource ephRa/ephDec against Horizons' astrometric RA/Dec at the Rubin times [mas].",
+        "sep: SSObservation ephRa/ephDec against Horizons' astrometric RA/Dec at the Rubin times [mas].",
         "'echo': the A's Horizons prints back. ng shift: how far the A's move the position, Horizons'",
         "  (with against without) and ours (compute_ephemerides_one with against without) [mas, median].",
         "",
@@ -1770,7 +1771,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cache", default=CACHE)
     ap.add_argument("--fixture", default=FIXTURE)
-    ap.add_argument("--sssource", default=SSSOURCE)
+    ap.add_argument("--ssobservation", default=SSOBSERVATION)
     ap.add_argument("--out", default=WORK, help="report directory")
     sub = ap.add_subparsers(dest="cmd", required=True)
     f = sub.add_parser("fetch")

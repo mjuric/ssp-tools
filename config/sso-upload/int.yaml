@@ -20,7 +20,7 @@
 # dax_ppdb SSO_TABLES and load_sso add it; sending it today fails the entire
 # load. Uploading a subset of these needs --allow-partial.
 # tables:
-#   - SSSource
+#   - SSObservation
 #   - SSObject
 #   - numbered_identifications
 #   - current_identifications

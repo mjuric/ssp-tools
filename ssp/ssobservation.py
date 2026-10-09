@@ -1,10 +1,10 @@
-"""Build the SSSource table (``ssp-build-sssource``, or ``python -m
-ssp.sssource``): the widened SSSource of docs/design/sssource-widened.md.
+"""Build the SSObservation table (``ssp-build-ssobservation``, or ``python -m
+ssp.ssobservation``): SSObservation of docs/design/sssource-widened.md.
 
 One row per row of ``dia_sources.parquet`` (extract-submitted-sources), i.e.
 per resolved X05 ``obs_sbn`` row, with exactly the columns of
-``ssp.sssource_contract.SSSourceDtype`` in six blocks: the obs_sbn link
-columns, the identification (ssObjectId, designation), the measurement's
+``ssp.ssobservation_contract.SSObservationDtype`` in six blocks: the obs_sbn
+link columns, the identification (ssObjectId, designation), the measurement's
 metadata and identifiers, the measurement itself (copied from
 dia_sources.parquet and cast to the schema's types), and the ephemeris and
 geometry columns, computed per object with ASSIST from mpc_orbits.
@@ -37,18 +37,20 @@ from .ephem_assist import (MJD_J2000, compute_ephemerides_one, open_ephem, tail_
                            tail_position_angles_f32)
 from .nearbysso import propagate as _propagate
 # (a module attribute, so tests can substitute it)
-from . import sssource_ellipse as _ellipse
+from . import ssobservation_ellipse as _ellipse
 from .delivery_contract import SHUTTER_INPUT_COLUMNS
-from .sssource_contract import (
-    ELLIPSE_COLUMNS, ID_SPLIT, MATCH_METHODS, SHUTTER_INTERNAL, SSSOURCE_DICTIONARY, SSSOURCE_NONNULL,
-    SSSOURCE_SORT, VIEW_DROPPED, SSSourceDtype,
+from .ssobservation_contract import (
+    ELLIPSE_COLUMNS, ID_SPLIT, MATCH_METHODS, SHUTTER_INTERNAL, SIDECAR_FILE, SIDECAR_KEY,
+    SSOBSERVATION_DICTIONARY, SSOBSERVATION_INTERNAL_DEFAULT, SSOBSERVATION_INTERNAL_DTYPE,
+    SSOBSERVATION_INTERNAL_NONNULL, SSOBSERVATION_NONNULL, SSOBSERVATION_SORT, VIEW_DROPPED,
+    SSObservationDtype,
 )
 
 
 # --------------------------------------------------------------------------
-# The column blocks of SSSourceDtype (see docs/design/sssource-widened.md)
+# The column blocks of SSObservationDtype (see docs/design/sssource-widened.md)
 # --------------------------------------------------------------------------
-_NAMES = SSSourceDtype.names
+_NAMES = SSObservationDtype.names
 
 #: Block 1 columns copied from dia_sources.parquet (status comes from
 #: obs_sbn, matchMethod from dia_sources.parquet or _derive_match_method).
@@ -77,7 +79,7 @@ EPHEMERIS_COLUMNS = _NAMES[_NAMES.index("eclLambda"):]
 #: not orbit-derived: they are filled for rows without an orbit too.
 MEASURED_EPH_COLUMNS = ("elongation", "eclLambda", "eclBeta", "galLon", "galLat")
 
-#: dia_sources.parquet columns not carried into SSSource: the view's query
+#: dia_sources.parquet columns not carried into SSObservation: the view's query
 #: helpers, the view's ``parentId`` (split into parentDiaSourceId /
 #: parentSourceId), extract-submitted-sources' match diagnostics (which
 #: stay in dia_sources.parquet), and the shutter correction's internal
@@ -87,9 +89,9 @@ DIA_DROPPED = VIEW_DROPPED + ("parentId", "obssubid", "match", "sep_mas", "dt_ms
                               "n_pass", "ambiguous") + SHUTTER_INTERNAL
 
 
-# The SSSource fields compute_sssource_entry fills in (and nothing else):
-# what a parallel worker returns to the parent. Keep in sync with it
-# (tests/test_sssource_parallel.py checks).
+# The SSObservation fields compute_ssobservation_entry fills in (and nothing
+# else): what a parallel worker returns to the parent. Keep in sync with it
+# (tests/test_ssobservation_parallel.py checks).
 EPH_FIELDS = [
     "ephRateRa", "ephRateDec", "ephRate",
     "ephAntiSunPA", "ephAntiMotionPA",
@@ -103,19 +105,19 @@ EPH_FIELDS = [
     *ELLIPSE_COLUMNS,
 ]
 
-#: The working array the ephemerides are computed in, one row per SSSource
+#: The working array the ephemerides are computed in, one row per SSObservation
 #: row: the object's key and designation, and the block-6 columns, with the
-#: SSSourceDtype types (as today's SSSource, so the values are bitwise the
-#: same).
-WORK_DTYPE = np.dtype([("ssObjectId", "<i8"), ("designation", SSSourceDtype["designation"])]
-                      + [(c, SSSourceDtype[c]) for c in EPHEMERIS_COLUMNS])
+#: SSObservationDtype types (as today's SSObservation, so the values are
+#: bitwise the same).
+WORK_DTYPE = np.dtype([("ssObjectId", "<i8"), ("designation", SSObservationDtype["designation"])]
+                      + [(c, SSObservationDtype[c]) for c in EPHEMERIS_COLUMNS])
 
 
 def along_cross_track(off_ra, off_dec, rate_ra, rate_dec):
     """The offset (``off_ra``, which includes cos(dec), and ``off_dec``)
     resolved along and across the predicted direction of motion (the rates
     ``rate_ra``, which includes cos(dec), and ``rate_dec``), as pipe_tasks'
-    ssoAssociation computes them (see ssp.sssource_contract, block 6)::
+    ssoAssociation computes them (see ssp.ssobservation_contract, block 6)::
 
         along = (off_ra * rate_ra + off_dec * rate_dec) / rate
         cross = (-off_ra * rate_dec + off_dec * rate_ra) / rate
@@ -154,7 +156,7 @@ def load_nongravs(mpc_orbits_path, designations):
     ``n_errors``; such an orbit, and one whose JSON parses to
     ``ssp.nongrav.NONE``, is left out (integrated with gravity only).
 
-    A designation on several rows (none in the catalog; build_sssource
+    A designation on several rows (none in the catalog; build_ssobservation
     rejects them in mpc_orbits anyway) gets the last of its rows with a
     parseable fit: a later unparseable or gravity-only row doesn't remove it.
     """
@@ -210,8 +212,8 @@ def load_nongravs(mpc_orbits_path, designations):
     return nongravs, n_errors
 
 
-def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None, nongravs=None):
-    """Fill the ephemeris-derived SSSource columns (EPH_FIELDS) for one
+def compute_ssobservation_entry(sss, assoc, mpcorb, dia, ephem, covs=None, nongravs=None):
+    """Fill the ephemeris-derived SSObservation columns (EPH_FIELDS) for one
     object.
 
     ``mpcorb`` must be indexed by unpacked_primary_provisional_designation;
@@ -219,7 +221,7 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None, nongravs=N
     ``dia`` (dia_index) and the observer's barycentric state (obs_pos [AU],
     obs_vel [km/s], each of shape (3,)); ``dia`` is a structured array of
     midpointMjdTai, ra and dec. ``covs`` maps designations to their orbits
-    with covariances (from ssp.sssource_ellipse.load_orbit_covariances);
+    with covariances (from ssp.ssobservation_ellipse.load_orbit_covariances);
     objects not in it, or all if it is None, get a NaN error ellipse.
     ``nongravs`` maps designations to their ``ssp.nongrav.NonGrav`` (from
     load_nongravs); the others, or all if it is None, are integrated with
@@ -257,7 +259,7 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None, nongravs=N
     sss["ephAntiMotionPA"] = tail_position_angles_f32(anti_motion)
 
     # Heliocentric and topocentric vectors are at light-emission time, per
-    # the SSSource schema, following JPL Horizons conventions (see
+    # the SSObservation schema, following JPL Horizons conventions (see
     # ssp.ephem_assist.EphResult).
     # (RA wrapped to [0, 360), bitwise as SkyCoord would)
     sss["ephRa"] = util.wrap_ra_deg(e.ra_deg)
@@ -315,7 +317,7 @@ def compute_sssource_entry(sss, assoc, mpcorb, dia, ephem, covs=None, nongravs=N
     # days since J2000, as compute_ephemerides_one integrates in; astropy
     # caches ephTimes.tdb), from the same observer positions, along the
     # precise pass's float64 line of sight (e.topo_pos, not the float32
-    # topo_x/y/z: see ssp.sssource_ellipse.ephemeris_ellipse).
+    # topo_x/y/z: see ssp.ssobservation_ellipse.ephemeris_ellipse).
     orbit = covs.get(provID) if covs is not None else None
     if orbit is None:
         for c in ELLIPSE_COLUMNS:
@@ -345,7 +347,7 @@ _PARALLEL = {}
 _EPHEM = None   # one ASSIST ephemeris per worker process, opened lazily
 
 
-def _sssource_chunk(g0, g1):
+def _ssobservation_chunk(g0, g1):
     """Worker: compute the EPH_FIELDS of the rows of groups [g0, g1);
     returns them, and the number of the ellipse's coarse propagations the
     step cap stopped (counted per process, see ssp.nearbysso.propagate)."""
@@ -357,7 +359,7 @@ def _sssource_chunk(g0, g1):
     idx_start, idx_end = _PARALLEL["idx_start"], _PARALLEL["idx_end"]
     r0, r1 = idx_start[g0], idx_end[g1 - 1]   # (groups are in row order)
 
-    # A private array holding only what compute_sssource_entry reads and
+    # A private array holding only what compute_ssobservation_entry reads and
     # EPH_FIELDS: writing any other field fails here, rather than being
     # silently lost.
     keys = ["ssObjectId", "designation"]
@@ -371,7 +373,7 @@ def _sssource_chunk(g0, g1):
     with contextlib.redirect_stdout(buf):
         for g in range(g0, g1):
             s, e = idx_start[g] - r0, idx_end[g] - r0
-            compute_sssource_entry(out[s:e], obs_state[r0 + s:r0 + e],
+            compute_ssobservation_entry(out[s:e], obs_state[r0 + s:r0 + e],
                                    _PARALLEL["mpcorb"], _PARALLEL["dia_eph"], _EPHEM,
                                    covs=_PARALLEL["covs"], nongravs=_PARALLEL["nongravs"])
     sys.stdout.write(buf.getvalue())
@@ -385,11 +387,11 @@ def _sssource_chunk(g0, g1):
 
 def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor=8, covs=None,
                         nongravs=None):
-    """Fill the EPH_FIELDS of ``sss`` with compute_sssource_entry, per
+    """Fill the EPH_FIELDS of ``sss`` with compute_ssobservation_entry, per
     object (``sss`` grouped by ssObjectId; ``obs_state`` its rows' observer
     states and DiaSource rows in ``dia_eph``; ``covs`` the orbit
     covariances for the error ellipse, and ``nongravs`` their non-gravitational
-    parameters, see compute_sssource_entry).
+    parameters, see compute_ssobservation_entry).
 
     With ``workers`` > 1, the objects are split into about ``chunk_factor *
     workers`` chunks, balanced by observation count, and computed in a
@@ -406,7 +408,7 @@ def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor
         _propagate.STEP_CAP_STOPS = 0
         util.group_by(
             [sss, obs_state], "ssObjectId",
-            partial(compute_sssource_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem, covs=covs,
+            partial(compute_ssobservation_entry, mpcorb=mpcorb, dia=dia_eph, ephem=ephem, covs=covs,
                     nongravs=nongravs),
         )
         return int(_propagate.STEP_CAP_STOPS)
@@ -427,7 +429,7 @@ def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor
     _PARALLEL.update(sss=sss, obs_state=obs_state, dia_eph=dia_eph, mpcorb=mpcorb, covs=covs,
                      nongravs=nongravs, idx_start=idx_start, idx_end=idx_end)
     try:
-        results = util.run_chunks(_sssource_chunk, chunks, workers, "ephemerides",
+        results = util.run_chunks(_ssobservation_chunk, chunks, workers, "ephemerides",
                                   weights=[int(counts[g0:g1].sum()) for g0, g1 in chunks])
     finally:
         _PARALLEL.clear()
@@ -439,35 +441,44 @@ def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor
 
 
 # --------------------------------------------------------------------------
-# Writing sssource.parquet: casts and checks to the contract's types
+# Writing ssobservation.parquet: casts and checks to the contract's types
 # --------------------------------------------------------------------------
 
+def column_dtype(name):
+    """The NumPy type of column ``name``: SSObservationDtype's, or for a
+    column that may be internal, SSOBSERVATION_INTERNAL_DTYPE's."""
+    if name in _NAMES:
+        return SSObservationDtype[name]
+    return np.dtype(SSOBSERVATION_INTERNAL_DTYPE[name])
+
+
 def arrow_type(name):
-    """The Arrow type of SSSource column ``name``, from SSSourceDtype:
-    ``U<n>`` is a string (dictionary-encoded for SSSOURCE_DICTIONARY), the
-    rest the NumPy type's equivalent."""
-    dt = SSSourceDtype[name]
+    """The Arrow type of column ``name`` (column_dtype): ``U<n>`` is a
+    string (dictionary-encoded for SSOBSERVATION_DICTIONARY), the rest the
+    NumPy type's equivalent."""
+    dt = column_dtype(name)
     if dt.kind == "U":
-        return pa.dictionary(pa.int32(), pa.string()) if name in SSSOURCE_DICTIONARY else pa.string()
+        return pa.dictionary(pa.int32(), pa.string()) if name in SSOBSERVATION_DICTIONARY else pa.string()
     return pa.from_numpy_dtype(dt)
 
 
-def sssource_schema():
-    """The Arrow schema of sssource.parquet: SSSourceDtype's columns, in
-    order, with their arrow_type, non-null exactly for SSSOURCE_NONNULL."""
-    return pa.schema([pa.field(n, arrow_type(n), nullable=n not in SSSOURCE_NONNULL) for n in _NAMES])
+def ssobservation_schema():
+    """The Arrow schema of ssobservation.parquet: SSObservationDtype's columns,
+    in order, with their arrow_type, non-null exactly for
+    SSOBSERVATION_NONNULL."""
+    return pa.schema([pa.field(n, arrow_type(n), nullable=n not in SSOBSERVATION_NONNULL) for n in _NAMES])
 
 
 def cast_column(name, arr):
     """Cast ``arr`` (an Arrow array, chunked or not, or a NumPy array) to
-    SSSource column ``name``'s type, and check it.
+    SSObservation column ``name``'s type, and check it.
 
     Raises ValueError if a narrowing integer cast would overflow, a finite
     float64 would overflow float32, a string is longer than the column's
-    ``char`` length, or a non-null column (SSSOURCE_NONNULL) has a NULL.
+    ``char`` length, or a non-null column (SSOBSERVATION_NONNULL) has a NULL.
     float64 -> float32 rounding is expected, not an error.
     """
-    dt = SSSourceDtype[name]
+    dt = column_dtype(name)
     target = arrow_type(name)
     if not isinstance(arr, (pa.Array, pa.ChunkedArray)):
         arr = pa.array(arr)
@@ -486,17 +497,18 @@ def cast_column(name, arr):
                 # (safe: raises on integer overflow and float truncation)
                 out = pc.cast(arr, value_type, safe=True)
         except (pa.ArrowInvalid, ValueError) as e:
-            raise ValueError(f"SSSource column {name!r}: cannot cast {arr.type} to {value_type}: {e}") from e
+            raise ValueError(f"SSObservation column {name!r}: cannot cast {arr.type} to {value_type}: "
+                             f"{e}") from e
         arr = out
 
     if dt.kind == "U" and arr.type == value_type and len(arr) and arr.null_count < len(arr):
         maxlen = pc.max(pc.utf8_length(arr)).as_py()
         if maxlen > dt.itemsize // 4:
-            raise ValueError(f"SSSource column {name!r}: a value of {maxlen} characters "
+            raise ValueError(f"SSObservation column {name!r}: a value of {maxlen} characters "
                              f"is longer than the column's {dt.itemsize // 4}")
 
-    if name in SSSOURCE_NONNULL and arr.null_count:
-        raise ValueError(f"SSSource column {name!r} is non-null, but has {arr.null_count:,} NULL values")
+    if (name in SSOBSERVATION_NONNULL or name in SSOBSERVATION_INTERNAL_NONNULL) and arr.null_count:
+        raise ValueError(f"SSObservation column {name!r} is non-null, but has {arr.null_count:,} NULL values")
 
     if arr.type != target:
         arr = pc.dictionary_encode(arr)
@@ -507,39 +519,40 @@ def cast_column(name, arr):
     return arr
 
 
-def sssource_table(columns, cast=True):
-    """The SSSource table from ``columns`` (name -> array, every column of
-    SSSourceDtype and nothing else), in schema order, each cast and checked
-    with cast_column; with ``cast=False`` the columns must already be
+def ssobservation_table(columns, cast=True):
+    """The SSObservation table from ``columns`` (name -> array, every column of
+    SSObservationDtype and nothing else), in schema order, each cast and
+    checked with cast_column; with ``cast=False`` the columns must already be
     cast_column's output (their types are checked, not their values)."""
     names = set(columns)
     if names != set(_NAMES):
-        raise ValueError(f"SSSource columns: missing {sorted(set(_NAMES) - names)}, "
+        raise ValueError(f"SSObservation columns: missing {sorted(set(_NAMES) - names)}, "
                          f"unexpected {sorted(names - set(_NAMES))}")
-    schema = sssource_schema()
+    schema = ssobservation_schema()
     if not cast:
         bad = [n for n in _NAMES if columns[n].type != schema.field(n).type]
         if bad:
-            raise ValueError(f"SSSource columns not cast (see cast_column): {bad}")
+            raise ValueError(f"SSObservation columns not cast (see cast_column): {bad}")
         return pa.Table.from_arrays([columns[n] for n in _NAMES], schema=schema)
     return pa.Table.from_arrays([cast_column(n, columns[n]) for n in _NAMES], schema=schema)
 
 
 def sort_indices(ssObjectId, midpointMjdTai, obsid):
-    """The row order of sssource.parquet (SSSOURCE_SORT): ascending, NULL
-    ssObjectId last."""
-    keys = pa.table(dict(zip(SSSOURCE_SORT, (ssObjectId, midpointMjdTai, obsid))))
+    """The row order of ssobservation.parquet (SSOBSERVATION_SORT): ascending,
+    NULL ssObjectId last."""
+    keys = pa.table(dict(zip(SSOBSERVATION_SORT, (ssObjectId, midpointMjdTai, obsid))))
     # (NULLs last by an explicit key: where null_placement goes differs
     # across pyarrow versions)
-    keys = keys.append_column("_null", pc.is_null(keys[SSSOURCE_SORT[0]]))
-    return pc.sort_indices(keys, sort_keys=[(k, "ascending") for k in ("_null", *SSSOURCE_SORT)]).to_numpy()
+    keys = keys.append_column("_null", pc.is_null(keys[SSOBSERVATION_SORT[0]]))
+    return pc.sort_indices(keys,
+                           sort_keys=[(k, "ascending") for k in ("_null", *SSOBSERVATION_SORT)]).to_numpy()
 
 
-def write_sssource(table, path):
-    """Write the SSSource ``table`` (from sssource_table, rows already in
-    sort_indices order) to ``path``, zstd-compressed."""
-    if table.schema != sssource_schema():
-        raise ValueError("not an SSSource table (see sssource_table)")
+def write_ssobservation(table, path):
+    """Write the SSObservation ``table`` (from ssobservation_table, rows
+    already in sort_indices order) to ``path``, zstd-compressed."""
+    if table.schema != ssobservation_schema():
+        raise ValueError("not an SSObservation table (see ssobservation_table)")
     pq.write_table(table, path, compression="zstd")
 
 
@@ -601,10 +614,11 @@ def _dia_read_columns(dia_present):
     corrected = shutter_corrected(dia_present)
     need = (list(LINK_COLUMNS) + list(MEASURED_ON_COLUMNS) + ["diaSourceId", "parentId"]
             + [c for c in MEASUREMENT_COLUMNS if corrected or c not in SHUTTER_FLAGS]
+            + (["midpointMjdTai_flag_degraded"] if corrected else [])
             + (["matchMethod"] if has_match_method else ["match", "obssubid"]))
     missing = [c for c in need + ["sep_mas", "dt_ms"] if c not in dia_present]
     if missing:
-        raise ValueError(f"dia_sources.parquet lacks {missing}: SSSource is built from the output of "
+        raise ValueError(f"dia_sources.parquet lacks {missing}: SSObservation is built from the output of "
                          "extract-submitted-sources")
     return need, has_match_method, corrected
 
@@ -631,7 +645,7 @@ def observer_states(t_mjd_tai, t_visit=None):
     with the acceleration a from the two velocities. (Exact evaluation per
     source costs ~0.2 ms per unique time: ~25 min and GBs for a day's 8M
     sources.) The shift is accurate to well under a micro-arcsecond as seen
-    from any solar-system distance (see tests/test_sssource_shutter.py).
+    from any solar-system distance (see tests/test_ssobservation_shutter.py).
     Rows with dt == 0 get exactly their visit time's state; rows with |dt|
     > MAX_SHIFT_S, or a non-finite dt, are computed exactly at their own
     time.
@@ -671,9 +685,10 @@ def observer_states(t_mjd_tai, t_visit=None):
 # The build
 # --------------------------------------------------------------------------
 
-def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0, seed=42,
+def build_ssobservation(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0, seed=42,
                    workers=1, chunk_factor=8):
-    """Build ``{output_dir}/sssource.parquet`` from the dia_sources (from
+    """Build ``{output_dir}/ssobservation.parquet`` (and the sidecar of
+    internal columns, ``{output_dir}/SIDECAR_FILE``) from the dia_sources (from
     extract-submitted-sources), MPC observation (obs_sbn), identification
     and orbit tables in ``input_dir``.
 
@@ -688,7 +703,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     copy_columns, has_match_method, corrected = _dia_read_columns(set(dia_present))
     unexpected = sorted(set(dia_present) - set(_NAMES) - set(DIA_DROPPED) - set(copy_columns))
     if unexpected:
-        print(f"WARNING: dia_sources.parquet columns not in SSSource, dropped: {unexpected}",
+        print(f"WARNING: dia_sources.parquet columns not in SSObservation, dropped: {unexpected}",
               file=sys.stderr)
 
     # Read only the columns linking and the ephemerides need here; the rest
@@ -730,7 +745,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
 
     # The association side table: from extract-submitted-sources, dia has
     # one row per obs_sbn row (obsid is unique), so each obs_sbn row gets
-    # one SSSource row; a source claimed by several (both endpoints of a
+    # one SSObservation row; a source claimed by several (both endpoints of a
     # trail, or repeated submissions) has one of them marked primary.
     assoc = (
         dia[["obsid", "file_row"]]
@@ -748,7 +763,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     util.assoc_validate_recorded(dia, assoc)
 
     # obs_sbn also holds observations of unidentified tracklets (status
-    # 'I', no provid nor permid). They are in SSSource too -- they were
+    # 'I', no provid nor permid). They are in SSObservation too -- they were
     # sent to and accepted by the MPC -- with a NULL ssObjectId and
     # designation, and NULL orbit-derived columns. Set them aside while
     # resolving the designations of the rest.
@@ -883,7 +898,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
               f"{MAX_SHIFT_S} s (or without a visit time) evaluated at their own time", flush=True)
 
     # Observer barycentric state for every observation, carried per row of
-    # assoc so compute_sssource_entry gets its object's slice: once per
+    # assoc so compute_ssobservation_entry gets its object's slice: once per
     # unique time (all sources from a visit share one midpointMjdTai), or,
     # with shutter-corrected times, once per visit time and shifted.
     # (a numpy structured array rather than columns of assoc, as slicing a
@@ -904,7 +919,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     sss["galLon"] = gal.l
     sss["galLat"] = gal.b
 
-    # compute_sssource_entry takes DiaSource rows per object; give it only
+    # compute_ssobservation_entry takes DiaSource rows per object; give it only
     # the columns it uses, as a numpy structured array (taking rows of all
     # ~85 pyarrow-backed columns, or even of a DataFrame, dominated the
     # per-object cost).
@@ -942,7 +957,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     del obs_state, mpcorb, covs, nongravs
 
     #
-    # Assemble the SSSource columns, in the output's row order
+    # Assemble the SSObservation columns, in the output's row order
     #
     order = sort_indices(pa.array(sss["ssObjectId"], mask=no_orbit),
                          dia_eph["midpointMjdTai"][assoc["dia_index"].to_numpy()],
@@ -957,7 +972,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     del assoc, designation
 
     # Block 6: NaN is NULL (a computed column with no value). The rest is
-    # as today's SSSource, bitwise.
+    # as today's SSObservation, bitwise.
     for name in EPHEMERIS_COLUMNS:
         v = sss[name]
         mask = np.isnan(v) if v.dtype.kind == "f" else None
@@ -974,7 +989,7 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
             arr = tbl.column(name).take(src)
             if name in ("diaSourceId", "parentId", "match", "obssubid", "measuredOn"):
                 pending[name] = arr
-            if name in SSSourceDtype.names:
+            if name in SSObservationDtype.names or name in SSOBSERVATION_INTERNAL_DTYPE:
                 columns[name] = cast_column(name, arr)
         del tbl
     if has_match_method:
@@ -994,7 +1009,11 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
         columns[name] = cast_column(name, arr)
     del pending
 
-    table = sssource_table(columns, cast=False)   # (each was cast above)
+    # The internal columns are not in the delivered table: they go to the
+    # sidecar, with obsid, in the same row order.
+    sidecar = pa.table({SIDECAR_KEY: columns[SIDECAR_KEY],
+                        **{name: columns.pop(name) for name in SSOBSERVATION_INTERNAL_DEFAULT}})
+    table = ssobservation_table(columns, cast=False)   # (each was cast above)
     del columns
     print(f"[{time.perf_counter() - t_start:.1f} s] assembled", flush=True)
     n_null = table["ssObjectId"].null_count
@@ -1006,21 +1025,22 @@ def build_sssource(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0,
     if max_objects is None and dia_sample_frac >= 1.0:
         assert table.num_rows == n_dia
 
-    path = f"{output_dir}/sssource.parquet"
-    write_sssource(table, path)
+    path = f"{output_dir}/ssobservation.parquet"
+    write_ssobservation(table, path)
+    pq.write_table(sidecar, f"{output_dir}/{SIDECAR_FILE}", compression="zstd")
     print(f"Wrote {path}: {table.num_rows:,} rows, {table.num_columns} columns "
           f"(ephemerides {t_eph:.1f} s, total {time.perf_counter() - t_start:.1f} s).")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="ssp-build-sssource",
-        description="Build the SSSource table from the submitted-source and MPC Parquet files",
+        prog="ssp-build-ssobservation",
+        description="Build the SSObservation table from the submitted-source and MPC Parquet files",
         epilog=(
             "Reads dia_sources (from extract-submitted-sources), obs_sbn, "
             "numbered_identifications, current_identifications and mpc_orbits "
-            ".parquet files from the input directory and writes sssource.parquet "
-            "(one row per dia_sources row, with the columns of the PPDB SSSource "
+            ".parquet files from the input directory and writes ssobservation.parquet "
+            "(one row per dia_sources row, with the columns of the PPDB SSObservation "
             "table) to the output directory. The ASSIST ephemeris files are taken "
             "from the SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables."
         ),
@@ -1065,7 +1085,7 @@ def main():
         parser.error("--chunk-factor must be at least 1")
 
     try:
-        build_sssource(
+        build_ssobservation(
             args.input_dir, args.output_dir,
             max_objects=args.max_objects, dia_sample_frac=args.dia_sample_frac, seed=args.seed,
             workers=args.workers, chunk_factor=args.chunk_factor,

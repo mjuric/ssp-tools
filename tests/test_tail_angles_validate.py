@@ -1,7 +1,7 @@
 """Network-free tests of bench/tail_angles_validate.py (WP T2 of
 docs/design/tail-angles.md): the independent position-angle implementation,
 the frame rotations, the Horizons quantity-27 request and parser (on an
-excerpt of a real answer) and the SSSource/NearbySSO consistency checker
+excerpt of a real answer) and the SSObservation/NearbySSO consistency checker
 (on synthetic tables, with injected faults). Nothing here talks to JPL."""
 
 import os
@@ -246,7 +246,7 @@ ASSIST = os.environ.get("SSP_ASSIST_PLANETS") and os.environ.get("SSP_ASSIST_AST
 
 
 @pytest.mark.skipif(
-    not (ASSIST and os.path.isdir(T.CACHE) and os.path.exists(T.REF_SSSOURCE)),
+    not (ASSIST and os.path.isdir(T.CACHE) and os.path.exists(T.REF_SSOBSERVATION)),
     reason="needs ASSIST data, the T2 Horizons cache and the non-grav fixture",
 )
 def test_cached_horizons_answer_agrees_in_icrs():
@@ -268,8 +268,8 @@ def test_cached_horizons_answer_agrees_in_icrs():
 
 
 def make_tables(tmp_path, n=400, seed=7, mutate=None):
-    """Synthetic SSSource and NearbySSO files. The 'production' angles come
-    from float64 vectors (perturbed by float32 rounding-size noise, as the
+    """Synthetic SSObservation and NearbySSO files. The 'production' angles
+    come from float64 vectors (perturbed by float32 rounding-size noise, as the
     EphResult is before it's cast) and are stored as float32, next to the
     vectors stored as float32. Rows 0-1 have no orbit."""
     rng = np.random.default_rng(seed)
@@ -315,7 +315,7 @@ def make_tables(tmp_path, n=400, seed=7, mutate=None):
     if mutate:
         mutate(s, nb)
     nb = {k: pa.array(np.asarray(v, np.float32) if k.startswith("ephAnti") else v) for k, v in nb.items()}
-    ps, pn = str(tmp_path / "sssource.parquet"), str(tmp_path / "nearbysso.parquet")
+    ps, pn = str(tmp_path / "ssobservation.parquet"), str(tmp_path / "nearbysso.parquet")
     pq.write_table(pa.table(s), ps)
     pq.write_table(pa.table(nb), pn)
     return ps, pn

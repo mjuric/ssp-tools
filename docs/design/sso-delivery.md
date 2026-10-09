@@ -1,5 +1,7 @@
 # Design: building and delivering the PPDB Solar System tables daily
 
+> **Renamed (2026-10-08):** the PPDB table called SSSource here is now **SSObservation**, and the code names follow it (`ssp.ssobservation`, `ssp-build-ssobservation`, `SSOBSERVATION_*`); see `docs/design/ssobservation-delivery.md`. This document keeps the names it was written with.
+
 Status: **implemented** (2026-10-01): `ssp-extract-sso-inputs`, `ssp-build-sso`, `ssp-upload-sso` and `ssp-sso-daily`. A full daily run with a dry-run upload to dev works end to end; the runbook is `docs/runbooks/sso-daily.md`. Real uploads wait on the DM-55678 items listed there.
 
 ## Context

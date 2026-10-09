@@ -389,7 +389,7 @@ def test_report_all_ok(tmp_path, fake_steps):
         p = tmp_path / "run" / e["file"]
         assert e["file"] == f"delivery/{t}.parquet"
         assert e["md5"] == B._md5(p) and e["bytes"] == p.stat().st_size
-    assert rep["tables"]["mpc_orbits"]["rows"] == 4 and rep["tables"]["SSSource"]["rows"] == 3
+    assert rep["tables"]["mpc_orbits"]["rows"] == 4 and rep["tables"]["SSObservation"]["rows"] == 3
     assert rep["checks"] == {c: {"status": "PASS", "report": "checks/fake.txt"} for c in B.EXPECTED_CHECKS}
     assert rep["input_paths"]["obs_sbn"] == str((tmp_path / "in" / "obs_sbn.parquet").resolve())
     assert all(rep["steps"][s]["ssp_tools_commit"] == rep["ssp_tools_commit"] for s in BUILD_STEPS)
@@ -411,7 +411,7 @@ def test_failed_check_not_deliverable(tmp_path, fake_steps):
 
 @pytest.mark.parametrize("checks", [
     "one FAIL",                 # (M3: the check results, not just the step's exit code)
-    "sssource missing",         # (an expected check that never ran)
+    "ssobservation missing",         # (an expected check that never ran)
     "extra FAIL",
 ])
 def test_deliverable_needs_every_check(tmp_path, fake_steps, checks):
@@ -420,8 +420,8 @@ def test_deliverable_needs_every_check(tmp_path, fake_steps, checks):
     write_inputs(tmp_path / "in")
     if checks == "one FAIL":
         fake_steps["checks"]["delivery:NearbySSO"] = "FAIL"
-    elif checks == "sssource missing":
-        for c in ("sssource:conformance", "sssource:offsets"):
+    elif checks == "ssobservation missing":
+        for c in ("ssobservation:conformance", "ssobservation:offsets"):
             del fake_steps["checks"][c]
     else:
         fake_steps["checks"]["something:else"] = "FAIL"
@@ -437,8 +437,8 @@ def test_deliverable_rules():
               tables={t: {} for t in DELIVERY_TABLES})
     assert B._deliverable(ok) is True
     for edit in (lambda r: r["tables"].pop("NearbySSO"),
-                 lambda r: r["checks"]["delivery:SSSource"].update(status="FAIL"),
-                 lambda r: r["checks"].pop("sssource:offsets"),
+                 lambda r: r["checks"]["delivery:SSObservation"].update(status="FAIL"),
+                 lambda r: r["checks"].pop("ssobservation:offsets"),
                  lambda r: r.update(checks={}),
                  lambda r: r["steps"]["ssobject"].update(status="skipped")):
         r = json.loads(json.dumps(ok))
@@ -452,10 +452,10 @@ def test_failed_step_then_from(tmp_path, fake_steps):
     fake_steps["fails"] = {"ssobject"}
     rep = B.build(tmp_path / "in", run, log=_quiet)
     st = {s: e["status"] for s, e in rep["steps"].items()}
-    assert st == dict(mpc="ok", sssource="ok", ssobject="failed", nearbysso="skipped", check="skipped")
+    assert st == dict(mpc="ok", ssobservation="ok", ssobject="failed", nearbysso="skipped", check="skipped")
     assert "exited 1" in rep["steps"]["ssobject"]["error"]
     assert "fake failure" in (run / "logs" / "ssobject.log").read_text()
-    assert rep["deliverable"] is False and set(rep["tables"]) == set(B.MPC_TABLES) | {"SSSource"}
+    assert rep["deliverable"] is False and set(rep["tables"]) == set(B.MPC_TABLES) | {"SSObservation"}
     # the report on disk is the failed run's
     assert json.loads((run / "report.json").read_text())["steps"]["ssobject"]["status"] == "failed"
 
@@ -464,16 +464,16 @@ def test_failed_step_then_from(tmp_path, fake_steps):
         B.build(tmp_path / "in", run, from_step="nearbysso", log=_quiet)
 
     # --from ssobject: the earlier outputs and entries are kept
-    sss = run / "delivery" / "SSSource.parquet"
+    sss = run / "delivery" / "SSObservation.parquet"
     mtime = sss.stat().st_mtime_ns
     fake_steps["fails"] = set()
     fake_steps["calls"].clear()
     rep2 = B.build(tmp_path / "in", run, from_step="ssobject", log=_quiet)
     assert fake_steps["calls"] == ["ssobject", "nearbysso", "check"]
     assert rep2["deliverable"] is True
-    for s in ("mpc", "sssource"):
+    for s in ("mpc", "ssobservation"):
         assert rep2["steps"][s] == rep["steps"][s]
-    assert rep2["tables"]["SSSource"] == rep["tables"]["SSSource"]
+    assert rep2["tables"]["SSObservation"] == rep["tables"]["SSObservation"]
     assert sss.stat().st_mtime_ns == mtime
 
 
@@ -494,9 +494,9 @@ def test_from_removes_later_outputs(tmp_path, fake_steps):
     write_inputs(tmp_path / "in")
     run = tmp_path / "run"
     B.build(tmp_path / "in", run, log=_quiet)
-    fake_steps["fails"] = {"sssource"}
-    rep = B.build(tmp_path / "in", run, from_step="sssource", log=_quiet)
-    assert rep["steps"]["sssource"]["status"] == "failed"
+    fake_steps["fails"] = {"ssobservation"}
+    rep = B.build(tmp_path / "in", run, from_step="ssobservation", log=_quiet)
+    assert rep["steps"]["ssobservation"]["status"] == "failed"
     left = sorted(os.listdir(run / "delivery"))
     assert left == sorted(f"{t}.parquet" for t in B.MPC_TABLES)
     assert set(rep["tables"]) == set(B.MPC_TABLES) and rep["checks"] == {}
@@ -517,29 +517,29 @@ def test_fresh_run_clears_old_outputs(tmp_path, fake_steps):
 def test_check_real_delivery_check_fails(tmp_path, monkeypatch):
     """The check step runs ssp.delivery_check: an empty delivery fails
     every table."""
-    monkeypatch.setattr(B, "have_sssource_validate", lambda: False)
+    monkeypatch.setattr(B, "have_ssobservation_validate", lambda: False)
     (tmp_path / "delivery").mkdir()
     assert B.step_check(tmp_path, log=_quiet) is False
     res = json.loads((tmp_path / "checks" / "results.json").read_text())
     assert set(res) == set(B.EXPECTED_CHECKS)
     assert all(v["status"] == "FAIL" for v in res.values())
-    assert "run from a source checkout" in (tmp_path / "checks" / "sssource-offsets.txt").read_text()
+    assert "run from a source checkout" in (tmp_path / "checks" / "ssobservation-offsets.txt").read_text()
 
 
 def test_check_without_bench_fails(tmp_path, monkeypatch):
-    """Without bench/, the SSSource checks FAIL as not available, so the
+    """Without bench/, the SSObservation checks FAIL as not available, so the
     delivery is not deliverable even if the delivery check passes."""
     from collections import namedtuple
     R = namedtuple("CheckResult", "name ok detail")
     monkeypatch.setattr(B, "check_delivery",
                         lambda d, **k: {t: [R("x", True, "ok")] for t in DELIVERY_TABLES})
-    monkeypatch.setattr(B, "have_sssource_validate", lambda: False)
+    monkeypatch.setattr(B, "have_ssobservation_validate", lambda: False)
     (tmp_path / "delivery").mkdir()
     assert B.step_check(tmp_path, log=_quiet) is False
     res = json.loads((tmp_path / "checks" / "results.json").read_text())
     assert set(res) == set(B.EXPECTED_CHECKS)
     failed = [k for k, v in res.items() if v["status"] == "FAIL"]
-    assert failed == ["sssource:conformance", "sssource:offsets"]
+    assert failed == ["ssobservation:conformance", "ssobservation:offsets"]
 
 
 def test_check_delivery_results(tmp_path, monkeypatch):
@@ -551,7 +551,7 @@ def test_check_delivery_results(tmp_path, monkeypatch):
         return {t: [R("columns", True, "ok"), R("pk", t != "SSObject", "dup")] for t in tables}
 
     monkeypatch.setattr(B, "check_delivery", check_delivery)
-    monkeypatch.setattr(B, "have_sssource_validate", lambda: False)
+    monkeypatch.setattr(B, "have_ssobservation_validate", lambda: False)
     (tmp_path / "delivery").mkdir()
     assert B.step_check(tmp_path, log=_quiet) is False
     res = json.loads((tmp_path / "checks" / "results.json").read_text())
@@ -565,8 +565,8 @@ def test_from_refuses_missing_kept_table(tmp_path, fake_steps):
     write_inputs(tmp_path / "in")
     run = tmp_path / "run"
     B.build(tmp_path / "in", run, log=_quiet)
-    (run / "delivery" / "SSSource.parquet").unlink()
-    with pytest.raises(ValueError, match="SSSource, from step sssource, is missing"):
+    (run / "delivery" / "SSObservation.parquet").unlink()
+    with pytest.raises(ValueError, match="SSObservation, from step ssobservation, is missing"):
         B.build(tmp_path / "in", run, from_step="ssobject", log=_quiet)
 
 
@@ -574,8 +574,8 @@ def test_from_refuses_changed_kept_table(tmp_path, fake_steps):
     write_inputs(tmp_path / "in")
     run = tmp_path / "run"
     B.build(tmp_path / "in", run, log=_quiet)
-    pq.write_table(pa.table({"x": [9, 9, 9, 9]}), run / "delivery" / "SSSource.parquet")
-    with pytest.raises(ValueError, match="SSSource.parquet has changed since step sssource"):
+    pq.write_table(pa.table({"x": [9, 9, 9, 9]}), run / "delivery" / "SSObservation.parquet")
+    with pytest.raises(ValueError, match="SSObservation.parquet has changed since step ssobservation"):
         B.build(tmp_path / "in", run, from_step="check", log=_quiet)
 
 
@@ -589,9 +589,9 @@ def test_from_mixed_commits(tmp_path, fake_steps, monkeypatch):
         B.build(tmp_path / "in", run, from_step="nearbysso", log=_quiet)
     rep = B.build(tmp_path / "in", run, from_step="nearbysso", allow_mixed_commits=True, log=_quiet)
     assert rep["deliverable"] is True and rep["ssp_tools_commit"] == "NEW"
-    assert rep["mixed_commits"] == dict(mpc="OLD", sssource="OLD", ssobject="OLD", nearbysso="NEW",
+    assert rep["mixed_commits"] == dict(mpc="OLD", ssobservation="OLD", ssobject="OLD", nearbysso="NEW",
                                         check="NEW")
-    assert rep["steps"]["sssource"]["ssp_tools_commit"] == "OLD"
+    assert rep["steps"]["ssobservation"]["ssp_tools_commit"] == "OLD"
     assert rep["steps"]["check"]["ssp_tools_commit"] == "NEW"
 
 
@@ -602,7 +602,7 @@ def test_inputs_changed_during_build(tmp_path, fake_steps, monkeypatch):
     inner = B.step_command
 
     def sc(step, *a, **k):
-        if step == "sssource":
+        if step == "ssobservation":
             shutil.copy(tmp_path / "other" / "dia_sources.parquet", tmp_path / "in" / "dia_sources.parquet")
         return inner(step, *a, **k)
 
@@ -778,8 +778,8 @@ def e2e(tmp_path_factory):
 def _expect_checks(rep):
     """The check step's results: every check passes."""
     ch = rep["checks"]
-    assert ch["sssource:conformance"]["status"] == "PASS"
-    assert ch["sssource:offsets"]["status"] == "PASS"
+    assert ch["ssobservation:conformance"]["status"] == "PASS"
+    assert ch["ssobservation:offsets"]["status"] == "PASS"
     assert all(ch[f"delivery:{t}"]["status"] == "PASS" for t in DELIVERY_TABLES), ch
     assert rep["steps"]["check"]["status"] == "ok" and rep["deliverable"] is True
 
@@ -791,7 +791,7 @@ def test_e2e_subset(e2e):
         assert rep["steps"][s]["status"] == "ok", (s, rep["steps"][s])
     _expect_checks(rep)
     assert set(rep["tables"]) == set(DELIVERY_TABLES)
-    assert rep["tables"]["SSSource"]["rows"] == tables["dia_sources"].num_rows
+    assert rep["tables"]["SSObservation"]["rows"] == tables["dia_sources"].num_rows
     assert rep["tables"]["mpc_orbits"]["rows"] == tables["mpc_orbits"].num_rows
     assert rep["tables"]["NearbySSO"]["rows"] > 0
     for t in DELIVERY_TABLES:
@@ -807,13 +807,13 @@ def test_e2e_subset(e2e):
     assert sum(des in ids for des, _ in pairs) > 0
     for des, sid in pairs:
         assert sid == ids.get(des), (des, sid)
-    assert (d / "run" / "work" / "sssource" / "in" / "obs_sbn.parquet").is_symlink()
+    assert (d / "run" / "work" / "ssobservation" / "in" / "obs_sbn.parquet").is_symlink()
 
 
 @needs_fixture
 def test_e2e_from_check(e2e):
     d, _, rep = e2e
-    sss = d / "run" / "delivery" / "SSSource.parquet"
+    sss = d / "run" / "delivery" / "SSObservation.parquet"
     mtime = sss.stat().st_mtime_ns
     rep2 = B.build(d / "in", d / "run", from_step="check", workers=E2E_WORKERS)
     for s in BUILD_STEPS[:-1]:

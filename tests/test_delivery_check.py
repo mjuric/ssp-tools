@@ -61,7 +61,7 @@ def test_pass(tmp_path, table):
     assert set(rs) == {"file", "columns", "types", "nulls", "char lengths", "primary key"}
 
 
-@pytest.mark.parametrize("table", ["SSSource", "mpc_orbits"])
+@pytest.mark.parametrize("table", ["SSObservation", "mpc_orbits"])
 def test_pass_dictionary_and_large_string(tmp_path, table):
     t = make_table(table, dictionary=True)
     assert failed(results(table, write(tmp_path, table, t))) == []
@@ -109,8 +109,8 @@ def test_misordered_columns(tmp_path):
 
 
 def test_missing_key_column(tmp_path):
-    t = make_table("SSSource").drop_columns(["obsid"])
-    rs = results("SSSource", write(tmp_path, "SSSource", t))
+    t = make_table("SSObservation").drop_columns(["obsid"])
+    rs = results("SSObservation", write(tmp_path, "SSObservation", t))
     assert failed(rs) == ["columns", "primary key"]
 
 
@@ -119,9 +119,9 @@ def test_missing_key_column(tmp_path):
 # --------------------------------------------------------------------------
 
 def test_int64_for_float(tmp_path):
-    t = make_table("SSSource")
+    t = make_table("SSObservation")
     t = replace(t, "ra", pa.array(range(N), pa.int64()))
-    rs = results("SSSource", write(tmp_path, "SSSource", t))
+    rs = results("SSObservation", write(tmp_path, "SSObservation", t))
     assert failed(rs) == ["types"]
     assert "ra: int64, want double" in rs["types"].detail
 
@@ -168,10 +168,10 @@ def test_unknown_felis_datatype(tmp_path):
 # --------------------------------------------------------------------------
 
 def test_nulls_in_non_null_column(tmp_path):
-    t = make_table("SSSource")
+    t = make_table("SSObservation")
     t = replace(t, "visit", pa.array([None, 1, 2, None, 4, 5], pa.int64()))
     t = replace(t, "trksub", pa.array([None] * N, pa.string()))   # nullable: fine
-    rs = results("SSSource", write(tmp_path, "SSSource", t))
+    rs = results("SSObservation", write(tmp_path, "SSObservation", t))
     assert failed(rs) == ["nulls"]
     assert "visit (2 NULLs)" in rs["nulls"].detail
     assert "trksub" not in rs["nulls"].detail
@@ -186,9 +186,9 @@ def test_duplicate_key(tmp_path):
 
 
 def test_duplicate_string_key_dictionary(tmp_path):
-    t = make_table("SSSource", dictionary=True)
+    t = make_table("SSObservation", dictionary=True)
     t = replace(t, "obsid", pa.array(["a", "b", "a", "c", "d", "e"]).dictionary_encode())
-    rs = results("SSSource", write(tmp_path, "SSSource", t))
+    rs = results("SSObservation", write(tmp_path, "SSObservation", t))
     assert failed(rs) == ["primary key"]
     assert "'a'" in rs["primary key"].detail
 
@@ -226,20 +226,20 @@ def test_composite_primary_key(tmp_path):
 
 @pytest.mark.parametrize("dictionary", [False, True])
 def test_over_long_char(tmp_path, dictionary):
-    t = make_table("SSSource")
+    t = make_table("SSObservation")
     arr = pa.array(["X", "Y", "TOOLONG", "X", "Y", "X"])   # status: char(1)
     t = replace(t, "status", arr.dictionary_encode() if dictionary else arr)
-    rs = results("SSSource", write(tmp_path, "SSSource", t))
+    rs = results("SSObservation", write(tmp_path, "SSObservation", t))
     assert failed(rs) == ["char lengths"]
     assert "status (1 values over 1, max 7" in rs["char lengths"].detail
 
 
 def test_unused_dictionary_entry_is_not_a_value(tmp_path):
-    t = make_table("SSSource")
+    t = make_table("SSObservation")
     dictionary = pa.array(["X", "Y", "UNUSED-AND-LONG"])
     arr = pa.DictionaryArray.from_arrays(pa.array([0, 1, 0, 1, 0, 1], pa.int32()), dictionary)
     t = replace(t, "status", arr)
-    assert failed(results("SSSource", write(tmp_path, "SSSource", t))) == []
+    assert failed(results("SSObservation", write(tmp_path, "SSObservation", t))) == []
 
 
 # --------------------------------------------------------------------------
@@ -256,7 +256,7 @@ def test_missing_file(tmp_path, capsys):
     assert D.main([str(tmp_path)]) == 1
     rep = capsys.readouterr().out
     assert "NearbySSO: FAIL" in rep and "NOT DELIVERABLE" in rep
-    assert D.main([str(tmp_path), "--tables", "SSSource", "SSObject"]) == 0
+    assert D.main([str(tmp_path), "--tables", "SSObservation", "SSObject"]) == 0
 
 
 def test_unreadable_file(tmp_path):

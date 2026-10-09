@@ -10,15 +10,15 @@ This builds and delivers the six PPDB Solar System tables (RFC-1188), in three s
 | 3. deliver | `ssp-upload-sso CONFIG RUN_DIR [--dry-run]` | GCS, Pub/Sub |
 | all of them | `ssp-sso-daily WORK_DIR [--upload CONFIG] [--dry-run]` | runs 0–3 in `WORK_DIR/<UTC date>/` |
 
-The tables: SSSource, SSObject, NearbySSO, `mpc_orbits`, `current_identifications` and `numbered_identifications`, per `sdm_schemas` `ppdb.yaml`/`sso_base.yaml` (tickets/DM-55375, lsst/sdm_schemas#549; copies in `tests/data/sdm_schemas/`).
+The tables: SSObservation, SSObject, NearbySSO, `mpc_orbits`, `current_identifications` and `numbered_identifications`, per `sdm_schemas` `ppdb.yaml`/`sso_base.yaml` (tickets/DM-55375, lsst/sdm_schemas#549; copies in `tests/data/sdm_schemas/`).
 
-Design: `docs/design/sso-delivery.md` (the stages), `docs/design/sssource-widened.md` (SSSource, SSObject), `docs/design/nearbysso.md` (NearbySSO) and `docs/design/nongrav.md` (non-gravitational forces, and comets in NearbySSO). The contract between the stages is `ssp/delivery_contract.py`.
+Design: `docs/design/sso-delivery.md` (the stages), `docs/design/sssource-widened.md` (SSObservation, SSObject), `docs/design/nearbysso.md` (NearbySSO) and `docs/design/nongrav.md` (non-gravitational forces, and comets in NearbySSO). The contract between the stages is `ssp/delivery_contract.py`.
 
 ## Setup (once)
 
 - **Code:** an ssp-tools **source checkout** with its venv.
   - `uv sync --extra all`; building ASSIST needs a C compiler.
-  - The build stage's SSSource checks need `bench/` from the checkout, and the upload configs live in `config/sso-upload/`. So run from the checkout (an editable install).
+  - The build stage's SSObservation checks need `bench/` from the checkout, and the upload configs live in `config/sso-upload/`. So run from the checkout (an editable install).
   - If a console script is missing after a pull, refresh the entry points: `VIRTUAL_ENV=$PWD/.venv uv pip install --no-deps -e .`
 - **ASSIST data:** `data/assist/linux_p1550p2650.440` and `data/assist/sb441-n16.bsp`. Export `SSP_ASSIST_PLANETS` and `SSP_ASSIST_ASTEROIDS`, and set `OMP_NUM_THREADS=1`.
 - **The correction table** (CT): `/sdf/data/rubin/user/mjuric/shutter-timing/corrections`, built by `shutter-timing-table` (the `shutter-timing` package, pinned in ssp-tools' venv; `docs/design/shutter-timing.md`). `--correction-table DIR` points stage 0 and the extract at another one. Stage 0 reads the raw zips under `/sdf/data/rubin/lsstdata/offline/instrument/LSSTCam`.
@@ -124,7 +124,7 @@ ssp-upload-sso dev RUN_DIR --dry-run           # prints the planned objects and 
 - **Layout:** `gs://<bucket>/<YYYYMMDDTHHMMSSmmm>/<Table>.parquet`, then a Pub/Sub message `{"bucket", "object_prefix", "uploaded_tables"}`. This is the contract of `lsst/dax_ppdb` `bigquery/sso_uploader.py`.
 - **NearbySSO is built and staged but not uploaded.** The loader (`lsst-dm/ppdb-cloud-functions` `load_sso`) fails the *whole* load when an unknown table is listed. NearbySSO joins the configs' `tables` once `dax_ppdb`'s `SSO_TABLES` and `load_sso` add it.
 - **Upload at most once per load window.** `load_sso` starts Dataflow under a fixed job name, `load-sso`, so a message that arrives while a load is running is acknowledged and dropped. Check that the previous load has finished before `--force`.
-- **The PPDB dataset must match the schema.** The loader writes into BigQuery tables built from the deployed `ppdb.yaml`, so the widened SSSource and the new columns load only once DM-55375 (lsst/sdm_schemas#549) is merged and the dataset rebuilt.
+- **The PPDB dataset must match the schema.** The loader writes into BigQuery tables built from the deployed `ppdb.yaml`, so SSObservation and the new columns load only once DM-55375 (lsst/sdm_schemas#549) is merged and the dataset rebuilt.
 
 ## Open items with the DM-55678 owners
 
@@ -146,7 +146,7 @@ See the end of this file, "Reference run".
 |---|---|---|
 | extract (MPC snapshot 2026-10-01T19:47:15Z) | 20:01 | — (the whole run's peak RSS was 25.9 GB) |
 | build: mpc | 40 s | 6.9 GB |
-| build: sssource | 3:03 | 13.7 GB |
+| build: ssobservation | 3:03 | 13.7 GB |
 | build: ssobject | 1:14 | 2.9 GB |
 | build: nearbysso | 5:26 | 12.9 GB |
 | build: check | 48 s | 5.8 GB |
@@ -155,14 +155,14 @@ See the end of this file, "Reference run".
 
 | table | rows |
 |---|---|
-| SSSource | 8,070,610 |
+| SSObservation | 8,070,610 |
 | SSObject | 297,762 |
 | NearbySSO | 1,290,832 |
 | mpc_orbits | 1,575,025 |
 | current_identifications | 2,099,684 |
 | numbered_identifications | 896,611 |
 
-- All 8 checks PASS: the six `delivery:<Table>` checks plus `sssource:conformance` and `sssource:offsets`. `deliverable` is true.
+- All 8 checks PASS: the six `delivery:<Table>` checks plus `ssobservation:conformance` and `ssobservation:offsets`. `deliverable` is true.
 - The dry-run upload planned `gs://ppdb-dev-sso-ingest/20261001T201900014/<Table>.parquet` for the five accepted tables, with NearbySSO held back.
 
 ## Rerun with non-gravitational forces (2026-10-01)
@@ -170,16 +170,16 @@ See the end of this file, "Reference run".
 Since `docs/design/nongrav.md`, the ephemerides apply the MPC's non-gravitational fits: 184 comets and 454 Yarkovsky asteroids. NearbySSO also includes comets.
 - The run is the same: no new inputs, options or steps.
 - Expect about 3 GB more peak memory in the nearbysso step (16.0 GB).
-- Warnings in the sssource and nearbysso logs name any orbit whose non-grav fit can't be parsed (it is integrated gravity-only), or whose `non_gravs` flag and CAR coefficients disagree. There were none on 2026-10-01.
+- Warnings in the ssobservation and nearbysso logs name any orbit whose non-grav fit can't be parsed (it is integrated gravity-only), or whose `non_gravs` flag and CAR coefficients disagree. There were none on 2026-10-01.
 
-`ssp-build-sso` on the 2026-10-01 inputs above, `nongrav` 6bdfe06, 32 workers: deliverable, all 8 checks PASS, in `/sdf/data/rubin/user/mjuric/nongrav/rerun/2026-10-01/run/`. SSSource 8,070,610 rows (only the 495 rows of non-grav objects changed); NearbySSO 1,290,839 rows (7 comet rows added). Timings and the comparison are in the design doc, "The full daily rerun".
+`ssp-build-sso` on the 2026-10-01 inputs above, `nongrav` 6bdfe06, 32 workers: deliverable, all 8 checks PASS, in `/sdf/data/rubin/user/mjuric/nongrav/rerun/2026-10-01/run/`. SSObservation 8,070,610 rows (only the 495 rows of non-grav objects changed); NearbySSO 1,290,839 rows (7 comet rows added). Timings and the comparison are in the design doc, "The full daily rerun".
 
 ## Tail position angles (2026-10-03)
 
-SSSource and NearbySSO have two new columns, `ephAntiSunPA` and `ephAntiMotionPA` (`docs/design/tail-angles.md`), from sdm_schemas `tickets/DM-55375` f2541a5. Nothing changes in the run itself. To check a delivery's angles:
+SSObservation and NearbySSO have two new columns, `ephAntiSunPA` and `ephAntiMotionPA` (`docs/design/tail-angles.md`), from sdm_schemas `tickets/DM-55375` f2541a5. Nothing changes in the run itself. To check a delivery's angles:
 
 ```bash
-python -m bench.tail_angles_validate consistency RUN_DIR/delivery/SSSource.parquet RUN_DIR/delivery/NearbySSO.parquet \
+python -m bench.tail_angles_validate consistency RUN_DIR/delivery/SSObservation.parquet RUN_DIR/delivery/NearbySSO.parquet \
     --dia-sources INPUTS_DIR/ppdb_dia_sources.parquet
 ```
 
@@ -195,12 +195,12 @@ NearbySSO matches comets and ISOs (designations C/, P/, D/, I/) within 15″, an
 
 ## Shutter-motion-corrected times (2026-10)
 
-SSSource's `midpointMjdTai` is the exposure midpoint corrected for the shutter's motion, with two flags, `midpointMjdTai_flag` and `midpointMjdTai_flag_degraded` (`docs/design/shutter-timing.md`). The run gains stage 0 (above); the extract reads the correction table.
+SSObservation's `midpointMjdTai` is the exposure midpoint corrected for the shutter's motion, with two flags, `midpointMjdTai_flag` and `midpointMjdTai_flag_degraded` (`docs/design/shutter-timing.md`). The run gains stage 0 (above); the extract reads the correction table.
 
-**SSSource vs. NearbySSO.** NearbySSO predicts at each DiaSource's own `midpointMjdTai`, still the visit time until AP corrects DiaSource. So at the same DiaSource the two tables differ by about the rate × Δt, Δt = SSSource's time − the DiaSource's (≤ 0.24 s for most visits, up to ~2 s for header-timed, degraded ones): up to a few tens of mas for fast objects, more on the degraded visits. The checks that compare the two (`bench/tail_angles_validate.py consistency`, `bench/nearbysso_validate.py same-orbits`, `bench/nongrav_validate.py nearbysso`) take Δt from SSSource and the DiaSource input, and allow for it (`bench/time_shift.py`):
+**SSObservation vs. NearbySSO.** NearbySSO predicts at each DiaSource's own `midpointMjdTai`, still the visit time until AP corrects DiaSource. So at the same DiaSource the two tables differ by about the rate × Δt, Δt = SSObservation's time − the DiaSource's (≤ 0.24 s for most visits, up to ~2 s for header-timed, degraded ones): up to a few tens of mas for fast objects, more on the degraded visits. The checks that compare the two (`bench/tail_angles_validate.py consistency`, `bench/nearbysso_validate.py same-orbits`, `bench/nongrav_validate.py nearbysso`) take Δt from SSObservation and the DiaSource input, and allow for it (`bench/time_shift.py`):
 
 - where Δt = 0, the old tolerances, unchanged;
-- positions: the motion over Δt is taken out first, and what's left must be within the old tolerance plus 0.2% of |rate| |Δt|, a bound on the track's curvature over Δt, and 0.05 mas (2% of |rate| |Δt| where SSSource has no ranges);
+- positions: the motion over Δt is taken out first, and what's left must be within the old tolerance plus 0.2% of |rate| |Δt|, a bound on the track's curvature over Δt, and 0.05 mas (2% of |rate| |Δt| where SSObservation has no ranges);
 - `ephOffset`, and "beyond the match radius" or "a nearer object": |rate| |Δt| × 1.02 + 0.05 mas on top;
 - rates, V and the tail angles: twice a geometric bound on their change over Δt;
 - each row's own Δt is used; only |Δt| > 10 s (not the same exposure) is a failure.
