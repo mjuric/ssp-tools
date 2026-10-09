@@ -522,7 +522,7 @@ def test_shutter_entry_from_reused_dia_sources(tmp_path, stubs):
 
 def test_correction_defaults():
     from ssp.export.submittable import DEFAULT_CORRECTION_TABLE
-    from ssp.sssource_contract import MAX_NOT_BUILT_VISITS
+    from ssp.ssobservation_contract import MAX_NOT_BUILT_VISITS
     a = M.build_parser().parse_args(["x"])
     assert (a.correction_table, a.max_not_built_visits) == (DEFAULT_CORRECTION_TABLE, MAX_NOT_BUILT_VISITS)
 

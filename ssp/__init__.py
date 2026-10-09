@@ -2,4 +2,4 @@
 
 __version__ = "0.1.0"
 
-__all__ = [ "ssobject", "sssource" ]
+__all__ = [ "ssobject", "ssobservation" ]

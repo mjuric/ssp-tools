@@ -1,4 +1,4 @@
-"""The SSSource/NearbySSO time-shift allowance (bench/time_shift.py,
+"""The SSObservation/NearbySSO time-shift allowance (bench/time_shift.py,
 docs/design/shutter-timing.md) in the three validators that compare the two
 tables, on synthetic inputs: at dt = 0 the old strict tolerances hold; at
 dt = 0.2 s a rate x dt difference passes; at dt = 0.2 s an extra error
@@ -72,8 +72,9 @@ def test_rate_allowance_main_belt():
 # --------------------------------------------------------------------------
 
 def _nss_case(dt=0.0, extra_mas=(0.0, 0.0), rates=(8.0, -6.0)):
-    """One object, one DiaSource: SSSource at T0 + dt, NearbySSO at T0 (its
-    DiaSource's time), behind by rate x dt, plus ``extra_mas`` (ra, dec)."""
+    """One object, one DiaSource: SSObservation at T0 + dt, NearbySSO at T0
+    (its DiaSource's time), behind by rate x dt, plus ``extra_mas``
+    (ra, dec)."""
     ra, dec = 150.0, 40.0
     rra, rdec = rates
     dia = pd.DataFrame({"diaSourceId": [1], "midpointMjdTai": [T0], "ra": [ra + 1 * 1 / 3600], "dec": [dec]})
@@ -89,7 +90,7 @@ def _nss_case(dt=0.0, extra_mas=(0.0, 0.0), rates=(8.0, -6.0)):
                         "ephRateRa": np.float32(rra), "ephRateDec": np.float32(rdec),
                         "ephVmag": np.float32(20),
                         "ephOffset": np.float32(1.0)})
-    return NV.compare_to_sssource(nss, sss, dia, {"2020 AB": ""}, lambda d, t: np.ones(len(d)))
+    return NV.compare_to_ssobservation(nss, sss, dia, {"2020 AB": ""}, lambda d, t: np.ones(len(d)))
 
 
 @pytest.mark.parametrize("dt, extra, status", [
@@ -111,7 +112,7 @@ def test_nearbysso_same_orbits(dt, extra, status):
 
 
 def test_nearbysso_unshifted_motion_fails_without_the_time():
-    """The rate x dt difference with SSSource's time equal to the
+    """The rate x dt difference with SSObservation's time equal to the
     DiaSource's (as before the correction) is a mismatch."""
     nss_like, _ = _nss_case(DT)       # NearbySSO's positions, behind by rate x dt
     sss = pd.DataFrame({"diaSourceId": [1], "designation": ["2020 AB"], "ephRa": [150.0], "ephDec": [40.0],
@@ -122,7 +123,7 @@ def test_nearbysso_unshifted_motion_fails_without_the_time():
                         "ephRateRa": np.float32(8), "ephRateDec": np.float32(-6), "ephVmag": np.float32(20),
                         "ephOffset": np.float32(1)})
     dia = pd.DataFrame({"diaSourceId": [1], "midpointMjdTai": [T0], "ra": [150.0003], "dec": [40.0]})
-    rows, _ = NV.compare_to_sssource(nss, sss, dia, {"2020 AB": ""}, lambda d, t: np.ones(len(d)))
+    rows, _ = NV.compare_to_ssobservation(nss, sss, dia, {"2020 AB": ""}, lambda d, t: np.ones(len(d)))
     assert rows["status"].iloc[0] == "value_mismatch"
 
 
@@ -145,7 +146,7 @@ def test_nearbysso_rate_and_vmag_allowances():
                             "helioRange": [1.0], "helioRangeRate": [5.0]})
         nss = pd.DataFrame({"diaSourceId": [1], "designation": ["X"], "ephRa": [ra], "ephDec": [dec],
                             "ephRateRa": [dr], "ephRateDec": [0.0], "ephVmag": [20.0], "ephOffset": [0.0]})
-        rows, _ = NV.compare_to_sssource(nss, sss, dia, {"X": ""}, lambda d, t: np.ones(len(d)))
+        rows, _ = NV.compare_to_ssobservation(nss, sss, dia, {"X": ""}, lambda d, t: np.ones(len(d)))
         assert (rows["status"].iloc[0] == "match") == ok
 
 
@@ -231,7 +232,7 @@ def _radec_unit(ra, dec):
 
 
 def _tail_tables(tmp_path, dt_true, dt_recorded, extra=None, n=200, seed=11):
-    """SSSource at T0 + dt_recorded (its angles from its own vectors);
+    """SSObservation at T0 + dt_recorded (its angles from its own vectors);
     NearbySSO's angles from the vectors moved back by dt_true (the observer
     fixed, the object moving at helio_v); half the objects close and fast.
     ``extra``: (row, deg) added to that NearbySSO angle. The DiaSource file

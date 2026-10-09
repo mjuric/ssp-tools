@@ -3,11 +3,11 @@ docs/design/nongrav.md, "Validation").
 
 Black-box checks, written from the design, the contracts
 (``ssp/nongrav.py``, ``ssp/nearbysso/_contract.py``,
-``ssp/sssource_contract.py``) and ``sso_base.yaml`` only. The MPC ``CAR``
+``ssp/ssobservation_contract.py``) and ``sso_base.yaml`` only. The MPC ``CAR``
 block is parsed here independently of ``ssp.nongrav``; the frames, the
 g(r) and the units come from the design doc. The implementation is called
 only through public entry points: the ``ssp-build-*`` outputs, and
-``ssp.sssource_ellipse.load_orbit_covariances`` + ``ssp.nearbysso.
+``ssp.ssobservation_ellipse.load_orbit_covariances`` + ``ssp.nearbysso.
 propagate.coarse`` / ``ellipse_at`` for the published error ellipse.
 
 Classes (``--objects objects.txt``, ``class<TAB>designation``, or derived
@@ -25,10 +25,10 @@ from ``mpc_orbits``' ``mpc_orb_jsonb.CAR.coefficient_names``):
 Subcommands (each prints a text report, also written to ``--out FILE``;
 exit 0 on PASS, 1 on FAIL)::
 
-  offsets SSSOURCE_NEW SSSOURCE_REF MPC_ORBITS [--objects objects.txt]
-          [--ng-errors any|unchanged|changed]
-      SSSource with non-gravs (NEW) against a gravity-only build of the same
-      inputs (REF). Gates: gravity-only objects bitwise identical in every
+  offsets SSOBSERVATION_NEW SSOBSERVATION_REF MPC_ORBITS
+          [--objects objects.txt] [--ng-errors any|unchanged|changed]
+      SSObservation with non-gravs (NEW) against a gravity-only build of the
+      same inputs (REF). Gates: gravity-only objects bitwise identical in every
       ephemeris, geometry and error column; non-grav objects' ephemerides
       changed; the comet_ng median ephOffset improves and no comet_ng object
       gets much worse; no Yarkovsky object gets worse beyond a small
@@ -39,15 +39,16 @@ exit 0 on PASS, 1 on FAIL)::
       reports). Per-class and per-object tables (median/max ephOffset, the
       ephemeris shift, the sigma ratio).
 
-  nearbysso NEARBYSSO SSSOURCE MPC_ORBITS DIA_SOURCES [--objects objects.txt]
-      NearbySSO built from the same mpc_orbits as SSSource, and DIA_SOURCES
-      the NearbySSO input. Each SSSource row with an orbit whose DiaSource
-      is in the input (by diaSourceId; by (visit, ra, dec) where SSSource's
-      diaSourceId is NULL, i.e. measuredOn = science) must have a NearbySSO
-      row for the same object with the same ephemeris, or a miss explained
-      by: offset > radius (the object's match radius: 5", 15" for comets
-      and ISOs, C/ P/ D/ I/), sigma > 10" (or no covariance), orbit filtered,
-      sungrazer (q < 0.02 au), a nearer object, or (asked of
+  nearbysso NEARBYSSO SSOBSERVATION MPC_ORBITS DIA_SOURCES
+          [--objects objects.txt]
+      NearbySSO built from the same mpc_orbits as SSObservation, and
+      DIA_SOURCES the NearbySSO input. Each SSObservation row with an orbit
+      whose DiaSource is in the input (by diaSourceId; by (visit, ra, dec)
+      where SSObservation's diaSourceId is NULL, i.e. measuredOn = science)
+      must have a NearbySSO row for the same object with the same ephemeris, or
+      a miss explained by: offset > radius (the object's match radius: 5", 15"
+      for comets and ISOs, C/ P/ D/ I/), sigma > 10" (or no covariance), orbit
+      filtered, sungrazer (q < 0.02 au), a nearer object, or (asked of
       propagate.coarse for what's left) sigma > 10" within +-0.34 d of the
       observation, where NearbySSO's nightly sample may gate the night.
       Gates: no unexplained misses; no NearbySSO row beyond its object's
@@ -55,7 +56,7 @@ exit 0 on PASS, 1 on FAIL)::
       has any; otherwise noted as not applicable); agreement of
       the matched rows; no S/ objects; no NearbySSO row for an orbit the
       filter drops. ``--table FILE``: the per-row table (Parquet).
-      Time shift (docs/design/shutter-timing.md): SSSource predicts at its
+      Time shift (docs/design/shutter-timing.md): SSObservation predicts at its
       own (shutter-corrected) midpointMjdTai, NearbySSO at the DiaSource's
       (DIA_SOURCES' midpointMjdTai). Where they differ by dt, the
       agreement tolerances and the offset-radius and nearer-object
@@ -63,7 +64,8 @@ exit 0 on PASS, 1 on FAIL)::
       ephOffset: |rate| |dt| plus a margin); where dt = 0 they are
       unchanged. |dt| > TS.DT_MAX_S (10 s, a sanity limit) fails.
 
-  uncertainty MPC_ORBITS [--sssource SSSOURCE] [--objects objects.txt]
+  uncertainty MPC_ORBITS [--ssobservation SSOBSERVATION]
+          [--objects objects.txt]
           [--n-orbits 10] [--draws 1000] [--times 3] [--workers 8]
       Monte Carlo of the published error ellipse. For a sample of comet_ng
       and Yarkovsky orbits, draws (state, A) from the CAR covariance (MPC
@@ -73,12 +75,12 @@ exit 0 on PASS, 1 on FAIL)::
       per draw, the design doc's g(r)), and projects on the sky from X05
       (geometric, no light time, as the coarse pass). The sample covariance
       is compared with ``propagate.coarse`` + ``ellipse_at`` (gate) and with
-      the SSSource ellipse columns at the same rows (gate, with
-      --sssource). A state-only Monte Carlo (A fixed at its value) is
+      the SSObservation ellipse columns at the same rows (gate, with
+      --ssobservation). A state-only Monte Carlo (A fixed at its value) is
       reported alongside, as a diagnostic: an ellipse that matches it but
       not the full one is missing the A partials. Times: the object's
-      SSSource observation times (--sssource), else epoch +- 60/300 days.
-      ``--table FILE``: the per-(orbit, time) table (Parquet).
+      SSObservation observation times (--ssobservation), else epoch +- 60/300
+      days. ``--table FILE``: the per-(orbit, time) table (Parquet).
 
 JPL comparisons (Horizons with the MPC elements plus non-gravs) are not
 part of this harness: they belong to WP N5, so that only one agent talks
@@ -87,11 +89,12 @@ to JPL at a time. This module makes no network requests.
 Examples (the 2026-10-01 fixture)::
 
   F=/sdf/data/rubin/user/mjuric/nongrav/fixtures/2026-10-01
-  python -m bench.nongrav_validate offsets new/sssource.parquet \\
+  python -m bench.nongrav_validate offsets new/ssobservation.parquet \\
       $F/ref_gravity/sssource.parquet $F/in/mpc_orbits.parquet \\
       --objects $F/objects.txt --out offsets.txt
   python -m bench.nongrav_validate uncertainty $F/in/mpc_orbits.parquet \\
-      --sssource new/sssource.parquet --objects $F/objects.txt --out unc.txt
+      --ssobservation new/ssobservation.parquet --objects $F/objects.txt \\
+      --out unc.txt
 
 The ASSIST files come from SSP_ASSIST_PLANETS / SSP_ASSIST_ASTEROIDS; set
 OMP_NUM_THREADS=1.
@@ -117,16 +120,17 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from bench.sssource_validate import bitwise_mismatch, to_np  # noqa: E402
+from bench.ssobservation_validate import bitwise_mismatch, to_np  # noqa: E402
 from bench import time_shift as TS  # noqa: E402
 from ssp.nearbysso import _contract as _C  # noqa: E402
+from ssp import ssobservation_parts as SP  # noqa: E402
 
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
 
-#: The ephemeris, geometry and error columns of SSSource (every computed
-#: column, block 6 of the SSSource contract): by prefix and by name.
+#: The ephemeris, geometry and error columns of SSObservation (every computed
+#: column, block 6 of the SSObservation contract): by prefix and by name.
 EPH_PREFIXES = ("ecl", "gal", "topo", "helio", "eph")
 EPH_EXACT = ("elongation", "phaseAngle")
 ERROR_COLUMNS = ("ephRaErr", "ephDecErr", "ephRa_ephDec_Cov")
@@ -184,20 +188,20 @@ SIGMA_MAX_ARCSEC = 10.0
 SUNGRAZER_Q_AU = 0.02
 #: Rows within this of a cut (the match radius, 10" sigma) are
 #: "borderline": the two tables compute their values separately (float32
-#: output, NearbySSO's ellipse from the nightly samples, SSSource's at the
+#: output, NearbySSO's ellipse from the nightly samples, SSObservation's at the
 #: observation), so a miss within 2% of a cut is explained by the cut.
 CUT_BORDER_REL = 0.02
-#: (visit, ra, dec) matching of SSSource rows without a diaSourceId to the
+#: (visit, ra, dec) matching of SSObservation rows without a diaSourceId to the
 #: NearbySSO input: both copy the same measurement, so any real difference
 #: is float rounding; 1 mas is far below the source density.
 POSITION_MATCH_MAS = 1.0
-#: A miss SSSource's ellipse doesn't explain is asked of propagate.coarse at
-#: these offsets [days] from the observation: NearbySSO gates on the
+#: A miss SSObservation's ellipse doesn't explain is asked of propagate.coarse
+#: at these offsets [days] from the observation: NearbySSO gates on the
 #: track's nightly sample, which the contract puts within 0.338 d of every
 #: visit of the night (VisitIndex.candidates), so a sigma > 10" anywhere in
 #: +-0.34 d may have gated the night.
 NIGHT_SAMPLE_OFFSETS_DAYS = (-0.34, -0.17, 0.0, 0.17, 0.34)
-#: Agreement of a matched row's ephemeris: SSSource and NearbySSO run the
+#: Agreement of a matched row's ephemeris: SSObservation and NearbySSO run the
 #: same precise pass on the same orbit, so they agree to integrator noise
 #: (the step sequence depends on the requested times): 0.1 mas observed for
 #: asteroids (bench/nearbysso_validate.py's TOL); comets near perihelion get
@@ -207,10 +211,10 @@ RATE_TOL_DEG_DAY = 1e-6
 VMAG_TOL = 1e-3
 #: ephOffset (float32 in both; the same DiaSource) agrees to this [arcsec].
 OFFSET_TOL_ARCSEC = 1e-3
-#: SSSource columns for the time-shift allowances (bench/time_shift.py).
+#: SSObservation columns for the time-shift allowances (bench/time_shift.py).
 SHIFT_COLUMNS = ("topoRange", "topoRangeRate", "helioRange", "helioRangeRate")
-#: "Most" comet rows: at least this fraction of the comet SSSource rows with
-#: an orbit and their DiaSource in the input must be matched (the cuts
+#: "Most" comet rows: at least this fraction of the comet SSObservation rows
+#: with an orbit and their DiaSource in the input must be matched (the cuts
 #: legitimately drop some: large offsets of comets without non-gravs,
 #: large sigmas of short arcs).
 COMET_MATCH_MIN_FRAC = 0.5
@@ -249,7 +253,7 @@ ASSIST_JD_REF = 2451545.0
 # --------------------------------------------------------------------------
 
 class Report:
-    """PASS/FAIL checks and informational lines (as sssource_validate)."""
+    """PASS/FAIL checks and informational lines (as ssobservation_validate)."""
 
     def __init__(self, title):
         self.title = title
@@ -480,8 +484,11 @@ def eph_columns(names):
 
 
 def _read_sss(path, columns):
-    have = pq.read_schema(path).names
-    return pq.read_table(path, columns=[c for c in columns if c in have])
+    """The ``columns`` present in the SSObservation at ``path``: the
+    partitioned SSObservation's directory or manifest, or a single Parquet
+    file."""
+    have = SP.read_schema(path).names
+    return SP.read_table(path, columns=[c for c in columns if c in have])
 
 
 def per_object_offsets(des, cls, off_new, off_ref):
@@ -524,8 +531,8 @@ def class_summary(obj, rows):
 
 def check_offsets(new, ref, mpc_orbits=None, objects=None, ng_errors="any", rep=None, orbits_df=None):
     rep = rep or Report(f"Non-grav offsets: {new} vs {ref}")
-    ref_names = pq.read_schema(ref).names
-    new_names = pq.read_schema(new).names
+    ref_names = SP.read_schema(ref).names
+    new_names = SP.read_schema(new).names
     cols = eph_columns(ref_names)
     missing = [c for c in cols if c not in new_names]
     rep.check("every reference ephemeris/geometry/error column present", not missing,
@@ -746,9 +753,9 @@ def _INT_MAPPER(t):
 
 
 def map_to_dia(sss, dia, tol_mas=POSITION_MATCH_MAS):
-    """The NearbySSO-input diaSourceId of each SSSource row (-1 if its
+    """The NearbySSO-input diaSourceId of each SSObservation row (-1 if its
     DiaSource isn't in the input) and how it was found ('id', 'position',
-    ''): by diaSourceId where SSSource has one, else by (visit, ra, dec)
+    ''): by diaSourceId where SSObservation has one, else by (visit, ra, dec)
     within tol_mas."""
     out = np.full(len(sss), -1, dtype=np.int64)
     how = np.full(len(sss), "", dtype=object)
@@ -776,17 +783,17 @@ def map_to_dia(sss, dia, tol_mas=POSITION_MATCH_MAS):
 
 
 def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
-    """The comparison (DataFrames): ``nss`` NearbySSO rows, ``sss`` SSSource
-    rows (designation, diaSourceId, visit, midpointMjdTai, ra, dec, eph*,
-    optionally SHIFT_COLUMNS), ``dia`` the NearbySSO input (diaSourceId,
-    visit, ra, dec, optionally midpointMjdTai: without it the time shift is
-    taken as 0, i.e. strict), ``orbits``
+    """The comparison (DataFrames): ``nss`` NearbySSO rows, ``sss``
+    SSObservation rows (designation, diaSourceId, visit, midpointMjdTai, ra,
+    dec, eph*, optionally SHIFT_COLUMNS), ``dia`` the NearbySSO input
+    (diaSourceId, visit, ra, dec, optionally midpointMjdTai: without it the
+    time shift is taken as 0, i.e. strict), ``orbits``
     mpc_orbits rows (designation, q, e, i, node, argperi, peri_time,
     mpc_orb_jsonb), ``cmap`` {designation: class}. ``coarse_sigma(
     designation, tai) -> sigma_major [arcsec]`` (optional) is asked about
     the otherwise unexplained misses: NearbySSO gates on its coarse track's
     nightly sigma, which can exceed 10" within the night even where
-    SSSource's ellipse at the observation is small. Returns the per-row
+    SSObservation's ellipse at the observation is small. Returns the per-row
     table."""
     # no natural satellites
     nd = nss["designation"].astype(str).to_numpy()
@@ -808,11 +815,11 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
                       f"{d} {o:.3f}\"" for d, o in zip(nd[far][:5], nss["ephOffset"].to_numpy()[far][:5]))
                       if far.any() else ""))
 
-    # SSSource rows with an orbit and a DiaSource in the input
+    # SSObservation rows with an orbit and a DiaSource in the input
     sss = sss[sss["designation"].notna() & sss["ephRa"].notna()].reset_index(drop=True)
     dsid, how = map_to_dia(sss, dia)
     in_input = dsid >= 0
-    rep.info(f"SSSource rows with an orbit: {len(sss):,}; DiaSource in the NearbySSO input: "
+    rep.info(f"SSObservation rows with an orbit: {len(sss):,}; DiaSource in the NearbySSO input: "
              f"{int(in_input.sum()):,} (by id {int((how == 'id').sum()):,}, by position "
              f"{int((how == 'position').sum()):,})")
     s = sss[in_input].reset_index(drop=True)
@@ -831,7 +838,8 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     def f(c):
         return s[c].to_numpy(np.float64) if c in s else np.full(n, np.nan)
 
-    # the time shift: SSSource at its own time, NearbySSO at the DiaSource's
+    # the time shift: SSObservation at its own time, NearbySSO at the
+    # DiaSource's
     if "midpointMjdTai" in dia and len(dia):
         dtime = dia.drop_duplicates("diaSourceId").set_index("diaSourceId")["midpointMjdTai"]
         t_dia = dtime.reindex(dsid[in_input]).to_numpy(np.float64)
@@ -902,14 +910,14 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     return df
 
 
-def check_nearbysso(nearbysso, sssource, mpc_orbits, dia_sources, objects=None, rep=None):
-    rep = rep or Report(f"Non-grav NearbySSO: {nearbysso} vs {sssource}")
+def check_nearbysso(nearbysso, ssobservation, mpc_orbits, dia_sources, objects=None, rep=None):
+    rep = rep or Report(f"Non-grav NearbySSO: {nearbysso} vs {ssobservation}")
     nss = pq.read_table(nearbysso, columns=["diaSourceId", "designation", "ephRa", "ephDec", "ephOffset",
                                             "ephVmag", "ephRateRa", "ephRateDec"]).to_pandas()
-    present = set(pq.read_schema(sssource).names)
-    sss = _read_sss(sssource, ["designation", "diaSourceId", "visit", "midpointMjdTai", "ra", "dec", "ephRa",
-                               "ephDec", "ephOffset", "ephVmag", "ephRateRa", "ephRateDec", *ERROR_COLUMNS,
-                               *(c for c in SHIFT_COLUMNS if c in present)]
+    present = set(SP.read_schema(ssobservation).names)
+    sss = _read_sss(ssobservation, ["designation", "diaSourceId", "visit", "midpointMjdTai", "ra", "dec",
+                               "ephRa", "ephDec", "ephOffset", "ephVmag", "ephRateRa", "ephRateDec",
+                               *ERROR_COLUMNS, *(c for c in SHIFT_COLUMNS if c in present)]
                     ).to_pandas(types_mapper=_INT_MAPPER)
     visits = np.unique(sss["visit"].astype("int64").to_numpy())
     from bench.nearbysso_validate import read_dia_subset
@@ -929,7 +937,7 @@ def check_nearbysso(nearbysso, sssource, mpc_orbits, dia_sources, objects=None, 
 
 def _nearbysso_gates(df, rep):
     if not len(df):
-        rep.check("SSSource rows in the NearbySSO input", False, "none")
+        rep.check("SSObservation rows in the NearbySSO input", False, "none")
         return
     comets = df["class"].isin(("comet_ng", "comet_grav"))
     nc = int(comets.sum())
@@ -939,8 +947,9 @@ def _nearbysso_gates(df, rep):
                   f"{mc:,} of {nc:,} comet rows ({mc / nc:.1%}; >= {COMET_MATCH_MIN_FRAC:.0%})")
     else:
         # e.g. the daily PPDB DiaSources, which hold none of the comets'
-        # SSSource DiaSources (2026-10-01): nothing to match, not a failure
-        rep.info("most comet rows matched: not applicable, no comet SSSource row's DiaSource is in "
+        # SSObservation DiaSources (2026-10-01): nothing to match, not a
+        # failure
+        rep.info("most comet rows matched: not applicable, no comet SSObservation row's DiaSource is in "
                  "the NearbySSO input")
     un = df[df["status"] == "UNEXPLAINED"]
     rep.check("every miss explained", un.empty,
@@ -952,7 +961,7 @@ def _nearbysso_gates(df, rep):
         dt_s = df["dt_s"].to_numpy(np.float64)
         big = np.abs(dt_s) > TS.DT_MAX_S
         nz = np.abs(dt_s[dt_s != 0])
-        rep.check(f"time shift SSSource - DiaSource within {TS.DT_MAX_S} s", not big.any(),
+        rep.check(f"time shift SSObservation - DiaSource within {TS.DT_MAX_S} s", not big.any(),
                   f"{int((dt_s != 0).sum()):,} of {len(df):,} rows shifted"
                   + (f", max |dt| {nz.max():.3f} s" if len(nz) else "")
                   + (f"; {int(big.sum())} beyond" if big.any() else "")
@@ -977,7 +986,7 @@ def _nearbysso_gates(df, rep):
     night = df[df["status"].str.contains("within the night", regex=False)]
     if len(night):
         rep.info("")
-        rep.info("Misses gated by the coarse track's sigma within the night, though SSSource's ellipse "
+        rep.info("Misses gated by the coarse track's sigma within the night, though SSObservation's ellipse "
                  "at the observation is small (sigma_major [arcsec]):")
         t = night[["designation", "class", "dia_id", "tai", "sss_sigma", "coarse_sigma_max"]]
         rep.info(_table(t.assign(dia_id=t["dia_id"].astype(str), tai=t["tai"].map("{:.5f}".format))))
@@ -1177,10 +1186,10 @@ def _mc_one(task):
 
 def published_ellipses(mpc_orbits, designations, tai_by_des):
     """``propagate.coarse`` + ``ellipse_at`` at each object's times, for
-    ORBIT_DTYPE rows from ``ssp.sssource_ellipse.load_orbit_covariances``.
+    ORBIT_DTYPE rows from ``ssp.ssobservation_ellipse.load_orbit_covariances``.
     {designation: (ra_err, dec_err, cov) [deg, deg, deg^2] arrays}."""
     from ssp.nearbysso import propagate
-    from ssp.sssource_ellipse import load_orbit_covariances
+    from ssp.ssobservation_ellipse import load_orbit_covariances
     ephem = open_ephem()
     rows = load_orbit_covariances(mpc_orbits, list(designations), ephem)
     out = {}
@@ -1208,13 +1217,13 @@ def pick_times(mjd, k):
     return u[np.unique(np.round(np.linspace(0, len(u) - 1, k)).astype(int))]
 
 
-def check_uncertainty(mpc_orbits, sssource=None, objects=None, n_orbits=MC_N_ORBITS, draws=MC_DRAWS,
+def check_uncertainty(mpc_orbits, ssobservation=None, objects=None, n_orbits=MC_N_ORBITS, draws=MC_DRAWS,
                       n_times=3, workers=8, seed=20261001, rep=None):
     rep = rep or Report(f"Non-grav uncertainty (Monte Carlo): {mpc_orbits}")
     rng = np.random.default_rng(seed)
     sss = None
-    if sssource:
-        sss = _read_sss(sssource, ["designation", "midpointMjdTai", "ephRa", *ERROR_COLUMNS]).to_pandas()
+    if ssobservation:
+        sss = _read_sss(ssobservation, ["designation", "midpointMjdTai", "ephRa", *ERROR_COLUMNS]).to_pandas()
         sss = sss[sss["designation"].notna() & sss["ephRa"].notna()]
     if objects:
         cands = {c: sorted(d for d, k in objects.items() if k == c) for c in ("comet_ng", "yarkovsky")}
@@ -1293,7 +1302,8 @@ def _uncertainty_gates(df, rep, draws, with_sss):
     if not len(df):
         rep.check("Monte Carlo results", False, "none")
         return
-    for src, label in (("coarse", "propagate.coarse + ellipse_at"), ("sss", "SSSource ephRaErr/ephDecErr")):
+    for src, label in (("coarse", "propagate.coarse + ellipse_at"),
+                       ("sss", "SSObservation ephRaErr/ephDecErr")):
         if src == "sss" and not with_sss:
             continue
         for mc in ("full", "state_only"):
@@ -1316,8 +1326,8 @@ def _uncertainty_gates(df, rep, draws, with_sss):
         rep.info(f"(diagnostic) {label} vs the state-only Monte Carlo: {int(so_ok.sum())} of {len(df)} "
                  f"within the band; median ratio RA {_nanmedian(so_r):.3f}, Dec {_nanmedian(so_d):.3f}")
     rep.info("")
-    rep.info("Per (orbit, time): sigmas [arcsec] (RA on the sky; MC full, MC state-only, coarse, SSSource) "
-             "and published/MC-full ratios:")
+    rep.info("Per (orbit, time): sigmas [arcsec] (RA on the sky; MC full, MC state-only, coarse, "
+             "SSObservation) and published/MC-full ratios:")
     df = df.assign(tai=df["tai"].map(lambda x: f"{x:.4f}"))
     rep.info(f"max |sample mean - nominal| / sigma (full MC): {df['full_bias'].max():.3f}")
     cols = ["designation", "kind", "tai", "dt_epoch", "full_ra", "full_dec", "full_rho", "full_bias",
@@ -1343,21 +1353,23 @@ def main(argv=None):
         p.add_argument("--objects", default=None, help="objects.txt (class<TAB>designation)")
         return p
 
-    p = add("offsets", "SSSource with non-gravs vs a gravity-only reference")
-    p.add_argument("new")
-    p.add_argument("ref")
+    p = add("offsets", "SSObservation with non-gravs vs a gravity-only reference")
+    sss_help = "SSObservation: the delivery directory, its manifest, or a single Parquet file"
+    p.add_argument("new", help=sss_help)
+    p.add_argument("ref", help=sss_help)
     p.add_argument("mpc_orbits")
     p.add_argument("--ng-errors", choices=("any", "unchanged", "changed"), default="any",
                    help="what the non-grav objects' error columns must do (default: only report)")
-    p = add("nearbysso", "NearbySSO vs SSSource for the same DiaSources")
+    p = add("nearbysso", "NearbySSO vs SSObservation for the same DiaSources")
     p.add_argument("nearbysso")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation", help=sss_help)
     p.add_argument("mpc_orbits")
     p.add_argument("dia_sources", help="the NearbySSO input DiaSources")
     p.add_argument("--table", default=None, help="also write the per-row table (Parquet)")
     p = add("uncertainty", "Monte Carlo of the published error ellipse")
     p.add_argument("mpc_orbits")
-    p.add_argument("--sssource", default=None, help="SSSource: observation times and its ellipse columns")
+    p.add_argument("--ssobservation", default=None,
+                   help="SSObservation: observation times and its ellipse columns")
     p.add_argument("--n-orbits", type=int, default=MC_N_ORBITS, help="orbits per class (comet_ng, yarkovsky)")
     p.add_argument("--draws", type=int, default=MC_DRAWS)
     p.add_argument("--times", type=int, default=3, help="times per orbit")
@@ -1370,11 +1382,11 @@ def main(argv=None):
     if a.cmd == "offsets":
         rep = check_offsets(a.new, a.ref, a.mpc_orbits, objects, a.ng_errors)
     elif a.cmd == "nearbysso":
-        rep, df = check_nearbysso(a.nearbysso, a.sssource, a.mpc_orbits, a.dia_sources, objects)
+        rep, df = check_nearbysso(a.nearbysso, a.ssobservation, a.mpc_orbits, a.dia_sources, objects)
     elif a.cmd == "uncertainty":
         if not 1 <= a.workers <= 32:
             ap.error("--workers must be 1..32 (shared nodes)")
-        rep, df = check_uncertainty(a.mpc_orbits, a.sssource, objects, a.n_orbits, a.draws, a.times,
+        rep, df = check_uncertainty(a.mpc_orbits, a.ssobservation, objects, a.n_orbits, a.draws, a.times,
                                     a.workers, a.seed)
     if df is not None and getattr(a, "table", None):
         df = df.copy()

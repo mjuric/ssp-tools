@@ -1,16 +1,16 @@
 # ***** GENERATED FILE, DO NOT EDIT BY HAND *****
 # ruff: noqa: W505
-# generated with .venv/bin/ssp-generate-dtypes tests/data/sdm_schemas/sso_base.yaml SSSource NearbySSO # noqa: E501
+# generated with .venv/bin/ssp-generate-dtypes tests/data/sdm_schemas/sso_base.yaml SSObservation NearbySSO # noqa: E501
 
 import numpy as np
 
-# SSSource: Solar System source measurements: one row per Rubin observation submitted to and accepted by the
-# MPC (obs_sbn), with the measurement it was submitted from (a DiaSource or a Source, see measuredOn) and its
-# ephemeris from mpc_orbits. Built from the record of submitted measurements, independent of the PPDB
+# SSObservation: Solar System source measurements: one row per Rubin observation submitted to and accepted by
+# the MPC (obs_sbn), with the measurement it was submitted from (a DiaSource or a Source, see measuredOn) and
+# its ephemeris from mpc_orbits. Built from the record of submitted measurements, independent of the PPDB
 # DiaSource table (RFC-1188).
-SSSourceDtype = np.dtype([
+SSObservationDtype = np.dtype([
     ('obsid', '<U32'),              # MPC's unique identifier of the observation (obs_sbn.obsid): the obs_sbn
-                                    # row this SSSource row is. The primary key.
+                                    # row this SSObservation row is. The primary key.
     ('trksub', '<U8'),              # Observer-assigned tracklet identifier, as submitted (obs_sbn.trksub).
     ('trkid', '<U16'),              # MPC-assigned tracklet identifier (obs_sbn.trkid).
     ('submission_id', '<U32'),      # Identifier of the MPC submission this observation arrived in
@@ -19,8 +19,6 @@ SSSourceDtype = np.dtype([
                                     # in the Isolated Tracklet File: accepted as valid, but not identified...
     ('primary', '|b1'),             # True on exactly one row per measurement (processing,
                                     # diaSourceId/sourceId): the '-A' row of a trail pair, else the row fr...
-    ('matchMethod', '<U16'),        # How the measurement this observation was submitted from was found:
-                                    # 'obssubid' (its obsSubID, LSST-<processing>-<id> or a bare id, looke...
     ('ssObjectId', '<i8'),          # Unique LSST identifier of the Solar System object
                                     # (SSObject.ssObjectId). NULL when this observation is not identified...
     ('designation', '<U16'),        # The unpacked primary provisional designation of the object the MPC
@@ -45,8 +43,6 @@ SSSourceDtype = np.dtype([
                                     # shutter's motion across the focal plane (the corrected time differs...
     ('midpointMjdTai_flag', '|b1'), # True when midpointMjdTai is the visit's midpoint, not corrected for the
                                     # shutter's motion (no correction is available for this visit or...
-    ('midpointMjdTai_flag_degraded', '|b1'), # True when midpointMjdTai is corrected for the shutter's
-                                             # motion, but with reduced accuracy.
     ('exposureTime', '<f4'),        # [s] Measured exposure (shutter-open) time of the visit, s: ConsDB
                                     # exposure.shut_time (= Butler visitInfo.exposureTime), looked up by...
     ('ra', '<f8'),                  # [deg] Right ascension of the centroid, degrees. DiaSource ra; Source ra

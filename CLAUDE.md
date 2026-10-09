@@ -23,7 +23,7 @@ The rules here are for development in ssp-tools, by Claude sessions and their su
 - Break the work into **work packages (WPs)** that subagents can build independently.
 - Group them into waves by what each needs from the others. A project may have two waves or many; there is no fixed set of phases.
 - Typical work for the integrating session itself, before the WPs that depend on it:
-  - **the contract:** a module of shared dtypes, function signatures and rules, e.g. `ssp/sssource_contract.py`, `ssp/delivery_contract.py`, `ssp/nearbysso/_contract.py`;
+  - **the contract:** a module of shared dtypes, function signatures and rules, e.g. `ssp/ssobservation_contract.py`, `ssp/delivery_contract.py`, `ssp/nearbysso/_contract.py`;
   - **schema changes;**
   - **fixtures:** read-only, with a README of facts.
 - **Work packages must not change the contract.** A needed change goes back to the integrator, who applies it for everyone and tells the affected agents.
@@ -91,6 +91,6 @@ The rules here are for development in ssp-tools, by Claude sessions and their su
 
 ## Environment
 
-- **Venv:** `.venv`, created with `uv sync --extra all`. After pulling new console scripts, refresh them with `VIRTUAL_ENV=$PWD/.venv uv pip install --no-deps -e .`
+- **Venv:** `.venv`, created with `uv sync --extra dev --extra all` (the dev extra brings pytest and pytest-xdist: run the suite with `pytest -n 16`). After pulling new console scripts, refresh them with `VIRTUAL_ENV=$PWD/.venv uv pip install --no-deps -e .`
 - **ASSIST data:** `data/assist/linux_p1550p2650.440` and `data/assist/sb441-n16.bsp`. Export the two `SSP_ASSIST_*` variables, and `OMP_NUM_THREADS=1`.
 - **Runbooks:** `docs/runbooks/sso-daily.md` (the daily PPDB Solar System tables).

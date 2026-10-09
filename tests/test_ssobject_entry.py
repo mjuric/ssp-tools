@@ -51,7 +51,7 @@ def test_nulls_and_statistics(tmp_path):
     for j, oid in enumerate(range(1, 6)):
         m = (dia_np["obsid"].str[1:].astype(int) // 9) == j
         t = dia_np["midpointMjdTai"][m].to_numpy()
-        e = ext[m.to_numpy()].astype(np.float32).astype(float)   # (SSSource is float32)
+        e = ext[m.to_numpy()].astype(np.float32).astype(float)   # (SSObservation is float32)
         e = e[~np.isnan(e)]
         assert obj["ssObjectId"][j] == oid
         assert obj["nObs"][j] == 9

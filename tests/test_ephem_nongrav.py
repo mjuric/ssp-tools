@@ -1,7 +1,7 @@
 """The precise pass with MPC non-gravitational forces (WP N1 of
 docs/design/nongrav.md): ssp.ephem_assist._propagate_one and
 compute_ephemerides_one take a NonGrav; gravity-only orbits are bitwise
-unchanged; SSSource passes each object's NonGrav through.
+unchanged; SSObservation passes each object's NonGrav through.
 
 tests/data/nongrav_orbits.json holds three 2026-10-01 mpc_orbits rows (the
 element columns and mpc_orb_jsonb): the comet P/2003 K2 (A1, A2) and the
@@ -18,7 +18,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from ssp import nongrav as N
-from ssp import sssource
+from ssp import ssobservation
 
 from test_nearbysso_propagate import load_orbit_rows, needs_assist, x05_state
 
@@ -290,7 +290,7 @@ def test_acceleration_rtn(ephem, model, axis):
     np.testing.assert_allclose(acc, expect, rtol=0, atol=1e-3 * abs(expect).max())
 
 # --------------------------------------------------------------------------
-# SSSource
+# SSObservation
 # --------------------------------------------------------------------------
 
 def _orbits_file(path, rows, row_group_size=2):
@@ -325,25 +325,25 @@ def test_load_nongravs(tmp_path, capsys):
     _orbits_file(p, rows)
     assert pq.ParquetFile(p).num_row_groups == 4
     want = ["2020 AA", COMET, "2020 BB", YARK, "2020 CC", "2020 EE", "2020 FF", "2020 ZZ", "", None]
-    ng, n_err = sssource.load_nongravs(p, want)
+    ng, n_err = ssobservation.load_nongravs(p, want)
     assert n_err == 1 and "2020 BB" in capsys.readouterr().err
     assert sorted(ng) == sorted([COMET, YARK, "2020 FF"])
     assert ng[COMET].model == "comet" and ng[YARK].model == "yarkovsky"
     for d in (COMET, YARK):
         np.testing.assert_array_equal(ng[d].A, N.nongrav_params(real[d]["mpc_orb_jsonb"]).A)
     np.testing.assert_array_equal(ng["2020 FF"].A, [1e-9, 2e-10, 0])
-    assert sssource.load_nongravs(p, []) == ({}, 0)
+    assert ssobservation.load_nongravs(p, []) == ({}, 0)
 
 
 def test_load_nongravs_no_json_column(tmp_path, capsys):
     p = tmp_path / "mpc_orbits.parquet"
     pq.write_table(pa.table({"unpacked_primary_provisional_designation": ["2020 AA"]}), p)
-    assert sssource.load_nongravs(p, ["2020 AA"]) == ({}, 0)
+    assert ssobservation.load_nongravs(p, ["2020 AA"]) == ({}, 0)
     assert "mpc_orb_jsonb" in capsys.readouterr().err
 
 
 def _recording_fake(record):
-    from test_sssource_parallel import _fake_ephemerides
+    from test_ssobservation_parallel import _fake_ephemerides
 
     def fake(provID, ephTimes, mpcorb, ephem, row=None, obs_pos=None, obs_vel=None, nongrav=None):
         record[provID] = nongrav
@@ -356,18 +356,18 @@ def _recording_fake(record):
 
 @pytest.mark.parametrize("workers", [1, 3])
 def test_compute_ephemerides_passes_nongrav(monkeypatch, workers):
-    from test_sssource_parallel import _tables
+    from test_ssobservation_parallel import _tables
     rec = {}
-    monkeypatch.setattr(sssource, "compute_ephemerides_one", _recording_fake(rec))
-    monkeypatch.setattr(sssource, "open_ephem", lambda: None)
+    monkeypatch.setattr(ssobservation, "compute_ephemerides_one", _recording_fake(rec))
+    monkeypatch.setattr(ssobservation, "open_ephem", lambda: None)
     sss, obs_state, dia_eph, mpcorb = _tables()
     base = sss.copy()
-    sssource.compute_ephemerides(base, obs_state, dia_eph, mpcorb, workers=1)
+    ssobservation.compute_ephemerides(base, obs_state, dia_eph, mpcorb, workers=1)
     desig = sorted(set(sss["designation"]))
     ngs = {desig[1]: N.NonGrav(np.array([0, 1e-3, 0]), "yarkovsky", np.array([0, 1, 0], bool), None),
            desig[5]: N.NonGrav(np.array([1e-9, 2e-3, 0]), "comet", np.array([1, 1, 0], bool), None)}
     rec.clear()
-    sssource.compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=workers, chunk_factor=2,
+    ssobservation.compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=workers, chunk_factor=2,
                                  nongravs=ngs)
     if workers == 1:
         assert set(rec) == set(desig)
@@ -379,15 +379,15 @@ def test_compute_ephemerides_passes_nongrav(monkeypatch, workers):
         np.testing.assert_allclose(sss["ephRa"][m], (base["ephRa"][m] + shift) % 360, atol=1e-9, err_msg=d)
 
 
-def test_build_sssource_passes_nongrav(tmp_path, monkeypatch):
-    """build_sssource reads each object's NonGrav from mpc_orbits'
+def test_build_ssobservation_passes_nongrav(tmp_path, monkeypatch):
+    """build_ssobservation reads each object's NonGrav from mpc_orbits'
     mpc_orb_jsonb and passes it to compute_ephemerides_one."""
-    from test_sssource_widened import OBJECTS, _FakeEllipse, _fake_observatory, make_inputs
+    from test_ssobservation_widened import OBJECTS, _FakeEllipse, _fake_observatory, make_inputs
     rec = {}
-    monkeypatch.setattr(sssource, "compute_ephemerides_one", _recording_fake(rec))
-    monkeypatch.setattr(sssource, "open_ephem", lambda: None)
-    monkeypatch.setattr(sssource.util, "observatory_barycentric_posvel", _fake_observatory)
-    monkeypatch.setattr(sssource, "_ellipse", _FakeEllipse())
+    monkeypatch.setattr(ssobservation, "compute_ephemerides_one", _recording_fake(rec))
+    monkeypatch.setattr(ssobservation, "open_ephem", lambda: None)
+    monkeypatch.setattr(ssobservation.util, "observatory_barycentric_posvel", _fake_observatory)
+    monkeypatch.setattr(ssobservation, "_ellipse", _FakeEllipse())
     make_inputs(tmp_path)
     t = pq.read_table(tmp_path / "mpc_orbits.parquet")
     js = {OBJECTS["A"][0]: _car(["yarkovski"], [-3.0]),
@@ -396,7 +396,7 @@ def test_build_sssource_passes_nongrav(tmp_path, monkeypatch):
     col = [js[d] for d in t["unpacked_primary_provisional_designation"].to_pylist()]
     pq.write_table(t.append_column("mpc_orb_jsonb", pa.array(col, type=pa.string())),
                    tmp_path / "mpc_orbits.parquet")
-    sssource.build_sssource(tmp_path, tmp_path, workers=1)
+    ssobservation.build_ssobservation(tmp_path, tmp_path, workers=1)
     A, B, D = OBJECTS["A"][0], OBJECTS["B"][0], OBJECTS["D"][0]
     assert set(rec) == {A, B, D}
     assert rec[A].model == "yarkovsky"
@@ -417,7 +417,7 @@ def test_load_nongravs_flag_or_coefficients(tmp_path, capsys):
     ]
     p = tmp_path / "mpc_orbits.parquet"
     _orbits_file(p, rows)
-    ng, n_err = sssource.load_nongravs(p, [r[0] for r in rows])
+    ng, n_err = ssobservation.load_nongravs(p, [r[0] for r in rows])
     assert n_err == 0 and sorted(ng) == ["2020 AA", "2020 CC"]
     np.testing.assert_allclose(ng["2020 AA"].A, [0, -2e-10, 0])
     err = capsys.readouterr().err
@@ -436,7 +436,7 @@ def test_load_nongravs_duplicates(tmp_path, capsys):
     ]
     p = tmp_path / "mpc_orbits.parquet"
     _orbits_file(p, rows)
-    ng, n_err = sssource.load_nongravs(p, ["2020 AA", "2020 BB"])
+    ng, n_err = ssobservation.load_nongravs(p, ["2020 AA", "2020 BB"])
     assert n_err == 2 and sorted(ng) == ["2020 AA"]
     np.testing.assert_array_equal(ng["2020 AA"].A, [2e-9, 0, 0])
     err = capsys.readouterr().err

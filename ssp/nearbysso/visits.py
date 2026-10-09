@@ -335,7 +335,7 @@ def build_visits(dia, threads=None):
     - ``center``: the normalized mean unit vector of its sources; ``radius``
       the largest angle [rad] from it to one of them.
     - ``obs_pos`` [AU], ``obs_vel`` [km/s]: X05 barycentric ICRF, from
-      ``util.observatory_barycentric_posvel`` (as SSSource).
+      ``util.observatory_barycentric_posvel`` (as SSObservation).
     - ``night``: ``visit // 100000`` (day_obs).
     """
     visit = np.asarray(dia["visit"])

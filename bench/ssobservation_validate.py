@@ -1,42 +1,63 @@
-"""Validation harness for the widened SSSource table (WP4 of
+"""Validation harness for SSObservation table (WP4 of
 docs/design/sssource-widened.md, "Validation").
 
-Black-box checks of ``sssource.parquet``, written from the design, the
-contract (``ssp/sssource_contract.py``) and ``sso_base.yaml`` only. The YAML
-is read directly (not through ``ssp/schema_ppdb.py``), and none of the
-writer's code (``ssp.sssource``, ``ssp.sssource_ellipse``) is used.
+Black-box checks of SSObservation, written from the design, the contract
+(``ssp/ssobservation_contract.py``) and ``sso_base.yaml`` only. The YAML is
+read directly (not through ``ssp/schema_ppdb.py``), and none of the writer's
+code (``ssp.ssobservation``, ``ssp.ssobservation_ellipse``,
+``ssp.ssobservation_parts``) is used.
+
+SSOBSERVATION is a partitioned SSObservation (docs/design/
+ssobservation-delivery.md): its directory, or its manifest
+(SSObservation.manifest.json). The parts are read one at a time, or a few
+columns at a time across the parts, and the internal columns (matchMethod,
+...) come from the sidecar the manifest names, matched on obsid. A
+reference (regression, mock: REF_SSOBSERVATION) may also be a single
+pre-rename Parquet file (an old build, with any internal columns in it).
 
 Subcommands (each prints a text report, optionally also to ``--out FILE``)::
 
-  conformance SSSOURCE [--schema sso_base.yaml]
-      names, order, Felis -> Arrow types, char lengths, NULLs, obsid
-      uniqueness, sort order, matchMethod/measuredOn values, the id split,
-      the ssObjectId NULL rule, the ellipse NULL rule, one primary row per
-      measurement, zstd + dictionary encoding
-  copied SSSOURCE DIA_SOURCES
+  conformance SSOBSERVATION [--schema sso_base.yaml]
+      per part: names, order, Felis -> Arrow types, nullability, char
+      lengths, NULLs, zstd + dictionary encoding; the partitioning
+      (ssp.delivery_check.check_ssobservation_parts: the manifest, the part
+      files, md5s, ranges, the cutting rules, the sidecar); across parts:
+      obsid uniqueness, sort order, matchMethod/measuredOn values, the id
+      split, the ssObjectId NULL rule, the ellipse NULL rule, one primary
+      row per measurement, the along/cross-track offsets
+  copied SSOBSERVATION DIA_SOURCES
       blocks 1 (the copied part), 3 and 4 against dia_sources.parquet, on obsid
-  clickhouse SSSOURCE [--n 10000]
+  clickhouse SSOBSERVATION [--n 10000]
       a sample stratified by processing, re-fetched from ssp.SubmittableSources
       by (processing, id); blocks 3 and 4 compared
-  offsets SSSOURCE
+  offsets SSOBSERVATION
       ephOffsetAlongTrack/CrossTrack recomputed from ephOffsetRa/Dec and
       ephRateRa/Dec by the contract's formula (also run by conformance)
-  regression NEW_SSSOURCE REF_SSSOURCE
-      the ephemeris/geometry columns bitwise equal to today's SSSource
+  regression NEW_SSOBSERVATION REF_SSOBSERVATION
+      the ephemeris/geometry columns bitwise equal to today's SSObservation
       (except the computed ellipse and along/cross-track columns)
-  ssobject-permutation SSSOURCE [DIA] MPCORB [--max-objects N]
-      ssp-build-ssobject, run as a black box on copies of SSSource with
+  ssobject-permutation SSOBSERVATION [DIA] MPCORB [--max-objects N]
+      ssp-build-ssobject, run as a black box on copies of SSObservation with
       the rows of each object permuted, must write byte-identical SSObject
-      files. SSObject reads its photometry from SSSource; DIA (passed on to
-      the builder, which ignores it) is needed only for --permute-dia
-  ellipse SSSOURCE NEARBYSSO --orbits-a A --orbits-b B
+      deliveries. SSObject reads its photometry from SSObservation; DIA
+      (passed on to the builder, which ignores it) is needed only for
+      --permute-dia
+  ellipse SSOBSERVATION NEARBYSSO --orbits-a A --orbits-b B
       the error ellipse against NearbySSO's, for rows in both whose orbit is
       identical in the two mpc_orbits snapshots
-  counts SSSOURCE OBS_SBN [--dia-sources DIA]
+  counts SSOBSERVATION OBS_SBN [--dia-sources DIA]
       rows against obs_sbn X05, status, and the I / #7 / non-primary counts
-  mock REF_SSSOURCE DIA_SOURCES OBS_SBN OUT [--nearbysso N] [--fault F ...]
-      (development) a widened SSSource faked from today's SSSource and
-      dia_sources.parquet, optionally with injected faults
+  mock REF_SSOBSERVATION DIA_SOURCES OBS_SBN OUT [--nearbysso N]
+       [--fault F ...] [--part-rows N]
+      (development) a partitioned SSObservation (directory OUT) faked from
+      a reference SSSource/SSObservation and dia_sources.parquet,
+      optionally with injected faults
+  partition SOURCE OUT [--part-rows N] [--internal-columns A,B]
+      (development) cut an SSObservation (e.g. a single pre-partitioning
+      file) into a partitioned one in directory OUT, by the contract's
+      rules, in its row order; the internal columns to the sidecar, and
+      columns the schema lacks dropped (reported). Nothing is added: a
+      column the schema has and the source lacks stays missing.
 
 Comparison rules (copied, clickhouse):
   * same type: exact (``==``);
@@ -54,6 +75,7 @@ Never run the clickhouse subcommand from the test suite.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -70,18 +92,27 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from ssp.sssource_contract import (  # noqa: E402
+from ssp.ssobservation_contract import (  # noqa: E402
     ELLIPSE_COLUMNS,
     ID_SPLIT,
+    MANIFEST_FORMAT_VERSION,
     MATCH_METHODS,
-    SSSOURCE_DICTIONARY,
-    SSSOURCE_SORT,
+    PART_FILE_FORMAT,
+    PART_ROWS_DEFAULT,
+    SIDECAR_FILE,
+    SIDECAR_KEY,
+    SSOBSERVATION_DICTIONARY,
+    SSOBSERVATION_INTERNAL_DEFAULT,
+    SSOBSERVATION_INTERNAL_DTYPE,
+    SSOBSERVATION_MANIFEST_FILE,
+    SSOBSERVATION_SORT,
     VIEW_DROPPED,
 )
 
 DEFAULT_SCHEMA = os.path.join(_ROOT, "tests", "data", "sdm_schemas", "sso_base.yaml")
 
 # ClickHouse (read-only; the server is shared)
+from ssp.delivery_contract import SHUTTER_INPUT_COLUMNS  # noqa: E402
 from ssp.export.submittable import current_host  # noqa: E402 (the ClickHouse host, see there)
 CH_PORT = 8123
 CH_DATABASE = "ssp"
@@ -97,10 +128,10 @@ FELIS_ARROW = {
 }
 FELIS_STRING = ("char", "string", "unicode", "text")
 
-#: Columns in the reference (today's SSSource) that must be bitwise equal:
+#: Columns in the reference (today's SSObservation) that must be bitwise equal:
 #: everything ephemeris and geometry except the ellipse and the along/cross-
 #: track offsets, which are new computations. (diaDistanceRank is no longer
-#: in SSSource; it moved to NearbySSO.)
+#: in SSObservation; it moved to NearbySSO.)
 REGRESSION_PREFIXES = ("ecl", "gal", "topo", "helio", "eph")
 REGRESSION_EXACT = ("elongation", "phaseAngle")
 
@@ -202,7 +233,7 @@ def _py(x):
 # The schema, straight from the YAML
 # --------------------------------------------------------------------------
 
-def schema_columns(path=DEFAULT_SCHEMA, table="SSSource"):
+def schema_columns(path=DEFAULT_SCHEMA, table="SSObservation"):
     """The YAML's column dicts for ``table``, in order."""
     with open(path) as f:
         doc = yaml.safe_load(f)
@@ -267,7 +298,7 @@ def to_np(col):
 
 
 def compare(actual, expected):
-    """Boolean mismatch mask of ``actual`` (the SSSource column) against
+    """Boolean mismatch mask of ``actual`` (the SSObservation column) against
     ``expected`` (its source). Floats narrowed to a smaller width are
     compared after casting ``expected`` to it; floats treat NULL == NaN;
     everything else compares values and NULL masks exactly."""
@@ -314,10 +345,241 @@ def bitwise_mismatch(actual, expected):
     return compare(actual, expected), 0
 
 
+# --------------------------------------------------------------------------
+# Reading and writing a partitioned SSObservation (the bench's own reader,
+# from the contract: it does not use the builder's code)
+# --------------------------------------------------------------------------
+
+def _concat(tables):
+    """Concatenate per-part tables; parts whose types differ (a faulty
+    delivery: e.g. dictionary in one part, plain in another) are decoded
+    and promoted."""
+    if len(tables) == 1:
+        return tables[0]
+    try:
+        return pa.concat_tables(tables)
+    except (pa.ArrowInvalid, pa.ArrowTypeError):
+        dec = [pa.table({c: _flat(t[c]) for c in t.column_names}) for t in tables]
+        return pa.concat_tables(dec, promote_options="permissive")
+
+
+class SSObs:
+    """An SSObservation to read: a partitioned one (its directory or its
+    manifest: the parts in part order, and the sidecar of internal columns
+    the manifest names), or a single Parquet file (a pre-partitioning
+    build, e.g. a reference; any internal columns are then in the file).
+
+    Columns are read part by part and concatenated; internal columns are
+    matched to the parts' rows on obsid."""
+
+    def __init__(self, path):
+        path = os.fspath(path)
+        p = os.path.abspath(path)
+        self.path = path
+        if os.path.isdir(p) or p.endswith(".json"):
+            mpath = os.path.join(p, SSOBSERVATION_MANIFEST_FILE) if os.path.isdir(p) else p
+            with open(mpath) as f:
+                self.manifest = json.load(f)
+            self.dir = os.path.dirname(mpath)
+            self.parts = [os.path.join(self.dir, q["file"]) for q in self.manifest["parts"]]
+            sc = self.manifest.get("sidecar") or {}
+            self.sidecar = os.path.join(self.dir, sc["file"]) if sc.get("file") else None
+        else:
+            self.manifest, self.dir = None, os.path.dirname(p)
+            self.parts, self.sidecar = [p], None
+        self.schema = pq.read_schema(self.parts[0])
+        self.delivered = list(self.schema.names)
+        side = pq.read_schema(self.sidecar).names if self.sidecar and os.path.exists(self.sidecar) else []
+        self.internal = [c for c in side if c != SIDECAR_KEY and c not in self.delivered]
+        self.column_names = self.delivered + self.internal
+
+    @property
+    def partitioned(self):
+        return self.manifest is not None
+
+    @property
+    def num_rows(self):
+        return sum(pq.ParquetFile(p).metadata.num_rows for p in self.parts)
+
+    def read(self, columns=None, filters=None):
+        """Those of ``columns`` (default: all) that the SSObservation has, in
+        that order: delivered columns from the parts (``filters`` as for
+        pq.read_table, on delivered columns), internal ones from the
+        sidecar, matched on obsid (NULL where the sidecar lacks the row)."""
+        cols = self.column_names if columns is None else \
+            [c for c in dict.fromkeys(columns) if c in self.column_names]
+        dcols = [c for c in cols if c in self.delivered]
+        icols = [c for c in cols if c in self.internal]
+        extra = [SIDECAR_KEY] if icols and SIDECAR_KEY not in dcols else []
+        t = _concat([pq.read_table(p, columns=dcols + extra, filters=filters) for p in self.parts])
+        if icols:
+            side = pq.read_table(self.sidecar, columns=[SIDECAR_KEY, *icols])
+            key, skey = _flat(t[SIDECAR_KEY]), _flat(side[SIDECAR_KEY])
+            take = None if filters is None and key.equals(skey) else pc.index_in(key, value_set=skey)
+            for c in icols:
+                t = t.append_column(c, side[c] if take is None else side[c].take(take))
+        return t.select(cols)
+
+    def label(self):
+        if not self.partitioned:
+            return f"{self.path} (a single file)"
+        return f"{self.path} ({len(self.parts)} parts" + (f", sidecar {os.path.basename(self.sidecar)})"
+                                                          if self.sidecar else ", no sidecar)")
+
+
+def _ssobs(x):
+    return x if isinstance(x, SSObs) else SSObs(x)
+
+
 def _read(path, columns):
-    """Read those of ``columns`` that ``path`` has."""
-    have = set(pq.read_schema(path).names)
-    return pq.read_table(path, columns=[c for c in columns if c in have])
+    """Read those of ``columns`` that the SSObservation, or any Parquet file,
+    at ``path`` has."""
+    return _ssobs(path).read(columns)
+
+
+def _file_md5(path):
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 24), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def _git_commit():
+    import subprocess
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=_ROOT, capture_output=True, text=True,
+                           timeout=30)
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def part_cuts(sid, part_rows):
+    """[(start, stop, null_part)] for ``sid`` (an ssObjectId column, in the
+    table's row order) by the contract's rules: ranged parts close at the
+    first object boundary at or after ``part_rows`` rows; the rows from the
+    first NULL ssObjectId on are cut every ``part_rows`` rows; an empty
+    table is one empty part."""
+    v, valid, _ = to_np(sid)
+    n = len(v)
+    if n == 0:
+        return [(0, 0, False)]
+    nulls = np.flatnonzero(~valid)
+    n_ranged = int(nulls[0]) if len(nulls) else n
+    starts = np.flatnonzero(v[1:n_ranged] != v[:n_ranged - 1]) + 1 if n_ranged > 1 else np.zeros(0, int)
+    out, start = [], 0
+    while start < n_ranged:
+        k = np.searchsorted(starts, start + part_rows, side="left")
+        stop = int(starts[k]) if k < len(starts) else n_ranged
+        out.append((start, stop, False))
+        start = stop
+    out += [(a, min(a + part_rows, n), True) for a in range(n_ranged, n, part_rows)]
+    return out
+
+
+def write_partitioned(source, out_dir, part_rows=PART_ROWS_DEFAULT, internal=SSOBSERVATION_INTERNAL_DEFAULT,
+                      drop=(), schema=DEFAULT_SCHEMA, batch_rows=262_144, log=None):
+    """Write ``source`` (an Arrow table, or an SSObservation read part by
+    part: an SSObs or its path), in its row order, as a partitioned
+    SSObservation in ``out_dir``: the parts (cut by part_cuts), the sidecar
+    (obsid + those of ``internal`` the source has), then the manifest. The
+    parts get the source's columns less the internal ones and ``drop``.
+    Columns are copied as they are: nothing is added or filled. Returns the
+    manifest."""
+    os.makedirs(out_dir, exist_ok=True)
+    is_table = isinstance(source, pa.Table)
+    src = None if is_table else _ssobs(source)
+    names = source.column_names if is_table else src.column_names
+    internal = [c for c in internal if c in names]
+    pcols = [c for c in (source.column_names if is_table else src.delivered)
+             if c not in internal and c not in drop]
+    sid = source["ssObjectId"] if is_table else src.read(["ssObjectId"])["ssObjectId"]
+    cuts = part_cuts(sid, part_rows)
+    sid_np, sid_valid, _ = to_np(sid)
+    del sid
+    if is_table:
+        out_schema = source.select(pcols).schema
+
+        def batches():
+            yield from source.select(pcols).to_batches(max_chunksize=batch_rows)
+    else:
+        out_schema = pa.schema([src.schema.field(c) for c in pcols])
+
+        def batches():
+            for p in src.parts:
+                yield from pq.ParquetFile(p).iter_batches(batch_size=batch_rows, columns=pcols)
+    use_dict = [c for c in SSOBSERVATION_DICTIONARY if c in pcols]
+
+    parts, k, writer, pos = [], 0, None, 0
+
+    def open_part(k):
+        f = PART_FILE_FORMAT.format(k)
+        return f, pq.ParquetWriter(os.path.join(out_dir, f), out_schema, compression="zstd",
+                                   use_dictionary=use_dict)
+
+    def close_part(k, f, w):
+        w.close()
+        a, b, null_part = cuts[k]
+        s = sid_np[a:b][sid_valid[a:b]]
+        path = os.path.join(out_dir, f)
+        parts.append({"file": f, "rows": b - a,
+                      "ssObjectId_min": None if null_part or not len(s) else int(s.min()),
+                      "ssObjectId_max": None if null_part or not len(s) else int(s.max()),
+                      "null_ssObjectId": bool(null_part),
+                      "bytes": os.path.getsize(path), "md5": _file_md5(path)})
+        if log:
+            log(f"  {f}: {b - a:,} rows" + ("" if null_part else f", ssObjectId {parts[-1]['ssObjectId_min']}"
+                                                                 f"..{parts[-1]['ssObjectId_max']}"))
+
+    f, writer = open_part(0)
+    for batch in batches():
+        t = pa.Table.from_batches([batch])
+        if t.schema != out_schema:
+            t = t.cast(out_schema)
+        off = 0
+        while off < len(t):
+            stop = cuts[k][1]
+            take = min(len(t) - off, stop - pos)
+            if take > 0:
+                writer.write_table(t.slice(off, take))
+                off += take
+                pos += take
+            if pos == stop and k + 1 < len(cuts):
+                close_part(k, f, writer)
+                k += 1
+                f, writer = open_part(k)
+    while k + 1 < len(cuts):                     # (only reached for parts with no rows left)
+        close_part(k, f, writer)
+        k += 1
+        f, writer = open_part(k)
+    close_part(k, f, writer)
+
+    side = source.select([SIDECAR_KEY, *internal]) if is_table else src.read([SIDECAR_KEY, *internal])
+    side_path = os.path.join(out_dir, SIDECAR_FILE)
+    pq.write_table(side, side_path, compression="zstd",
+                   use_dictionary=[c for c in SSOBSERVATION_DICTIONARY if c in internal])
+    del side
+    m = {
+        "table": "SSObservation",
+        "format_version": MANIFEST_FORMAT_VERSION,
+        "schema": {"source": "lsst/sdm_schemas tickets/DM-55375", "file": os.path.basename(schema),
+                   "md5": _file_md5(schema) if os.path.exists(schema) else None},
+        "ssp_tools_commit": _git_commit(),
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "partition_key": "ssObjectId",
+        "sort": list(SSOBSERVATION_SORT),
+        "part_rows": part_rows,
+        "rows": sum(p["rows"] for p in parts),
+        "parts": parts,
+        "sidecar": {"file": SIDECAR_FILE, "key": SIDECAR_KEY, "columns": internal,
+                    "rows": pq.ParquetFile(side_path).metadata.num_rows,
+                    "bytes": os.path.getsize(side_path), "md5": _file_md5(side_path)},
+    }
+    with open(os.path.join(out_dir, SSOBSERVATION_MANIFEST_FILE), "w") as fh:
+        json.dump(m, fh, indent=1)
+    return m
 
 
 def _obsid_index(ref_obsid, query_obsid):
@@ -333,61 +595,110 @@ def _obsid_index(ref_obsid, query_obsid):
 # 1. conformance
 # --------------------------------------------------------------------------
 
+def _schema_dir(schema):
+    """The directory with ppdb.yaml for the delivery check: the --schema
+    file's own, if it has one, else the vendored copy."""
+    d = os.path.dirname(os.path.abspath(schema))
+    return d if os.path.exists(os.path.join(d, "ppdb.yaml")) else os.path.dirname(DEFAULT_SCHEMA)
+
+
+def check_partitioning(obs, schema=DEFAULT_SCHEMA, rep=None):
+    """The partitioned delivery (manifest, parts, sidecar), by
+    ssp.delivery_check.check_ssobservation_parts; FAIL for a single file."""
+    rep = rep or Report(f"SSObservation partitioning: {obs.path}")
+    if not obs.partitioned:
+        rep.check("partitioned (parts, manifest, sidecar)", False,
+                  f"{obs.path}: a single Parquet file, not a partitioned SSObservation")
+        return rep
+    from ssp.delivery_check import check_ssobservation_parts
+    for r in check_ssobservation_parts(obs.dir, _schema_dir(schema)):
+        rep.check(f"partitioning: {r.name}", r.ok, r.detail)
+    return rep
+
+
 def check_conformance(path, schema=DEFAULT_SCHEMA, rep=None):
-    rep = rep or Report(f"SSSource conformance: {path}")
+    """The schema rules per part (names, order, types, nullability, NULLs,
+    char lengths, zstd, dictionary encoding), the partitioning, and the
+    content rules across parts (obsid uniqueness, sort order, values, the
+    id split, the NULL rules, primary rows, the offsets)."""
+    rep = rep or Report(f"SSObservation conformance: {path}")
+    obs = _ssobs(path)
     cols = schema_columns(schema)
     names = [c["name"] for c in cols]
     spec = {c["name"]: c for c in cols}
-    pf = pq.ParquetFile(path)
-    arrow = pf.schema_arrow
-    n = pf.metadata.num_rows
-    rep.info(f"schema: {schema} ({len(names)} SSSource columns); file: {n:,} rows, {len(arrow)} columns")
+    n = obs.num_rows
+    rep.info(f"schema: {schema} ({len(names)} SSObservation columns)")
+    rep.info(f"SSObservation: {obs.label()}: {n:,} rows, {len(obs.delivered)} columns"
+             + (f"; internal (sidecar): {obs.internal}" if obs.internal else ""))
 
-    # names and order
-    got = arrow.names
-    if got == names:
-        rep.check("column names and order", True, f"{len(names)} columns")
-    else:
-        missing = [c for c in names if c not in got]
-        extra = [c for c in got if c not in names]
-        first = next((k for k, (a, b) in enumerate(zip(got, names)) if a != b), min(len(got), len(names)))
-        rep.check("column names and order", False,
-                  f"missing {missing}, extra {extra}, first difference at position {first}: "
-                  f"{got[first] if first < len(got) else '<end>'} vs "
-                  f"{names[first] if first < len(names) else '<end>'}")
+    check_partitioning(obs, schema, rep)
 
-    present = [c for c in names if c in got]
+    # the per-file checks, on each part
+    name_bad, type_bad, nullable_bad, too_long, comp, nodict = [], [], [], [], {}, {}
+    with_nulls = {}
+    nonnull = [c for c in names if spec[c].get("nullable", True) is False]
+    for p in obs.parts:
+        tag = os.path.basename(p)
+        pf = pq.ParquetFile(p)
+        arrow = pf.schema_arrow
+        got = arrow.names
+        if got != names:
+            missing = [c for c in names if c not in got]
+            extra = [c for c in got if c not in names]
+            first = next((k for k, (a, b) in enumerate(zip(got, names)) if a != b), min(len(got), len(names)))
+            name_bad.append(f"{tag}: missing {missing}, extra {extra}, first difference at position {first}: "
+                            f"{got[first] if first < len(got) else '<end>'} vs "
+                            f"{names[first] if first < len(names) else '<end>'}")
+        present = [c for c in names if c in got]
+        type_bad += [f"{tag}: {c}: {arrow.field(c).type} (Felis {spec[c]['datatype']})"
+                     for c in present if not arrow_type_ok(spec[c]["datatype"], arrow.field(c).type)]
+        nullable_bad += [f"{tag}: {c} ({'nullable' if arrow.field(c).nullable else 'required'})"
+                         for c in present if arrow.field(c).nullable != spec[c].get("nullable", True)]
+        # per-column NULLs and string lengths (one column at a time)
+        for c in present:
+            sized = spec[c].get("length") and spec[c]["datatype"] in FELIS_STRING
+            if c not in nonnull and not sized:
+                continue
+            col = pf.read(columns=[c])[c]
+            if c in nonnull and col.null_count:
+                with_nulls[c] = with_nulls.get(c, 0) + col.null_count
+            L = spec[c].get("length")
+            if sized and arrow_type_ok("char", col.type):
+                m = pc.max(pc.utf8_length(_flat(col))).as_py()
+                if m is not None and m > L:
+                    too_long.append(f"{tag}: {c} (max {m} > {L})")
+            del col
+        # Parquet layout
+        md = pf.metadata
+        for rg in range(md.num_row_groups):
+            g = md.row_group(rg)
+            for k in range(g.num_columns):
+                cc = g.column(k)
+                if not cc.num_values:          # an empty chunk has no encoding to check
+                    continue
+                comp.setdefault(cc.compression, set()).add(tag)
+                if cc.path_in_schema in SSOBSERVATION_DICTIONARY and \
+                        not any("DICT" in e for e in cc.encodings):
+                    nodict.setdefault(cc.path_in_schema, set()).add(tag)
 
-    # types
-    bad = [f"{c}: {arrow.field(c).type} (Felis {spec[c]['datatype']})"
-           for c in present if not arrow_type_ok(spec[c]["datatype"], arrow.field(c).type)]
-    rep.check("Arrow types match the Felis datatypes", not bad, "; ".join(bad))
-    bad = [c for c in present if arrow.field(c).nullable != spec[c].get("nullable", True)]
-    rep.check("Arrow field nullability matches the YAML", not bad,
-              ", ".join(f"{c} ({'nullable' if arrow.field(c).nullable else 'required'})" for c in bad))
-
-    # per-column NULLs and string lengths (one column at a time)
-    nonnull = [c for c in present if spec[c].get("nullable", True) is False]
-    with_nulls, too_long = [], []
-    for c in present:
-        col = pf.read(columns=[c])[c]
-        if c in nonnull and col.null_count:
-            with_nulls.append(f"{c} ({col.null_count:,})")
-        L = spec[c].get("length")
-        if L and spec[c]["datatype"] in FELIS_STRING and arrow_type_ok("char", col.type):
-            lengths = pc.utf8_length(_flat(col))
-            m = pc.max(lengths).as_py()
-            if m is not None and m > L:
-                too_long.append(f"{c} (max {m} > {L})")
+    nparts = f"{len(obs.parts)} part{'s' if len(obs.parts) > 1 else ''}"
+    rep.check("column names and order", not name_bad,
+              "; ".join(name_bad) or f"{len(names)} columns, {nparts}")
+    rep.check("Arrow types match the Felis datatypes", not type_bad, "; ".join(type_bad))
+    rep.check("Arrow field nullability matches the YAML", not nullable_bad, ", ".join(nullable_bad))
     rep.check("no NULLs in nullable: false columns", not with_nulls,
               f"{len(nonnull)} non-null columns"
-              + (f"; NULLs in {', '.join(with_nulls)}" if with_nulls else ""))
+              + ("; NULLs in " + ", ".join(f"{c} ({k:,})" for c, k in with_nulls.items()) if with_nulls
+                 else ""))
     rep.check("char values fit their length", not too_long, ", ".join(too_long))
 
     need = ["obsid", "ssObjectId", "midpointMjdTai", "matchMethod", "measuredOn", "processing",
             "designation", "status", "primary", *ID_COLUMNS, *ELLIPSE_COLUMNS,
             *[c for c in names if c.startswith("eph")]]
-    t = pf.read(columns=[c for c in dict.fromkeys(need) if c in got])
+    t = obs.read(need)
+    if "matchMethod" not in t.column_names:
+        rep.info("matchMethod is in neither the table nor its sidecar: not checked")
+        need.remove("matchMethod")
 
     def has(*cs):
         miss = [c for c in cs if c not in t.column_names]
@@ -405,11 +716,11 @@ def check_conformance(path, schema=DEFAULT_SCHEMA, rep=None):
             f", e.g. {sorted(set(obsid[dup]))[:5]}" if nd != n else ""))
 
     # sort order
-    if has(*SSSOURCE_SORT):
+    if has(*SSOBSERVATION_SORT):
         check_sort(t, rep)
 
     # categorical values
-    if has("matchMethod"):
+    if "matchMethod" in need and has("matchMethod"):
         v, valid, _ = to_np(t["matchMethod"])
         bad = sorted(set(v[valid]) - set(MATCH_METHODS))
         rep.check("matchMethod values in MATCH_METHODS", not bad,
@@ -430,26 +741,19 @@ def check_conformance(path, schema=DEFAULT_SCHEMA, rep=None):
     if has("ephRa", "ephOffset", *TRACK_INPUTS, *TRACK_COLUMNS):
         check_offsets_table(t, rep)
 
-    # Parquet layout
-    comp, nodict = set(), set()
-    md = pf.metadata
-    for rg in range(md.num_row_groups):
-        g = md.row_group(rg)
-        for k in range(g.num_columns):
-            cc = g.column(k)
-            comp.add(cc.compression)
-            name = cc.path_in_schema
-            if name in SSSOURCE_DICTIONARY and not any("DICT" in e for e in cc.encodings):
-                nodict.add(name)
-    rep.check("zstd compression", comp == {"ZSTD"}, ", ".join(sorted(comp)))
-    rep.check("SSSOURCE_DICTIONARY columns dictionary-encoded", not nodict,
-              f"not dictionary-encoded: {sorted(nodict)}" if nodict else ", ".join(SSSOURCE_DICTIONARY))
+    others = sorted(c for c in comp if c != "ZSTD")
+    rep.check("zstd compression", not others, ", ".join(
+        f"{c} ({', '.join(sorted(comp[c]))})" if c != "ZSTD" else c for c in sorted(comp)))
+    rep.check("SSOBSERVATION_DICTIONARY columns dictionary-encoded", not nodict,
+              "not dictionary-encoded: " + "; ".join(f"{c} ({', '.join(sorted(nodict[c]))})"
+                                                     for c in sorted(nodict))
+              if nodict else ", ".join(SSOBSERVATION_DICTIONARY))
     return rep
 
 
 def check_sort(t, rep):
-    """Ascending SSSOURCE_SORT, NULL ssObjectId last."""
-    key0, *rest = SSSOURCE_SORT
+    """Ascending SSOBSERVATION_SORT, NULL ssObjectId last."""
+    key0, *rest = SSOBSERVATION_SORT
     sid, valid, _ = to_np(t[key0])
     keys = [np.where(valid, sid, 0), ~valid]          # NULL rows last
     for c in rest:
@@ -460,7 +764,7 @@ def check_sort(t, rep):
             keys.insert(0, to_np(col)[0])
     order = np.lexsort(keys)
     out = np.flatnonzero(order != np.arange(len(order)))
-    detail = f"by {SSSOURCE_SORT}, NULL {key0} last"
+    detail = f"by {SSOBSERVATION_SORT}, NULL {key0} last"
     if len(out):
         i = out[0]
         first = _py(to_np(t["obsid"])[0][i])
@@ -666,14 +970,14 @@ def check_offsets_table(t, rep, eps=TRACK_EPS, sep_gate=TRACK_SEP_GATE_ARCSEC, s
 
 def check_offsets(path, rep=None, **kw):
     """The along/cross-track checks alone (only the columns they need)."""
-    rep = rep or Report(f"SSSource along/cross-track offsets: {path}")
-    have = pq.read_schema(path).names
+    rep = rep or Report(f"SSObservation along/cross-track offsets: {path}")
+    obs = _ssobs(path)
     need = ["obsid", "ephRa", "ephOffset", *TRACK_INPUTS, *TRACK_COLUMNS]
-    miss = [c for c in need if c not in have]
+    miss = [c for c in need if c not in obs.column_names]
     if miss:
         rep.check("columns needed by the offsets check present", False, f"missing {miss}")
         return rep
-    t = pq.read_table(path, columns=need)
+    t = obs.read(need)
     rep.info(f"{len(t):,} rows")
     return check_offsets_table(t, rep, **kw)
 
@@ -704,7 +1008,7 @@ def check_primary(t, rep):
 # --------------------------------------------------------------------------
 
 #: Block-1 columns copied from dia_sources (status comes from obs_sbn).
-COPIED_BLOCK1 = ("trksub", "trkid", "submission_id", "primary", "matchMethod")
+COPIED_BLOCK1 = ("trksub", "trkid", "submission_id", "primary")
 #: dia_sources' names of the view's id and parentId.
 DIA_ID, DIA_PARENT = "diaSourceId", "parentId"
 
@@ -732,7 +1036,7 @@ def compare_columns(rep, ss, src, columns, keys, label, src_missing="fail"):
         detail += f"; {len(bad)} columns differ:\n" + "\n".join(bad)
     rep.check(label, not bad, detail)
     if absent:
-        msg = f"absent from SSSource or the source: {absent}"
+        msg = f"absent from SSObservation or the source: {absent}"
         if src_missing == "fail":
             rep.check(f"{label}: source has every column", False, msg)
         else:
@@ -755,42 +1059,57 @@ def check_id_values(rep, ss, measured_on, src_id, src_parent, keys, label):
 
 
 class _Columns:
-    """A Parquet file's columns, read one at a time on access and
+    """An SSObservation's (or a Parquet file's) columns, read one at a time
+    on access (across the parts; internal ones from the sidecar) and
     ``take``n by ``rows`` (keeps memory to a column, not a table)."""
 
     def __init__(self, path, rows):
-        self.pf, self.rows = pq.ParquetFile(path), pa.array(rows)
-        self.column_names = self.pf.schema_arrow.names
+        self.src, self.rows = _ssobs(path), pa.array(rows)
+        self.column_names = self.src.column_names
 
     def __getitem__(self, c):
-        return self.pf.read(columns=[c])[c].take(self.rows)
+        return self.src.read([c])[c].take(self.rows)
 
 
-def check_copied(sssource, dia_sources, schema=DEFAULT_SCHEMA, rep=None):
-    rep = rep or Report(f"SSSource copied columns: {sssource} vs {dia_sources}")
+def check_copied(ssobservation, dia_sources, schema=DEFAULT_SCHEMA, rep=None):
+    rep = rep or Report(f"SSObservation copied columns: {ssobservation} vs {dia_sources}")
     names = [c["name"] for c in schema_columns(schema)]
     b = blocks(names)
     block3 = [c for c in b[3] if c not in ID_COLUMNS]
 
-    ss_obsid = to_np(pq.read_table(sssource, columns=["obsid"])["obsid"])[0]
+    obs = _ssobs(ssobservation)
+    ss_obsid = to_np(obs.read(["obsid"])["obsid"])[0]
     dia_obsid = to_np(pq.read_table(dia_sources, columns=["obsid"])["obsid"])[0]
     idx = _obsid_index(dia_obsid, ss_obsid)
     n_extra = int(np.sum(idx < 0))
     n_unused = len(dia_obsid) - len(np.unique(idx[idx >= 0]))
     rep.check("same obsid set as dia_sources",
               n_extra == 0 and n_unused == 0 and len(ss_obsid) == len(dia_obsid),
-              f"SSSource {len(ss_obsid):,} rows, dia_sources {len(dia_obsid):,}; "
+              f"SSObservation {len(ss_obsid):,} rows, dia_sources {len(dia_obsid):,}; "
               f"{n_extra:,} not in dia_sources, "
-              f"{n_unused:,} dia_sources rows without an SSSource row")
+              f"{n_unused:,} dia_sources rows without an SSObservation row")
     keep = idx >= 0
-    ss = _Columns(sssource, np.flatnonzero(keep))
+    ss = _Columns(obs, np.flatnonzero(keep))
     src = _Columns(dia_sources, idx[keep])
     keys = ss_obsid[keep]
 
     b1 = [c for c in COPIED_BLOCK1 if c in src.column_names]
-    if "matchMethod" not in src.column_names:
-        rep.info("dia_sources has no matchMethod (pre-WP1 extractor): not compared")
     compare_columns(rep, ss, src, b1, keys, "block 1 (copied) equal")
+    # the internal columns (the sidecar's; a single file's own) against
+    # dia_sources, which carries them all
+    internal, comparable = [c for c in SSOBSERVATION_INTERNAL_DTYPE if c in ss.column_names], []
+    pre_shutter = not any(c in src.column_names for c in SHUTTER_INPUT_COLUMNS)
+    for c in internal:
+        if c in src.column_names:
+            comparable.append(c)
+        elif c == "matchMethod":
+            rep.info("dia_sources has no matchMethod (pre-WP1 extractor): not compared")
+        elif c in SHUTTER_INPUT_COLUMNS and pre_shutter:
+            rep.info(f"dia_sources has no shutter-timing columns (pre-S1 extractor): {c} not compared")
+        else:
+            rep.check(f"internal column {c} in dia_sources", False, "absent from dia_sources")
+    if comparable:
+        compare_columns(rep, ss, src, comparable, keys, f"internal columns equal ({', '.join(comparable)})")
     compare_columns(rep, ss, src, block3, keys, "block 3 (measuredOn, processing, processingTable) equal")
     compare_columns(rep, ss, src, b[4], keys, "block 4 equal (exact, float64->float32 after the cast)",
                     src_missing="fail")
@@ -853,14 +1172,14 @@ def ch_fetch(keys, host=None, port=CH_PORT, database=CH_DATABASE, user=None, wor
     return pa.concat_tables(parts, promote_options="permissive") if parts else None
 
 
-def check_clickhouse(sssource, n=10_000, seed=1, fetch=ch_fetch, schema=DEFAULT_SCHEMA, rep=None):
-    rep = rep or Report(f"SSSource vs ClickHouse {CH_DATABASE}.{CH_VIEW}: {sssource}")
+def check_clickhouse(ssobservation, n=10_000, seed=1, fetch=ch_fetch, schema=DEFAULT_SCHEMA, rep=None):
+    rep = rep or Report(f"SSObservation vs ClickHouse {CH_DATABASE}.{CH_VIEW}: {ssobservation}")
     if n > CH_MAX_ROWS:
         raise SystemExit(f"--n at most {CH_MAX_ROWS:,} (the server is shared)")
     names = [c["name"] for c in schema_columns(schema)]
     b = blocks(names)
     block3 = [c for c in b[3] if c not in ID_COLUMNS and c != "processing"]
-    ss_all = _read(sssource, ["obsid", "processing", *block3, *b[4], *ID_COLUMNS])
+    ss_all = _read(ssobservation, ["obsid", "processing", *block3, *b[4], *ID_COLUMNS])
     proc_all = to_np(ss_all["processing"])[0]
     rows = stratified_sample(proc_all, n, np.random.default_rng(seed))
     ss = ss_all.take(pa.array(rows))
@@ -904,7 +1223,7 @@ def check_clickhouse(sssource, n=10_000, seed=1, fetch=ch_fetch, schema=DEFAULT_
 
 
 # --------------------------------------------------------------------------
-# 4. regression: against today's SSSource
+# 4. regression: against today's SSObservation
 # --------------------------------------------------------------------------
 
 def regression_columns(names):
@@ -913,9 +1232,11 @@ def regression_columns(names):
 
 
 def check_regression(new, ref, rep=None):
-    rep = rep or Report(f"SSSource regression: {new} vs {ref}")
-    ref_names = pq.read_schema(ref).names
-    new_names = pq.read_schema(new).names
+    rep = rep or Report(f"SSObservation regression: {new} vs {ref}")
+    ref, new = _ssobs(ref), _ssobs(new)
+    rep.info(f"new: {new.label()}; reference: {ref.label()}")
+    ref_names = ref.column_names
+    new_names = new.column_names
     cols = regression_columns(ref_names)
     missing = [c for c in cols if c not in new_names]
     rep.check("every reference ephemeris/geometry column present", not missing,
@@ -923,8 +1244,8 @@ def check_regression(new, ref, rep=None):
     cols = [c for c in cols if c in new_names]
 
     extra_ref = [c for c in ("designation", "ssObjectId", "primary", "processing", "submission_id", "trksub",
-                             "trkid", "diaSourceId") if c in ref_names]
-    rt = pq.read_table(ref, columns=["obsid", *cols, *extra_ref])
+                             "trkid", "diaSourceId", "sourceId") if c in ref_names]
+    rt = ref.read(["obsid", *cols, *extra_ref])
     nt = _read(new, ["obsid", *cols, "designation", "ssObjectId", "primary", "processing", "submission_id",
                      "trksub", "trkid", *ID_COLUMNS, "measuredOn"])
     r_obsid, n_obsid = to_np(rt["obsid"])[0], to_np(nt["obsid"])[0]
@@ -986,7 +1307,12 @@ def check_regression(new, ref, rep=None):
                     src_missing="info")
     if "diaSourceId" in rt.column_names and "measuredOn" in nt.column_names:
         mid, _ = _measurement_id(nt)
-        rid, rv, _ = to_np(rt["diaSourceId"])
+        if "sourceId" in rt.column_names:
+            # a reference with the id split too (an SSObservation, not
+            # the old SSSource): its own measurement id
+            rid, rv = _measurement_id(rt)
+        else:
+            rid, rv, _ = to_np(rt["diaSourceId"])
         mism = ~rv | (mid != rid)
         rep.check("reference diaSourceId == the row's diaSourceId/sourceId", not mism.any(),
                   f"{int(mism.sum()):,} differ ({_examples(keys, mism, mid, rid)})" if mism.any() else "")
@@ -1037,10 +1363,10 @@ def ellipse_metrics(a, b):
     return rel_ra, rel_dec, drho
 
 
-def check_ellipse(sssource, nearbysso, orbits_a, orbits_b, processing="AP-DS", rtol=1e-2, rho_tol=1e-2,
+def check_ellipse(ssobservation, nearbysso, orbits_a, orbits_b, processing="AP-DS", rtol=1e-2, rho_tol=1e-2,
                   rep=None, worst=10):
-    rep = rep or Report(f"SSSource ellipse vs NearbySSO: {sssource} vs {nearbysso}")
-    ss = _read(sssource, ["obsid", "diaSourceId", "designation", "processing", "midpointMjdTai",
+    rep = rep or Report(f"SSObservation ellipse vs NearbySSO: {ssobservation} vs {nearbysso}")
+    ss = _read(ssobservation, ["obsid", "diaSourceId", "designation", "processing", "midpointMjdTai",
                           *ELLIPSE_COLUMNS])
     # filter in Arrow: a nullable int64 column goes to pandas as float64,
     # which loses ids > 2^53
@@ -1050,7 +1376,7 @@ def check_ellipse(sssource, nearbysso, orbits_a, orbits_b, processing="AP-DS", r
         ss = ss[ss["processing"] == processing]
     nss = pq.read_table(nearbysso, columns=["diaSourceId", "designation", *ELLIPSE_COLUMNS])
     nss = nss.filter(pc.is_valid(nss["diaSourceId"])).to_pandas()
-    rep.info(f"SSSource rows with a diaSourceId and designation ({processing or 'all'}): {len(ss):,}; "
+    rep.info(f"SSObservation rows with a diaSourceId and designation ({processing or 'all'}): {len(ss):,}; "
              f"NearbySSO rows: {len(nss):,}")
     j = ss.merge(nss, on=["diaSourceId", "designation"], suffixes=("", "_nss"))
     rep.info(f"present in both (diaSourceId and designation): {len(j):,} rows, "
@@ -1067,9 +1393,9 @@ def check_ellipse(sssource, nearbysso, orbits_a, orbits_b, processing="AP-DS", r
     a = [j[c].to_numpy(dtype=np.float64) for c in ELLIPSE_COLUMNS]
     b = [j[c + "_nss"].to_numpy(dtype=np.float64) for c in ELLIPSE_COLUMNS]
     pa_, pb = np.isfinite(a[0]), np.isfinite(b[0])
-    rep.check("ellipse present in SSSource wherever NearbySSO has one", not np.any(pb & ~pa_),
+    rep.check("ellipse present in SSObservation wherever NearbySSO has one", not np.any(pb & ~pa_),
               f"both {int(np.sum(pa_ & pb)):,}; NearbySSO only {int(np.sum(pb & ~pa_)):,}; "
-              f"SSSource only {int(np.sum(pa_ & ~pb)):,}; neither {int(np.sum(~pa_ & ~pb)):,}")
+              f"SSObservation only {int(np.sum(pa_ & ~pb)):,}; neither {int(np.sum(~pa_ & ~pb)):,}")
     both = pa_ & pb
     if not both.any():
         return rep
@@ -1084,7 +1410,7 @@ def check_ellipse(sssource, nearbysso, orbits_a, orbits_b, processing="AP-DS", r
     jb = j[both].assign(rel_ra=rel_ra, rel_dec=rel_dec, drho=drho, score=score)
     w = jb.sort_values("score", ascending=False).head(worst)
     rep.info("worst cases (diaSourceId, designation, "
-             "SSSource raErr/decErr/cov vs NearbySSO's [deg], metrics):")
+             "SSObservation raErr/decErr/cov vs NearbySSO's [deg], metrics):")
     for r in w.itertuples():
         rep.info(f"  {r.diaSourceId} {r.designation!s:14s} "
                  f"{r.ephRaErr:.4g}/{r.ephDecErr:.4g}/{r.ephRa_ephDec_Cov:.3g} vs "
@@ -1100,18 +1426,18 @@ def check_ellipse(sssource, nearbysso, orbits_a, orbits_b, processing="AP-DS", r
 # 6. counts: against obs_sbn
 # --------------------------------------------------------------------------
 
-def check_counts(sssource, obs_sbn, dia_sources=None, station="X05", rep=None):
-    rep = rep or Report(f"SSSource counts: {sssource} vs {obs_sbn}")
-    ss = _read(sssource, ["obsid", "status", "ssObjectId", "designation", "primary", "processing",
+def check_counts(ssobservation, obs_sbn, dia_sources=None, station="X05", rep=None):
+    rep = rep or Report(f"SSObservation counts: {ssobservation} vs {obs_sbn}")
+    ss = _read(ssobservation, ["obsid", "status", "ssObjectId", "designation", "primary", "processing",
                           "measuredOn", "matchMethod"])
     ob = pq.read_table(obs_sbn, columns=["obsid", "stn", "status"])
     stn = to_np(ob["stn"])[0]
     x05 = ob.filter(pa.array(stn == station))
-    rep.info(f"obs_sbn: {len(ob):,} rows, {len(x05):,} {station}; SSSource: {len(ss):,} rows")
+    rep.info(f"obs_sbn: {len(ob):,} rows, {len(x05):,} {station}; SSObservation: {len(ss):,} rows")
     ss_obsid, x_obsid = to_np(ss["obsid"])[0], to_np(x05["obsid"])[0]
     idx = _obsid_index(x_obsid, ss_obsid)
     n_not_x05 = int(np.sum(idx < 0))
-    rep.check(f"every SSSource row is an obs_sbn {station} row", n_not_x05 == 0,
+    rep.check(f"every SSObservation row is an obs_sbn {station} row", n_not_x05 == 0,
               f"{n_not_x05:,} are not" + (f", e.g. {list(ss_obsid[idx < 0][:3])}" if n_not_x05 else ""))
 
     if dia_sources:
@@ -1126,7 +1452,7 @@ def check_counts(sssource, obs_sbn, dia_sources=None, station="X05", rep=None):
                   f"{len(ss_set - dia_set):,} extra")
     else:
         n_left = len(x_obsid) - len(set(idx[idx >= 0]))
-        rep.info(f"(no --dia-sources) {station} rows without an SSSource row: {n_left:,}")
+        rep.info(f"(no --dia-sources) {station} rows without an SSObservation row: {n_left:,}")
 
     keep = idx >= 0
     st, sv, _ = to_np(ss["status"])
@@ -1159,7 +1485,8 @@ def check_counts(sssource, obs_sbn, dia_sources=None, station="X05", rep=None):
 
 
 # --------------------------------------------------------------------------
-# 7. ssobject-permutation: SSObject must not depend on SSSource's row order
+# 7. ssobject-permutation: SSObject must not depend on SSObservation's
+#    row order
 # --------------------------------------------------------------------------
 
 def default_ssobject_cmd():
@@ -1168,15 +1495,17 @@ def default_ssobject_cmd():
     return [exe] if os.path.exists(exe) else ["ssp-build-ssobject"]
 
 
-def sssource_subset(sssource, max_objects=None, seed=0):
-    """SSSource, or the rows of ``max_objects`` objects drawn at random
-    (``seed``) from those with an ssObjectId."""
+def ssobservation_subset(ssobservation, max_objects=None, seed=0):
+    """SSObservation (with its internal columns), or the rows of
+    ``max_objects`` objects drawn at random (``seed``) from those with an
+    ssObjectId."""
+    obs = _ssobs(ssobservation)
     if not max_objects:
-        return pq.read_table(sssource)
-    sid = pc.unique(pq.read_table(sssource, columns=["ssObjectId"])["ssObjectId"].drop_null()).to_numpy()
+        return obs.read()
+    sid = pc.unique(obs.read(["ssObjectId"])["ssObjectId"].drop_null()).to_numpy()
     if max_objects < len(sid):
         sid = np.sort(np.random.default_rng(seed).choice(sid, max_objects, replace=False))
-    return pq.read_table(sssource, filters=[("ssObjectId", "in", sid.tolist())])
+    return obs.read(filters=[("ssObjectId", "in", sid.tolist())])
 
 
 def _sha256(path):
@@ -1236,10 +1565,10 @@ def diff_tables(a, b, key="ssObjectId"):
 
 
 def permutation(sid, seed, shuffle_objects=False):
-    """Row order of a permuted SSSource copy: the rows of each object (and
+    """Row order of a permuted SSObservation copy: the rows of each object (and
     the NULL-ssObjectId rows, as one group) shuffled among themselves, the
     groups kept together, in their order in the file (the builder requires
-    SSSource grouped by ssObjectId) or, with ``shuffle_objects``, shuffled
+    SSObservation grouped by ssObjectId) or, with ``shuffle_objects``, shuffled
     too. ``sid``: the ssObjectId column (Arrow)."""
     v, valid, _ = to_np(sid)
     group = pd.factorize(pd.Series(np.where(valid, v, -1)), sort=False)[0]
@@ -1249,21 +1578,25 @@ def permutation(sid, seed, shuffle_objects=False):
     return np.lexsort((rng.random(len(group)), group))
 
 
-def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=None, object_seed=0,
+def check_ssobject_permutation(ssobservation, dia, mpcorb, seeds=(1, 2), max_objects=None, object_seed=0,
                                workdir=None, cmd=None, extra_args=(), include_original=False,
                                shuffle_objects=False, permute_dia=False, rep=None):
     """Run ssp-build-ssobject (a black box, via its CLI) on permuted copies
-    of SSSource (one per seed: see ``permutation``; also the file's own
-    order with ``include_original``) and require byte-identical outputs.
-    ``dia`` (None for none) is passed to the builder between SSSource and
+    of SSObservation (one per seed: see ``permutation``; also its own order
+    with ``include_original``), each written as a partitioned SSObservation
+    directory (parts, manifest, sidecar; write_partitioned), and require
+    byte-identical outputs.
+    ``dia`` (None for none) is passed to the builder between SSObservation and
     the orbits, as its older 3-argument form had it; today's builder
     ignores it. With ``permute_dia``, the DiaSource file is also given a
-    random row order per seed (restricted to the SSSource rows' obsids)."""
+    random row order per seed (restricted to the SSObservation rows'
+    obsids)."""
     import shlex
+    import shutil
     import subprocess
     import tempfile
 
-    rep = rep or Report(f"SSObject permutation invariance: {sssource}")
+    rep = rep or Report(f"SSObject permutation invariance: {ssobservation}")
     if permute_dia and dia is None:
         raise ValueError("--permute-dia needs a DiaSource file")
     cmd = shlex.split(cmd) if isinstance(cmd, str) else list(cmd or default_ssobject_cmd())
@@ -1273,9 +1606,10 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
         workdir = tmp.name
     os.makedirs(workdir, exist_ok=True)
     try:
-        t = sssource_subset(sssource, max_objects, object_seed)
+        obs = _ssobs(ssobservation)
+        t = ssobservation_subset(obs, max_objects, object_seed)
         n_obj = len(pc.unique(t["ssObjectId"].drop_null())) if "ssObjectId" in t.column_names else 0
-        rep.info(f"SSSource: {len(t):,} rows, {n_obj:,} objects"
+        rep.info(f"SSObservation: {len(t):,} rows, {n_obj:,} objects"
                  + (f" (a random {max_objects:,}, seed {object_seed})" if max_objects else " (all)"))
         rep.info("permutation: rows within each object" + (", and the objects' order" if shuffle_objects
                                                             else " (objects kept in the file's order)"))
@@ -1286,17 +1620,17 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
                 keep = pc.is_in(dia_t["obsid"], value_set=pc.unique(t["obsid"]))
                 dia_t = dia_t.filter(keep)
             rep.info(f"DiaSource: {len(dia_t):,} rows, permuted per seed")
-        rep.info(f"builder: {shlex.join(cmd)} SSSOURCE {dia + ' ' if dia else ''}{mpcorb} --output OUT "
+        rep.info(f"builder: {shlex.join(cmd)} SSOBSERVATION {dia + ' ' if dia else ''}{mpcorb} --output OUT "
                  f"{shlex.join(extra_args)}")
         runs = [("original", None)] if include_original else []
         runs += [(f"seed {s}", s) for s in seeds]
         outs = []
         for name, s in runs:
             tag = "original" if s is None else f"seed{s}"
-            src = os.path.join(workdir, f"sssource.{tag}.parquet")
+            src = os.path.join(workdir, f"ssobservation.{tag}")
             out = os.path.join(workdir, f"ssobject.{tag}.parquet")
             perm = np.arange(len(t)) if s is None else permutation(t["ssObjectId"], s, shuffle_objects)
-            pq.write_table(t.take(pa.array(perm)), src, compression="zstd")
+            write_partitioned(t.take(pa.array(perm)), src, internal=obs.internal)
             dia_src = dia
             if dia_t is not None:
                 dia_src = os.path.join(workdir, f"dia_sources.{tag}.parquet")
@@ -1314,7 +1648,7 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
                                                      f"log {log.name}"))
             if ok:
                 outs.append((name, out))
-                os.remove(src)
+                shutil.rmtree(src)
                 if dia_src and dia_src != dia:
                     os.remove(dia_src)
         if len(outs) < 2:
@@ -1339,7 +1673,7 @@ def check_ssobject_permutation(sssource, dia, mpcorb, seeds=(1, 2), max_objects=
 
 
 # --------------------------------------------------------------------------
-# mock: a widened SSSource faked from today's (development)
+# mock: an SSObservation faked from sdm_schemas main's SSSource (development)
 # --------------------------------------------------------------------------
 
 FAULTS = {
@@ -1388,14 +1722,21 @@ def match_method_from_dia(match, obssubid):
     return out.astype(object)
 
 
-def build_mock(ref, dia_sources, obs_sbn, out, nearbysso=None, faults=(), schema=DEFAULT_SCHEMA, seed=2):
-    """Write a widened SSSource made from today's SSSource (blocks 2, 6),
-    dia_sources (blocks 1, 3, 4) and obs_sbn (status), following the design.
-    The ellipse comes from NearbySSO where it has the row, else made up."""
+def build_mock(ref, dia_sources, obs_sbn, out, nearbysso=None, faults=(), schema=DEFAULT_SCHEMA, seed=2,
+               part_rows=PART_ROWS_DEFAULT):
+    """Write an SSObservation made from a reference SSSource/SSObservation
+    (``ref``: a partitioned one, or a single pre-rename file; blocks 2, 6),
+    dia_sources (blocks 1, 3, 4) and obs_sbn (status), following the
+    design, as a partitioned SSObservation in directory ``out`` (the
+    internal columns in its sidecar: matchMethod from dia_sources' (or,
+    for a pre-WP1 extract, from its match/obssubid), and
+    midpointMjdTai_flag_degraded where dia_sources has it). The ellipse
+    comes from NearbySSO where it has the row, else made up. Returns the
+    table (internal columns included), before partitioning."""
     cols = schema_columns(schema)
     names = [c["name"] for c in cols]
     b = blocks(names)
-    rt = pq.read_table(ref)
+    rt = _ssobs(ref).read()
     dia = pq.read_table(dia_sources)
     ob = pq.read_table(obs_sbn, columns=["obsid", "status"])
     d_obsid = to_np(dia["obsid"])[0]
@@ -1410,10 +1751,16 @@ def build_mock(ref, dia_sources, obs_sbn, out, nearbysso=None, faults=(), schema
     for c in b[1]:
         if c == "status":
             data[c] = ob["status"].take(pa.array(o_idx))
-        elif c == "matchMethod":
-            data[c] = pa.array(match_method_from_dia(to_np(dia["match"])[0], to_np(dia["obssubid"])[0]))
         else:
             data[c] = dia[c]
+    internal = {}
+    if "matchMethod" in dia.column_names:
+        internal["matchMethod"] = _flat(dia["matchMethod"]).cast(pa.string())
+    elif "match" in dia.column_names and "obssubid" in dia.column_names:
+        internal["matchMethod"] = pa.array(match_method_from_dia(to_np(dia["match"])[0],
+                                                                 to_np(dia["obssubid"])[0]), pa.string())
+    if "midpointMjdTai_flag_degraded" in dia.column_names:
+        internal["midpointMjdTai_flag_degraded"] = _flat(dia["midpointMjdTai_flag_degraded"]).cast(pa.bool_())
     era, erv, _ = to_np(rt["ephRa"])
     orbit = erv & ~np.isnan(era)
     rs, rsv, _ = to_np(rt["ssObjectId"])
@@ -1460,7 +1807,7 @@ def build_mock(ref, dia_sources, obs_sbn, out, nearbysso=None, faults=(), schema
 
     fields, arrays = [], []
     for c in cols:
-        typ = felis_arrow_type(c["datatype"], c["name"] in SSSOURCE_DICTIONARY)
+        typ = felis_arrow_type(c["datatype"], c["name"] in SSOBSERVATION_DICTIONARY)
         if "type" in faults and c["name"] == "detector":
             typ = pa.int32()
         arr = _flat(data[c["name"]])
@@ -1468,14 +1815,16 @@ def build_mock(ref, dia_sources, obs_sbn, out, nearbysso=None, faults=(), schema
             arr.cast(typ, safe=not (pa.types.is_floating(typ) and pa.types.is_floating(arr.type)))
         fields.append(pa.field(c["name"], arr.type, nullable=c.get("nullable", True)))
         arrays.append(arr)
+    for c, arr in internal.items():
+        fields.append(pa.field(c, arr.type, nullable=False))
+        arrays.append(arr)
     t = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
     sid, sv, _ = to_np(t["ssObjectId"])
     obsid_rank = pc.rank(_flat(t["obsid"]), sort_keys="ascending").to_numpy()
     order = np.lexsort((obsid_rank, to_np(t["midpointMjdTai"])[0], np.where(sv, sid, 0), ~sv))
     t = t.take(pa.array(order))
     t = apply_faults(t, faults, from_nss=(hit & orbit)[order])
-    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    pq.write_table(t, out, compression="zstd")
+    write_partitioned(t, out, part_rows=part_rows, internal=list(internal), schema=schema)
     return t
 
 
@@ -1497,7 +1846,7 @@ def _replace(t, name, i, value):
 
 
 def apply_faults(t, faults, from_nss=None):
-    """Inject ``faults`` (names from FAULTS) into a widened SSSource table;
+    """Inject ``faults`` (names from FAULTS) into an SSObservation table;
     ``from_nss`` marks the rows whose ellipse came from NearbySSO."""
     for f in faults:
         if f not in FAULTS:
@@ -1577,13 +1926,36 @@ def apply_faults(t, faults, from_nss=None):
     return t
 
 
+def partition(source, out, part_rows=PART_ROWS_DEFAULT, internal=SSOBSERVATION_INTERNAL_DEFAULT,
+              schema=DEFAULT_SCHEMA):
+    """Cut the SSObservation ``source`` into a partitioned one in ``out``
+    (write_partitioned), dropping the columns the schema lacks (other than
+    the internal ones); prints what it did. Returns 0."""
+    src = _ssobs(source)
+    names = [c["name"] for c in schema_columns(schema)]
+    internal = [c for c in internal if c in src.column_names]
+    drop = [c for c in src.delivered if c not in names and c not in internal]
+    lacking = [c for c in names if c not in src.delivered]
+    print(f"source: {src.label()}: {src.num_rows:,} rows, {len(src.delivered)} columns")
+    print(f"internal (to the sidecar): {internal}")
+    print(f"dropped (not in {os.path.basename(schema)}): {drop}")
+    if lacking:
+        print(f"NOT in the source, so missing from the parts (nothing is filled in): {lacking}")
+    t0 = time.time()
+    m = write_partitioned(src, out, part_rows=part_rows, internal=internal, drop=drop, schema=schema,
+                          log=print)
+    print(f"wrote {out}: {len(m['parts'])} parts, {m['rows']:,} rows, sidecar {m['sidecar']['columns']}, "
+          f"in {time.time() - t0:.1f} s")
+    return 0
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="python -m bench.sssource_validate",
-                                 description="Black-box validation of the widened SSSource table.")
+    ap = argparse.ArgumentParser(prog="python -m bench.ssobservation_validate",
+                                 description="Black-box validation of SSObservation table.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add(name, help_):
@@ -1592,14 +1964,14 @@ def main(argv=None):
         return p
 
     p = add("conformance", "schema and content rules, from sso_base.yaml")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("--schema", default=DEFAULT_SCHEMA)
     p = add("copied", "blocks 1/3/4 against dia_sources.parquet")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("dia_sources")
     p.add_argument("--schema", default=DEFAULT_SCHEMA)
     p = add("clickhouse", "a stratified sample re-fetched from ssp.SubmittableSources")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("--n", type=int, default=10_000, help=f"sample size (<= {CH_MAX_ROWS:,})")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--workers", type=int, default=CH_MAX_WORKERS,
@@ -1609,28 +1981,30 @@ def main(argv=None):
     p.add_argument("--user", default=None)
     p.add_argument("--schema", default=DEFAULT_SCHEMA)
     p = add("offsets", "along/cross-track offsets against the contract's formula")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("--eps", type=float, default=TRACK_EPS, help="tolerance in float32 eps x |offset|")
     p.add_argument("--sep-gate", type=float, default=TRACK_SEP_GATE_ARCSEC,
                    help="gate along^2+cross^2 ~ ephOffset^2 on rows with ephOffset <= this [arcsec]")
     p.add_argument("--sep-rtol", type=float, default=TRACK_SEP_RTOL)
-    p = add("regression", "ephemeris/geometry bitwise equal to today's SSSource")
+    p = add("regression", "ephemeris/geometry bitwise equal to today's SSObservation")
     p.add_argument("new")
     p.add_argument("ref")
     p = add("ellipse", "the error ellipse against NearbySSO")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("nearbysso")
-    p.add_argument("--orbits-a", required=True, help="mpc_orbits the SSSource was built from")
+    p.add_argument("--orbits-a", required=True, help="mpc_orbits the SSObservation was built from")
     p.add_argument("--orbits-b", required=True, help="mpc_orbits the NearbySSO was built from")
-    p.add_argument("--processing", default="AP-DS", help="SSSource processing to compare ('all' for any)")
+    p.add_argument("--processing", default="AP-DS",
+                   help="SSObservation processing to compare ('all' for any)")
     p.add_argument("--rtol", type=float, default=1e-2)
     p.add_argument("--rho-tol", type=float, default=1e-2)
     p = add("counts", "rows and status against obs_sbn")
-    p.add_argument("sssource")
+    p.add_argument("ssobservation")
     p.add_argument("obs_sbn")
     p.add_argument("--dia-sources", default=None)
-    p = add("ssobject-permutation", "ssp-build-ssobject on row-permuted SSSource copies: identical output")
-    p.add_argument("sssource")
+    p = add("ssobject-permutation",
+            "ssp-build-ssobject on row-permuted SSObservation copies: identical output")
+    p.add_argument("ssobservation")
     p.add_argument("inputs", nargs="+", metavar="[DIA] MPCORB",
                    help="the MPC orbits; optionally a DiaSource file before them (passed to the builder, "
                         "which ignores it; needed for --permute-dia)")
@@ -1648,20 +2022,28 @@ def main(argv=None):
     p.add_argument("--builder", default=None, help="the builder command (default: ssp-build-ssobject)")
     p.add_argument("--workers", type=int, default=None, help="passed to the builder as --workers")
     p.add_argument("--builder-args", default="", help="more arguments for the builder (one string)")
-    p = sub.add_parser("mock", help="(development) a widened SSSource faked from today's")
+    p = sub.add_parser("mock", help="(development) an SSObservation faked from today's")
     p.add_argument("ref")
     p.add_argument("dia_sources")
     p.add_argument("obs_sbn")
-    p.add_argument("out")
+    p.add_argument("out", help="the output directory (parts, manifest, sidecar)")
     p.add_argument("--nearbysso", default=None)
     p.add_argument("--fault", action="append", default=[], choices=sorted(FAULTS))
+    p.add_argument("--schema", default=DEFAULT_SCHEMA)
+    p.add_argument("--part-rows", type=int, default=PART_ROWS_DEFAULT)
+    p = sub.add_parser("partition", help="(development) cut an SSObservation into a partitioned one")
+    p.add_argument("source", help="an SSObservation: a single Parquet file, or a partitioned one")
+    p.add_argument("out", help="the output directory (parts, manifest, sidecar)")
+    p.add_argument("--part-rows", type=int, default=PART_ROWS_DEFAULT)
+    p.add_argument("--internal-columns", default=",".join(SSOBSERVATION_INTERNAL_DEFAULT),
+                   help="columns to the sidecar, those the source has (default: %(default)s)")
     p.add_argument("--schema", default=DEFAULT_SCHEMA)
 
     a = ap.parse_args(argv)
     if a.cmd == "conformance":
-        rep = check_conformance(a.sssource, a.schema)
+        rep = check_conformance(a.ssobservation, a.schema)
     elif a.cmd == "copied":
-        rep = check_copied(a.sssource, a.dia_sources, a.schema)
+        rep = check_copied(a.ssobservation, a.dia_sources, a.schema)
     elif a.cmd == "clickhouse":
         if not 1 <= a.workers <= CH_MAX_WORKERS:
             ap.error(f"--workers must be 1..{CH_MAX_WORKERS} (the server is shared)")
@@ -1670,29 +2052,34 @@ def main(argv=None):
 
         def fetch(keys):
             return ch_fetch(keys, a.host, a.port, CH_DATABASE, a.user, a.workers)
-        rep = check_clickhouse(a.sssource, a.n, a.seed, fetch, a.schema)
+        rep = check_clickhouse(a.ssobservation, a.n, a.seed, fetch, a.schema)
     elif a.cmd == "offsets":
-        rep = check_offsets(a.sssource, eps=a.eps, sep_gate=a.sep_gate, sep_rtol=a.sep_rtol)
+        rep = check_offsets(a.ssobservation, eps=a.eps, sep_gate=a.sep_gate, sep_rtol=a.sep_rtol)
     elif a.cmd == "regression":
         rep = check_regression(a.new, a.ref)
     elif a.cmd == "ellipse":
-        rep = check_ellipse(a.sssource, a.nearbysso, a.orbits_a, a.orbits_b, a.processing, a.rtol, a.rho_tol)
+        rep = check_ellipse(a.ssobservation, a.nearbysso, a.orbits_a, a.orbits_b, a.processing, a.rtol,
+                            a.rho_tol)
     elif a.cmd == "counts":
-        rep = check_counts(a.sssource, a.obs_sbn, a.dia_sources)
+        rep = check_counts(a.ssobservation, a.obs_sbn, a.dia_sources)
     elif a.cmd == "ssobject-permutation":
         import shlex
         extra = shlex.split(a.builder_args) + (["--workers", str(a.workers)] if a.workers else [])
         seeds = [int(x) for x in a.seeds.split(",") if x.strip()]
         if len(a.inputs) > 2:
-            ap.error("ssobject-permutation: expected SSSOURCE [DIA] MPCORB")
+            ap.error("ssobject-permutation: expected SSOBSERVATION [DIA] MPCORB")
         dia, mpcorb = (a.inputs if len(a.inputs) == 2 else (None, a.inputs[0]))
-        rep = check_ssobject_permutation(a.sssource, dia, mpcorb, seeds, a.max_objects,
+        rep = check_ssobject_permutation(a.ssobservation, dia, mpcorb, seeds, a.max_objects,
                                          a.object_seed, a.workdir, a.builder, extra, a.include_original,
                                          a.shuffle_objects, a.permute_dia)
     elif a.cmd == "mock":
-        t = build_mock(a.ref, a.dia_sources, a.obs_sbn, a.out, a.nearbysso, a.fault, a.schema)
+        t = build_mock(a.ref, a.dia_sources, a.obs_sbn, a.out, a.nearbysso, a.fault, a.schema,
+                       part_rows=a.part_rows)
         print(f"wrote {a.out}: {len(t):,} rows, {t.num_columns} columns; faults: {a.fault or 'none'}")
         return 0
+    elif a.cmd == "partition":
+        return partition(a.source, a.out, a.part_rows, [c for c in a.internal_columns.split(",") if c],
+                         a.schema)
     return rep.finish(a.out)
 
 

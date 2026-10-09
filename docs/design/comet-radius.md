@@ -1,5 +1,7 @@
 # Design: a larger NearbySSO match radius for comets and ISOs
 
+> **Renamed (2026-10-08):** the PPDB table called SSSource here is now **SSObservation**, and the code names follow it (`ssp.ssobservation`, `ssp-build-ssobservation`, `SSOBSERVATION_*`); see `docs/design/ssobservation-delivery.md`. This document keeps the names it was written with.
+
 ## Context
 
 NearbySSO matches each DiaSource to the nearest eligible predicted position within `MATCH_RADIUS_ARCSEC` = 5″, the same radius for every object. Comets and interstellar objects (ISOs) call for a larger one:

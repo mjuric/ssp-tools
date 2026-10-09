@@ -11,7 +11,7 @@ sliced:
 2. **Orbits** (``workers`` forked processes, chunks of orbits, the
    costliest first; see ``orbit_schedule``), per orbit over all nights:
    ``propagate.coarse``, ``VisitIndex.candidates``, the precise
-   ``compute_ephemerides_one`` at the candidate visits (as SSSource), the
+   ``compute_ephemerides_one`` at the candidate visits (as SSObservation), the
    error ellipse there (``propagate.ellipse_at``) and the sigma gate; at
    visits whose sources carry their own times, also the published values'
    rates of change (``DOT_DTYPE``; see "Times" below). The eligible
@@ -420,7 +420,7 @@ def process_orbit(i, w, ephem, stage_t):
         stage_t["ellipse"] += time.perf_counter() - t3
         return None, c, None
 
-    # V exactly as SSSource computes it: from its float32 helio/topo
+    # V exactly as SSObservation computes it: from its float32 helio/topo
     # columns (and its float64 phase angle)
     helio = e.helio_pos[:, k].astype(np.float32)
     topo = e.topo_pos[:, k].astype(np.float32)
@@ -430,8 +430,8 @@ def process_orbit(i, w, ephem, stage_t):
     p = np.empty(k.size, dtype=PRED_DTYPE)
     p["visit"] = cand[k]
     p["orbit"] = i
-    # (as SSSource: RA wrapped to [0, 360); the separation is measured from
-    # the prediction, in pass 3)
+    # (as SSObservation: RA wrapped to [0, 360); the separation is measured
+    # from the prediction, in pass 3)
     p["ra"] = util.wrap_ra_deg(e.ra_deg[k])
     p["dec"] = e.dec_deg[k]
     p["vmag"] = hg_V_mag(e.H, e.G, helio_r, topo_r, e.phase_angle[k])
@@ -440,7 +440,7 @@ def process_orbit(i, w, ephem, stage_t):
     p["ra_err"] = ra_err[k]
     p["dec_err"] = dec_err[k]
     p["ra_dec_cov"] = ra_dec_cov[k]
-    # the tail position angles, exactly as SSSource computes them
+    # the tail position angles, exactly as SSObservation computes them
     anti_sun, anti_motion = tail_position_angles(e.helio_pos[:, k], e.helio_vel[:, k], e.topo_pos[:, k])
     p["anti_sun_pa"] = tail_position_angles_f32(anti_sun)
     p["anti_motion_pa"] = tail_position_angles_f32(anti_motion)

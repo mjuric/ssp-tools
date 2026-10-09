@@ -1,10 +1,11 @@
-"""The SSSource/NearbySSO time-shift allowance (docs/design/shutter-timing.md,
-"SSSource vs. NearbySSO").
+"""The SSObservation/NearbySSO time-shift allowance
+(docs/design/shutter-timing.md, "SSObservation vs. NearbySSO").
 
-Until AP corrects DiaSource times, SSSource predicts at the shutter-corrected
-``midpointMjdTai`` and NearbySSO at the DiaSource's own (visit) time. At the
-same DiaSource the two predictions differ by about the object's rate times
-Δt = SSSource.midpointMjdTai - DiaSource.midpointMjdTai: within 0.24 s for
+Until AP corrects DiaSource times, SSObservation predicts at the
+shutter-corrected ``midpointMjdTai`` and NearbySSO at the DiaSource's own
+(visit) time. At the same DiaSource the two predictions differ by about the
+object's rate times
+Δt = SSObservation.midpointMjdTai - DiaSource.midpointMjdTai: within 0.24 s for
 most visits, but up to ~2 s for header-timed (degraded) ones. Every
 allowance uses each row's own Δt; nothing assumes a bound on it below
 DT_MAX_S, a sanity limit.
@@ -15,10 +16,11 @@ rows are held to today's tolerances.
 Rules (Δt in days; every allowance is 0 where Δt == 0 or Δt is unknown):
 
 - position (ephRa, ephDec): the motion over Δt is taken out first, as a
-  vector: the residual |(NearbySSO - SSSource) + (ephRateRa, ephRateDec) Δt|
+  vector: the residual
+  |(NearbySSO - SSObservation) + (ephRateRa, ephRateDec) Δt|
   (the two tables' mean rates; on the tangent plane) must be within the
   check's tolerance + RESID_REL_MARGIN |rate| |Δt| + SAFETY x α Δt^2 / 2
-  + ABS_MARGIN_MAS, α the angular-acceleration bound below (where SSSource
+  + ABS_MARGIN_MAS, α the angular-acceleration bound below (where SSObservation
   has no ranges: REL_MARGIN |rate| |Δt| + ABS_MARGIN_MAS). (At most
   |rate| |Δt| (1 + REL_MARGIN) + ABS_MARGIN_MAS on top of the tolerance,
   and much stricter, along and across the track.) At Δt = 0 the plain
@@ -31,7 +33,8 @@ Rules (Δt in days; every allowance is 0 where Δt == 0 or Δt is unknown):
   (A_OBSERVER + GM_sun / r^2 + GM_earth / Δ^2) / Δ + 2 |Δdot| ω / Δ
   + ω^2 (1 + |tan dec|)  [rad/d^2]
   (A_OBSERVER: the observer's diurnal plus Earth's orbital acceleration;
-  r, Δ, Δdot: SSSource's helioRange, topoRange, topoRangeRate; ω the rate);
+  r, Δ, Δdot: SSObservation's helioRange, topoRange, topoRangeRate;
+  ω the rate);
 - ephVmag [mag]: SAFETY x (5/ln 10 (|Δdot|/Δ + |rdot|/r) + PHASE_SLOPE x
   (ω + v_max / r)) |Δt|;
 - tail position angles [deg]: SAFETY x (ω (1 + |tan dec| + 1/f) + ω_w / f)
@@ -86,10 +89,11 @@ def _a(x):
     return np.asarray(x, dtype=np.float64)
 
 
-def dt_days(t_sssource, t_dia):
-    """Δt [d] = SSSource.midpointMjdTai - DiaSource.midpointMjdTai; 0 where
-    either is unknown (NaN), so those rows are held to the strict tolerance."""
-    d = _a(t_sssource) - _a(t_dia)
+def dt_days(t_ssobservation, t_dia):
+    """Δt [d] = SSObservation.midpointMjdTai - DiaSource.midpointMjdTai; 0
+    where either is unknown (NaN), so those rows are held to the strict
+    tolerance."""
+    d = _a(t_ssobservation) - _a(t_dia)
     return np.where(np.isfinite(d), d, 0.0)
 
 
@@ -127,9 +131,9 @@ def position_margin_mas(rate, dt, accel=None):
 
 
 def motion_residual_mas(ra_s, dec_s, ra_n, dec_n, rate_ra, rate_dec, dt):
-    """|(NearbySSO - SSSource) + rate Δt| [mas] on the tangent plane at
-    SSSource's position: what's left of the two predictions' difference
-    once the motion over Δt = t_SSSource - t_DiaSource is taken out
+    """|(NearbySSO - SSObservation) + rate Δt| [mas] on the tangent plane at
+    SSObservation's position: what's left of the two predictions' difference
+    once the motion over Δt = t_SSObservation - t_DiaSource is taken out
     (NearbySSO, at the earlier time by Δt, is behind by rate x Δt).
     ``rate_ra`` includes cos(dec) [deg/d]. NaN rates leave the plain
     difference."""
@@ -212,9 +216,9 @@ def summary_line(dt):
     dt_s = np.abs(_a(dt)) * SECONDS_PER_DAY
     nz = dt_s[dt_s > 0]
     if not len(nz):
-        return "time shift SSSource - DiaSource: 0 on every compared row (strict tolerances)"
-    return (f"time shift SSSource - DiaSource: 0 on {int((dt_s == 0).sum()):,} rows (strict), nonzero on "
-            f"{len(nz):,} (|dt| median {np.median(nz):.3f} s, max {nz.max():.3f} s); allowances per "
+        return "time shift SSObservation - DiaSource: 0 on every compared row (strict tolerances)"
+    return (f"time shift SSObservation - DiaSource: 0 on {int((dt_s == 0).sum()):,} rows (strict), nonzero "
+            f"on {len(nz):,} (|dt| median {np.median(nz):.3f} s, max {nz.max():.3f} s); allowances per "
             f"bench/time_shift.py")
 
 

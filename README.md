@@ -46,7 +46,7 @@ uv run pytest
 
 ### Ephemeris data files
 
-SSSource ephemerides are computed with [ASSIST](https://assist.readthedocs.io),
+SSObservation ephemerides are computed with [ASSIST](https://assist.readthedocs.io),
 which needs the JPL DE440 planet file (`linux_p1550p2650.440`) and the ASSIST
 asteroid perturber file (`sb441-n16.bsp`). Point these environment variables
 at them:
@@ -171,7 +171,7 @@ fast-export --config examples/exports.yaml --host your.host --dbname your_db --u
 
 ### Butler Catalog Extraction
 
-`extract-catalog` streams LSST Butler dataset tables into a single Parquet file (one row group per dataset, e.g. per visit). This complements `fast-export` for Postgres sources by enabling efficient extraction of Science Pipelines data products. Its output can no longer be the input of `ssp-build-sssource`, which needs the `obs_sbn` linkage `extract-submitted-sources` adds (see below).
+`extract-catalog` streams LSST Butler dataset tables into a single Parquet file (one row group per dataset, e.g. per visit). This complements `fast-export` for Postgres sources by enabling efficient extraction of Science Pipelines data products. Its output can no longer be the input of `ssp-build-ssobservation`, which needs the `obs_sbn` linkage `extract-submitted-sources` adds (see below).
 
 Basic invocation (shows a progress bar by default):
 ```bash
@@ -212,8 +212,8 @@ The resulting Parquet file is optimized for downstream columnar analytics (Arrow
 ### Submitted-source Extraction (ClickHouse)
 
 `extract-submitted-sources` builds the `dia_sources.parquet` that
-`ssp-build-sssource` needs (an `extract-catalog` DiaSource file can't feed it
-any more: SSSource is built per `obs_sbn` row, from the columns this tool
+`ssp-build-ssobservation` needs (an `extract-catalog` DiaSource file can't feed it
+any more: SSObservation is built per `obs_sbn` row, from the columns this tool
 adds). It makes it for the X05 rows of an MPC `obs_sbn` dump from the
 ClickHouse view `ssp.SubmittableSources`, which serves the source catalogs of
 every processing Rubin has submitted from (each under a `processing` label such
@@ -265,7 +265,7 @@ warning.
 Outputs:
 - `dia_sources.parquet` – one row per resolved obs_sbn row (`obsid` is the
   key): all of the view's columns (`id` renamed to `diaSourceId`; DiaSource
-  columns SSSource/SSObject need but the view lacks are null), plus the obs_sbn row's `obsid`, `obssubid` and submitted
+  columns SSObservation/SSObject need but the view lacks are null), plus the obs_sbn row's `obsid`, `obssubid` and submitted
   tracklet (`submission_id`, `trksub`, and MPC's `trkid`), `primary`, `match`
   (`id` or `position`) and the match diagnostics `sep_mas`, `dt_ms`, `dmag`,
   `band_ok`, `n_pass`, `ambiguous`. A source can be claimed by several rows:
@@ -277,19 +277,19 @@ Outputs:
   with a `reason` and the closest failing candidate's separation and time
   offset.
 
-`ssp-build-sssource` turns this file into SSSource (below); `ssp-build-ssobject`
-then joins SSSource to it on `obsid` and computes every per-object quantity
+`ssp-build-ssobservation` turns this file into SSObservation (below); `ssp-build-ssobject`
+then joins SSObservation to it on `obsid` and computes every per-object quantity
 from the `primary` rows of objects with an orbit only, so no detection is
 counted twice.
 
-### SSSource Table Construction
+### SSObservation Table Construction
 
-`ssp-build-sssource` (or `python -m ssp.sssource`) builds the SSSource table
+`ssp-build-ssobservation` (or `python -m ssp.ssobservation`) builds the SSObservation table
 of the PPDB (RFC-1188; see `docs/design/sssource-widened.md`): **one row per
 row of `dia_sources.parquet`**, i.e. per Rubin observation submitted to and
 accepted by the MPC (`obs_sbn`, keyed by `obsid`), measurement-complete, so
 that users need no join to DiaSource or Source. Its columns are exactly those
-of `ssp.schema_ppdb.SSSourceDtype` (generated from `sdm_schemas`'
+of `ssp.schema_ppdb.SSObservationDtype` (generated from `sdm_schemas`'
 `sso_base.yaml`), in six blocks:
 
 1. the `obs_sbn` link: `obsid`, `trksub`, `trkid`, `submission_id`, `status`
@@ -338,9 +338,9 @@ The ASSIST data files must be configured as described under
 [Ephemeris data files](#ephemeris-data-files).
 
 ```bash
-ssp-build-sssource                                   # all objects -> ./analysis/outputs/sssource.parquet
-ssp-build-sssource --max-objects 10                  # quick test on 10 random objects
-ssp-build-sssource --input-dir in/ --output-dir out/
+ssp-build-ssobservation                                   # all objects -> ./analysis/outputs/ssobservation.parquet
+ssp-build-ssobservation --max-objects 10                  # quick test on 10 random objects
+ssp-build-ssobservation --input-dir in/ --output-dir out/
 ```
 
 Options: `--workers N` sets the number of worker processes for the
@@ -350,31 +350,31 @@ output is identical for any `N`. `--max-objects N` and `--dia-sample-frac F`
 subsample the inputs for testing (`--seed` sets the random seed); `--reraise`
 re-raises exceptions for debugging.
 
-An end-to-end run is extraction, SSSource, then SSObject:
+An end-to-end run is extraction, SSObservation, then SSObject:
 
 ```bash
 extract-submitted-sources analysis/inputs/obs_sbn.parquet analysis/inputs/dia_sources.parquet
-ssp-build-sssource
-ssp-build-ssobject analysis/outputs/sssource.parquet analysis/inputs/mpc_orbits.parquet \
+ssp-build-ssobservation
+ssp-build-ssobject analysis/outputs/ssobservation.parquet analysis/inputs/mpc_orbits.parquet \
   --output analysis/outputs/ssobject.parquet
 ```
 
 ### SSObject Table Construction
 
-`ssp-build-ssobject` constructs SSObject tables from SSSource and MPC orbit data. This tool processes photometric and orbital data to create comprehensive solar system object catalogs with fitted parameters.
+`ssp-build-ssobject` constructs SSObject tables from SSObservation and MPC orbit data. This tool processes photometric and orbital data to create comprehensive solar system object catalogs with fitted parameters.
 
 Basic usage:
 ```bash
-ssp-build-ssobject sssource.parquet mpc_orbits.parquet --output ssobject.parquet
+ssp-build-ssobject ssobservation.parquet mpc_orbits.parquet --output ssobject.parquet
 ```
 
-(The older form, `sssource.parquet dia_sources.parquet mpc_orbits.parquet`, is
+(The older form, `ssobservation.parquet dia_sources.parquet mpc_orbits.parquet`, is
 still accepted; the DiaSource file is not read.)
 
 Arguments:
-- `sssource.parquet` – SSSource Parquet file (from `ssp-build-sssource`; only the columns used are read).
-  The photometry is SSSource's own: `band`, and the float32 `psfFlux` and `psfFluxErr`, so SSObject
-  can be reproduced from the published SSSource.
+- `ssobservation.parquet` – SSObservation Parquet file (from `ssp-build-ssobservation`; only the columns used are read).
+  The photometry is SSObservation's own: `band`, and the float32 `psfFlux` and `psfFluxErr`, so SSObject
+  can be reproduced from the published SSObservation.
 - `mpc_orbits.parquet` – MPC orbit Parquet file with orbital elements
 - `--output ssobject.parquet` – Output SSObject Parquet file
 - `--workers N` – Number of worker processes for the per-object fits and the MOIDs (default: `min(64, CPUs)`).
@@ -431,12 +431,12 @@ ssp-generate-dtypes schema.yaml > ssp/schema.py
 
 Generate dtypes for specific tables:
 ```bash
-ssp-generate-dtypes schema.yaml SSObject SSSource > some-table-dtypes.py
+ssp-generate-dtypes schema.yaml SSObject SSObservation > some-table-dtypes.py
 ```
 
 Arguments:
 - `schema.yaml` – Felis YAML schema file containing table definitions
-- `table_names` – Optional list of table names to process (default: SSObject, SSSource, mpc_orbits, current_identifications, numbered_identifications)
+- `table_names` – Optional list of table names to process (default: SSObject, SSObservation, mpc_orbits, current_identifications, numbered_identifications)
 
 The output includes:
 - Generated file header with command provenance

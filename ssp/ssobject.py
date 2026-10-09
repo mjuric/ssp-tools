@@ -1,11 +1,12 @@
-"""Build the SSObject table from the (widened) SSSource and mpc_orbits.
+"""Build the SSObject table from SSObservation and mpc_orbits.
 
-Per object and band, an H/G12 fit of SSSource's photometry (``fit_band``):
+Per object and band, an H/G12 fit of SSObservation's photometry (``fit_band``):
 a band's slope fit fails (``{band}_slope_fit_failed``) when the free G12
 ends at a bound, the fit isn't invertible, it uses fewer than 3 points, or
 its points span less than 2 deg in phase angle; H is then refit at a
 fiducial G12 (0.5). See ``compute_ssobject`` for the details. Every value
-is a function of the set of an object's SSSource rows, whatever their order.
+is a function of the set of an object's SSObservation rows, whatever their
+order.
 """
 import pandas as pd
 import numpy as np
@@ -13,6 +14,7 @@ from functools import partial
 from . import photfit
 from . import util
 from . import schema
+from . import ssobservation_parts
 from .moid import MOIDSolver, earth_orbit
 import argparse
 import os
@@ -54,20 +56,30 @@ def nJy_err_to_mag_err(f_njy, f_err_njy):
 
 FIT_COLUMNS = ["psfMag", "psfMagErr", "phaseAngle", "topoRange", "helioRange"]
 
-# The only SSSource (widened, ssp.schema_ppdb.SSSourceDtype) columns
-# compute_ssobject uses. The photometry is SSSource's own: band, and the
+# The only SSObservation (widened, ssp.schema_ppdb.SSObservationDtype) columns
+# compute_ssobject uses. The photometry is SSObservation's own: band, and the
 # float32 psfFlux and psfFluxErr, converted to magnitudes in float64.
 SSS_COLUMNS = ["ssObjectId", "designation", "primary", "ephRa",
                "midpointMjdTai", "band", "psfFlux", "psfFluxErr", "extendedness",
                "phaseAngle", "topoRange", "helioRange"]
 
 
+def read_ssobservation_columns(path, columns=SSS_COLUMNS):
+    """SSObservation's ``columns`` (default: those compute_ssobject uses) as
+    a pyarrow-backed DataFrame, as pd.read_parquet(..., dtype_backend=
+    "pyarrow") gives them. ``path``: the partitioned SSObservation (its
+    directory or manifest), or a single Parquet file
+    (ssp.ssobservation_parts.read_table)."""
+    t = ssobservation_parts.read_table(path, columns=list(columns))
+    return t.to_pandas(types_mapper=pd.ArrowDtype).reset_index(drop=True)
+
+
 def _entry_columns(sss):
-    """The SSSource columns that compute_ssobject_entry reads, as numpy
+    """The SSObservation columns that compute_ssobject_entry reads, as numpy
     arrays, converted once for the whole table rather than per object
     (slicing and reducing the pyarrow-backed frame per object cost about a
     third of the per-object time). The magnitudes are computed in float64
-    from SSSource's float32 fluxes."""
+    from SSObservation's float32 fluxes."""
     flux = sss["psfFlux"].to_numpy(dtype=np.float64, na_value=np.nan)
     flux_err = sss["psfFluxErr"].to_numpy(dtype=np.float64, na_value=np.nan)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -266,7 +278,7 @@ def compute_ssobject_entry(
 #
 # Workers are forked, and read their inputs from this module-level dict,
 # filled in by the parent just before it creates the pool. The (large)
-# joined SSSource frame is thus inherited through fork, never pickled.
+# joined SSObservation frame is thus inherited through fork, never pickled.
 # Tasks are (start, end) index ranges; results are small numpy arrays.
 #
 _PARALLEL = {}
@@ -310,10 +322,10 @@ def compute_ssobject(
     fiducialG12=None, minPhaseSpan=MIN_PHASE_SPAN,
 ):
     """
-    Compute solar system object properties from SSSource and MPC orbit
+    Compute solar system object properties from SSObservation and MPC orbit
     data.
 
-    This function takes a pre-grouped (widened) SSSource table, computes
+    This function takes a pre-grouped SSObservation table, computes
     per-object quantities from its photometry and geometry, and
     calculates additional orbital parameters like Tisserand J and Minimum
     Orbit Intersection Distance (MOID) with Earth for matching objects.
@@ -321,7 +333,7 @@ def compute_ssobject(
     Parameters
     ----------
     sss : pandas.DataFrame
-        SSSource table, pre-grouped by 'ssObjectId' (the order of each
+        SSObservation table, pre-grouped by 'ssObjectId' (the order of each
         object's rows doesn't matter). Must have the ``SSS_COLUMNS``.
     mpcorb : pandas.DataFrame
         MPC orbit data with columns like
@@ -386,29 +398,29 @@ def compute_ssobject(
 
     missing = [c for c in SSS_COLUMNS if c not in sss.columns]
     if missing:
-        raise ValueError(f"SSSource lacks the columns {missing} (SSObject needs the widened SSSource)")
+        raise ValueError(f"SSObservation lacks the columns {missing} (SSObject needs SSObservation)")
 
     # Sources without an orbit get no SSObject: unmatched ones (a NULL
-    # ssObjectId in the widened SSSource; 0 in older files), and any other
+    # ssObjectId in SSObservation; 0 in older files), and any other
     # with NULL/NaN ephemerides (older files: designated objects with no
     # mpc_orbits row). (np.isnan as well, as pyarrow-backed isna() misses NaN)
     oid = sss["ssObjectId"]
     unmatched = oid.isna().to_numpy(dtype=bool) | (oid.fillna(0) == 0).to_numpy(dtype=bool)
     no_orbit = unmatched | np.isnan(sss["ephRa"].to_numpy(dtype=float, na_value=np.nan))
     if no_orbit.any():
-        print(f"Skipping {no_orbit.sum():,} SSSource rows without an orbit "
+        print(f"Skipping {no_orbit.sum():,} SSObservation rows without an orbit "
               f"({unmatched.sum():,} unmatched)")
         sss = sss[~no_orbit]
 
     # A source claimed by several obs_sbn rows (both endpoints of a trail,
-    # repeated submissions) has several SSSource rows; count it once.
+    # repeated submissions) has several SSObservation rows; count it once.
     sss = sss[sss["primary"].to_numpy(dtype=bool)]
 
     # assert that sss is pre-grouped by ssObjectId
     assert util.values_grouped(sss["ssObjectId"]), (
-        "SSSource table must be pre-grouped by ssObjectId. "
+        "SSObservation table must be pre-grouped by ssObjectId. "
         "An easy way to do this is to sort by ssObjectId before calling compute_ssobject(). "
-        "The grouping is required for correct per-object computations, and since SSSource is "
+        "The grouping is required for correct per-object computations, and since SSObservation is "
         "typically large and we want to avoid copies, it's not done internally."
     )
 
@@ -505,24 +517,30 @@ def compute_ssobject(
 
 def main():
     """
-    CLI entry point for building SSObject table from SSSource,
+    CLI entry point for building SSObject table from SSObservation,
     DiaSource, and MPC orbit data.
     """
     parser = argparse.ArgumentParser(
-        description="Build SSObject table from SSSource and MPC orbit Parquet files",
+        description="Build SSObject table from SSObservation and MPC orbit Parquet files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  ssp-build-ssobject sssource.parquet mpc_orbits.parquet --output ssobject.parquet
+  ssp-build-ssobject delivery/ mpc_orbits.parquet --output ssobject.parquet
+  ssp-build-ssobject delivery/SSObservation.manifest.json mpc_orbits.parquet -o ssobject.parquet
+  ssp-build-ssobject ssobservation.parquet mpc_orbits.parquet --output ssobject.parquet
 
-The photometry comes from SSSource. The older form, with dia_sources.parquet
-between the two, is still accepted; that file is not read.
+SSObservation is the partitioned delivery (the directory holding
+SSObservation.manifest.json, or the manifest), or a single Parquet file (the
+layout before the partitioned delivery). The photometry comes from
+SSObservation. The older form, with dia_sources.parquet between the two, is
+still accepted; that file is not read.
         """
     )
 
     parser.add_argument(
-        "sssource_parquet",
-        help="Path to the (widened) SSSource Parquet file"
+        "ssobservation",
+        help="SSObservation: the directory holding SSObservation.manifest.json, the manifest, "
+             "or a single SSObservation Parquet file"
     )
     parser.add_argument(
         "inputs", nargs="+", metavar="mpcorb_parquet",
@@ -611,9 +629,9 @@ between the two, is still accepted; that file is not read.
 
     args = parser.parse_args()
     if len(args.inputs) > 2:
-        parser.error("expected: sssource_parquet [diasource_parquet] mpcorb_parquet")
+        parser.error("expected: ssobservation [diasource_parquet] mpcorb_parquet")
     if len(args.inputs) == 2:
-        print(f"Note: {args.inputs[0]} is not read; the photometry comes from SSSource.")
+        print(f"Note: {args.inputs[0]} is not read; the photometry comes from SSObservation.")
     args.mpcorb_parquet = args.inputs[-1]
     if args.workers < 1:
         parser.error("--workers must be at least 1")
@@ -621,13 +639,12 @@ between the two, is still accepted; that file is not read.
         parser.error("--chunk-factor must be at least 1")
 
     try:
-        # Load SSSource: only the columns compute_ssobject uses (the
-        # widened SSSource has ~180)
-        print(f"Loading SSSource from {args.sssource_parquet}...")
-        sss = pd.read_parquet(args.sssource_parquet, engine="pyarrow", dtype_backend="pyarrow",
-                              columns=SSS_COLUMNS).reset_index(drop=True)
+        # Load SSObservation: only the columns compute_ssobject uses (the
+        # SSObservation has ~180)
+        print(f"Loading SSObservation from {args.ssobservation}...")
+        sss = read_ssobservation_columns(args.ssobservation)
         num = len(sss)
-        print(f"Loaded {num:,} SSSource rows")
+        print(f"Loaded {num:,} SSObservation rows")
 
         # Load MPC orbits
         mpcorb_columns = [
@@ -674,10 +691,8 @@ if __name__ == "__main__":
     # Loads
     #
 
-    # load SSSource
-    sss = pd.read_parquet(f'{output_dir}/sssource.parquet',
-                          engine="pyarrow", dtype_backend="pyarrow",
-                          columns=SSS_COLUMNS).reset_index(drop=True)
+    # load SSObservation
+    sss = read_ssobservation_columns(output_dir)
 
     # Load mpcorb
     mpcorb = pd.read_parquet(f'{input_dir}/mpc_orbits.parquet',

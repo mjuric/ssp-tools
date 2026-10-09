@@ -31,6 +31,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
+  "pytest-xdist",
 ]
 assist = [
   "assist",
@@ -52,7 +53,7 @@ fast-export = "ssp.export:main"
 extract-catalog = "ssp.export.butler:main"
 extract-submitted-sources = "ssp.export.submittable:main"
 ssp-extract-sso-inputs = "ssp.sso_inputs:main"
-ssp-build-sssource = "ssp.sssource:main"
+ssp-build-ssobservation = "ssp.ssobservation:main"
 ssp-build-ssobject = "ssp.ssobject:main"
 ssp-build-nearbysso = "ssp.nearbysso.build:main"
 ssp-build-sso = "ssp.sso_build:main"

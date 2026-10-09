@@ -648,7 +648,7 @@ def _position_angle_deg(w, east, north):
 
 def tail_position_angles(helio_pos, helio_vel, topo_pos):
     """The tail position angles ``(anti_sun_pa, anti_motion_pa)`` [deg]
-    (JPL Horizons quantity 27, ``PsAng`` and ``PsAMV``; SSSource and
+    (JPL Horizons quantity 27, ``PsAng`` and ``PsAMV``; SSObservation and
     NearbySSO ``ephAntiSunPA``, ``ephAntiMotionPA``).
 
     ``helio_pos`` [AU], ``helio_vel`` [km/s] and ``topo_pos`` [AU] are (3, N)
@@ -658,7 +658,7 @@ def tail_position_angles(helio_pos, helio_vel, topo_pos):
     Sun -> object vector (``helio_pos``) and the negative heliocentric
     velocity (``-helio_vel``). Returns two (N,) float64 arrays in [0, 360),
     NaN where the vector's projection is exactly zero or any input of the
-    row is NaN. See ssp/sssource_contract.py, "Tail position angles".
+    row is NaN. See ssp/ssobservation_contract.py, "Tail position angles".
     """
     hp = np.asarray(helio_pos, dtype=np.float64)
     hv = np.asarray(helio_vel, dtype=np.float64)
@@ -687,7 +687,7 @@ def tail_position_angles(helio_pos, helio_vel, topo_pos):
 def tail_position_angles_f32(pa):
     """``pa`` (from ``tail_position_angles``) as the float32 column values:
     rounded to float32, with a value that rounds up to 360 wrapped to 0 so
-    that the column stays in [0, 360). SSSource and NearbySSO both store
+    that the column stays in [0, 360). SSObservation and NearbySSO both store
     the angles through this, so the two tables agree bitwise."""
     f = np.asarray(pa, dtype=np.float64).astype(np.float32)
     f[f >= np.float32(360.0)] = np.float32(0.0)

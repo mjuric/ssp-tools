@@ -831,10 +831,10 @@ def test_end_to_end(tmp_path, synth, orbits, ephem, expected):
     want = res["designation"].map({"2007 VY347": 1234.0, "2025 PM": 5678.0}).to_numpy(dtype=float)
     np.testing.assert_array_equal(sso_id, want)
 
-    # the eph* values are SSSource's, for the same orbit and DiaSource: to
+    # the eph* values are SSObservation's, for the same orbit and DiaSource: to
     # integrator noise (it depends on the set of times integrated through,
     # here all the candidate visits, there only the matched ones), 3.6 uas
-    from ssp.sssource import WORK_DTYPE, compute_sssource_entry
+    from ssp.ssobservation import WORK_DTYPE, compute_ssobservation_entry
     from ssp.util import observatory_barycentric_posvel
     import astropy.units as u
     mpcorb = pd.DataFrame({k: orbits[k] for k in ("q", "e", "i", "node", "argperi", "peri_time", "epoch_mjd",
@@ -852,13 +852,13 @@ def test_end_to_end(tmp_path, synth, orbits, ephem, expected):
         assoc["dia_index"] = np.arange(len(ids))
         assoc["obs_pos"] = rp.to_value(u.au).T
         assoc["obs_vel"] = vp.to_value(u.km / u.s).T
-        compute_sssource_entry(sss, assoc, mpcorb, de, ephem)
+        compute_ssobservation_entry(sss, assoc, mpcorb, de, ephem)
         np.testing.assert_allclose(grp["ephRa"], sss["ephRa"], rtol=0, atol=1e-9)
         np.testing.assert_allclose(grp["ephDec"], sss["ephDec"], rtol=0, atol=1e-9)
         for c in ("ephOffset", "ephRateRa", "ephRateDec"):
             np.testing.assert_allclose(grp[c], sss[c].astype(np.float32), rtol=1e-6, atol=1e-6,
                                        err_msg=f"{desig} {c}")
-        # (V goes through SSSource's float32 columns: identical, as the
+        # (V goes through SSObservation's float32 columns: identical, as the
         # noise is far below their precision)
         np.testing.assert_array_equal(grp["ephVmag"], sss["ephVmag"], err_msg=f"{desig} ephVmag")
         # the tail angles, computed the same way (equal unless the integrator

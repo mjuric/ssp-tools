@@ -3,8 +3,8 @@ docs/design/nearbysso.md, "Validation").
 
 Black-box checks of the builder's *outputs* (``nearbysso.parquet``, of
 ``_contract.NEARBYSSO_DTYPE``) against its inputs (the DiaSource Parquet,
-``mpc_orbits``) and independent references (SSSource, JPL Horizons, the JPL
-SBDB). It is written from the design and the contract only: the orbit
+``mpc_orbits``) and independent references (SSObservation, JPL Horizons, the
+JPL SBDB). It is written from the design and the contract only: the orbit
 filter, the visits, the brute-force prefilter and the matching are
 re-implemented here, and the builder's code is called only through the
 contract (``propagate.coarse`` for sigma), so a shared bug is unlikely.
@@ -18,7 +18,8 @@ between objects for a DiaSource compares separations in arcsec.
 
 Subcommands (each writes ``<out>/<name>.txt`` and ``<out>/<name>.parquet``)::
 
-  same-orbits          NearbySSO vs SSSource built from the SAME mpc_orbits
+  same-orbits          NearbySSO vs SSObservation built from the SAME
+                       mpc_orbits
   dp2-intersection     vs DP2 SSSource (other orbits/cuts); reported only
   horizons-adjudicate  which side of each discrepancy matches Horizons
   horizons-positions   stratified Horizons spot check, < 1 mas RMS gate
@@ -26,7 +27,7 @@ Subcommands (each writes ``<out>/<name>.txt`` and ``<out>/<name>.parquet``)::
   brute-force          coarse-pass safety: all orbits, exact ephemerides
   rank                 diaDistanceRank recomputed by brute force from the
                        DiaSources of each sampled row's visit
-  mock-nearbysso       (development) a NearbySSO file faked from SSSource,
+  mock-nearbysso       (development) a NearbySSO file faked from SSObservation,
                        with injected faults, to exercise the checks
   mock-rank            (development) a NearbySSO file with diaDistanceRank
                        added by brute force, optionally with faults
@@ -42,7 +43,7 @@ these subcommands in parallel or from the test suite.
 Example::
 
   python -m bench.nearbysso_validate same-orbits \\
-      --nearbysso nearbysso.parquet --sssource sssource.parquet \\
+      --nearbysso nearbysso.parquet --ssobservation ssobservation.parquet \\
       --dia dia.parquet --orbits mpc_orbits.parquet --out report/
 """
 
@@ -71,6 +72,7 @@ if _ROOT not in sys.path:
 
 from bench.ephem_bench import horizons_observer, horizons_request  # noqa: E402
 from ssp import util  # noqa: E402
+from ssp import ssobservation_parts as SP  # noqa: E402
 from ssp.ephem_assist import (  # noqa: E402
     ASSIST_SUN,
     C_AU_PER_DAY,
@@ -106,8 +108,8 @@ ELEMENTS = ["q", "e", "i", "node", "argperi", "peri_time"]
 #: code and inputs should agree bitwise; these allow for integrator step
 #: choices that depend on the set of requested times (numerical noise).
 TOL = dict(pos_mas=0.1, rate_deg_day=1e-7, vmag=1e-4)
-#: SSSource columns read, where present, for the time-shift allowance
-#: (bench/time_shift.py): SSSource predicts at its (shutter-corrected)
+#: SSObservation columns read, where present, for the time-shift allowance
+#: (bench/time_shift.py): SSObservation predicts at its (shutter-corrected)
 #: midpointMjdTai, read as ``sss_midpointMjdTai``, NearbySSO at the
 #: DiaSource's. Where the two times are equal the tolerances are TOL's.
 SHIFT_COLUMNS = ["topoRange", "topoRangeRate", "helioRange", "helioRangeRate"]
@@ -740,34 +742,34 @@ def derive_visits(dia):
 
 
 # ---------------------------------------------------------------------------
-# 1/2. Comparison against an SSSource
+# 1/2. Comparison against an SSObservation
 # ---------------------------------------------------------------------------
 
-def compare_to_sssource(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
+def compare_to_ssobservation(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
                         radius=None, sigma_max=SIGMA_MAX):
-    """Compare NearbySSO rows (``nss``) with SSSource rows (``sss``).
+    """Compare NearbySSO rows (``nss``) with SSObservation rows (``sss``).
 
-    ``dia``: diaSourceId, midpointMjdTai, ra, dec for the SSSource rows'
+    ``dia``: diaSourceId, midpointMjdTai, ra, dec for the SSObservation rows'
     DiaSources. ``reason_of``: designation -> filter reason ('' kept).
     ``sigma_fn(designations, mjd_tai) -> sigma_major [arcsec]`` (NaN:
     unknown), called only for rows no cheaper reason explains. ``radius``:
-    None (the default) for each SSSource row's object's own match radius
+    None (the default) for each SSObservation row's object's own match radius
     (`radius_of`), or one radius [arcsec] for all.
 
     Time shift (docs/design/shutter-timing.md): where ``sss`` has
-    ``sss_midpointMjdTai`` (SSSource's own time) and it differs from the
+    ``sss_midpointMjdTai`` (SSObservation's own time) and it differs from the
     DiaSource's ``midpointMjdTai`` by dt, the two predictions differ by
     about rate x dt: the eph* tolerances, the separation-from-radius and
     the nearer-object decisions get bench/time_shift.py's allowances on
     top; at dt = 0 they are unchanged. |dt| > TS.DT_MAX_S is a failure.
 
-    Returns (rows, summary): one row per SSSource row with its status:
+    Returns (rows, summary): one row per SSObservation row with its status:
 
     - ``match``: same designation, eph* within ``tol`` (+ the time shift);
     - ``value_mismatch``: same designation, an eph* value outside ``tol``;
     - ``filtered:<reason>``: the object fails NearbySSO's orbit filter;
     - ``no_diasource`` / ``sss_no_ephemeris``: incomparable inputs;
-    - ``separation``: SSSource's prediction is beyond its object's match
+    - ``separation``: SSObservation's prediction is beyond its object's match
       radius from the DiaSource;
     - ``nearer_object``: NearbySSO gave the DiaSource a nearer object
       (ties by designation);
@@ -790,7 +792,7 @@ def compare_to_sssource(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
     d = d.merge(nsub, on="diaSourceId", how="left")
     n = len(d)
 
-    # a NULL designation (SSSource rows of no known object) is "" (not in
+    # a NULL designation (SSObservation rows of no known object) is "" (not in
     # mpc_orbits); pandas 3 keeps NaN through astype(str)
     des = np.array(["" if pd.isna(x) else str(x) for x in d["designation"].to_numpy(dtype=object)],
                    dtype=object)
@@ -806,7 +808,8 @@ def compare_to_sssource(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
                                         d["dia_ra"].to_numpy()[m], d["dia_dec"].to_numpy()[m])
     d["sep"] = sep
 
-    # the time shift: SSSource at its own time, NearbySSO at the DiaSource's
+    # the time shift: SSObservation at its own time, NearbySSO at the
+    # DiaSource's
     def opt(c):
         return d[c].to_numpy(dtype=float) if c in d else np.full(n, np.nan)
     dt = TS.dt_days(opt("sss_midpointMjdTai"), d["midpointMjdTai"].to_numpy(dtype=float))
@@ -866,7 +869,7 @@ def compare_to_sssource(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
         (~have_dia, "no_diasource"),
         (~sss_ok, "sss_no_ephemeris"),
         # NearbySSO's prediction (at the DiaSource's time) may be beyond
-        # the radius where SSSource's (at its own) is just within it
+        # the radius where SSObservation's (at its own) is just within it
         (np.nan_to_num(sep, nan=np.inf) > rad - pos_allow / 1e3, "separation"),
     ):
         m = todo & cond
@@ -897,16 +900,16 @@ def compare_to_sssource(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
         np.abs(sigma - sigma_max) < 0.01 * sigma_max)
     d["identical"] = identical
 
-    # NearbySSO rows for DiaSources not in this SSSource at all
+    # NearbySSO rows for DiaSources not in this SSObservation at all
     in_sss = np.isin(nss["diaSourceId"].to_numpy(), d["diaSourceId"].to_numpy())
     # NearbySSO rows beyond their own object's match radius (wrong,
-    # whatever SSSource says)
+    # whatever SSObservation says)
     beyond = beyond_radius(nss, radius)
     counts = pd.Series(status).value_counts().to_dict()
     ms = d[same]
     summary = {
-        "n_sssource": n, "n_nearbysso": len(nss), "n_nearbysso_duplicate_ids": n_dup,
-        "n_nearbysso_not_in_sssource": int((~in_sss).sum()),
+        "n_ssobservation": n, "n_nearbysso": len(nss), "n_nearbysso_duplicate_ids": n_dup,
+        "n_nearbysso_not_in_ssobservation": int((~in_sss).sum()),
         "n_nearbysso_beyond_radius": int(beyond.sum()),
         "nearbysso_beyond_radius": nss.loc[beyond, "diaSourceId"].head(10).tolist(),
         "status_counts": {k: int(v) for k, v in sorted(counts.items())},
@@ -939,19 +942,19 @@ def beyond_radius(nss, radius=None):
 
 
 def report_comparison(rep, summary, tol=None):
-    rep(f"SSSource rows:          {summary['n_sssource']:,}")
+    rep(f"SSObservation rows:          {summary['n_ssobservation']:,}")
     rep(f"NearbySSO rows:         {summary['n_nearbysso']:,} "
-        f"({summary['n_nearbysso_not_in_sssource']:,} for DiaSources not in SSSource; "
+        f"({summary['n_nearbysso_not_in_ssobservation']:,} for DiaSources not in SSObservation; "
         f"{summary['n_nearbysso_duplicate_ids']} duplicate diaSourceIds)")
     rep(f"NearbySSO rows with ephOffset beyond their object's match radius: "
         f"{summary['n_nearbysso_beyond_radius']:,}"
         + (f" (e.g. {summary['nearbysso_beyond_radius']})" if summary['n_nearbysso_beyond_radius'] else ""))
-    rep("status of each SSSource row:")
+    rep("status of each SSObservation row:")
     for k, v in summary["status_counts"].items():
         rep(f"  {k:32s} {v:>10,}")
     rep(f"bitwise-identical eph* rows: {summary['n_identical']:,}")
     if "n_time_shifted" in summary:
-        rep(f"rows where SSSource's midpointMjdTai differs from the DiaSource's: "
+        rep(f"rows where SSObservation's midpointMjdTai differs from the DiaSource's: "
             f"{summary['n_time_shifted']:,} (max |dt| {summary['max_abs_dt_s']:.3f} s; "
             f"{summary['n_dt_too_large']} beyond {TS.DT_MAX_S} s, a failure); their tolerances add "
             f"bench/time_shift.py's allowances, the others are strict")
@@ -989,10 +992,10 @@ SSS_PROCESSING = "AP-DS"
 
 
 def _read_sss(path, extra=(), processing=SSS_PROCESSING):
-    """The SSSource columns compared, one row per DiaSource, keyed by
+    """The SSObservation columns compared, one row per DiaSource, keyed by
     diaSourceId.
 
-    A widened SSSource (with ``measuredOn``) mixes DiaSources and Sources
+    A SSObservation (with ``measuredOn``) mixes DiaSources and Sources
     from several processings, with a NULL diaSourceId on Source rows and a
     DiaSource repeated on non-primary rows: keep its ``primary``,
     ``measuredOn == 'difference'`` rows of ``processing`` (None or 'all':
@@ -1000,14 +1003,16 @@ def _read_sss(path, extra=(), processing=SSS_PROCESSING):
     comparisons join on it, diaSourceId are unique. Read through Arrow, so
     the 64-bit ids stay exact (default pandas would make a NULL-containing
     integer column float64); integer columns with NULLs become pandas Int64.
-    An earlier-layout SSSource is read as is.
+    An earlier-layout SSObservation is read as is. ``path``: the
+    partitioned SSObservation's directory or manifest, or a single Parquet
+    file.
     """
-    present = set(pq.read_schema(path).names)
+    present = set(SP.read_schema(path).names)
     cols = [c for c in ["diaSourceId", "designation", "ssObjectId"] + EPH_COMPARED + ["ephOffset"]
             + list(extra) + ["midpointMjdTai"] + SHIFT_COLUMNS if c in present]
     widened = "measuredOn" in present
     key = ["processing", "measuredOn", "primary"] if widened else []
-    t = pq.read_table(path, columns=list(dict.fromkeys(cols + key)))
+    t = SP.read_table(path, columns=list(dict.fromkeys(cols + key)))
     if widened:
         keep = pc.and_(pc.equal(t["measuredOn"].cast(pa.string()), "difference"), t["primary"])
         if processing not in (None, "all"):
@@ -1028,20 +1033,20 @@ def _read_sss(path, extra=(), processing=SSS_PROCESSING):
             out[c] = pd.array(a.to_pylist(), dtype="Int64")
         else:
             out[c] = a.to_pandas()
-    # SSSource's own time, kept apart from the DiaSource's midpointMjdTai
+    # SSObservation's own time, kept apart from the DiaSource's midpointMjdTai
     return pd.DataFrame(out, columns=t.column_names).rename(columns={"midpointMjdTai": "sss_midpointMjdTai"})
 
 
 def cmd_same_orbits(args):
     rep = Report("same-orbits", args.out)
-    rep("# NearbySSO vs SSSource built from the same mpc_orbits")
-    rep(f"nearbysso={args.nearbysso}\nsssource={args.sssource}\ndia={args.dia}\norbits={args.orbits}")
-    nss, sss = _read_nss(args.nearbysso), _read_sss(args.sssource, processing=args.sss_processing)
+    rep("# NearbySSO vs SSObservation built from the same mpc_orbits")
+    rep(f"nearbysso={args.nearbysso}\nssobservation={args.ssobservation}\ndia={args.dia}\norbits={args.orbits}")
+    nss, sss = _read_nss(args.nearbysso), _read_sss(args.ssobservation, processing=args.sss_processing)
     dia = read_dia_subset(args.dia, ids=np.union1d(sss["diaSourceId"], nss["diaSourceId"]))
     orbits = read_orbits(args.orbits, designations=set(sss["designation"].dropna()))
     sigma_fn = None if args.no_sigma else SigmaOracle(args.orbits)
     tol = dict(pos_mas=args.pos_tol_mas, rate_deg_day=args.rate_tol, vmag=args.vmag_tol)
-    rows, summary = compare_to_sssource(nss, sss, dia, reason_lookup(orbits), sigma_fn, tol)
+    rows, summary = compare_to_ssobservation(nss, sss, dia, reason_lookup(orbits), sigma_fn, tol)
     report_comparison(rep, summary, tol)
     if sigma_fn is not None and sigma_fn.note:
         rep(sigma_fn.note)
@@ -1077,7 +1082,7 @@ def reconcile_designations(des, ident):
 def cmd_dp2_intersection(args):
     rep = Report("dp2-intersection", args.out)
     rep("# NearbySSO vs DP2 SSSource (different orbits and cuts): REPORT ONLY, not gated")
-    nss, sss = _read_nss(args.nearbysso), _read_sss(args.sssource, processing=args.sss_processing)
+    nss, sss = _read_nss(args.nearbysso), _read_sss(args.ssobservation, processing=args.sss_processing)
     ident = pd.read_parquet(args.identifications, columns=[
         "unpacked_primary_provisional_designation", "unpacked_secondary_provisional_designation",
         "packed_secondary_provisional_designation"])
@@ -1105,7 +1110,7 @@ def cmd_dp2_intersection(args):
         f"{len(both):,} DP2 rows, {len(nss_both):,} NearbySSO rows")
     dia = read_dia_subset(args.dia, ids=np.union1d(both["diaSourceId"], nss_both["diaSourceId"]))
     sigma_fn = SigmaOracle(args.orbits) if args.sigma else None
-    rows, summary = compare_to_sssource(nss_both, both, dia, lookup, sigma_fn)
+    rows, summary = compare_to_ssobservation(nss_both, both, dia, lookup, sigma_fn)
     report_comparison(rep, summary, TOL)
     rep("d position [mas] of matched rows:", _stats(rows["d_pos_mas"], "mas"))
     rep("(different orbit snapshots: differences are expected; not gated)")
@@ -1141,12 +1146,12 @@ def adjudicate_rows(disc, h_ra, h_dec, tol_mas=1.0, radius=None):
     have = np.isfinite(h_ra)
     v[have & same & ss & ns] = "both_match"
     v[have & same & ss & ~ns] = "sss_matches: NearbySSO bug"
-    v[have & same & ~ss & ns] = "nss_matches: SSSource issue"
+    v[have & same & ~ss & ns] = "nss_matches: SSObservation issue"
     v[have & same & ~ss & ~ns] = "neither_matches"
     miss = have & ~same
     v[miss & ss & within] = "sss_matches, within radius: NearbySSO missed it"
     v[miss & ss & ~within] = "sss_matches, outside radius per Horizons"
-    v[miss & ~ss] = "sss_disagrees: SSSource issue"
+    v[miss & ~ss] = "sss_disagrees: SSObservation issue"
     d["verdict"] = v
     return d
 
@@ -2181,11 +2186,11 @@ def cmd_mock_rank(args):
 
 
 # ---------------------------------------------------------------------------
-# Development: a NearbySSO faked from SSSource, with injected faults
+# Development: a NearbySSO faked from SSObservation, with injected faults
 # ---------------------------------------------------------------------------
 
-def mock_from_sssource(sss, dia, reason_of, rng=None, n_drop=0, n_perturb=0):
-    """A NEARBYSSO_DTYPE table from SSSource rows that NearbySSO should
+def mock_from_ssobservation(sss, dia, reason_of, rng=None, n_drop=0, n_perturb=0):
+    """A NEARBYSSO_DTYPE table from SSObservation rows that NearbySSO should
     contain (object kept by the filter, prediction within its match
     radius), nearest per DiaSource, zero ellipses; then ``n_drop`` rows
     removed and ``n_perturb`` positions shifted by 1-10 mas. Returns
@@ -2213,10 +2218,10 @@ def mock_from_sssource(sss, dia, reason_of, rng=None, n_drop=0, n_perturb=0):
 
 
 def cmd_mock(args):
-    sss = _read_sss(args.sssource, processing=args.sss_processing)
+    sss = _read_sss(args.ssobservation, processing=args.sss_processing)
     dia = read_dia_subset(args.dia, ids=sss["diaSourceId"].to_numpy())
     orbits = read_orbits(args.orbits, designations=set(sss["designation"].dropna()))
-    out, faults = mock_from_sssource(sss, dia, reason_lookup(orbits), args.seed, args.drop, args.perturb)
+    out, faults = mock_from_ssobservation(sss, dia, reason_lookup(orbits), args.seed, args.drop, args.perturb)
     out.to_parquet(args.output, index=False)
     faults.to_parquet(args.output + ".faults.parquet", index=False)
     print(f"wrote {len(out):,} rows to {args.output}; {len(faults)} faults injected")
@@ -2249,24 +2254,25 @@ def main(argv=None):
         p.add_argument("--out", required=True, help="report directory")
         p.add_argument("--seed", type=int, default=42)
 
-    p = sub.add_parser("same-orbits", help="vs SSSource from the same mpc_orbits")
+    p = sub.add_parser("same-orbits", help="vs SSObservation from the same mpc_orbits")
     common(p)
-    p.add_argument("--sssource", required=True)
+    p.add_argument("--ssobservation", required=True,
+                   help="SSObservation: the delivery directory, its manifest, or a single Parquet file")
     p.add_argument("--no-sigma", action="store_true", help="don't compute sigma (classify as unknown)")
     p.add_argument("--pos-tol-mas", type=float, default=TOL["pos_mas"])
     p.add_argument("--rate-tol", type=float, default=TOL["rate_deg_day"], help="deg/day")
     p.add_argument("--vmag-tol", type=float, default=TOL["vmag"])
     p.add_argument("--sss-processing", default=SSS_PROCESSING,
-                   help="widened SSSource: the processing to compare (default: %(default)s; 'all')")
+                   help="SSObservation: the processing to compare (default: %(default)s; 'all')")
     p.set_defaults(func=cmd_same_orbits)
 
     p = sub.add_parser("dp2-intersection", help="vs DP2 SSSource on the objects both keep (report)")
     common(p)
-    p.add_argument("--sssource", required=True, help="DP2 SSSource (designation or ssObjectId)")
+    p.add_argument("--ssobservation", required=True, help="DP2 SSSource (designation or ssObjectId)")
     p.add_argument("--identifications", required=True, help="current_identifications Parquet")
     p.add_argument("--sigma", action="store_true", help="compute sigma for unexplained misses")
     p.add_argument("--sss-processing", default=SSS_PROCESSING,
-                   help="widened SSSource: the processing to compare (default: %(default)s; 'all')")
+                   help="SSObservation: the processing to compare (default: %(default)s; 'all')")
     p.set_defaults(func=cmd_dp2_intersection)
 
     p = sub.add_parser("horizons-adjudicate", help="Horizons verdict on discrepancies")
@@ -2321,8 +2327,8 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=42)
     p.set_defaults(func=cmd_mock_rank)
 
-    p = sub.add_parser("mock-nearbysso", help="(development) fake NearbySSO from SSSource")
-    p.add_argument("--sssource", required=True)
+    p = sub.add_parser("mock-nearbysso", help="(development) fake NearbySSO from SSObservation")
+    p.add_argument("--ssobservation", required=True)
     p.add_argument("--dia", required=True)
     p.add_argument("--orbits", required=True)
     p.add_argument("--output", required=True)
@@ -2330,7 +2336,7 @@ def main(argv=None):
     p.add_argument("--perturb", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sss-processing", default=SSS_PROCESSING,
-                   help="widened SSSource: the processing to compare (default: %(default)s; 'all')")
+                   help="SSObservation: the processing to compare (default: %(default)s; 'all')")
     p.set_defaults(func=cmd_mock)
 
     args = ap.parse_args(argv)

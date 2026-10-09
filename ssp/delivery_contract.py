@@ -37,7 +37,7 @@ INPUT_FILES = {
     "dia_sources": ("dia_sources.parquet",
                     "the measurement each obs_sbn X05 row was submitted from: today "
                     "extract-submitted-sources output (ssp.SubmittableSources), with "
-                    "shutter-corrected times (ssp.sssource_contract, 'Shutter-motion')"),
+                    "shutter-corrected times (ssp.ssobservation_contract, 'Shutter-motion')"),
     "ppdb_dia_sources": ("ppdb_dia_sources.parquet",
                          "PPDB DiaSource: diaSourceId, visit, midpointMjdTai, ra, dec"),
 }
@@ -92,7 +92,8 @@ SHUTTER_INPUT_COLUMNS = ["midpointMjdTaiVisit", "midpointMjdTai_flag",
 # or |obstime - corrected time| is within DT_MS (10 ms); the minute-bucket
 # position fallback covers both times. The correction is applied before
 # matching. NOT_BUILT visits: the visit time, flagged, with a warning; more
-# than ssp.sssource_contract.MAX_NOT_BUILT_VISITS of them fail the extract.
+# than ssp.ssobservation_contract.MAX_NOT_BUILT_VISITS of them fail the
+# extract.
 #
 # ssp-sso-daily runs a stage 0 before the extract: shutter-timing-table
 # --out <corrections dir> (resumes; at most 32 workers); a calibration
@@ -107,16 +108,20 @@ DERIVED_FROM = {"dia_sources": "obs_sbn"}
 # Stage 2 -> 3: the delivery (RUN_DIR/delivery) and the report
 # --------------------------------------------------------------------------
 
-#: The PPDB Solar System tables, delivered as RUN_DIR/delivery/<Table>.parquet.
+#: The PPDB Solar System tables, delivered as RUN_DIR/delivery/<Table>.parquet,
+#: except SSObservation, which is delivered as parts plus a manifest and a
+#: sidecar (ssp.ssobservation_contract: PART_FILE_FORMAT,
+#: SSOBSERVATION_MANIFEST_FILE, SIDECAR_FILE; docs/design/
+#: ssobservation-delivery.md).
 #: Their columns, order, types and nullability are ppdb.yaml's tables of
 #: these names, resolved through its columnRefs into sso_base.yaml (see
 #: delivery_schema()).
-DELIVERY_TABLES = ("SSSource", "SSObject", "NearbySSO",
+DELIVERY_TABLES = ("SSObservation", "SSObject", "NearbySSO",
                    "mpc_orbits", "current_identifications", "numbered_identifications")
 DELIVERY_DIR = "delivery"
 
 #: Build steps, in order (ssp-build-sso --from STEP).
-BUILD_STEPS = ("mpc", "sssource", "ssobject", "nearbysso", "check")
+BUILD_STEPS = ("mpc", "ssobservation", "ssobject", "nearbysso", "check")
 
 #: RUN_DIR/report.json, written by stage 2 and updated by stage 3.
 REPORT_FILE = "report.json"
@@ -124,7 +129,10 @@ REPORT_FIELDS = {
     "inputs": "the input manifest, as read",
     "ssp_tools_commit": "git commit of the code that built the delivery",
     "steps": "{step: {status: 'ok'|'failed'|'skipped', started_utc, wall_s, max_rss_gb, log}}",
-    "tables": "{Table: {file, rows, md5, bytes}} for every delivered table",
+    "tables": "{Table: {file, rows, md5, bytes}} for every delivered table; for SSObservation "
+              "{manifest, manifest_md5, parts: [file, ...], sidecar, rows, bytes} (rows and bytes "
+              "are totals over the parts, not counting the manifest or the sidecar; each part's md5 "
+              "is in the manifest, and the manifest's own md5 is manifest_md5)",
     "checks": "{check: {status: 'PASS'|'FAIL', report}}",
     "deliverable": "true only if every step and check passed; stage 3 refuses otherwise",
     "upload": "set by stage 3: {config, bucket, object_prefix, tables, message_id, dry_run, utc}",
@@ -145,13 +153,18 @@ REPORT_FIELDS = {
 #
 # Upload: a fresh prefix per upload, UPLOAD_PREFIX_FORMAT of the UTC time
 # with milliseconds (datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")[:-3]);
-# each table to gs://<bucket>/<prefix>/<Table>.parquet with
+# each table to gs://<bucket>/<prefix>/<Table>.parquet (SSObservation: each
+# part, then the manifest, under their own names; never the sidecar) with
 # if_generation_match=0 (never overwrite); on any failure, delete what this
 # upload wrote and fail. Then publish one Pub/Sub message, JSON:
 #   {"bucket": <bucket>, "object_prefix": <prefix>,
-#    "uploaded_tables": [<Table>, ...]}
+#    "uploaded_tables": [<Table>, ...],
+#    "files": {<Table>: [<object name relative to the prefix>, ...]}}
+# (files is new with the partitioned SSObservation, for the PPDB loader
+# owners' review; a single-file table lists its one file. SSObservation
+# lists its parts in part order, then SSOBSERVATION_MANIFEST_FILE.)
 UPLOAD_PREFIX_FORMAT = "%Y%m%dT%H%M%S%f"   # then [:-3]: milliseconds
-UPLOAD_MESSAGE_FIELDS = ("bucket", "object_prefix", "uploaded_tables")
+UPLOAD_MESSAGE_FIELDS = ("bucket", "object_prefix", "uploaded_tables", "files")
 
 
 def delivery_schema(schema_dir=SCHEMA_DIR):
@@ -187,7 +200,24 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 #   in nullable: false columns; the primary key unique and non-NULL.
 # check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES)
 #     -> dict[table, list[CheckResult]]
-#   Fails (a FAIL result) for a missing file.
+#   Fails (a FAIL result) for a missing file. SSObservation is checked
+#   through its manifest (check_ssobservation_parts below) and check_table
+#   runs on every part.
+# check_ssobservation_parts(delivery_dir) -> list[CheckResult]
+#   The manifest has SSOBSERVATION_MANIFEST_FIELDS (format_version
+#   MANIFEST_FORMAT_VERSION)
+#   and its parts PART_FIELDS; the files on disk matching PART_GLOB are
+#   exactly the manifest's, named PART_FILE_FORMAT contiguously from 0;
+#   each part's rows, bytes and md5 match, and its ssObjectId min/max and
+#   null_ssObjectId match its contents; ranged parts ascend and are
+#   disjoint, no ssObjectId appears in two parts, NULL parts come last and
+#   hold only NULLs; every ranged part but the last has >= part_rows rows,
+#   every NULL part but the last exactly part_rows; rows sum to "rows";
+#   rows are in SSOBSERVATION_SORT order within and across parts; the
+#   sidecar matches SIDECAR_FIELDS, has obsid followed by its columns with
+#   SSOBSERVATION_INTERNAL_DTYPE's types, non-null, the same obsid sequence
+#   as the parts concatenated, and its rows/bytes/md5; the sidecar's
+#   columns are not in the delivered schema.
 # CheckResult: a NamedTuple (name: str, ok: bool, detail: str).
 # CLI: python -m ssp.delivery_check DELIVERY_DIR [--tables ...]
 #   (exit 0 if every result is ok).

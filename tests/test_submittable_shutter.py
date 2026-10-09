@@ -17,7 +17,7 @@ from astropy.time import Time
 
 from ssp.delivery_contract import SHUTTER_INPUT_COLUMNS, SHUTTER_MANIFEST_FIELD
 from ssp.export import submittable as S
-from ssp.sssource_contract import MAX_NOT_BUILT_VISITS
+from ssp.ssobservation_contract import MAX_NOT_BUILT_VISITS
 
 pytest.importorskip("shutter_timing.corrections")
 

@@ -1,5 +1,7 @@
 # Design: faster SSSource/SSObject builds
 
+> **Renamed (2026-10-08):** the PPDB table called SSSource here is now **SSObservation**, and the code names follow it (`ssp.ssobservation`, `ssp-build-ssobservation`, `SSOBSERVATION_*`); see `docs/design/ssobservation-delivery.md`. This document keeps the names it was written with.
+
 Status: **implemented** (2026-09-27). See *Results* for what landed and
 where it departed from this design. Tracks items 3 and 4 of
 [#9](https://github.com/mjuric/ssp-tools/issues/9).

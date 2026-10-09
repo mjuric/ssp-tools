@@ -1,5 +1,5 @@
 """SSObject doesn't depend on the order of its input rows: random
-permutations of each object's SSSource rows (and of the objects) give a
+permutations of each object's SSObservation rows (and of the objects) give a
 bitwise identical SSObject, on synthetic data and on real objects."""
 
 import os
@@ -39,9 +39,10 @@ def test_permutations_synthetic():
 
 
 # A sample of real objects whose fits differed between the dia_sources and
-# SSSource row orders before the fix: 2-point fits, fits at a single phase
+# SSObservation row orders before the fix: 2-point fits, fits at a single phase
 # angle, and well-posed fits (G12 within the search tolerance), in each band.
-REAL_SSSOURCE = "/sdf/data/rubin/user/mjuric/sssource-widened/integration/2026-09-30/out/sssource.parquet"
+REAL_SSOBSERVATION = ("/sdf/data/rubin/user/mjuric/sssource-widened/integration/2026-09-30/out/"
+                      "sssource.parquet")
 REAL_SAMPLE = [
     4698171701206207264, 4699592356212525856, 4769649895566101280, 4771647738258475808,
     4986665960266615328, 5202275865340168992, 5203705243458620192, 5636310193646160672,
@@ -53,9 +54,9 @@ REAL_SAMPLE = [
 ]
 
 
-@pytest.mark.skipif(not os.path.exists(REAL_SSSOURCE), reason="needs the 2026-09-30 fixture (USDF)")
+@pytest.mark.skipif(not os.path.exists(REAL_SSOBSERVATION), reason="needs the 2026-09-30 fixture (USDF)")
 def test_permutations_real_sample():
-    t = pq.read_table(REAL_SSSOURCE, columns=ssobject.SSS_COLUMNS,
+    t = pq.read_table(REAL_SSOBSERVATION, columns=ssobject.SSS_COLUMNS,
                       filters=pc.field("ssObjectId").isin(REAL_SAMPLE))
     sss = t.to_pandas(types_mapper=pd.ArrowDtype)
     ref = compute_ssobject(sss, None)

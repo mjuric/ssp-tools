@@ -1,7 +1,7 @@
-"""WP3 of the widened SSSource: the predicted position's error ellipse
+"""WP3 of SSObservation: the predicted position's error ellipse
 (``ephRaErr``, ``ephDecErr``, ``ephRa_ephDec_Cov``). See
 docs/design/sssource-widened.md ("How it is built", item 2) and the WP3
-section of ``ssp.sssource_contract``.
+section of ``ssp.ssobservation_contract``.
 
 This is NearbySSO's machinery (``ssp.nearbysso.propagate``), used the same
 way ``ssp.nearbysso.build.process_orbit`` uses it: ``coarse`` for the
@@ -33,7 +33,7 @@ import numpy as np
 from .nearbysso import propagate
 from .nearbysso._contract import ORBIT_DTYPE
 
-#: mpc_orbits' designation column (the SSSource ``designation``).
+#: mpc_orbits' designation column (the SSObservation ``designation``).
 _KEY = "unpacked_primary_provisional_designation"
 
 #: Rows per batch when streaming mpc_orbits.
@@ -99,7 +99,7 @@ def load_orbit_covariances(mpc_orbits_path, designations, ephem, *, verbose=True
     ``designations`` present in ``mpc_orbits_path``.
 
     The rows are ``ssp.nearbysso.orbits.load_orbits(..., with_filter=False)``'s
-    (SSSource keeps comets and short arcs), computed on only the requested
+    (SSObservation keeps comets and short arcs), computed on only the requested
     rows: mpc_orbits is first streamed and filtered by designation, so the
     cost is that of the subset (12-19 s and 5-6.5 GB peak for 300k of 1.57M
     orbits, against 15 s and 7.3 GB for the whole catalog). ``ephem`` is
@@ -142,7 +142,7 @@ def ephemeris_ellipse(orbit, t_assist, obs_pos, topo_pos, ephem):
     precise pass's object - observer vectors [AU] (``EphResult.topo_pos.T``).
     The times need not be sorted, and may repeat.
 
-    Pass the precise pass's float64 ``topo_pos``, not SSSource's float32
+    Pass the precise pass's float64 ``topo_pos``, not SSObservation's float32
     ``topo_x/y/z``: a short arc's position covariance is a cigar along the
     line of sight (sigma ~0.1 AU radially against ~1e-6 AU across), so the
     projection is sensitive to the direction. The float32 rounding (~3e-8

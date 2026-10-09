@@ -1,8 +1,8 @@
 """Black-box validation of the tail position angles (WP T2 of
 docs/design/tail-angles.md): ``ephAntiSunPA`` and ``ephAntiMotionPA`` in
-SSSource and NearbySSO.
+SSObservation and NearbySSO.
 
-Written from the design, the contract (``ssp/sssource_contract.py``, "Tail
+Written from the design, the contract (``ssp/ssobservation_contract.py``, "Tail
 position angles"; ``ssp/nearbysso/_contract.py``) and ``sso_base.yaml``
 only. The angles are recomputed here by this module's own implementation of
 the contract's definition (``position_angle``); the production function
@@ -21,15 +21,15 @@ Subcommands::
               angles computed from the EphResult in the ICRS, the mean
               equator of date and the true equator of date, against PsAng /
               PsAMV. Settles which pole Horizons uses and checks ours.
-  consistency SSSOURCE NEARBYSSO [--dia-sources DIA]
+  consistency SSOBSERVATION NEARBYSSO [--dia-sources DIA]
               (pass/fail, no network) the two tables' angles equal at the
               same (designation, diaSourceId): bitwise, or within
               max(1 float32 ulp, 1e-4 deg), since the two passes'
               integrations may differ at ~1e-11 deg (both counts
               reported); non-null exactly where there is an orbit; in
-              [0, 360); and SSSource's angles recomputed from its own
+              [0, 360); and SSObservation's angles recomputed from its own
               float32 helio_* / topo_* columns. With DIA (the NearbySSO
-              input, ppdb_dia_sources.parquet), a pair whose SSSource
+              input, ppdb_dia_sources.parquet), a pair whose SSObservation
               midpointMjdTai differs from its DiaSource's (the shutter
               correction, docs/design/shutter-timing.md) also gets the
               time-shift allowance of bench/time_shift.py on top; pairs at
@@ -44,7 +44,7 @@ lock on the cache), >= 1.5 s apart, at most BUDGET requests in total
 (counted from this cache's requests.log), every response cached and every
 request logged. Never run ``fetch`` from tests or CI. Never contact the MPC.
 
-Time scales: the Rubin times are SSSource's midpointMjdTai; Horizons is
+Time scales: the Rubin times are SSObservation's midpointMjdTai; Horizons is
 asked for TT (TAI + 32.184 s), sent with 10 decimals, and our side uses
 exactly the times sent (as bench.jpl_compare does).
 """
@@ -66,8 +66,9 @@ from bench import jpl_compare as J
 WORK = "/sdf/data/rubin/user/mjuric/tail-angles/work/t2"
 CACHE = os.path.join(WORK, "cache")
 FIXTURE = J.FIXTURE
-#: The fixture's reference SSSource (midpointMjdTai of each object's rows).
-REF_SSSOURCE = os.path.join(FIXTURE, "ref_gravity", "sssource.parquet")
+#: The fixture's reference SSObservation (midpointMjdTai of each object's
+#: rows).
+REF_SSOBSERVATION = os.path.join(FIXTURE, "ref_gravity", "sssource.parquet")   # (fixture, pre-rename name)
 #: Horizons requests allowed for this WP, over all runs.
 BUDGET = 15
 
@@ -240,13 +241,15 @@ def header_model_pars(meta):
 # ---------------------------------------------------------------------------
 
 
-def rubin_times_tt(designations, sssource=REF_SSSOURCE):
+def rubin_times_tt(designations, ssobservation=REF_SSOBSERVATION):
     """{designation: TT MJDs as sent}: the unique midpointMjdTai of each
-    object's rows with an orbit, + 32.184 s, rounded as sent."""
-    import pyarrow.parquet as pq
+    object's rows with an orbit, + 32.184 s, rounded as sent.
+    ``ssobservation``: the partitioned SSObservation's directory or
+    manifest, or a single Parquet file."""
+    from ssp import ssobservation_parts as SP
 
-    df = pq.read_table(
-        sssource,
+    df = SP.read_table(
+        ssobservation,
         columns=["designation", "midpointMjdTai", "ephRa"],
         filters=[("designation", "in", list(designations))],
     ).to_pandas()
@@ -254,10 +257,10 @@ def rubin_times_tt(designations, sssource=REF_SSSOURCE):
 
 
 class Plan:
-    def __init__(self, client, sssource=REF_SSSOURCE, objects=OBJECTS):
+    def __init__(self, client, ssobservation=REF_SSOBSERVATION, objects=OBJECTS):
         self.client = client
         self.objects = objects
-        self.tt = rubin_times_tt([o[0] for o in objects], sssource)
+        self.tt = rubin_times_tt([o[0] for o in objects], ssobservation)
 
     def requests(self):
         return [
@@ -276,7 +279,7 @@ class Plan:
 
 def cmd_fetch(args):
     client = J.JPLClient(args.cache, offline=args.dry_run, budget=BUDGET)
-    plan = Plan(client, args.sssource)
+    plan = Plan(client, args.ssobservation)
     reqs = plan.requests()
     if args.only:
         reqs = [r for r in reqs if r[2].split(" ", 1)[1] in args.only]
@@ -405,7 +408,7 @@ def cmd_jpl(args):
     from ssp.ephem_assist import open_ephem
 
     client = J.JPLClient(args.cache, offline=True, budget=BUDGET)
-    plan = Plan(client, args.sssource)
+    plan = Plan(client, args.ssobservation)
     ephem = open_ephem(os.environ.get("SSP_ASSIST_PLANETS"), os.environ.get("SSP_ASSIST_ASTEROIDS"))
     parts, notes = [], ""
     for d, _, kind, _ in plan.objects:
@@ -514,7 +517,7 @@ def jpl_report(rows, summ, rms, best, notes, passed, n_req):
 
 
 # ---------------------------------------------------------------------------
-# consistency: SSSource and NearbySSO
+# consistency: SSObservation and NearbySSO
 # ---------------------------------------------------------------------------
 
 PA_COLS = ("ephAntiSunPA", "ephAntiMotionPA")
@@ -524,7 +527,7 @@ EPS32 = 2.0**-24
 RECOMP_FLOOR_DEG = 1e-3
 #: Safety factor on the float32 error bound.
 RECOMP_SAFETY = 4.0
-#: SSSource vs NearbySSO: a pair that isn't bitwise equal must agree
+#: SSObservation vs NearbySSO: a pair that isn't bitwise equal must agree
 #: within max(1 float32 ulp, this) [deg].
 PAIR_TOL_DEG = 1e-4
 
@@ -596,35 +599,39 @@ def _dia_times(dia_sources, ids):
     return dict(zip(t.column("diaSourceId").to_numpy(), t.column("midpointMjdTai").to_numpy()))
 
 
-def consistency(sssource, nearbysso, dia_sources=None):
-    """(passed, report lines) of the SSSource/NearbySSO angle checks.
+def consistency(ssobservation, nearbysso, dia_sources=None):
+    """(passed, report lines) of the SSObservation/NearbySSO angle checks.
     ``dia_sources``: the NearbySSO input, for the time-shift allowance
-    (bench/time_shift.py); None holds every pair to the strict rule."""
+    (bench/time_shift.py); None holds every pair to the strict rule.
+    ``ssobservation``: the partitioned SSObservation's directory or
+    manifest, or a single Parquet file."""
     import pyarrow as pa
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
+
+    from ssp import ssobservation_parts as SP
 
     from bench import time_shift as TS
 
     L, checks = [], []
     cols = ["designation", "diaSourceId", "ephRa", "ephDec", "phaseAngle", *PA_COLS]
     cols += [f"helio_{c}" for c in ("x", "y", "z", "vx", "vy", "vz")] + [f"topo_{c}" for c in "xyz"]
-    present = set(pq.read_schema(sssource).names)
+    present = set(SP.read_schema(ssobservation).names)
     cols += [c for c in ("midpointMjdTai", "ephRate", "ephRateRa", "ephRateDec") if c in present]
-    s = pq.read_table(sssource, columns=cols)
+    s = SP.read_table(ssobservation, columns=cols)
     s = s.append_column("_row", pa.array(np.arange(s.num_rows, dtype=np.int64)))
     n = pq.read_table(nearbysso, columns=["designation", "diaSourceId", "ephRa", *PA_COLS])
-    for name, t in (("sssource", s), ("nearbysso", n)):
+    for name, t in (("ssobservation", s), ("nearbysso", n)):
         for c in PA_COLS:
             ty = t.schema.field(c).type
             checks.append((str(ty) == "float", f"{name}.{c}: type {ty} (float32 expected)"))
-    L.append(f"SSSource {s.num_rows:,} rows; NearbySSO {n.num_rows:,} rows")
+    L.append(f"SSObservation {s.num_rows:,} rows; NearbySSO {n.num_rows:,} rows")
 
     # 1. NULL rules and range
     s_orbit = s.column("ephRa").is_valid().to_numpy(zero_copy_only=False)
     n_orbit = n.column("ephRa").is_valid().to_numpy(zero_copy_only=False)
     s_sun, s_mot = _f(s, PA_COLS[0]), _f(s, PA_COLS[1])
-    checks += check_angle_columns(s_sun, s_mot, s_orbit, "sssource")
+    checks += check_angle_columns(s_sun, s_mot, s_orbit, "ssobservation")
     checks += check_angle_columns(_f(n, PA_COLS[0]), _f(n, PA_COLS[1]), n_orbit, "nearbysso")
     checks.append((bool(n_orbit.all()), f"nearbysso: {int((~n_orbit).sum())} rows without ephRa"))
 
@@ -647,7 +654,7 @@ def consistency(sssource, nearbysso, dia_sources=None):
         return df
 
     a, b = keyed(s, "s_"), keyed(n, "n_")
-    for name, df in (("sssource", a), ("nearbysso", b)):
+    for name, df in (("ssobservation", a), ("nearbysso", b)):
         dup = int(df.duplicated(["designation", "diaSourceId"]).sum())
         L.append(f"{name}: {dup} repeated (designation, diaSourceId) keys")
     m = a.merge(b, on=["designation", "diaSourceId"], how="inner")
@@ -658,13 +665,14 @@ def consistency(sssource, nearbysso, dia_sources=None):
         .sum()
     )
     L.append(
-        f"matched (designation, diaSourceId): {len(m):,} rows; NearbySSO rows without an SSSource match: "
-        f"{unmatched:,} (expected: NearbySSO also covers unattributed DiaSources)"
+        f"matched (designation, diaSourceId): {len(m):,} rows; NearbySSO rows without an "
+        f"SSObservation match: {unmatched:,} (expected: NearbySSO also covers unattributed DiaSources)"
     )
     checks.append((len(m) > 0, f"matched rows: {len(m):,} (> 0 expected)"))
 
-    # the time shift of each pair (docs/design/shutter-timing.md): SSSource
-    # at its midpointMjdTai, NearbySSO at its DiaSource's; 0 -> strict
+    # the time shift of each pair (docs/design/shutter-timing.md):
+    # SSObservation at its midpointMjdTai, NearbySSO at its DiaSource's;
+    # 0 -> strict
     row = m["_row"].to_numpy()
     dt = np.zeros(len(m))
     if dia_sources is not None and "midpointMjdTai" in present:
@@ -677,8 +685,8 @@ def consistency(sssource, nearbysso, dia_sources=None):
         big = TS.too_large(dt)
         checks.append((not big.any(), f"time shift: {int(big.sum())} pairs with |dt| > {TS.DT_MAX_S} s"))
     else:
-        L.append("time shift: not computed (no --dia-sources, or no SSSource midpointMjdTai); every pair "
-                 "held to the strict rule")
+        L.append("time shift: not computed (no --dia-sources, or no SSObservation midpointMjdTai); every "
+                 "pair held to the strict rule")
     if "ephRate" in present:
         rate = _f(s, "ephRate")
     elif "ephRateRa" in present:
@@ -732,10 +740,10 @@ def consistency(sssource, nearbysso, dia_sources=None):
         )
         if bad.any():
             k = np.flatnonzero(bad)[:3]
-            msg += f" (e.g. SSSource {sv[k].tolist()} vs NearbySSO {nv[k].tolist()})"
+            msg += f" (e.g. SSObservation {sv[k].tolist()} vs NearbySSO {nv[k].tolist()})"
         checks.append((not bad.any(), msg))
 
-    # 3. recomputation from SSSource's own float32 vectors
+    # 3. recomputation from SSObservation's own float32 vectors
     hp = np.array([_f(s, f"helio_{c}") for c in "xyz"])
     hv = np.array([_f(s, f"helio_v{c}") for c in "xyz"])
     tp = np.array([_f(s, f"topo_{c}") for c in "xyz"])
@@ -744,7 +752,7 @@ def consistency(sssource, nearbysso, dia_sources=None):
     checks.append(
         (
             bool((use == s_orbit).all()),
-            f"sssource: {int((s_orbit & ~use).sum())} rows with an orbit but a NULL helio_/topo_ column",
+            f"ssobservation: {int((s_orbit & ~use).sum())} rows with an orbit but a NULL helio_/topo_ column",
         )
     )
     sun, mot = tail_angles(hp[:, use], hv[:, use], tp[:, use])
@@ -780,7 +788,7 @@ def consistency(sssource, nearbysso, dia_sources=None):
 
 
 def cmd_consistency(args):
-    passed, lines = consistency(args.sssource_file, args.nearbysso_file, args.dia_sources)
+    passed, lines = consistency(args.ssobservation_file, args.nearbysso_file, args.dia_sources)
     text = "\n".join(lines) + "\n"
     print(text)
     if args.report:
@@ -791,7 +799,7 @@ def cmd_consistency(args):
 
 def cmd_status(args):
     client = J.JPLClient(args.cache, offline=True, budget=BUDGET)
-    plan = Plan(client, args.sssource)
+    plan = Plan(client, args.ssobservation)
     for service, params, label in plan.requests():
         print(
             f"{'cached ' if client.cached(service, params, label) else 'missing'}  {label}  "
@@ -814,7 +822,8 @@ def main(argv=None):
     )
     ap.add_argument("--cache", default=CACHE)
     ap.add_argument(
-        "--sssource", default=REF_SSSOURCE, help="the SSSource giving the Rubin times (fetch, jpl)"
+        "--ssobservation", default=REF_SSOBSERVATION,
+        help="the SSObservation giving the Rubin times (fetch, jpl)"
     )
     ap.add_argument("--out", default=WORK, help="report directory (jpl)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -825,8 +834,9 @@ def main(argv=None):
     f.add_argument("--show-url", action="store_true")
     sub.add_parser("status")
     sub.add_parser("jpl")
-    c = sub.add_parser("consistency", help="SSSource vs NearbySSO angles, no network")
-    c.add_argument("sssource_file")
+    c = sub.add_parser("consistency", help="SSObservation vs NearbySSO angles, no network")
+    c.add_argument("ssobservation_file", help="SSObservation: the delivery directory, its manifest, or a "
+                                              "single Parquet file")
     c.add_argument("nearbysso_file")
     c.add_argument("--report", help="also write the report to this file")
     c.add_argument("--dia-sources", help="the NearbySSO input (ppdb_dia_sources.parquet): the DiaSource "

@@ -1,5 +1,7 @@
 # Design: tail position angles in SSSource and NearbySSO
 
+> **Renamed (2026-10-08):** the PPDB table called SSSource here is now **SSObservation**, and the code names follow it (`ssp.ssobservation`, `ssp-build-ssobservation`, `SSOBSERVATION_*`); see `docs/design/ssobservation-delivery.md`. This document keeps the names it was written with.
+
 ## Context
 
 Comets' ion and dust tails point, to a first approximation, along two directions that follow from geometry alone:

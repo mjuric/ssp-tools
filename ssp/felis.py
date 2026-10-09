@@ -7,7 +7,8 @@ import sys
 import yaml
 
 # Default tables to process if none specified
-DEFAULT_TABLES = ["SSObject", "SSSource", "mpc_orbits", "current_identifications", "numbered_identifications"]
+DEFAULT_TABLES = ["SSObject", "SSObservation", "mpc_orbits", "current_identifications",
+                  "numbered_identifications"]
 
 
 # ----------------------------------------------------------------------
