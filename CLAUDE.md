@@ -91,6 +91,6 @@ The rules here are for development in ssp-tools, by Claude sessions and their su
 
 ## Environment
 
-- **Venv:** `.venv`, created with `uv sync --extra all`. After pulling new console scripts, refresh them with `VIRTUAL_ENV=$PWD/.venv uv pip install --no-deps -e .`
+- **Venv:** `.venv`, created with `uv sync --extra dev --extra all` (the dev extra brings pytest and pytest-xdist: run the suite with `pytest -n 16`). After pulling new console scripts, refresh them with `VIRTUAL_ENV=$PWD/.venv uv pip install --no-deps -e .`
 - **ASSIST data:** `data/assist/linux_p1550p2650.440` and `data/assist/sb441-n16.bsp`. Export the two `SSP_ASSIST_*` variables, and `OMP_NUM_THREADS=1`.
 - **Runbooks:** `docs/runbooks/sso-daily.md` (the daily PPDB Solar System tables).

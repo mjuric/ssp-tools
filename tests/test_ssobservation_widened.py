@@ -590,22 +590,16 @@ def _designated_status_i(tmp_path):
 
 
 def test_designated_status_i_kept_unidentified(tmp_path, offline, capsys):
-    # (the status is trusted: NULL ssObjectId and designation, with a warning)
+    # (a rescinded identification: status 'I' with the provid left filled;
+    # NULL ssObjectId and designation, however many there are)
     obsid = _designated_status_i(tmp_path)
     build_ssobservation(tmp_path, tmp_path)
-    assert "1 status 'I' rows have a provid or permid" in capsys.readouterr().err
+    assert "1 of them with a rescinded identification" in capsys.readouterr().out
     t = read_output(tmp_path)
     row = t.filter(pc.equal(t["obsid"], obsid)).to_pylist()
     assert len(row) == 1
     assert row[0]["status"] == "I" and row[0]["ssObjectId"] is None and row[0]["designation"] is None
     assert row[0]["ephRa"] is None
-
-
-def test_designated_status_i_limit(tmp_path, offline, monkeypatch):
-    _designated_status_i(tmp_path)
-    monkeypatch.setattr(ssobservation, "MAX_DESIGNATED_I_ROWS", 0)
-    with pytest.raises(ValueError, match="status 'I' rows have a provid or permid"):
-        build_ssobservation(tmp_path, tmp_path)
 
 
 def test_requires_extractor_output(tmp_path, offline):

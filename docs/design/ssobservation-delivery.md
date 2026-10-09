@@ -177,6 +177,8 @@ The schema rename is in lsst/sdm_schemas#549 at `27a404c`. The RFC drafts (PR #7
 **Finding: status-'I' rows with a designation.** The MPC snapshot of 2026-10-08 has 4 `obs_sbn` rows with status 'I' that carry a provid (2015 GF54, from one Rubin submission of 2026-10-07, without a `trksub`).
 - The builder refused them, as master's would have.
 - **Owner decision (2026-10-08):** trust the status. They are kept unidentified (NULL `ssObjectId` and `designation`), with a warning that names them. More than `MAX_DESIGNATED_I_ROWS` (100) still fail the build (#90).
+- **Explanation (owner, 2026-10-08):** these are tracklets whose identification with a known object was rescinded. The MPC sets the status to 'I' but may leave the provid filled. They are to be treated as having no provid. MPC-wide, 2,130 `obs_sbn` rows across many stations are in this state, so it is a normal MPC state, not an anomaly.
+- **Rule:** status 'I' alone makes a row unidentified, whatever its provid and permid. The warning and the `MAX_DESIGNATED_I_ROWS` limit of #90 are dropped; the build log gives the count. The output is unchanged: in the delivery of 2026-10-09, NULL `designation` and status 'I' coincide exactly (63,831 rows).
 
 **End-to-end run (A4).**
 - **Command:** `ssp-sso-daily /sdf/data/rubin/user/mjuric/ssobservation-delivery/daily --upload dev --dry-run`.
