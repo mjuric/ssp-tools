@@ -27,8 +27,11 @@ Exit status 0 only if every result is ok.
 from __future__ import annotations
 
 import argparse
+import datetime
+import fnmatch
 import hashlib
 import json
+import re
 import sys
 import time
 from functools import lru_cache
@@ -48,7 +51,9 @@ from ssp.ssobservation_contract import (
     PART_FILE_FORMAT,
     PART_GLOB,
     SIDECAR_FIELDS,
+    SIDECAR_FILE,
     SIDECAR_KEY,
+    SSOBSERVATION_DICTIONARY,
     SSOBSERVATION_INTERNAL_DTYPE,
     SSOBSERVATION_MANIFEST_FIELDS,
     SSOBSERVATION_MANIFEST_FILE,
@@ -337,8 +342,35 @@ def _sort_violations(prev, sid, mjd, obsid):
     return idx - (1 if prev is not None else 0)
 
 
+#: The manifest's fixed schema entry (sso_base.yaml of sdm_schemas
+#: tickets/DM-55375; its md5 is not recomputed here).
+MANIFEST_SCHEMA_SOURCE = "lsst/sdm_schemas tickets/DM-55375"
+MANIFEST_SCHEMA_FILE = "sso_base.yaml"
+
+_HEX32 = re.compile(r"[0-9a-f]{32}")
+_HEX = re.compile(r"[0-9a-f]{7,64}")
+
+
+def _is_md5(x):
+    return isinstance(x, str) and _HEX32.fullmatch(x) is not None
+
+
+def _is_utc_iso(x):
+    """An ISO 8601 time in UTC ('...Z' or '+00:00')."""
+    if not isinstance(x, str):
+        return False
+    try:
+        t = datetime.datetime.fromisoformat(x[:-1] + "+00:00" if x.endswith("Z") else x)
+    except ValueError:
+        return False
+    return t.utcoffset() == datetime.timedelta(0)
+
+
 def _manifest_problems(m):
-    """Problems with the manifest's top-level fields (a list of strings)."""
+    """Problems with the manifest's fields and their types and values (a
+    list of strings). Fields the contract does not name are allowed, at
+    every level, so that a later format may add some (forward
+    compatibility); the fields it names must be present and valid."""
     probs = []
     missing = [f for f in SSOBSERVATION_MANIFEST_FIELDS if f not in m]
     if missing:
@@ -352,10 +384,21 @@ def _manifest_problems(m):
         probs.append(f"part_rows {m['part_rows']!r} is not a positive integer")
     if "rows" in m and not (_is_int(m["rows"]) and m["rows"] >= 0):
         probs.append(f"rows {m['rows']!r} is not a non-negative integer")
-    sch = m.get("schema")
+    if "created_utc" in m and not _is_utc_iso(m["created_utc"]):
+        probs.append(f"created_utc {m['created_utc']!r} is not an ISO 8601 UTC time")
+    if "ssp_tools_commit" in m and m["ssp_tools_commit"] is not None and \
+            not (isinstance(m["ssp_tools_commit"], str) and _HEX.fullmatch(m["ssp_tools_commit"])):
+        probs.append(f"ssp_tools_commit {m['ssp_tools_commit']!r} is neither null nor a hex commit")
     if "schema" in m:
+        sch = m["schema"]
         if not isinstance(sch, dict) or not {"source", "file", "md5"} <= set(sch):
             probs.append(f"schema {sch!r} lacks source/file/md5")
+        else:
+            if sch["source"] != MANIFEST_SCHEMA_SOURCE or sch["file"] != MANIFEST_SCHEMA_FILE:
+                probs.append(f"schema source/file {sch['source']!r}/{sch['file']!r}, want "
+                             f"{MANIFEST_SCHEMA_SOURCE!r}/{MANIFEST_SCHEMA_FILE!r}")
+            if sch["md5"] is not None and not _is_md5(sch["md5"]):
+                probs.append(f"schema md5 {sch['md5']!r} is neither null nor 32 hex digits")
     if "parts" in m and (not isinstance(m["parts"], list) or not m["parts"]):
         probs.append("parts is not a non-empty list")
     elif isinstance(m.get("parts"), list):
@@ -364,22 +407,31 @@ def _manifest_problems(m):
             if miss:
                 probs.append(f"parts[{k}] lacks {miss}")
                 continue
-            bad = [f for f in ("rows", "bytes") if not (_is_int(p[f]) and p[f] >= 0)]
+            bad = [] if isinstance(p["file"], str) else ["file"]
+            bad += [f for f in ("rows", "bytes") if not (_is_int(p[f]) and p[f] >= 0)]
             bad += [f for f in ("ssObjectId_min", "ssObjectId_max") if p[f] is not None and not _is_int(p[f])]
             if not isinstance(p["null_ssObjectId"], bool):
                 bad.append("null_ssObjectId")
-            if not isinstance(p["md5"], str):
+            if not _is_md5(p["md5"]):
                 bad.append("md5")
             if bad:
-                probs.append(f"parts[{k}] ({p['file']}): bad {bad}")
-    sc = m.get("sidecar")
+                probs.append(f"parts[{k}] ({p['file']!r}): bad {bad}")
     if "sidecar" in m:
+        sc = m["sidecar"]
         miss = [f for f in SIDECAR_FIELDS if not isinstance(sc, dict) or f not in sc]
         if miss:
             probs.append(f"sidecar lacks {miss}")
-        elif sc["key"] != SIDECAR_KEY or not isinstance(sc["columns"], list):
-            probs.append(f"sidecar key {sc['key']!r} (want {SIDECAR_KEY!r}) or columns {sc['columns']!r}"
-                         " not a list")
+        else:
+            bad = [] if sc["file"] == SIDECAR_FILE else [f"file {sc['file']!r} (want {SIDECAR_FILE!r})"]
+            if sc["key"] != SIDECAR_KEY:
+                bad.append(f"key {sc['key']!r} (want {SIDECAR_KEY!r})")
+            if not (isinstance(sc["columns"], list) and all(isinstance(c, str) for c in sc["columns"])):
+                bad.append(f"columns {sc['columns']!r} (want a list of names)")
+            bad += [f for f in ("rows", "bytes") if not (_is_int(sc[f]) and sc[f] >= 0)]
+            if not _is_md5(sc["md5"]):
+                bad.append("md5")
+            if bad:
+                probs.append(f"sidecar: bad {bad}")
     return probs
 
 
@@ -393,7 +445,11 @@ def check_ssobservation_parts(delivery_dir, schema_dir=SCHEMA_DIR):
     Reads the parts one at a time and only the columns the checks need
     (the primary key, ssObjectId, midpointMjdTai), so memory is a few
     columns, not the table; the key and obsid columns of every part are
-    held at once for the uniqueness and sidecar checks."""
+    held at once for the uniqueness and sidecar checks. (Memory is linear
+    in the rows: about 250 B/row, ~2.5 GB for 8M rows.)
+
+    Any part or sidecar that cannot be read or checked is a FAIL result,
+    never an exception."""
     d = Path(delivery_dir)
     mpath = d / SSOBSERVATION_MANIFEST_FILE
     res = []
@@ -410,17 +466,22 @@ def check_ssobservation_parts(delivery_dir, schema_dir=SCHEMA_DIR):
     res.append(CheckResult("manifest", not probs, "; ".join(probs) if probs else
                            f"{mpath.name}: format_version {m['format_version']}, {len(m['parts'])} parts, "
                            f"part_rows {m['part_rows']:,}, {m['rows']:,} rows"))
-    parts = [p for p in m.get("parts") or [] if isinstance(p, dict) and isinstance(p.get("file"), str)]
+    entries = m.get("parts") if isinstance(m.get("parts"), list) else []
+    # (an entry without a usable file name FAILs the manifest check and the
+    # names below; only the usable ones can be read)
+    parts = [p for p in entries if isinstance(p, dict) and isinstance(p.get("file"), str)
+             and Path(p["file"]).name == p["file"]]
     part_rows = m.get("part_rows") if _is_int(m.get("part_rows")) and m.get("part_rows") > 0 else None
 
     # the part files: exactly the manifest's, named contiguously from 0
-    names = [p["file"] for p in parts]
+    names = [p.get("file") if isinstance(p, dict) else p for p in entries]
     want = [PART_FILE_FORMAT.format(k) for k in range(len(names))]
     on_disk = sorted(f.name for f in d.glob(PART_GLOB))
     probs = []
     if names != want:
-        probs.append(f"manifest names {_fmt_names(names)}, want {_fmt_names(want)} (contiguous from 0)")
-    missing = [f for f in names if f not in on_disk]
+        probs.append(f"manifest names {_fmt_names([repr(x) for x in names])}, want {_fmt_names(want)} "
+                     "(contiguous from 0)")
+    missing = [f for f in names if isinstance(f, str) and f not in on_disk]
     extra = [f for f in on_disk if f not in names]
     if missing:
         probs.append(f"missing on disk: {_fmt_names(missing)}")
@@ -428,6 +489,16 @@ def check_ssobservation_parts(delivery_dir, schema_dir=SCHEMA_DIR):
         probs.append(f"on disk but not in the manifest: {_fmt_names(extra)}")
     span = f"{names[0]} .. {names[-1]}" if names else "-"
     res.append(CheckResult("part files", not probs, "; ".join(probs) or f"{len(names)} parts, {span}"))
+
+    # no other SSObservation files (a stale SSObservation.parquet, a .bak,
+    # ...): any name starting with "ssobservation", in any case, that is not
+    # a part, the manifest or the sidecar (stray part-named files are the
+    # 'part files' check's)
+    known = {SSOBSERVATION_MANIFEST_FILE, SIDECAR_FILE}
+    stray = sorted(f.name for f in d.iterdir() if f.name.lower().startswith("ssobservation")
+                   and f.name not in known and not fnmatch.fnmatchcase(f.name, PART_GLOB))
+    res.append(CheckResult("stray files", not stray, f"not part of the delivery: {_fmt_names(stray)}"
+                           if stray else "no other SSObservation* files"))
 
     # per part: integrity, contents, sort order, schema
     integ, contents, order_bad, schema_bad = [], [], [], []
@@ -443,79 +514,98 @@ def check_ssobservation_parts(delivery_dir, schema_dir=SCHEMA_DIR):
         if not f.exists():
             continue
         try:
-            pf = pq.ParquetFile(f)
-        except Exception as e:
-            integ.append(f"{p['file']}: cannot read ({type(e).__name__})")
-            continue
-        nrows = pf.metadata.num_rows
-        nbytes = f.stat().st_size
-        bad = []
-        if p.get("rows") != nrows:
-            bad.append(f"rows {p.get('rows')!r} vs {nrows:,}")
-        if p.get("bytes") != nbytes:
-            bad.append(f"bytes {p.get('bytes')!r} vs {nbytes:,}")
-        md5 = file_md5(f)
-        if p.get("md5") != md5:
-            bad.append(f"md5 {p.get('md5')!r} vs {md5}")
-        if bad:
-            integ.append(f"{p['file']}: " + ", ".join(bad))
-        sch = pf.schema_arrow.remove_metadata()
-        if schema0 is None:
-            schema0 = (p["file"], sch)
-        elif not sch.equals(schema0[1]):
-            diff = [fl.name for fl, f0 in zip(sch, schema0[1]) if not fl.equals(f0)]
-            where = f" at {_fmt_names(diff, 3)}" if diff else f" ({len(sch)} vs {len(schema0[1])} columns)"
-            schema_bad.append(f"{p['file']} differs from {schema0[0]}{where}")
-        need = [c for c in dict.fromkeys([*SSOBSERVATION_SORT, *keys, SIDECAR_KEY]) if c in sch.names]
-        t = pf.read(columns=need)
-        n_read += 1
-        for k in keys:
-            if k in t.column_names:
-                key_cols[k].append(_decoded(t[k]))
-        if SIDECAR_KEY in t.column_names:
-            obsids.append(_decoded(t[SIDECAR_KEY]))
-        if "ssObjectId" not in t.column_names:
-            contents.append(f"{p['file']}: no ssObjectId column")
-            continue
-        sid = t["ssObjectId"]
-        n_null = sid.null_count
-        mm = pc.min_max(sid)
-        mn, mx = mm["min"].as_py(), mm["max"].as_py()
-        last_count = 0
-        if nrows - n_null and mx is not None:
-            last_count = int(pc.sum(pc.equal(sid, mx)).as_py() or 0)
-        actual.append(dict(file=p["file"], rows=nrows, null=n_null, min=mn, max=mx, last=last_count,
-                           manifest=p))
-        # the manifest's range and null flag against the contents
-        bad = []
-        is_null_part = bool(p.get("null_ssObjectId"))
-        if is_null_part:
-            if n_null != nrows:
-                bad.append(f"null_ssObjectId true but {nrows - n_null:,} rows have an ssObjectId")
-            if nrows == 0:
-                bad.append("a NULL part with no rows")
-        else:
-            if n_null:
-                bad.append(f"{n_null:,} NULL ssObjectId rows in a ranged part")
-            if nrows == 0 and len(parts) > 1:
-                bad.append("an empty part (only the empty table's single part may be empty)")
-        if p.get("ssObjectId_min") != (None if is_null_part else mn) or \
-                p.get("ssObjectId_max") != (None if is_null_part else mx):
-            bad.append(f"ssObjectId_min/max {p.get('ssObjectId_min')!r}/{p.get('ssObjectId_max')!r}, "
-                       f"contents {mn!r}/{mx!r}" +(" (a NULL part's must be null)" if is_null_part else ""))
-        if bad:
-            contents.append(f"{p['file']}: " + "; ".join(bad))
-        # the sort order, carrying the previous part's last row
-        if all(c in t.column_names for c in SSOBSERVATION_SORT) and nrows:
-            v = _sort_violations(prev, sid, t["midpointMjdTai"], t[SIDECAR_KEY])
-            if len(v):
-                i = int(v[0])
-                where = "its first row (after the previous part's last)" if i == 0 else f"row {i:,}"
-                order_bad.append(f"{p['file']}: {len(v):,} rows out of order, first at {where}")
-            last = t.slice(nrows - 1, 1)
-            prev = (last["ssObjectId"][0].as_py(), last["midpointMjdTai"][0].as_py(),
-                    _decoded(last[SIDECAR_KEY])[0].as_py())
-        del t
+            try:
+                pf = pq.ParquetFile(f)
+            except Exception as e:
+                integ.append(f"{p['file']}: cannot read ({type(e).__name__})")
+                continue
+            nrows = pf.metadata.num_rows
+            nbytes = f.stat().st_size
+            bad = []
+            if p.get("rows") != nrows:
+                bad.append(f"rows {p.get('rows')!r} vs {nrows:,}")
+            if p.get("bytes") != nbytes:
+                bad.append(f"bytes {p.get('bytes')!r} vs {nbytes:,}")
+            md5 = file_md5(f)
+            if p.get("md5") != md5:
+                bad.append(f"md5 {p.get('md5')!r} vs {md5}")
+            if bad:
+                integ.append(f"{p['file']}: " + ", ".join(bad))
+            sch = pf.schema_arrow.remove_metadata()
+            if schema0 is None:
+                schema0 = (p["file"], sch)
+            elif not sch.equals(schema0[1]):
+                diff = [fl.name for fl, f0 in zip(sch, schema0[1]) if not fl.equals(f0)]
+                where = (f" at {_fmt_names(diff, 3)}" if diff
+                         else f" ({len(sch)} vs {len(schema0[1])} columns)")
+                schema_bad.append(f"{p['file']} differs from {schema0[0]}{where}")
+            need = [c for c in dict.fromkeys([*SSOBSERVATION_SORT, *keys, SIDECAR_KEY]) if c in sch.names]
+            t = pf.read(columns=need)
+            n_read += 1
+            for k in keys:
+                if k in t.column_names:
+                    key_cols[k].append(_decoded(t[k]))
+            if SIDECAR_KEY in t.column_names:
+                obsids.append(_decoded(t[SIDECAR_KEY]))
+            if "ssObjectId" not in t.column_names:
+                contents.append(f"{p['file']}: no ssObjectId column")
+                continue
+            sid = t["ssObjectId"]
+            if not pa.types.is_int64(sid.type):
+                contents.append(f"{p['file']}: ssObjectId is {sid.type}, want int64 (its range and order "
+                                "not checked)")
+                continue
+            n_null = sid.null_count
+            mm = pc.min_max(sid)
+            mn, mx = mm["min"].as_py(), mm["max"].as_py()
+            last_count = 0
+            if nrows - n_null and mx is not None:
+                last_count = int(pc.sum(pc.equal(sid, mx)).as_py() or 0)
+            actual.append(dict(file=p["file"], rows=nrows, null=n_null, min=mn, max=mx, last=last_count,
+                               manifest=p))
+            # the manifest's range and null flag against the contents
+            bad = []
+            is_null_part = bool(p.get("null_ssObjectId"))
+            if is_null_part:
+                if n_null != nrows:
+                    bad.append(f"null_ssObjectId true but {nrows - n_null:,} rows have an ssObjectId")
+                if nrows == 0:
+                    bad.append("a NULL part with no rows")
+            else:
+                if n_null:
+                    bad.append(f"{n_null:,} NULL ssObjectId rows in a ranged part")
+                if nrows == 0 and len(parts) > 1:
+                    bad.append("an empty part (only the empty table's single part may be empty)")
+            if p.get("ssObjectId_min") != (None if is_null_part else mn) or \
+                    p.get("ssObjectId_max") != (None if is_null_part else mx):
+                bad.append(f"ssObjectId_min/max {p.get('ssObjectId_min')!r}/{p.get('ssObjectId_max')!r}, "
+                           f"contents {mn!r}/{mx!r}"
+                           + (" (a NULL part's must be null)" if is_null_part else ""))
+            if bad:
+                contents.append(f"{p['file']}: " + "; ".join(bad))
+            # the sort order, carrying the previous part's last row
+            if all(c in t.column_names for c in SSOBSERVATION_SORT) and nrows:
+                mjd = t["midpointMjdTai"]
+                if not pa.types.is_floating(mjd.type):
+                    order_bad.append(f"{p['file']}: midpointMjdTai is {mjd.type}, not checked")
+                    continue
+                # a NaN (or NULL) sort key compares false both ways, so it
+                # could hide disorder: a FAIL of its own
+                n_nan = (pc.sum(pc.is_nan(mjd)).as_py() or 0) + mjd.null_count
+                if n_nan:
+                    order_bad.append(f"{p['file']}: {n_nan:,} NaN or NULL midpointMjdTai (the order is "
+                                     "undefined)")
+                v = _sort_violations(prev, sid, mjd, t[SIDECAR_KEY])
+                if len(v):
+                    i = int(v[0])
+                    where = "its first row (after the previous part's last)" if i == 0 else f"row {i:,}"
+                    order_bad.append(f"{p['file']}: {len(v):,} rows out of order, first at {where}")
+                last = t.slice(nrows - 1, 1)
+                prev = (last["ssObjectId"][0].as_py(), last["midpointMjdTai"][0].as_py(),
+                        _decoded(last[SIDECAR_KEY])[0].as_py())
+            del t
+        except Exception as e:      # an unreadable or malformed part: a FAIL, not a crash
+            contents.append(f"{p['file']}: cannot check ({type(e).__name__}: {e})")
 
     res.append(CheckResult("part integrity", not integ, "; ".join(integ) or
                            f"rows, bytes and md5 match for {len(actual)} parts"))
@@ -583,7 +673,7 @@ def check_ssobservation_parts(delivery_dir, schema_dir=SCHEMA_DIR):
     elif any(len(v) != n_read for v in key_cols.values()):
         res.append(CheckResult("primary key across parts", False, f"({', '.join(keys)}): not in the parts"))
     else:
-        kt = pa.table({k: pa.chunked_array([c for col in v for c in col.chunks],
+        kt = pa.table({k: pa.chunked_array([c.cast(v[0].type) for col in v for c in col.chunks],
                                            type=v[0].type if v else pa.string())
                        for k, v in key_cols.items()})
         nn = kt.drop_null()
@@ -604,21 +694,24 @@ def check_ssobservation_parts(delivery_dir, schema_dir=SCHEMA_DIR):
 
 
 def _check_sidecar(d, m, obsids, total, schema_dir):
-    """The sidecar: its manifest entry, file, columns and types, NULLs, and
-    the obsid sequence (``obsids``: the parts' obsid columns, in part
-    order)."""
-    res = []
+    """The sidecar: its manifest entry, file, columns and types, encoding,
+    NULLs, and the obsid sequence (``obsids``: the parts' obsid columns, in
+    part order). Anything unreadable is a FAIL, not an exception."""
     sc = m.get("sidecar")
     if not isinstance(sc, dict) or not isinstance(sc.get("file"), str):
         return [CheckResult("sidecar", False, "the manifest has no usable sidecar entry")]
-    f = d / sc["file"]
+    if sc["file"] != SIDECAR_FILE:
+        # never opened: it may point outside the delivery directory
+        return [CheckResult("sidecar", False, f"the manifest names {sc['file']!r}, want {SIDECAR_FILE!r}")]
+    f = d / SIDECAR_FILE
     if not f.exists():
         return [CheckResult("sidecar", False, f"{f}: missing")]
     try:
         pf = pq.ParquetFile(f)
+        nrows, nbytes, md5 = pf.metadata.num_rows, f.stat().st_size, file_md5(f)
     except Exception as e:
         return [CheckResult("sidecar", False, f"{f}: cannot read ({type(e).__name__}: {e})")]
-    nrows, nbytes, md5 = pf.metadata.num_rows, f.stat().st_size, file_md5(f)
+    res = []
     bad = []
     if sc.get("rows") != nrows:
         bad.append(f"rows {sc.get('rows')!r} vs {nrows:,}")
@@ -631,45 +724,78 @@ def _check_sidecar(d, m, obsids, total, schema_dir):
     res.append(CheckResult("sidecar", not bad, "; ".join(bad) or f"{f.name}: {nrows:,} rows, md5 matches"))
 
     # columns: obsid, then the manifest's columns, of the contract's types,
-    # none of them delivered
+    # none of them delivered, none twice
     arrow = pf.schema_arrow
+    names = arrow.names
+    dups = sorted({c for c in names if names.count(c) > 1})
     cols = sc.get("columns") if isinstance(sc.get("columns"), list) else []
     want = [SIDECAR_KEY, *cols]
     delivered = {c["name"] for c in _schema(str(schema_dir))["SSObservation"]}
     probs = []
-    if arrow.names != want:
-        probs.append(f"columns {arrow.names}, want {want} (obsid, then the manifest's columns)")
-    if SIDECAR_KEY in arrow.names and not _is_string(arrow.field(SIDECAR_KEY).type):
-        probs.append(f"{SIDECAR_KEY}: {arrow.field(SIDECAR_KEY).type}, want string")
-    for c in dict.fromkeys([*cols, *[n for n in arrow.names if n != SIDECAR_KEY]]):
+    if names != want:
+        probs.append(f"columns {names}, want {want} (obsid, then the manifest's columns)")
+    if dups:
+        probs.append(f"duplicated columns {dups}")
+    types = {}
+    for fld in arrow:
+        types.setdefault(fld.name, fld.type)
+    if SIDECAR_KEY in types and not _is_string(types[SIDECAR_KEY]):
+        probs.append(f"{SIDECAR_KEY}: {types[SIDECAR_KEY]}, want string")
+    for c in dict.fromkeys([*[c for c in cols if isinstance(c, str)],
+                            *[n for n in names if n != SIDECAR_KEY]]):
         if c in delivered:
             probs.append(f"{c} is also in the delivered schema")
         elif c not in SSOBSERVATION_INTERNAL_DTYPE:
             probs.append(f"{c} is not a column that may be internal (SSOBSERVATION_INTERNAL_DTYPE)")
-        elif c in arrow.names and not _np_dtype_ok(SSOBSERVATION_INTERNAL_DTYPE[c], arrow.field(c).type):
-            probs.append(f"{c}: {arrow.field(c).type}, want {SSOBSERVATION_INTERNAL_DTYPE[c]}")
+        elif c in types and not _np_dtype_ok(SSOBSERVATION_INTERNAL_DTYPE[c], types[c]):
+            probs.append(f"{c}: {types[c]}, want {SSOBSERVATION_INTERNAL_DTYPE[c]}")
     res.append(CheckResult("sidecar columns", not probs, "; ".join(probs) or
                            f"{SIDECAR_KEY} + {cols}, contract types, none delivered"))
 
-    # NULLs, one column at a time
+    # encoding: zstd, the SSOBSERVATION_DICTIONARY columns dictionary-encoded
+    # (column chunks without values are skipped: they carry no encoding)
+    probs = set()
+    md = pf.metadata
+    for rg in range(md.num_row_groups):
+        g = md.row_group(rg)
+        for k in range(g.num_columns):
+            cc = g.column(k)
+            if not cc.num_values:
+                continue
+            if cc.compression != "ZSTD":
+                probs.add(f"{cc.path_in_schema}: {cc.compression}, want ZSTD")
+            if cc.path_in_schema in SSOBSERVATION_DICTIONARY and not any("DICT" in e for e in cc.encodings):
+                probs.add(f"{cc.path_in_schema}: not dictionary-encoded")
+    res.append(CheckResult("sidecar encoding", not probs, "; ".join(sorted(probs)) or
+                           "zstd; dictionary columns dictionary-encoded"))
+
+    # NULLs, one column at a time (a duplicated name can't be read by name)
     with_nulls = []
-    for c in arrow.names:
+    for c in dict.fromkeys(names):
+        if c in dups:
+            with_nulls.append(f"{c} (duplicated: not checked)")
+            continue
         n = pf.read(columns=[c])[c].null_count
         if n:
             with_nulls.append(f"{c} ({n:,} NULLs)")
     res.append(CheckResult("sidecar nulls", not with_nulls, "; ".join(with_nulls) or
-                           f"no NULLs in its {len(arrow.names)} columns"))
+                           f"no NULLs in its {len(names)} columns"))
 
     # the same obsid sequence as the parts, in part order
-    if SIDECAR_KEY not in arrow.names:
-        res.append(CheckResult("sidecar obsid", False, f"no {SIDECAR_KEY} column"))
+    if SIDECAR_KEY not in names or SIDECAR_KEY in dups:
+        res.append(CheckResult("sidecar obsid", False, f"no single {SIDECAR_KEY} column"))
         return res
-    side = _decoded(pf.read(columns=[SIDECAR_KEY])[SIDECAR_KEY])
-    parts = pa.chunked_array([c.cast(pa.string()) for col in obsids for c in col.chunks], type=pa.string())
+    try:
+        side = _decoded(pf.read(columns=[SIDECAR_KEY])[SIDECAR_KEY]).cast(pa.string())
+        parts = pa.chunked_array([c.cast(pa.string()) for col in obsids for c in col.chunks],
+                                 type=pa.string())
+    except Exception as e:
+        res.append(CheckResult("sidecar obsid", False, f"cannot compare ({type(e).__name__}: {e})"))
+        return res
     if len(side) != len(parts):
         res.append(CheckResult("sidecar obsid", False, f"{len(side):,} rows, the parts {len(parts):,}"))
         return res
-    eq = pc.fill_null(pc.equal(side.cast(pa.string()), parts), False)
+    eq = pc.fill_null(pc.equal(side, parts), False)
     n_bad = len(eq) - (pc.sum(eq).as_py() or 0)
     if n_bad:
         first = int(np.flatnonzero(~np.asarray(eq.to_numpy(zero_copy_only=False), dtype=bool))[0])
@@ -687,7 +813,9 @@ def ssobservation_part_files(delivery_dir):
     d = Path(delivery_dir)
     try:
         m = json.loads((d / SSOBSERVATION_MANIFEST_FILE).read_text())
-        return [d / p["file"] for p in m["parts"]]
+        return [d / p["file"] for p in m["parts"]
+                if isinstance(p, dict) and isinstance(p.get("file"), str)
+                and Path(p["file"]).name == p["file"]]
     except Exception:
         return sorted(d.glob(PART_GLOB))
 
@@ -700,12 +828,19 @@ def check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES):
     out = {}
     for table in tables:
         if table == "SSObservation":
-            res = check_ssobservation_parts(delivery_dir, schema_dir)
+            try:
+                res = check_ssobservation_parts(delivery_dir, schema_dir)
+            except Exception as e:      # a safety net: a FAIL, never a crash
+                res = [CheckResult("partitioning", False, f"cannot check ({type(e).__name__}: {e})")]
             files = ssobservation_part_files(delivery_dir)
             if not files:
                 res.append(CheckResult("parts", False, f"{Path(delivery_dir)}: no {PART_GLOB}"))
             for f in files:
-                for r in check_table(table, f, schema_dir):
+                try:
+                    rs = check_table(table, f, schema_dir)
+                except Exception as e:
+                    rs = [CheckResult("file", False, f"{f}: cannot check ({type(e).__name__}: {e})")]
+                for r in rs:
                     res.append(CheckResult(f"{r.name} [{f.name}]", r.ok, r.detail))
             out[table] = res
             continue

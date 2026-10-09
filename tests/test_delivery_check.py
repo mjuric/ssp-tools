@@ -33,7 +33,7 @@ def _array(c, n=N, dictionary=False):
     if dt == "timestamp":
         return pa.array(range(n), pa.timestamp("us"))
     if dt == "boolean":
-        return pa.array([i % 2 == 0 for i in range(n)])
+        return pa.array([i % 2 == 0 for i in range(n)], pa.bool_())
     return pa.array(range(n), D.FELIS_ARROW[dt])
 
 
@@ -334,9 +334,9 @@ def parts_result(d, name):
     return next(r for r in D.check_ssobservation_parts(d) if r.name == name)
 
 
-PARTS_CHECKS = ["manifest", "part files", "part integrity", "part contents", "part ranges", "part sizes",
-                "rows total", "sort order", "part schemas", "primary key across parts", "sidecar",
-                "sidecar columns", "sidecar nulls", "sidecar obsid"]
+PARTS_CHECKS = ["manifest", "part files", "stray files", "part integrity", "part contents", "part ranges",
+                "part sizes", "rows total", "sort order", "part schemas", "primary key across parts",
+                "sidecar", "sidecar columns", "sidecar encoding", "sidecar nulls", "sidecar obsid"]
 
 
 def test_parts_fixture_layout(tmp_path):
@@ -366,6 +366,9 @@ def test_parts_pass_edge_cases(tmp_path, sid):
     if not sid:
         m = read_manifest(tmp_path)
         assert len(m["parts"]) == 1 and m["parts"][0]["rows"] == 0
+    # check_table on every part passes too
+    out = D.check_delivery(tmp_path, tables=["SSObservation"])["SSObservation"]
+    assert [r for r in out if not r.ok] == []
 
 
 def test_parts_pass_internal_none(tmp_path):
@@ -756,3 +759,247 @@ def test_parts_cli(tmp_path, capsys):
     assert "SSObservation: PASS" in capsys.readouterr().out
     (tmp_path / SIDECAR_FILE).unlink()
     assert D.main([str(tmp_path), "--tables", "SSObservation"]) == 1
+
+
+# --- review round 1: stray files, the sidecar's name, manifest types ------
+
+@pytest.mark.parametrize("name", ["SSObservation.parquet", "SSObservation.part0001.parquet.bak",
+                                  "SSObservation.manifest.json.old", "ssobservation.part0009.parquet",
+                                  "SSOBSERVATION_internal.parquet", "SSObservation_internal.parquet~"])
+def test_parts_stray_file(tmp_path, name):
+    write_ss(tmp_path)
+    write(tmp_path, "SSObject", make_table("SSObject"))          # other tables' files: fine
+    (tmp_path / name).write_bytes(b"stale")
+    assert parts_failed(tmp_path) == ["stray files"]
+    assert name in parts_result(tmp_path, "stray files").detail
+
+
+@pytest.mark.parametrize("name", ["../SSObservation_internal.parquet", "sub/SSObservation_internal.parquet",
+                                  "other.parquet"])
+def test_parts_sidecar_name(tmp_path, name):
+    d = tmp_path / "d"
+    m = write_ss(d)
+    target = d / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(d / SIDECAR_FILE, target)
+    m["sidecar"]["file"] = name
+    write_manifest(d, m)
+    f = parts_failed(d)
+    assert "manifest" in f and "sidecar" in f
+    assert "want 'SSObservation_internal.parquet'" in parts_result(d, "sidecar").detail
+
+
+def _set(m, path, value):
+    *head, last = path
+    for k in head:
+        m = m[k]
+    m[last] = value
+
+
+@pytest.mark.parametrize("path,value", [
+    (("parts", 0, "rows"), True), (("parts", 0, "bytes"), "123"), (("parts", 0, "rows"), 3.0),
+    (("parts", 0, "md5"), "z" * 32), (("parts", 0, "md5"), 12345), (("parts", 0, "md5"), "abc"),
+    (("parts", 0, "null_ssObjectId"), 0), (("parts", 0, "ssObjectId_min"), "1"),
+    (("parts", 0, "ssObjectId_max"), 1.0), (("parts", 0, "file"), 7),
+    (("format_version",), True), (("part_rows",), True), (("rows",), "9"), (("rows",), True),
+    (("created_utc",), "yesterday"), (("created_utc",), "2026-10-08T12:00:00+02:00"),
+    (("created_utc",), "2026-10-08T12:00:00"), (("created_utc",), None),
+    (("ssp_tools_commit",), 12345), (("ssp_tools_commit",), "not-a-commit"),
+    (("schema", "source"), "nonsense"), (("schema", "file"), "other.yaml"), (("schema", "md5"), "deadbeef"),
+    (("sidecar", "key"), "obsId"), (("sidecar", "rows"), True), (("sidecar", "md5"), None),
+    (("sidecar", "columns"), "matchMethod"), (("parts",), []), (("parts",), {}),
+])
+def test_parts_manifest_types(tmp_path, path, value):
+    m = write_ss(tmp_path)
+    _set(m, path, value)
+    write_manifest(tmp_path, m)
+    assert "manifest" in parts_failed(tmp_path)
+
+
+def test_parts_manifest_empty_parts_message(tmp_path):
+    m = write_ss(tmp_path)
+    m["parts"] = []
+    write_manifest(tmp_path, m)
+    assert "parts is not a non-empty list" in parts_result(tmp_path, "manifest").detail
+
+
+def test_parts_manifest_good_values(tmp_path):
+    m = write_ss(tmp_path)
+    m["ssp_tools_commit"] = "0123456789abcdef0123456789abcdef01234567"
+    m["schema"]["md5"] = "0123456789abcdef0123456789abcdef"
+    m["created_utc"] = "2026-10-08T12:00:00.123456+00:00"
+    write_manifest(tmp_path, m)
+    assert parts_failed(tmp_path) == []
+
+
+def test_parts_manifest_extra_fields_allowed(tmp_path):
+    # unknown fields are allowed at every level (forward compatibility)
+    m = write_ss(tmp_path)
+    m["bogus"] = 1
+    m["parts"][0]["extra"] = "x"
+    m["sidecar"]["what"] = 2
+    m["schema"]["ref"] = "abc"
+    write_manifest(tmp_path, m)
+    assert parts_failed(tmp_path) == []
+
+
+def test_parts_manifest_bad_file_entry_not_filtered(tmp_path):
+    # an extra parts entry whose file is not a string: FAILs, not ignored
+    m = write_ss(tmp_path)
+    m["parts"].append({"file": 7, "rows": 0, "ssObjectId_min": None, "ssObjectId_max": None,
+                       "null_ssObjectId": True, "bytes": 0, "md5": "0" * 32})
+    write_manifest(tmp_path, m)
+    f = parts_failed(tmp_path)
+    assert "manifest" in f and "part files" in f
+
+
+# --- NaN sort keys, the sidecar's encoding --------------------------------
+
+def test_parts_nan_midpoint(tmp_path):
+    t = ss_table()
+    mjd = t["midpointMjdTai"].to_pylist()
+    mjd[1] = float("nan")
+    write_ss(tmp_path, replace(t, "midpointMjdTai", pa.array(mjd, pa.float64())))
+    assert parts_failed(tmp_path) == ["sort order"]
+    assert "1 NaN or NULL midpointMjdTai" in parts_result(tmp_path, "sort order").detail
+
+
+@pytest.mark.parametrize("kw", [dict(compression="snappy"), dict(use_dictionary=False)])
+def test_parts_sidecar_encoding(tmp_path, kw):
+    write_ss(tmp_path)
+    pq.write_table(sidecar_for(ss_table()), tmp_path / SIDECAR_FILE, **{"compression": "zstd", **kw})
+    refresh(tmp_path)
+    assert parts_failed(tmp_path) == ["sidecar encoding"]
+
+
+def test_parts_sidecar_encoding_empty_table(tmp_path):
+    write_ss(tmp_path, ss_table([]))
+    assert parts_result(tmp_path, "sidecar encoding").ok
+
+
+# --- crashes become FAILs -------------------------------------------------
+
+def _rewrite_part(d, k, col, arr):
+    p = d / PART_FILE_FORMAT.format(k)
+    t = pq.read_table(p)
+    t = t.set_column(t.column_names.index(col), col, arr)
+    pq.write_table(t, p, compression="zstd")
+    refresh(d)
+
+
+def _no_crash(d):
+    rs = D.check_ssobservation_parts(d)
+    out = D.check_delivery(d, tables=["SSObservation"])["SSObservation"]
+    return sorted(r.name for r in rs if not r.ok), out
+
+
+def test_parts_uint64_ssobjectid_no_crash(tmp_path):
+    write_ss(tmp_path)
+    _rewrite_part(tmp_path, 1, "ssObjectId", pa.array([2 ** 63 + 5] * 2, pa.uint64()))
+    f, out = _no_crash(tmp_path)
+    assert "part contents" in f
+    assert "ssObjectId is uint64" in parts_result(tmp_path, "part contents").detail
+    assert not all(r.ok for r in out)
+
+
+def test_parts_string_ssobjectid_no_crash(tmp_path):
+    write_ss(tmp_path)
+    for k, n in enumerate([3, 2, 1, 2, 1]):
+        _rewrite_part(tmp_path, k, "ssObjectId", pa.array([None if k > 2 else str(k)] * n, pa.string()))
+    f, out = _no_crash(tmp_path)
+    assert "part contents" in f
+    assert not all(r.ok for r in out)
+
+
+def test_parts_sidecar_duplicated_column_no_crash(tmp_path):
+    write_ss(tmp_path)
+    side = sidecar_for(ss_table())
+    side = pa.Table.from_arrays([side["obsid"], side["matchMethod"], side["matchMethod"]],
+                                names=["obsid", "matchMethod", "matchMethod"])
+    pq.write_table(side, tmp_path / SIDECAR_FILE, compression="zstd")
+    m = read_manifest(tmp_path)
+    m["sidecar"]["columns"] = ["matchMethod"]
+    refresh(tmp_path, m)
+    f, out = _no_crash(tmp_path)
+    assert "sidecar columns" in f
+    assert "duplicated columns ['matchMethod']" in parts_result(tmp_path, "sidecar columns").detail
+
+
+# --- the sort tie-break and the cutting rules' edges ----------------------
+
+def test_parts_sort_tie_break_on_obsid(tmp_path):
+    # rows 0 and 1: same ssObjectId and midpointMjdTai, so obsid decides
+    t = ss_table()
+    mjd = t["midpointMjdTai"].to_pylist()
+    mjd[1] = mjd[0]
+    t = replace(t, "midpointMjdTai", pa.array(mjd, pa.float64()))
+    write_ss(tmp_path / "ok", t)
+    assert parts_failed(tmp_path / "ok") == []                  # obs000 < obs001: in order
+    order = [1, 0, 2, 3, 4, 5, 6, 7, 8]
+    write_ss(tmp_path / "bad", t.take(order), sidecar=sidecar_for(t).take(order))
+    assert parts_failed(tmp_path / "bad") == ["sort order"]
+
+
+def test_parts_sort_tie_break_across_boundary(tmp_path):
+    # the NULL rows with equal midpointMjdTai, obsid descending across the
+    # boundary of the two NULL parts
+    t = ss_table()
+    mjd = t["midpointMjdTai"].to_pylist()
+    mjd[6:] = [61010.0] * 3
+    t = replace(t, "midpointMjdTai", pa.array(mjd, pa.float64()))
+    write_ss(tmp_path / "ok", t)
+    assert parts_failed(tmp_path / "ok") == []
+    order = [0, 1, 2, 3, 4, 5, 6, 8, 7]
+    write_ss(tmp_path / "bad", t.take(order), sidecar=sidecar_for(t).take(order))
+    assert parts_failed(tmp_path / "bad") == ["sort order"]
+
+
+SID6 = [1, 1, 2, 2, 3, None]
+
+
+def test_parts_closure_exact_boundary(tmp_path):
+    # part0000 has objects 1 and 2: exactly part_rows (2) rows before its
+    # last object, so it should have closed after object 1
+    write_ss(tmp_path, ss_table(SID6), splits=[(0, 4, False), (4, 5, False), (5, 6, True)])
+    assert parts_failed(tmp_path) == ["part sizes"]
+
+
+def test_parts_closure_last_ranged_part(tmp_path):
+    # the last ranged part [2, 2, 3] should have closed after object 2
+    write_ss(tmp_path, ss_table(SID6), splits=[(0, 2, False), (2, 5, False), (5, 6, True)])
+    assert parts_failed(tmp_path) == ["part sizes"]
+    assert "SSObservation.part0001.parquet: not closed" in parts_result(tmp_path, "part sizes").detail
+
+
+def test_parts_small_middle_ranged_part(tmp_path):
+    # part0001 [2] (1 row < 2) is neither the first nor the last ranged part
+    write_ss(tmp_path, ss_table([1, 1, 2, 3, 3, None]),
+             splits=[(0, 2, False), (2, 3, False), (3, 5, False), (5, 6, True)])
+    assert parts_failed(tmp_path) == ["part sizes"]
+    assert "SSObservation.part0001.parquet: 1 rows < part_rows" in parts_result(tmp_path, "part sizes").detail
+
+
+def test_parts_last_null_part_too_big(tmp_path):
+    write_ss(tmp_path, splits=[(0, 3, False), (3, 5, False), (5, 6, False), (6, 9, True)])
+    assert parts_failed(tmp_path) == ["part sizes"]
+    assert "the last NULL part must have 1..2" in parts_result(tmp_path, "part sizes").detail
+
+
+def test_parts_empty_ranged_part_after_full(tmp_path):
+    write_ss(tmp_path, ss_table([1, 1]), splits=[(0, 2, False), (2, 2, False)])
+    assert parts_failed(tmp_path) == ["part contents"]
+
+
+def test_check_delivery_no_parts(tmp_path):
+    out = D.check_delivery(tmp_path, tables=["SSObservation"])["SSObservation"]
+    assert [(r.name, r.ok) for r in out] == [("manifest", False), ("parts", False)]
+
+
+def test_parts_empty_table_flagged_null(tmp_path):
+    # the empty table's single part flagged as a NULL part: both the
+    # contents (an empty NULL part) and the empty-table rule FAIL
+    write_ss(tmp_path, ss_table([]), splits=[(0, 0, True)])
+    f = parts_failed(tmp_path)
+    assert "part contents" in f and "part sizes" in f
+    assert "a NULL part with no rows" in parts_result(tmp_path, "part contents").detail
+    assert "null_ssObjectId false" in parts_result(tmp_path, "part sizes").detail

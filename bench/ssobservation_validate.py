@@ -103,6 +103,7 @@ from ssp.ssobservation_contract import (  # noqa: E402
     SIDECAR_KEY,
     SSOBSERVATION_DICTIONARY,
     SSOBSERVATION_INTERNAL_DEFAULT,
+    SSOBSERVATION_INTERNAL_DTYPE,
     SSOBSERVATION_MANIFEST_FILE,
     SSOBSERVATION_SORT,
     VIEW_DROPPED,
@@ -111,6 +112,7 @@ from ssp.ssobservation_contract import (  # noqa: E402
 DEFAULT_SCHEMA = os.path.join(_ROOT, "tests", "data", "sdm_schemas", "sso_base.yaml")
 
 # ClickHouse (read-only; the server is shared)
+from ssp.delivery_contract import SHUTTER_INPUT_COLUMNS  # noqa: E402
 from ssp.export.submittable import current_host  # noqa: E402 (the ClickHouse host, see there)
 CH_PORT = 8123
 CH_DATABASE = "ssp"
@@ -672,6 +674,8 @@ def check_conformance(path, schema=DEFAULT_SCHEMA, rep=None):
             g = md.row_group(rg)
             for k in range(g.num_columns):
                 cc = g.column(k)
+                if not cc.num_values:          # an empty chunk has no encoding to check
+                    continue
                 comp.setdefault(cc.compression, set()).add(tag)
                 if cc.path_in_schema in SSOBSERVATION_DICTIONARY and \
                         not any("DICT" in e for e in cc.encodings):
@@ -1004,7 +1008,7 @@ def check_primary(t, rep):
 # --------------------------------------------------------------------------
 
 #: Block-1 columns copied from dia_sources (status comes from obs_sbn).
-COPIED_BLOCK1 = ("trksub", "trkid", "submission_id", "primary", "matchMethod")
+COPIED_BLOCK1 = ("trksub", "trkid", "submission_id", "primary")
 #: dia_sources' names of the view's id and parentId.
 DIA_ID, DIA_PARENT = "diaSourceId", "parentId"
 
@@ -1089,10 +1093,23 @@ def check_copied(ssobservation, dia_sources, schema=DEFAULT_SCHEMA, rep=None):
     src = _Columns(dia_sources, idx[keep])
     keys = ss_obsid[keep]
 
-    b1 = [c for c in COPIED_BLOCK1 if c in src.column_names and (c != "matchMethod" or c in ss.column_names)]
-    if "matchMethod" not in src.column_names:
-        rep.info("dia_sources has no matchMethod (pre-WP1 extractor): not compared")
+    b1 = [c for c in COPIED_BLOCK1 if c in src.column_names]
     compare_columns(rep, ss, src, b1, keys, "block 1 (copied) equal")
+    # the internal columns (the sidecar's; a single file's own) against
+    # dia_sources, which carries them all
+    internal, comparable = [c for c in SSOBSERVATION_INTERNAL_DTYPE if c in ss.column_names], []
+    pre_shutter = not any(c in src.column_names for c in SHUTTER_INPUT_COLUMNS)
+    for c in internal:
+        if c in src.column_names:
+            comparable.append(c)
+        elif c == "matchMethod":
+            rep.info("dia_sources has no matchMethod (pre-WP1 extractor): not compared")
+        elif c in SHUTTER_INPUT_COLUMNS and pre_shutter:
+            rep.info(f"dia_sources has no shutter-timing columns (pre-S1 extractor): {c} not compared")
+        else:
+            rep.check(f"internal column {c} in dia_sources", False, "absent from dia_sources")
+    if comparable:
+        compare_columns(rep, ss, src, comparable, keys, f"internal columns equal ({', '.join(comparable)})")
     compare_columns(rep, ss, src, block3, keys, "block 3 (measuredOn, processing, processingTable) equal")
     compare_columns(rep, ss, src, b[4], keys, "block 4 equal (exact, float64->float32 after the cast)",
                     src_missing="fail")

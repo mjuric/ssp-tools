@@ -120,7 +120,7 @@ def sidecar(t, match=None):
     obsid = t["obsid"].to_pylist()
     return pa.table({"obsid": pa.array(obsid, pa.string()),
                      "matchMethod": pa.array([match.get(o, "position") for o in obsid], pa.string()),
-                     "midpointMjdTai_flag_degraded": pa.array([False] * len(obsid))})
+                     "midpointMjdTai_flag_degraded": pa.array([False] * len(obsid), pa.bool_())})
 
 
 def write_ss(t, path, part_rows=2, side=None, compression="zstd", use_dictionary=True, **kw):
@@ -158,6 +158,9 @@ def dia_from(t):
     parent = [p if p is not None else q for p, q in zip(t["parentDiaSourceId"].to_pylist(),
                                                          t["parentSourceId"].to_pylist())]
     cols["parentId"] = pa.array(parent, pa.int64())
+    # the internal columns, as the sidecar has them (by obsid)
+    cols["matchMethod"] = pa.array([MATCH.get(o, "position") for o in t["obsid"].to_pylist()], pa.string())
+    cols["midpointMjdTai_flag_degraded"] = pa.array([False] * len(t))
     return pa.table(cols)
 
 
@@ -990,8 +993,7 @@ def test_regression_reference_partitioned(tmp_path, good):
 
 def test_mock_writes_partitioned(tmp_path, good):
     t = table()
-    dia = dia_from(t).append_column("matchMethod", pa.array(_values()["matchMethod"]))
-    dia = dia.append_column("midpointMjdTai_flag_degraded", pa.array([False] * N))
+    dia = dia_from(t)
     dia_p = write(dia, tmp_path / "dia.parquet")
     obs_p = write(_obs_sbn(t), tmp_path / "obs.parquet")
     out = tmp_path / "mock"
@@ -1009,3 +1011,46 @@ def test_mock_writes_partitioned(tmp_path, good):
     m["parts"][0]["md5"] = "0" * 32
     write_manifest(out, m)
     assert "partitioning: part integrity" in failed(V.check_conformance(str(out)))
+
+
+# --------------------------------------------------------------------------
+# review round 1: the internal columns in `copied`; the empty table
+# --------------------------------------------------------------------------
+
+INTERNAL_EQUAL = "internal columns equal (matchMethod, midpointMjdTai_flag_degraded)"
+
+
+def test_copied_compares_internal_columns(tmp_path, good):
+    dia = write(dia_from(table()), tmp_path / "dia.parquet")
+    rep = V.check_copied(good, dia)
+    assert INTERNAL_EQUAL in {n for n, _ in rep.results} and rep.ok, rep.text()
+    # a flipped flag in the sidecar
+    t = table()
+    side = sidecar(t)
+    side = side.set_column(2, "midpointMjdTai_flag_degraded", pa.array([True] + [False] * (N - 1)))
+    bad = write_ss(t, tmp_path / "flag", side=side)
+    rep = V.check_copied(bad, dia)
+    assert failed(rep) == {INTERNAL_EQUAL}
+    assert "midpointMjdTai_flag_degraded: 1 rows" in rep.text()
+    # a wrong matchMethod in the sidecar
+    bad = write_ss(t, tmp_path / "mm", side=sidecar(t, match={**MATCH, "obs003": "position"}))
+    assert failed(V.check_copied(bad, dia)) == {INTERNAL_EQUAL}
+
+
+def test_copied_internal_column_missing_from_dia(tmp_path, good):
+    # dia_sources with the shutter columns but without the flag: a FAIL
+    dia = write(dia_from(table()).drop_columns(["midpointMjdTai_flag_degraded"]), tmp_path / "d.parquet")
+    assert "internal column midpointMjdTai_flag_degraded in dia_sources" in failed(V.check_copied(good, dia))
+    # a pre-S1 dia_sources (no shutter columns at all): not compared
+    d = dia_from(table()).drop_columns(["midpointMjdTai_flag_degraded", "midpointMjdTai_flag"])
+    rep = V.check_copied(good, write(d, tmp_path / "d2.parquet"))
+    assert "pre-S1 extractor" in rep.text()
+    assert "internal column midpointMjdTai_flag_degraded in dia_sources" not in failed(rep)
+
+
+def test_conformance_empty_table(tmp_path):
+    t = table().slice(0, 0)
+    p = write_ss(t, tmp_path / "empty", side=sidecar(t))
+    rep = V.check_conformance(p)
+    assert "SSOBSERVATION_DICTIONARY columns dictionary-encoded" not in failed(rep)
+    assert not [n for n in rep.failed if n.startswith("partitioning")], rep.text()
