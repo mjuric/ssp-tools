@@ -130,8 +130,9 @@ REPORT_FIELDS = {
     "ssp_tools_commit": "git commit of the code that built the delivery",
     "steps": "{step: {status: 'ok'|'failed'|'skipped', started_utc, wall_s, max_rss_gb, log}}",
     "tables": "{Table: {file, rows, md5, bytes}} for every delivered table; for SSObservation "
-              "{manifest, parts: [file, ...], sidecar, rows, bytes} (totals over the parts; md5 "
-              "per part is in the manifest)",
+              "{manifest, manifest_md5, parts: [file, ...], sidecar, rows, bytes} (rows and bytes "
+              "are totals over the parts, not counting the manifest or the sidecar; each part's md5 "
+              "is in the manifest, and the manifest's own md5 is manifest_md5)",
     "checks": "{check: {status: 'PASS'|'FAIL', report}}",
     "deliverable": "true only if every step and check passed; stage 3 refuses otherwise",
     "upload": "set by stage 3: {config, bucket, object_prefix, tables, message_id, dry_run, utc}",
