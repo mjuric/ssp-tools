@@ -6,6 +6,7 @@ inputs of test_ssobservation_widened (offline)."""
 import datetime
 import hashlib
 import json
+import pathlib
 import subprocess
 import sys
 
@@ -264,6 +265,25 @@ def test_failed_rebuild_leaves_no_manifest(tmp_path, offline, monkeypatch):  # n
     assert not (tmp_path / SSOBSERVATION_MANIFEST_FILE).exists()
     assert not (tmp_path / SIDECAR_FILE).exists()
     assert sorted(f.name for f in tmp_path.glob("SSObservation*")) == [PART_FILE_FORMAT.format(0)]
+
+
+def test_manifest_removed_first(tmp_path, offline, monkeypatch):  # noqa: F811
+    # a removal that stops after the first file leaves no manifest
+    _built(tmp_path, part_rows=1)
+    removed = []
+    orig = pathlib.Path.unlink
+
+    def unlink(self, missing_ok=False):
+        if removed:
+            raise OSError("interrupted")
+        removed.append(self.name)
+        orig(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", unlink)
+    with pytest.raises(OSError, match="interrupted"):
+        build_ssobservation(tmp_path, tmp_path, part_rows=1)
+    assert removed == [SSOBSERVATION_MANIFEST_FILE]
+    assert not (tmp_path / SSOBSERVATION_MANIFEST_FILE).exists()
 
 
 def _built_table(tmp_path):
