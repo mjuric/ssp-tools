@@ -1,10 +1,10 @@
 {panel:title=Revision (2026-10)}
-This description was revised in October 2026 to match the implementation. It renames {{NearbyAsteroids}} to {{NearbySSO}} and defines it, makes the {{SSSource}} and {{SSObject}} design concrete, and proposes removing {{ssObjectId}} from {{DiaSource}}. The schema is in [lsst/sdm_schemas#549|https://github.com/lsst/sdm_schemas/pull/549] (DM-55375). The original text is in the issue history.
+This description was revised in October 2026 to match the implementation. It renames {{NearbyAsteroids}} to {{NearbySSO}} and defines it, makes the observation table and {{SSObject}} concrete, renames the PPDB's {{SSSource}} to {{SSObservation}}, and proposes removing {{ssObjectId}} from {{DiaSource}}. The schema was reviewed on 2026-10-08. The schema is in [lsst/sdm_schemas#549|https://github.com/lsst/sdm_schemas/pull/549] (DM-55375). The original text is in the issue history.
 {panel}
 
 h2. Summary
 
-This RFC proposes changing the PPDB Solar System table baseline from the current model, where {{SSSource}} is tightly linked 1:1 to {{DiaSource}}, to a decoupled model. In the new model, the Solar System tables are built from a durable record of the measurements submitted to the MPC. {{SSSource}} and {{SSObject}} become independent of the contents and the identifier namespace of the PPDB {{DiaSource}} table. A separate, daily-regenerated association table, {{NearbySSO}}, lets users relate PPDB {{DiaSource}} detections to known Solar System objects predicted near them.
+This RFC proposes changing the PPDB Solar System table baseline from the current model, where {{SSSource}} is tightly linked 1:1 to {{DiaSource}}, to a decoupled model. In the new model, the Solar System tables are built from a durable record of the measurements submitted to the MPC. The PPDB's observation table, renamed {{SSObservation}}, and {{SSObject}} become independent of the contents and the identifier namespace of the PPDB {{DiaSource}} table. A separate, daily-regenerated association table, {{NearbySSO}}, lets users relate PPDB {{DiaSource}} detections to known Solar System objects predicted near them.
 
 h2. Motivation
 
@@ -17,20 +17,21 @@ h2. Proposed Change
 Adopt a new PPDB Solar System table baseline with the following design:
 
 # *A durable record of submitted measurements.* For every submission to the MPC, keep the full measurement it was made from: the Source or DiaSource astrometric and photometric fields, and their provenance. Keep it so that it can be found again by the identifiers the MPC returns. How the record is kept is an implementation detail.
-# *{{SSSource}} from the MPC's accepted observations.* {{SSSource}} has one row per Rubin observation accepted by the MPC, keyed by the MPC's observation identifier ({{obsid}}). Each row carries:
+# *{{SSObservation}} from the MPC's accepted observations.* {{SSObservation}} (until now the PPDB's {{SSSource}}) has one row per Rubin observation accepted by the MPC, keyed by the MPC's observation identifier ({{obsid}}). Each row carries:
 #* the link to the MPC submission;
 #* the full measurement the observation was submitted from, from a difference image or a science image, with its processing provenance;
 #* the predicted position with its error ellipse, and the observed-minus-predicted residuals.
 Observations the MPC accepted but hasn't linked to a known object are kept, with a NULL {{ssObjectId}}. {{DiaSource}} is not consulted.
-# *{{SSObject}} from {{SSSource}}.* Per-object quantities, including the photometric phase-curve fits, are computed from {{SSSource}} alone.
+The table is renamed because its structure and meaning now differ from the alert's {{SSSource}}: in an alert, {{SSSource}} says that a known object is nearby; in the PPDB, each row is an observation of the object, in the MPC's vocabulary. The alert's {{SSSource}} is unchanged; {{NearbySSO}} is its PPDB counterpart.
+# *{{SSObject}} from {{SSObservation}}.* Per-object quantities, including the photometric phase-curve fits, are computed from {{SSObservation}} alone.
 # *Break the schema dependency between {{DiaSource}} and the Solar System tables.* Remove {{ssObjectId}} and {{ssObjectReassocTimeMjdTai}} from {{DiaSource}}, and {{SSSource}} and {{SSObject}} from the APDB.
 # *No Solar System updates to {{DiaSource}}.* Treat all {{DiaSource}} rows as normal {{DiaObject}}-associated difference-image detections, rather than mutating them daily based on Solar System associations.
 # *Add {{NearbySSO}}* (previously "NearbyAsteroids"): a daily-regenerated table that, for each {{DiaSource}}, names the nearest known Solar System object predicted near it.
 #* An object is matched to a {{DiaSource}} if its predicted position lies within an AP-determined matching radius. The radius may differ between classes of objects, e.g. asteroids and comets, which are extended and less well predicted. A prediction is used only if its uncertainty is small enough for the association to be meaningful.
 #* Each row gives the object, its predicted position and error ellipse, the offset from the {{DiaSource}}, the rank of the {{DiaSource}} among those near the prediction, and the predicted magnitude, rates of motion and tail directions.
-#* Rows are not linked to {{SSSource}}: most associated detections have not been submitted to the MPC.
-#* We leave open the option for the table to also list objects predicted to be in the field of view but not matched to any {{DiaSource}}, with a NULL {{diaSourceId}}.
-# *Daily delivery.* Each day, {{SSSource}}, {{SSObject}}, {{NearbySSO}} and the MPC tables ({{mpc_orbits}}, {{current_identifications}}, {{numbered_identifications}}) are rebuilt from one consistent MPC snapshot and bulk-loaded into the PPDB.
+#* Rows are not linked to {{SSObservation}}: most associated detections have not been submitted to the MPC.
+#* Listing objects predicted to be in the field of view but not matched to any {{DiaSource}} (rows with a NULL {{diaSourceId}}) is a possible future extension. It is not part of this revision.
+# *Daily delivery.* Each day, {{SSObservation}}, {{SSObject}}, {{NearbySSO}} and the MPC tables ({{mpc_orbits}}, {{current_identifications}}, {{numbered_identifications}}) are rebuilt from one consistent MPC snapshot and bulk-loaded into the PPDB.
 
 The schema of all these tables is in [lsst/sdm_schemas#549|https://github.com/lsst/sdm_schemas/pull/549].
 
@@ -54,16 +55,17 @@ The validation is in the {{NearbySSO}} paper (link to be added).
 
 h2. Implementation Notes
 
-* The record of submitted measurements must keep enough astrometric, photometric, provenance and processing-context metadata to reconstruct {{SSSource}} and {{SSObject}} without consulting {{DiaSource}}.
-* {{SSSource}} should be measurement-complete for Solar System use cases: its schema includes the fields needed for Solar System science queries without a join to {{DiaSource}}.
-* {{NearbySSO}} is regenerated in full and bulk-loaded daily. It is not the authoritative Solar System association state; that role belongs to {{SSSource}}/{{SSObject}}.
+* The record of submitted measurements must keep enough astrometric, photometric, provenance and processing-context metadata to reconstruct {{SSObservation}} and {{SSObject}} without consulting {{DiaSource}}.
+* {{SSObservation}} should be measurement-complete for Solar System use cases: its schema includes the fields needed for Solar System science queries without a join to {{DiaSource}}.
+* {{NearbySSO}} is regenerated in full and bulk-loaded daily. It is not the authoritative Solar System association state; that role belongs to {{SSObservation}}/{{SSObject}}.
+* {{SSObservation}} is delivered as Parquet files partitioned by {{ssObjectId}}, with a JSON manifest describing the partitioning, so that it can be loaded directly into the PPDB.
 * The matching radius and the uncertainty cut of {{NearbySSO}} are set by the AP team and may be tuned without a further RFC.
 
 {code:title=Data flow}
  MPC replica (one snapshot) ──┬─> obs_sbn (accepted Rubin observations)
                               │        │  resolved to the submitted measurement
                               │        v
- record of submitted ─────────┼─> SSSource ──> SSObject
+ record of submitted ─────────┼─> SSObservation ──> SSObject
    measurements               │
                               ├─> mpc_orbits, current_identifications, numbered_identifications
                               │

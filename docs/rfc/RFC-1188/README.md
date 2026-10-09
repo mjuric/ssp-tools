@@ -10,7 +10,7 @@ Drafts of an update to [RFC-1188](https://rubinobs.atlassian.net/browse/RFC-1188
 
 ## What changes, and why
 
-The decisions were made with the owner on 2026-10-05:
+The decisions were made with the owner on 2026-10-05, and updated after the schema review on 2026-10-08:
 
 | item | decision |
 |---|---|
@@ -23,6 +23,9 @@ The decisions were made with the owner on 2026-10-05:
 | Measured position errors | Not mentioned. |
 | Level of detail | A summary that points to lsst/sdm_schemas#549 for the columns. |
 | Body vs. comment | The body is rewritten (it is what gets adopted); one comment summarizes the change and answers the open comments. |
+| PPDB `SSSource` → `SSObservation` (schema review, 2026-10-08) | Renamed, because the PPDB table and the alert's `SSSource` now differ in structure and meaning; the alert's `SSSource` is unchanged, and `NearbySSO` is its PPDB counterpart. |
+| Undetected predictions (2026-10-08) | Deferred: described as a possible future extension, not part of this revision (ssp-tools issue #86). |
+| Delivery format (2026-10-08) | `SSObservation` is delivered as Parquet parts partitioned by `ssObjectId`, with a JSON manifest: one line in the Implementation Notes. Its internal columns are not mentioned. |
 
 ## Before posting
 
