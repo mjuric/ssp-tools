@@ -1,5 +1,7 @@
 """The SSObservation validation harness (bench/ssobservation_validate), on
-small synthetic tables. No network, no fixtures."""
+small synthetic tables written as partitioned SSObservations (parts, a
+manifest and a sidecar, by hand: tests/ssobs_parts_fixture.py). No network,
+no fixtures."""
 import os
 import sys
 
@@ -12,7 +14,14 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bench import ssobservation_validate as V
-from ssp.ssobservation_contract import ELLIPSE_COLUMNS, SSOBSERVATION_DICTIONARY
+from ssobs_parts_fixture import cuts, read_manifest, write_manifest, write_parts
+from ssp.ssobservation_contract import (
+    ELLIPSE_COLUMNS,
+    PART_FILE_FORMAT,
+    SIDECAR_FILE,
+    SSOBSERVATION_DICTIONARY,
+    SSOBSERVATION_MANIFEST_FILE,
+)
 
 COLS = V.schema_columns()
 NAMES = [c["name"] for c in COLS]
@@ -94,8 +103,32 @@ def table(d=None, **overrides):
 
 
 def write(t, path, **kw):
+    """A single Parquet file (dia_sources, a pre-rename reference, ...)."""
     kw.setdefault("compression", "zstd")
     pq.write_table(t, path, **kw)
+    return str(path)
+
+
+#: The internal columns of each row, by obsid (the sidecar's).
+MATCH = dict(zip(_values()["obsid"], _values()["matchMethod"]))
+
+
+def sidecar(t, match=None):
+    """The sidecar for SSObservation table ``t``: obsid, matchMethod (by
+    obsid, from ``match`` or MATCH) and midpointMjdTai_flag_degraded."""
+    match = match or MATCH
+    obsid = t["obsid"].to_pylist()
+    return pa.table({"obsid": pa.array(obsid, pa.string()),
+                     "matchMethod": pa.array([match.get(o, "position") for o in obsid], pa.string()),
+                     "midpointMjdTai_flag_degraded": pa.array([False] * len(obsid), pa.bool_())})
+
+
+def write_ss(t, path, part_rows=2, side=None, compression="zstd", use_dictionary=True, **kw):
+    """Write SSObservation table ``t`` as a partitioned SSObservation in
+    directory ``path`` (by default three parts: objects 1 and 2, then the
+    NULL-ssObjectId rows); returns the directory."""
+    write_parts(t, path, part_rows=part_rows, sidecar=sidecar(t) if side is None else side,
+                compression=compression, dictionary=use_dictionary, **kw)
     return str(path)
 
 
@@ -105,7 +138,7 @@ def failed(rep):
 
 @pytest.fixture
 def good(tmp_path):
-    return write(table(), tmp_path / "ssobservation.parquet")
+    return write_ss(table(), tmp_path / "SSObservation")
 
 
 def dia_from(t):
@@ -125,6 +158,9 @@ def dia_from(t):
     parent = [p if p is not None else q for p, q in zip(t["parentDiaSourceId"].to_pylist(),
                                                          t["parentSourceId"].to_pylist())]
     cols["parentId"] = pa.array(parent, pa.int64())
+    # the internal columns, as the sidecar has them (by obsid)
+    cols["matchMethod"] = pa.array([MATCH.get(o, "position") for o in t["obsid"].to_pylist()], pa.string())
+    cols["midpointMjdTai_flag_degraded"] = pa.array([False] * len(t))
     return pa.table(cols)
 
 
@@ -202,7 +238,7 @@ def test_conformance_pass(good):
 
 
 def _conf(tmp_path, t, **kw):
-    return failed(V.check_conformance(write(t, tmp_path / "bad.parquet", **kw)))
+    return failed(V.check_conformance(write_ss(t, tmp_path / "bad", **kw)))
 
 
 def test_conformance_order(tmp_path):
@@ -226,7 +262,7 @@ def test_conformance_nulls(tmp_path):
     # declared nullable although the YAML says not
     t = table()
     t = t.cast(pa.schema([f.with_nullable(True) for f in t.schema]))
-    assert failed(V.check_conformance(write(t, tmp_path / "n.parquet"))) == {
+    assert failed(V.check_conformance(write_ss(t, tmp_path / "n"))) == {
         "Arrow field nullability matches the YAML"}
 
 
@@ -250,12 +286,10 @@ def test_conformance_sort(tmp_path):
 
 
 def test_conformance_categories(tmp_path):
-    # (matchMethod is internal: read from the sidecar next to the file)
+    # (matchMethod is internal: read from the sidecar)
     d = _values()
-    pq.write_table(pa.table({"obsid": d["obsid"], "matchMethod": ["id"] + d["matchMethod"][1:]}),
-                   tmp_path / V.SIDECAR_FILE)
-    assert "matchMethod values in MATCH_METHODS" in _conf(tmp_path, table(d))
-    (tmp_path / V.SIDECAR_FILE).unlink()
+    side = sidecar(table(d), match={**MATCH, "obs000": "id"})
+    assert "matchMethod values in MATCH_METHODS" in _conf(tmp_path, table(d), side=side)
     d = _values()
     d["measuredOn"] = ["direct"] + d["measuredOn"][1:]
     assert "measuredOn values in ID_SPLIT" in _conf(tmp_path, table(d))
@@ -504,7 +538,7 @@ def test_ellipse_fail(tmp_path, good):
     # NearbySSO has an ellipse where SSObservation has none
     d = _values()
     d["ephRaErr"][0] = d["ephDecErr"][0] = d["ephRa_ephDec_Cov"][0] = None
-    ss = write(table(d), tmp_path / "ss.parquet")
+    ss = write_ss(table(d), tmp_path / "ss")
     rep = V.check_ellipse(ss, write(_nss(t), tmp_path / "n.parquet"), oa, ob)
     assert "ellipse present in SSObservation wherever NearbySSO has one" in failed(rep)
 
@@ -553,7 +587,7 @@ def test_counts_fail(tmp_path, good):
     assert "rows == the X05 obs_sbn rows dia_sources resolved" in failed(V.check_counts(good, ob, dia))
     d = _values()
     d["designation"][5] = "2030 ZZ"
-    bad_ss = write(table(d), tmp_path / "ss.parquet")
+    bad_ss = write_ss(table(d), tmp_path / "ss")
     assert "status 'I' rows undesignated and without ssObjectId" in failed(V.check_counts(bad_ss, ob))
 
 
@@ -565,7 +599,7 @@ def test_cli_exit_codes(tmp_path, good):
     out = tmp_path / "rep.txt"
     assert V.main(["conformance", good, "--out", str(out)]) == 0
     assert "RESULT: PASS" in out.read_text()
-    bad = write(table().take([1, 0, 2, 3, 4, 5]), tmp_path / "bad.parquet")
+    bad = write_ss(table().take([1, 0, 2, 3, 4, 5]), tmp_path / "bad")
     assert V.main(["conformance", bad]) == 1
 
 
@@ -613,7 +647,7 @@ def _off(tmp_path, **cols):
     for c, (i, v) in cols.items():
         d[c] = list(d[c])
         d[c][i] = v
-    return failed(V.check_offsets(write(table(d), tmp_path / "off.parquet")))
+    return failed(V.check_offsets(write_ss(table(d), tmp_path / "off")))
 
 
 def test_offsets_fail_values(tmp_path):
@@ -640,7 +674,7 @@ def test_offsets_fail_null_rule(tmp_path):
     assert NULL_RULE in _off(tmp_path, ephRateRa=(0, 0.0), ephRateDec=(0, 0.0))
     # a NaN where a value is due counts as missing (and is reported)
     along = [float("nan")] + _values()["ephOffsetAlongTrack"][1:]
-    rep = V.check_offsets(write(table(_values(), ephOffsetAlongTrack=along), tmp_path / "nan.parquet"))
+    rep = V.check_offsets(write_ss(table(_values(), ephOffsetAlongTrack=along), tmp_path / "nan"))
     assert NULL_RULE in failed(rep)
     assert "written as NaN, not NULL: 1 cells" in rep.text()
 
@@ -652,7 +686,7 @@ def test_offsets_in_conformance(tmp_path):
 def test_offsets_missing_columns(tmp_path):
     t = table().drop_columns(["ephOffsetAlongTrack"])
     assert "columns needed by the offsets check present" in failed(
-        V.check_offsets(write(t, tmp_path / "x.parquet")))
+        V.check_offsets(write_ss(t, tmp_path / "x")))
 
 
 def test_regression_skips_track_and_rank(tmp_path, good):
@@ -673,13 +707,19 @@ def test_regression_skips_track_and_rank(tmp_path, good):
 # --------------------------------------------------------------------------
 
 FAKE_BUILDER = '''
+import json
+import os
 import sys
 import pyarrow as pa
 import pyarrow.parquet as pq
 args = sys.argv[1:]
 out = args[args.index("--output") + 1]
 mode = args[args.index("--mode") + 1] if "--mode" in args else "sorted"
-t = pq.read_table(args[0], columns=["ssObjectId", "midpointMjdTai", "psfFlux"]).to_pandas()
+# SSObservation: a partitioned directory, read through its manifest
+m = json.load(open(os.path.join(args[0], "SSObservation.manifest.json")))
+t = pa.concat_tables([pq.read_table(os.path.join(args[0], p["file"]),
+                                    columns=["ssObjectId", "midpointMjdTai", "psfFlux"])
+                      for p in m["parts"]]).to_pandas()
 sid = t["ssObjectId"].fillna(-1).to_numpy()
 starts = sid[1:] != sid[:-1]
 if len(set(sid[1:][starts])) != starts.sum() or (len(sid) and sid[0] in set(sid[1:][starts])):
@@ -712,7 +752,7 @@ def _many(tmp_path, n_obj=30, per=7):
          "midpointMjdTai": np.tile(np.arange(per, dtype=float), n_obj) + 61000,
          "psfFlux": np.arange(n_obj * per, dtype=np.float32) + 1.5}
     t = pa.table(d).append_column("obsid", pa.array([f"o{k}" for k in range(n_obj * per)]))
-    return write(t, tmp_path / "many.parquet")
+    return write_ss(t, tmp_path / "many", part_rows=50, side=pa.table({"obsid": t["obsid"]}))
 
 
 def test_ssobject_permutation_pass(tmp_path, builder):
@@ -754,7 +794,7 @@ def test_ssobject_permutation_fail(tmp_path, builder):
 
 def test_ssobject_permutation_dia(tmp_path, builder):
     ss = _many(tmp_path)
-    dia = write(pq.read_table(ss, columns=["obsid"]), tmp_path / "dia.parquet")
+    dia = write(V.SSObs(ss).read(["obsid"]), tmp_path / "dia.parquet")
     args = ["--mode", "sorted", "--dia-first"]
     assert V.check_ssobject_permutation(ss, dia, "m", cmd=builder, extra_args=args).ok
     rep = V.check_ssobject_permutation(ss, dia, "m", cmd=builder, extra_args=args, permute_dia=True,
@@ -808,3 +848,209 @@ def test_diff_tables():
     b = pa.table({"ssObjectId": [1, 2], "H": pa.array([1.0, 2.0], pa.float32())})
     assert any(line.startswith("H: 1 rows") for line in V.diff_tables(a, b))
     assert V.diff_tables(a, a.slice(1)) == ["rows: 2 vs 1"]
+
+
+# --------------------------------------------------------------------------
+# the partitioned SSObservation: the reader, the writer, and the
+# conformance check across parts
+# --------------------------------------------------------------------------
+
+def test_fixture_parts(good):
+    m = read_manifest(good)
+    assert [p["rows"] for p in m["parts"]] == [2, 2, 2]
+    assert [p["null_ssObjectId"] for p in m["parts"]] == [False, False, True]
+    assert m["sidecar"]["columns"] == ["matchMethod", "midpointMjdTai_flag_degraded"]
+
+
+def test_reader(tmp_path, good):
+    t = table()
+    for path in (good, os.path.join(good, SSOBSERVATION_MANIFEST_FILE)):
+        obs = V.SSObs(path)
+        assert obs.partitioned and len(obs.parts) == 3
+        assert obs.internal == ["matchMethod", "midpointMjdTai_flag_degraded"]
+        assert obs.num_rows == N
+        r = obs.read(["obsid", "matchMethod", "ssObjectId", "nope"])
+        assert r.column_names == ["obsid", "matchMethod", "ssObjectId"]
+        assert r["obsid"].to_pylist() == t["obsid"].to_pylist()
+        assert r["matchMethod"].to_pylist() == _values()["matchMethod"]
+    # with a filter, the sidecar is matched on obsid
+    r = V.SSObs(good).read(["matchMethod", "obsid"], filters=[("ssObjectId", "=", 2)])
+    assert r.to_pylist() == [{"matchMethod": "position", "obsid": "obs002"},
+                             {"matchMethod": "obssubid", "obsid": "obs003"}]
+    # a sidecar in another order: matched on obsid
+    write_ss(t, tmp_path / "shuffled", side=sidecar(t).take([5, 4, 3, 2, 1, 0]))
+    assert V.SSObs(tmp_path / "shuffled").read(["matchMethod"])["matchMethod"].to_pylist() == \
+        _values()["matchMethod"]
+    # a single (pre-rename) file: its own columns, no sidecar
+    single = write(t.append_column("matchMethod", pa.array(_values()["matchMethod"])),
+                   tmp_path / "old.parquet")
+    obs = V.SSObs(single)
+    assert not obs.partitioned and obs.internal == [] and "matchMethod" in obs.column_names
+    assert obs.read(["matchMethod"])["matchMethod"].to_pylist() == _values()["matchMethod"]
+
+
+@pytest.mark.parametrize("sid,part_rows", [
+    ([1, 1, 2, 2, None, None], 2), ([1, 1, 1, 2, 3, 3, 3, 3, 4, None, None, None], 2),
+    ([5] * 7, 3), ([None] * 5, 2), ([], 2), ([1, 2, 3, 4, 5, None], 1), ([1, 2, 3, 4, 5], 10),
+])
+def test_part_cuts(sid, part_rows):
+    assert V.part_cuts(pa.array(sid, pa.int64()), part_rows) == cuts(sid, part_rows)
+
+
+def test_write_partitioned_passes_the_checks(tmp_path):
+    from ssp.delivery_check import check_ssobservation_parts
+    t = table()
+    full = t.append_column("matchMethod", pa.array(_values()["matchMethod"])) \
+            .append_column("midpointMjdTai_flag_degraded", pa.array([True] * N))
+    for k, part_rows in enumerate((1, 2, 3, 100)):
+        out = tmp_path / f"w{k}"
+        m = V.write_partitioned(full, out, part_rows=part_rows, batch_rows=1)
+        assert m["sidecar"]["columns"] == ["matchMethod", "midpointMjdTai_flag_degraded"]
+        assert [(p["rows"]) for p in m["parts"]] == [b - a for a, b, _ in cuts(t["ssObjectId"].to_pylist(),
+                                                                                  part_rows)]
+        assert [r for r in check_ssobservation_parts(out) if not r.ok] == []
+        assert V.check_conformance(str(out)).ok
+        assert V.SSObs(out).read(["obsid"])["obsid"].to_pylist() == t["obsid"].to_pylist()
+
+
+def test_partition_cli(tmp_path, capsys):
+    # an old build: one file, matchMethod in it, a column the schema
+    # lacks, and a column the schema has missing
+    t = table().append_column("matchMethod", pa.array(_values()["matchMethod"]))
+    t = t.append_column("oldColumn", pa.array([1] * N)).drop_columns(["glint_trail"])
+    src = write(t, tmp_path / "SSSource.parquet")
+    out = tmp_path / "parts"
+    assert V.main(["partition", src, str(out), "--part-rows", "2"]) == 0
+    text = capsys.readouterr().out
+    assert "dropped (not in sso_base.yaml): ['oldColumn']" in text
+    assert "missing from the parts (nothing is filled in): ['glint_trail']" in text
+    m = read_manifest(out)
+    assert len(m["parts"]) == 3 and m["sidecar"]["columns"] == ["matchMethod"]
+    obs = V.SSObs(out)
+    assert "oldColumn" not in obs.delivered and "matchMethod" not in obs.delivered
+    assert obs.read(["matchMethod"])["matchMethod"].to_pylist() == _values()["matchMethod"]
+    f = failed(V.check_conformance(str(out)))
+    assert "column names and order" in f and "partitioning: part integrity" not in f
+
+
+def test_conformance_single_file_is_not_partitioned(tmp_path):
+    single = write(table(), tmp_path / "ssobservation.parquet")
+    f = failed(V.check_conformance(single))
+    assert "partitioned (parts, manifest, sidecar)" in f
+
+
+def test_conformance_partitioning_faults(tmp_path, good):
+    import shutil
+    shutil.copy(os.path.join(good, PART_FILE_FORMAT.format(0)),
+                os.path.join(good, PART_FILE_FORMAT.format(7)))
+    assert "partitioning: part files" in failed(V.check_conformance(good))
+    os.remove(os.path.join(good, PART_FILE_FORMAT.format(7)))
+    assert V.check_conformance(good).ok
+    os.remove(os.path.join(good, SIDECAR_FILE))
+    f = failed(V.check_conformance(good))
+    assert "partitioning: sidecar" in f
+
+
+def test_conformance_per_part(tmp_path):
+    # one part with a different type: the part is named
+    p = write_ss(table(), tmp_path / "ss")
+    f1 = os.path.join(p, PART_FILE_FORMAT.format(1))
+    t = pq.read_table(f1)
+    t = t.set_column(NAMES.index("detector"), "detector", t["detector"].cast(pa.int32()))
+    pq.write_table(t, f1, compression="zstd")
+    rep = V.check_conformance(p)
+    assert "Arrow types match the Felis datatypes" in failed(rep)
+    assert "SSObservation.part0001.parquet: detector: int32" in rep.text()
+    assert "partitioning: part schemas" in failed(rep)
+    # one part not zstd: the part is named
+    p = write_ss(table(), tmp_path / "ss2")
+    f2 = os.path.join(p, PART_FILE_FORMAT.format(2))
+    pq.write_table(pq.read_table(f2), f2, compression="snappy")
+    rep = V.check_conformance(p)
+    assert "zstd compression" in failed(rep)
+    assert "SNAPPY (SSObservation.part0002.parquet)" in rep.text()
+
+
+def test_conformance_across_parts(tmp_path):
+    # obsid duplicated across two parts (unique within each)
+    d = _values()
+    d["obsid"][4] = d["obsid"][0]
+    f = _conf(tmp_path, table(d))
+    assert {"obsid unique", "partitioning: primary key across parts"} <= f
+    # rows out of order across a part boundary only
+    t = table()
+    t = t.set_column(NAMES.index("midpointMjdTai"), "midpointMjdTai",
+                     pa.array([61000.1, 61000.2, 61000.3, 61000.4, 61000.6, 61000.5]))
+    f = _conf(tmp_path, t, part_rows=2, splits=[(0, 2, False), (2, 4, False), (4, 5, True), (5, 6, True)])
+    assert "sort order" in f
+
+
+def test_regression_reference_partitioned(tmp_path, good):
+    # the reference may be a partitioned SSObservation too
+    assert V.check_regression(good, good).ok
+    assert V.main(["regression", good, os.path.join(good, SSOBSERVATION_MANIFEST_FILE)]) == 0
+
+
+def test_mock_writes_partitioned(tmp_path, good):
+    t = table()
+    dia = dia_from(t)
+    dia_p = write(dia, tmp_path / "dia.parquet")
+    obs_p = write(_obs_sbn(t), tmp_path / "obs.parquet")
+    out = tmp_path / "mock"
+    assert V.main(["mock", good, dia_p, obs_p, str(out), "--part-rows", "2"]) == 0
+    m = read_manifest(out)
+    assert len(m["parts"]) == 3
+    assert m["sidecar"]["columns"] == ["matchMethod", "midpointMjdTai_flag_degraded"]
+    rep = V.check_conformance(str(out))
+    assert not [n for n in rep.failed if n.startswith("partitioning")], rep.text()
+    # the internal columns come from dia_sources, into the sidecar
+    side = pq.read_table(out / SIDECAR_FILE)
+    want = dict(zip(_values()["obsid"], _values()["matchMethod"]))
+    assert [want[o] for o in side["obsid"].to_pylist()] == side["matchMethod"].to_pylist()
+    # the manifest names the parts in order; a manifest edit is caught
+    m["parts"][0]["md5"] = "0" * 32
+    write_manifest(out, m)
+    assert "partitioning: part integrity" in failed(V.check_conformance(str(out)))
+
+
+# --------------------------------------------------------------------------
+# review round 1: the internal columns in `copied`; the empty table
+# --------------------------------------------------------------------------
+
+INTERNAL_EQUAL = "internal columns equal (matchMethod, midpointMjdTai_flag_degraded)"
+
+
+def test_copied_compares_internal_columns(tmp_path, good):
+    dia = write(dia_from(table()), tmp_path / "dia.parquet")
+    rep = V.check_copied(good, dia)
+    assert INTERNAL_EQUAL in {n for n, _ in rep.results} and rep.ok, rep.text()
+    # a flipped flag in the sidecar
+    t = table()
+    side = sidecar(t)
+    side = side.set_column(2, "midpointMjdTai_flag_degraded", pa.array([True] + [False] * (N - 1)))
+    bad = write_ss(t, tmp_path / "flag", side=side)
+    rep = V.check_copied(bad, dia)
+    assert failed(rep) == {INTERNAL_EQUAL}
+    assert "midpointMjdTai_flag_degraded: 1 rows" in rep.text()
+    # a wrong matchMethod in the sidecar
+    bad = write_ss(t, tmp_path / "mm", side=sidecar(t, match={**MATCH, "obs003": "position"}))
+    assert failed(V.check_copied(bad, dia)) == {INTERNAL_EQUAL}
+
+
+def test_copied_internal_column_missing_from_dia(tmp_path, good):
+    # dia_sources with the shutter columns but without the flag: a FAIL
+    dia = write(dia_from(table()).drop_columns(["midpointMjdTai_flag_degraded"]), tmp_path / "d.parquet")
+    assert "internal column midpointMjdTai_flag_degraded in dia_sources" in failed(V.check_copied(good, dia))
+    # a pre-S1 dia_sources (no shutter columns at all): not compared
+    d = dia_from(table()).drop_columns(["midpointMjdTai_flag_degraded", "midpointMjdTai_flag"])
+    rep = V.check_copied(good, write(d, tmp_path / "d2.parquet"))
+    assert "pre-S1 extractor" in rep.text()
+    assert "internal column midpointMjdTai_flag_degraded in dia_sources" not in failed(rep)
+
+
+def test_conformance_empty_table(tmp_path):
+    t = table().slice(0, 0)
+    p = write_ss(t, tmp_path / "empty", side=sidecar(t))
+    rep = V.check_conformance(p)
+    assert "SSOBSERVATION_DICTIONARY columns dictionary-encoded" not in failed(rep)
+    assert not [n for n in rep.failed if n.startswith("partitioning")], rep.text()
