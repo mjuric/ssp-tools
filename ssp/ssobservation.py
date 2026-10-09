@@ -45,7 +45,7 @@ from .nearbysso import propagate as _propagate
 from . import ssobservation_ellipse as _ellipse
 from .delivery_contract import SHUTTER_INPUT_COLUMNS
 from .ssobservation_contract import (
-    ELLIPSE_COLUMNS, ID_SPLIT, MANIFEST_FORMAT_VERSION, MATCH_METHODS, PART_FILE_FORMAT, PART_GLOB,
+    ELLIPSE_COLUMNS, ID_SPLIT, MANIFEST_FORMAT_VERSION, MATCH_METHODS, PART_FILE_FORMAT,
     PART_ROWS_DEFAULT, SHUTTER_INTERNAL, SIDECAR_FILE, SIDECAR_KEY, SSOBSERVATION_DICTIONARY,
     SSOBSERVATION_INTERNAL_DEFAULT, SSOBSERVATION_INTERNAL_DTYPE, SSOBSERVATION_INTERNAL_NONNULL,
     SSOBSERVATION_MANIFEST_FILE, SSOBSERVATION_NONNULL, SSOBSERVATION_SORT, VIEW_DROPPED,
@@ -656,7 +656,11 @@ def _file_entry(path):
 
 def source_commit():
     """``git rev-parse HEAD`` of the source tree this module runs from, or
-    None where it isn't a git checkout."""
+    None where it isn't the root of a git checkout (REPO_ROOT/.git, a
+    directory, or a file in a worktree): an installed copy inside some
+    other checkout doesn't report that checkout's commit."""
+    if not (REPO_ROOT / ".git").exists():
+        return None
     try:
         r = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], capture_output=True,
                            text=True, timeout=30)
@@ -676,16 +680,34 @@ def schema_md5():
 def write_partitioned(table, sidecar, output_dir, part_rows=PART_ROWS_DEFAULT):
     """Write the SSObservation ``table`` (rows in SSOBSERVATION_SORT order)
     to ``output_dir`` as parts (part_bounds), then the ``sidecar`` (obsid
-    and the internal columns, same rows), then the manifest, last. Earlier
-    parts and manifest there are removed first. Returns the manifest."""
+    and the internal columns, same rows), then the manifest, last.
+
+    Refuses (ValueError) a sidecar whose obsid sequence isn't the table's,
+    and a table whose ssObjectId isn't non-decreasing with NULLs last.
+    Every file in ``output_dir`` named SSObservation* or ssobservation*
+    (any case) is removed first, the manifest before the rest, so that
+    the directory holds only this build's files, and a write that fails
+    part way leaves no manifest. Returns the manifest."""
     if sidecar.num_rows != table.num_rows:
         raise ValueError(f"sidecar has {sidecar.num_rows:,} rows, SSObservation {table.num_rows:,}")
+    if not sidecar.column_names or sidecar.column_names[0] != SIDECAR_KEY:
+        raise ValueError(f"the sidecar's first column must be {SIDECAR_KEY}, not {sidecar.column_names[:1]}")
+    if not sidecar[SIDECAR_KEY].equals(table[SIDECAR_KEY]):
+        raise ValueError(f"the sidecar's {SIDECAR_KEY} sequence differs from SSObservation's")
+    ids = table["ssObjectId"].combine_chunks()
+    n_ranged = len(ids) - ids.null_count
+    if ids.slice(0, n_ranged).null_count:
+        raise ValueError("ssObjectId: NULL rows are not last")
+    v = ids.slice(0, n_ranged).to_numpy(zero_copy_only=False)
+    if n_ranged > 1 and not np.all(v[1:] >= v[:-1]):
+        raise ValueError("ssObjectId is not in ascending order")
+
     out = Path(output_dir)
-    # (the manifest first: a run that fails part way leaves no manifest)
-    for p in [out / SSOBSERVATION_MANIFEST_FILE, *sorted(out.glob(PART_GLOB))]:
+    stale = sorted(p for p in out.iterdir() if p.name.lower().startswith("ssobservation") and not p.is_dir())
+    stale.sort(key=lambda p: p.name != SSOBSERVATION_MANIFEST_FILE)   # (the manifest first)
+    for p in stale:
         p.unlink(missing_ok=True)
 
-    ids = table["ssObjectId"].combine_chunks()
     parts = []
     for k, (s, e) in enumerate(part_bounds(ids, part_rows)):
         name = PART_FILE_FORMAT.format(k)
@@ -768,17 +790,19 @@ def shutter_corrected(dia_present):
     return bool(have)
 
 
-def _dia_read_columns(dia_present):
+def _dia_read_columns(dia_present, match_method=True):
     """The dia_sources.parquet columns the build copies (block 1, 3 and 4),
     whether matchMethod is among them, and whether the times are
     shutter-corrected (shutter_corrected); raises ValueError if some are
-    missing."""
+    missing. Without ``match_method`` (matchMethod not produced), neither
+    matchMethod nor the match and obssubid it is derived from are needed."""
     has_match_method = "matchMethod" in dia_present
     corrected = shutter_corrected(dia_present)
     need = (list(LINK_COLUMNS) + list(MEASURED_ON_COLUMNS) + ["diaSourceId", "parentId"]
             + [c for c in MEASUREMENT_COLUMNS if corrected or c not in SHUTTER_FLAGS]
-            + (["midpointMjdTai_flag_degraded"] if corrected else [])
-            + (["matchMethod"] if has_match_method else ["match", "obssubid"]))
+            + (["midpointMjdTai_flag_degraded"] if corrected else []))
+    if match_method:
+        need += ["matchMethod"] if has_match_method else ["match", "obssubid"]
     missing = [c for c in need + ["sep_mas", "dt_ms"] if c not in dia_present]
     if missing:
         raise ValueError(f"dia_sources.parquet lacks {missing}: SSObservation is built from the output of "
@@ -875,12 +899,11 @@ def build_ssobservation(input_dir, output_dir, max_objects=None, dia_sample_frac
     dia_path = f"{input_dir}/dia_sources.parquet"
     dia_file = pq.ParquetFile(dia_path)
     dia_present = dia_file.schema_arrow.names
-    copy_columns, has_match_method, corrected = _dia_read_columns(set(dia_present))
+    copy_columns, has_match_method, corrected = _dia_read_columns(
+        set(dia_present), match_method="matchMethod" in internal_columns)
     unexpected = sorted(set(dia_present) - set(_NAMES) - set(DIA_DROPPED) - set(copy_columns))
     # (the columns that may be internal are produced only when configured)
     copy_columns = [c for c in copy_columns if c not in SSOBSERVATION_INTERNAL_DTYPE or c in internal_columns]
-    if "matchMethod" not in internal_columns:
-        copy_columns = [c for c in copy_columns if c not in ("match", "obssubid")]
     if unexpected:
         print(f"WARNING: dia_sources.parquet columns not in SSObservation, dropped: {unexpected}",
               file=sys.stderr)

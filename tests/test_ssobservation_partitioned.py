@@ -228,12 +228,80 @@ def test_empty_table(tmp_path, offline):  # noqa: F811
     assert pq.read_table(out / SIDECAR_FILE).num_rows == 0
 
 
-def test_rebuild_removes_stale_parts(tmp_path, offline):  # noqa: F811
+def test_rebuild_removes_stale_files(tmp_path, offline):  # noqa: F811
     _built(tmp_path, part_rows=1)
+    stale = ["ssobservation.parquet", "SSObservation.manifest.json.tmp", "SSObservation.part0099.parquet",
+             "SSOBSERVATION.notes.txt", "ssObservation_internal.old.parquet"]
+    for name in stale:
+        (tmp_path / name).write_text("stale")
+    (tmp_path / "ssobservation_dir").mkdir()                 # (a directory is left alone)
+    (tmp_path / "other.parquet").write_text("kept")
+    old_sidecar = (tmp_path / SIDECAR_FILE).stat().st_mtime_ns
     m = _built(tmp_path, part_rows=10**9)
-    names = sorted(f.name for f in tmp_path.iterdir()
-                   if f.name.lower().startswith(("ssobservation", "ssobservation_internal")))
-    assert names == sorted([p["file"] for p in m["parts"]] + [SIDECAR_FILE, SSOBSERVATION_MANIFEST_FILE])
+    names = sorted(f.name for f in tmp_path.iterdir() if f.name.lower().startswith("ssobservation"))
+    assert names == sorted([p["file"] for p in m["parts"]]
+                           + [SIDECAR_FILE, SSOBSERVATION_MANIFEST_FILE, "ssobservation_dir"])
+    assert len(m["parts"]) == 2
+    assert (tmp_path / "other.parquet").read_text() == "kept"
+    assert (tmp_path / SIDECAR_FILE).stat().st_mtime_ns >= old_sidecar
+
+
+def test_failed_rebuild_leaves_no_manifest(tmp_path, offline, monkeypatch):  # noqa: F811
+    _built(tmp_path, part_rows=1)
+    assert (tmp_path / SSOBSERVATION_MANIFEST_FILE).exists() and (tmp_path / SIDECAR_FILE).exists()
+    calls = []
+    orig = ssobservation.write_ssobservation
+
+    def failing(table, path):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        orig(table, path)
+
+    monkeypatch.setattr(ssobservation, "write_ssobservation", failing)
+    with pytest.raises(OSError, match="disk full"):
+        build_ssobservation(tmp_path, tmp_path, part_rows=1)
+    assert not (tmp_path / SSOBSERVATION_MANIFEST_FILE).exists()
+    assert not (tmp_path / SIDECAR_FILE).exists()
+    assert sorted(f.name for f in tmp_path.glob("SSObservation*")) == [PART_FILE_FORMAT.format(0)]
+
+
+def _built_table(tmp_path):
+    src = tmp_path / "src"
+    _built(src, part_rows=10**9)
+    return ssobservation_parts.read_ssobservation(src), pq.read_table(src / SIDECAR_FILE)
+
+
+def _refused(tmp_path, t, side, match):
+    out = tmp_path / "out"
+    out.mkdir(exist_ok=True)
+    (out / SSOBSERVATION_MANIFEST_FILE).write_text("{}")
+    with pytest.raises(ValueError, match=match):
+        write_partitioned(t, side, out, part_rows=2)
+    # (refused before anything is removed or written)
+    assert (out / SSOBSERVATION_MANIFEST_FILE).read_text() == "{}"
+    assert not list(out.glob("SSObservation.part*"))
+
+
+def test_write_refuses_mismatched_sidecar(tmp_path, offline):  # noqa: F811
+    t, side = _built_table(tmp_path)
+    _refused(tmp_path, t, side.slice(1), "sidecar has 13 rows")
+    perm = list(range(1, side.num_rows)) + [0]
+    _refused(tmp_path, t, side.take(perm), "sequence differs")
+    swapped = side.set_column(0, SIDECAR_KEY, pa.array(side[SIDECAR_KEY].to_pylist()[::-1]))
+    _refused(tmp_path, t, swapped, "sequence differs")
+    _refused(tmp_path, t, side.select(side.column_names[1:] + [SIDECAR_KEY]), "first column")
+
+
+def test_write_refuses_unsorted_ssobjectid(tmp_path, offline):  # noqa: F811
+    t, side = _built_table(tmp_path)
+    n_ranged = N_ROWS - N_NULL
+    # the last object's rows first: ssObjectId descends
+    perm = list(range(n_ranged - 1, n_ranged)) + list(range(n_ranged - 1)) + list(range(n_ranged, N_ROWS))
+    _refused(tmp_path, t.take(perm), side.take(perm), "not in ascending order")
+    # a NULL row among the ranged ones
+    perm = [N_ROWS - 1] + list(range(N_ROWS - 1))
+    _refused(tmp_path, t.take(perm), side.take(perm), "NULL rows are not last")
 
 
 # --------------------------------------------------------------------------
@@ -289,6 +357,8 @@ def test_manifest(tmp_path, offline, part_rows, n_ranged):  # noqa: F811
     assert s["rows"] == N_ROWS
     assert s["bytes"] == (tmp_path / SIDECAR_FILE).stat().st_size
     assert s["md5"] == _md5(tmp_path / SIDECAR_FILE)
+    md = pq.ParquetFile(tmp_path / SIDECAR_FILE).metadata
+    assert all(md.row_group(0).column(k).compression == "ZSTD" for k in range(md.num_columns))
 
 
 def test_manifest_without_source_tree(tmp_path, offline, monkeypatch):  # noqa: F811
@@ -296,6 +366,28 @@ def test_manifest_without_source_tree(tmp_path, offline, monkeypatch):  # noqa: 
     m = _built(tmp_path / "b")
     assert m["schema"]["md5"] is None
     assert m["ssp_tools_commit"] is None
+
+
+def test_source_commit(tmp_path, monkeypatch):
+    def git(*args, cwd=tmp_path / "repo"):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd,
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    (tmp_path / "repo").mkdir()
+    git("init", "-q")
+    git("commit", "-q", "--allow-empty", "-m", "x")
+    sha = git("rev-parse", "HEAD")
+    (tmp_path / "repo" / "site-packages").mkdir()
+    monkeypatch.setattr(ssobservation, "REPO_ROOT", tmp_path / "repo")
+    assert ssobservation.source_commit() == sha
+    # an installed copy inside another checkout: not that checkout's commit
+    monkeypatch.setattr(ssobservation, "REPO_ROOT", tmp_path / "repo" / "site-packages")
+    assert ssobservation.source_commit() is None
+    # a worktree (.git is a file)
+    git("worktree", "add", "-q", "--detach", str(tmp_path / "wt"))
+    assert (tmp_path / "wt" / ".git").is_file()
+    monkeypatch.setattr(ssobservation, "REPO_ROOT", tmp_path / "wt")
+    assert ssobservation.source_commit() == sha
 
 
 def test_default_part_rows(tmp_path, offline):  # noqa: F811
@@ -362,6 +454,18 @@ def test_internal_columns_not_produced(tmp_path, offline, monkeypatch):  # noqa:
     read.clear()
     build_ssobservation(tmp_path, tmp_path, internal_columns=())
     assert not set(read) & set(SSOBSERVATION_INTERNAL_DTYPE)
+
+
+def test_match_inputs_not_needed_without_match_method(tmp_path, offline):  # noqa: F811
+    # without matchMethod configured, neither it nor match/obssubid (what it
+    # is derived from) is needed in dia_sources.parquet
+    dia, _ = make_inputs(tmp_path)
+    assert "matchMethod" not in dia.column_names
+    pq.write_table(dia.drop_columns(["match", "obssubid"]), tmp_path / "dia_sources.parquet")
+    with pytest.raises(ValueError, match="lacks"):
+        build_ssobservation(tmp_path, tmp_path)
+    m = build_ssobservation(tmp_path, tmp_path, internal_columns=("midpointMjdTai_flag_degraded",))
+    assert m["rows"] == N_ROWS
 
 
 def test_internal_columns_derived_match_method(tmp_path, offline):  # noqa: F811
