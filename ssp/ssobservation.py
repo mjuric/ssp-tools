@@ -12,10 +12,15 @@ geometry columns, computed per object with ASSIST from mpc_orbits.
 
 import argparse
 import contextlib
+import datetime
+import hashlib
 import io
+import json
 import os
+import subprocess
 import sys
 import time
+from pathlib import Path
 
 from astropy.coordinates import (
     SkyCoord,
@@ -40,9 +45,10 @@ from .nearbysso import propagate as _propagate
 from . import ssobservation_ellipse as _ellipse
 from .delivery_contract import SHUTTER_INPUT_COLUMNS
 from .ssobservation_contract import (
-    ELLIPSE_COLUMNS, ID_SPLIT, MATCH_METHODS, SHUTTER_INTERNAL, SIDECAR_FILE, SIDECAR_KEY,
-    SSOBSERVATION_DICTIONARY, SSOBSERVATION_INTERNAL_DEFAULT, SSOBSERVATION_INTERNAL_DTYPE,
-    SSOBSERVATION_INTERNAL_NONNULL, SSOBSERVATION_NONNULL, SSOBSERVATION_SORT, VIEW_DROPPED,
+    ELLIPSE_COLUMNS, ID_SPLIT, MANIFEST_FORMAT_VERSION, MATCH_METHODS, PART_FILE_FORMAT, PART_GLOB,
+    PART_ROWS_DEFAULT, SHUTTER_INTERNAL, SIDECAR_FILE, SIDECAR_KEY, SSOBSERVATION_DICTIONARY,
+    SSOBSERVATION_INTERNAL_DEFAULT, SSOBSERVATION_INTERNAL_DTYPE, SSOBSERVATION_INTERNAL_NONNULL,
+    SSOBSERVATION_MANIFEST_FILE, SSOBSERVATION_NONNULL, SSOBSERVATION_SORT, VIEW_DROPPED,
     SSObservationDtype,
 )
 
@@ -441,7 +447,7 @@ def compute_ephemerides(sss, obs_state, dia_eph, mpcorb, workers=1, chunk_factor
 
 
 # --------------------------------------------------------------------------
-# Writing ssobservation.parquet: casts and checks to the contract's types
+# Writing SSObservation: casts and checks to the contract's types
 # --------------------------------------------------------------------------
 
 def column_dtype(name):
@@ -463,9 +469,9 @@ def arrow_type(name):
 
 
 def ssobservation_schema():
-    """The Arrow schema of ssobservation.parquet: SSObservationDtype's columns,
-    in order, with their arrow_type, non-null exactly for
-    SSOBSERVATION_NONNULL."""
+    """The Arrow schema of the SSObservation (each part):
+    SSObservationDtype's columns, in order, with their arrow_type, non-null
+    exactly for SSOBSERVATION_NONNULL."""
     return pa.schema([pa.field(n, arrow_type(n), nullable=n not in SSOBSERVATION_NONNULL) for n in _NAMES])
 
 
@@ -538,7 +544,7 @@ def ssobservation_table(columns, cast=True):
 
 
 def sort_indices(ssObjectId, midpointMjdTai, obsid):
-    """The row order of ssobservation.parquet (SSOBSERVATION_SORT): ascending,
+    """The row order of the SSObservation (SSOBSERVATION_SORT): ascending,
     NULL ssObjectId last."""
     keys = pa.table(dict(zip(SSOBSERVATION_SORT, (ssObjectId, midpointMjdTai, obsid))))
     # (NULLs last by an explicit key: where null_placement goes differs
@@ -550,10 +556,167 @@ def sort_indices(ssObjectId, midpointMjdTai, obsid):
 
 def write_ssobservation(table, path):
     """Write the SSObservation ``table`` (from ssobservation_table, rows
-    already in sort_indices order) to ``path``, zstd-compressed."""
+    already in sort_indices order), or a part of it, to ``path``,
+    zstd-compressed."""
     if table.schema != ssobservation_schema():
         raise ValueError("not an SSObservation table (see ssobservation_table)")
     pq.write_table(table, path, compression="zstd")
+
+
+# --------------------------------------------------------------------------
+# The internal columns, the parts and the manifest
+# (ssp.ssobservation_contract, "Internal columns and the sidecar" and "The
+# partitioned delivery")
+# --------------------------------------------------------------------------
+
+#: The repository root, when running from a source tree (for the manifest's
+#: schema md5 and commit).
+REPO_ROOT = Path(__file__).resolve().parent.parent
+#: The schema copy ssp/schema_ppdb.py is generated from, relative to REPO_ROOT.
+SCHEMA_FILE = Path("tests/data/sdm_schemas/sso_base.yaml")
+SCHEMA_SOURCE = "lsst/sdm_schemas tickets/DM-55375"
+
+
+def check_internal_columns(internal_columns):
+    """The configured internal columns as a tuple, checked: each in
+    SSOBSERVATION_INTERNAL_DTYPE and not in SSObservationDtype, none
+    repeated. Raises ValueError otherwise."""
+    if isinstance(internal_columns, str):
+        raise ValueError("internal_columns is a sequence of column names, not a string "
+                         "(see parse_internal_columns)")
+    cols = tuple(internal_columns)
+    delivered = [c for c in cols if c in _NAMES]
+    if delivered:
+        raise ValueError(f"internal columns {delivered} are in the delivered SSObservation schema: "
+                         "a column is either delivered or internal, not both")
+    unknown = [c for c in cols if c not in SSOBSERVATION_INTERNAL_DTYPE]
+    if unknown:
+        raise ValueError(f"internal columns {unknown} are not columns the build can make internal "
+                         f"(one of {list(SSOBSERVATION_INTERNAL_DTYPE)})")
+    dup = sorted({c for c in cols if cols.count(c) > 1})
+    if dup:
+        raise ValueError(f"internal columns {dup} given more than once")
+    return cols
+
+
+def parse_internal_columns(text):
+    """``--internal-columns``: comma-separated names; an empty string is
+    none. Not checked (see check_internal_columns)."""
+    return tuple(c.strip() for c in text.split(",")) if text.strip() else ()
+
+
+def sidecar_schema(internal_columns):
+    """The sidecar's Arrow schema: obsid, then ``internal_columns`` in that
+    order, all non-null."""
+    return pa.schema([pa.field(SIDECAR_KEY, arrow_type(SIDECAR_KEY), nullable=False)]
+                     + [pa.field(c, arrow_type(c), nullable=False) for c in internal_columns])
+
+
+def part_bounds(ssObjectId, part_rows):
+    """The parts' row ranges [(start, end), ...] of a table in
+    SSOBSERVATION_SORT order whose ssObjectId column is ``ssObjectId`` (an
+    Arrow array, NULLs last), as the contract cuts them: a ranged part
+    closes at the first object boundary at or after ``part_rows`` rows; the
+    NULL rows follow in parts of ``part_rows`` rows; an empty table is one
+    empty part."""
+    if part_rows < 1:
+        raise ValueError(f"part_rows must be at least 1, not {part_rows}")
+    n = len(ssObjectId)
+    if n == 0:
+        return [(0, 0)]
+    n_null = ssObjectId.null_count
+    n_ranged = n - n_null
+    if n_null and ssObjectId.slice(0, n_ranged).null_count:
+        raise ValueError("ssObjectId: NULL rows are not last")
+    ids = ssObjectId.slice(0, n_ranged).to_numpy(zero_copy_only=False)
+    # (the row after each object's last row, ascending; ends with n_ranged)
+    ends = np.append(np.flatnonzero(ids[1:] != ids[:-1]) + 1, n_ranged)
+    bounds = []
+    start = 0
+    while start < n_ranged:
+        end = int(ends[np.searchsorted(ends, start + part_rows, side="left")]) \
+            if start + part_rows < n_ranged else n_ranged
+        bounds.append((start, end))
+        start = end
+    bounds += [(s, min(s + part_rows, n)) for s in range(n_ranged, n, part_rows)]
+    return bounds
+
+
+def _md5(path, bufsize=1 << 24):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while chunk := f.read(bufsize):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _file_entry(path):
+    return {"bytes": os.path.getsize(path), "md5": _md5(path)}
+
+
+def source_commit():
+    """``git rev-parse HEAD`` of the source tree this module runs from, or
+    None where it isn't a git checkout."""
+    try:
+        r = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], capture_output=True,
+                           text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = r.stdout.strip()
+    return sha if r.returncode == 0 and sha else None
+
+
+def schema_md5():
+    """The md5 of the sso_base.yaml copy (SCHEMA_FILE) in the source tree,
+    or None where it isn't there."""
+    p = REPO_ROOT / SCHEMA_FILE
+    return _md5(p) if p.is_file() else None
+
+
+def write_partitioned(table, sidecar, output_dir, part_rows=PART_ROWS_DEFAULT):
+    """Write the SSObservation ``table`` (rows in SSOBSERVATION_SORT order)
+    to ``output_dir`` as parts (part_bounds), then the ``sidecar`` (obsid
+    and the internal columns, same rows), then the manifest, last. Earlier
+    parts and manifest there are removed first. Returns the manifest."""
+    if sidecar.num_rows != table.num_rows:
+        raise ValueError(f"sidecar has {sidecar.num_rows:,} rows, SSObservation {table.num_rows:,}")
+    out = Path(output_dir)
+    # (the manifest first: a run that fails part way leaves no manifest)
+    for p in [out / SSOBSERVATION_MANIFEST_FILE, *sorted(out.glob(PART_GLOB))]:
+        p.unlink(missing_ok=True)
+
+    ids = table["ssObjectId"].combine_chunks()
+    parts = []
+    for k, (s, e) in enumerate(part_bounds(ids, part_rows)):
+        name = PART_FILE_FORMAT.format(k)
+        write_ssobservation(table.slice(s, e - s), out / name)
+        sl = ids.slice(s, e - s)
+        null = bool(e > s and sl.null_count)
+        parts.append({"file": name, "rows": e - s,
+                      "ssObjectId_min": None if null or e == s else sl[0].as_py(),
+                      "ssObjectId_max": None if null or e == s else sl[-1].as_py(),
+                      "null_ssObjectId": null, **_file_entry(out / name)})
+
+    pq.write_table(sidecar, out / SIDECAR_FILE, compression="zstd")
+    manifest = {
+        "table": "SSObservation",
+        "format_version": MANIFEST_FORMAT_VERSION,
+        "schema": {"source": SCHEMA_SOURCE, "file": SCHEMA_FILE.name, "md5": schema_md5()},
+        "ssp_tools_commit": source_commit(),
+        "created_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "partition_key": "ssObjectId",
+        "sort": list(SSOBSERVATION_SORT),
+        "part_rows": part_rows,
+        "rows": table.num_rows,
+        "parts": parts,
+        "sidecar": {"file": SIDECAR_FILE, "key": SIDECAR_KEY,
+                    "columns": [c for c in sidecar.column_names if c != SIDECAR_KEY],
+                    "rows": sidecar.num_rows, **_file_entry(out / SIDECAR_FILE)},
+    }
+    tmp = out / (SSOBSERVATION_MANIFEST_FILE + ".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2) + "\n")
+    tmp.replace(out / SSOBSERVATION_MANIFEST_FILE)
+    return manifest
 
 
 def _derive_match_method(match, obssubid):
@@ -686,22 +849,38 @@ def observer_states(t_mjd_tai, t_visit=None):
 # --------------------------------------------------------------------------
 
 def build_ssobservation(input_dir, output_dir, max_objects=None, dia_sample_frac=1.0, seed=42,
-                   workers=1, chunk_factor=8):
-    """Build ``{output_dir}/ssobservation.parquet`` (and the sidecar of
-    internal columns, ``{output_dir}/SIDECAR_FILE``) from the dia_sources (from
+                        workers=1, chunk_factor=8, part_rows=PART_ROWS_DEFAULT,
+                        internal_columns=SSOBSERVATION_INTERNAL_DEFAULT):
+    """Build the SSObservation in ``output_dir`` from the dia_sources (from
     extract-submitted-sources), MPC observation (obs_sbn), identification
-    and orbit tables in ``input_dir``.
+    and orbit tables in ``input_dir``: its parts (PART_FILE_FORMAT, cut
+    every ``part_rows`` rows at object boundaries), the sidecar of the
+    ``internal_columns`` (SIDECAR_FILE) and the manifest
+    (SSOBSERVATION_MANIFEST_FILE); see write_partitioned. Returns the
+    manifest.
+
+    ``internal_columns`` (each in SSOBSERVATION_INTERNAL_DTYPE, none in
+    SSObservationDtype) go to the sidecar, in that order; the other
+    columns of SSOBSERVATION_INTERNAL_DTYPE aren't produced.
 
     ``max_objects`` and ``dia_sample_frac`` subsample the inputs, for
     testing. ``workers`` > 1 computes the ephemerides in that many forked
     processes (see compute_ephemerides); the output is identical.
     """
     t_start = time.perf_counter()
+    internal_columns = check_internal_columns(internal_columns)
+    if not isinstance(part_rows, (int, np.integer)) or isinstance(part_rows, bool) or part_rows < 1:
+        raise ValueError(f"part_rows must be an integer of at least 1, not {part_rows!r}")
+    part_rows = int(part_rows)
     dia_path = f"{input_dir}/dia_sources.parquet"
     dia_file = pq.ParquetFile(dia_path)
     dia_present = dia_file.schema_arrow.names
     copy_columns, has_match_method, corrected = _dia_read_columns(set(dia_present))
     unexpected = sorted(set(dia_present) - set(_NAMES) - set(DIA_DROPPED) - set(copy_columns))
+    # (the columns that may be internal are produced only when configured)
+    copy_columns = [c for c in copy_columns if c not in SSOBSERVATION_INTERNAL_DTYPE or c in internal_columns]
+    if "matchMethod" not in internal_columns:
+        copy_columns = [c for c in copy_columns if c not in ("match", "obssubid")]
     if unexpected:
         print(f"WARNING: dia_sources.parquet columns not in SSObservation, dropped: {unexpected}",
               file=sys.stderr)
@@ -992,7 +1171,9 @@ def build_ssobservation(input_dir, output_dir, max_objects=None, dia_sample_frac
             if name in SSObservationDtype.names or name in SSOBSERVATION_INTERNAL_DTYPE:
                 columns[name] = cast_column(name, arr)
         del tbl
-    if has_match_method:
+    if "matchMethod" not in internal_columns:
+        pass
+    elif has_match_method:
         _check_values("matchMethod", columns["matchMethod"], MATCH_METHODS)
     else:
         print("dia_sources.parquet has no matchMethod (it predates it); "
@@ -1004,15 +1185,16 @@ def build_ssobservation(input_dir, output_dir, max_objects=None, dia_sample_frac
               "midpointMjdTai is the visit midpoint, midpointMjdTai_flag set on every row")
         n = len(src)
         columns[SHUTTER_FLAGS[0]] = cast_column(SHUTTER_FLAGS[0], pa.array(np.ones(n, dtype=bool)))
-        columns[SHUTTER_FLAGS[1]] = cast_column(SHUTTER_FLAGS[1], pa.array(np.zeros(n, dtype=bool)))
+        if SHUTTER_FLAGS[1] in internal_columns:
+            columns[SHUTTER_FLAGS[1]] = cast_column(SHUTTER_FLAGS[1], pa.array(np.zeros(n, dtype=bool)))
     for name, arr in _split_ids(pending["measuredOn"], pending["diaSourceId"], pending["parentId"]).items():
         columns[name] = cast_column(name, arr)
     del pending
 
     # The internal columns are not in the delivered table: they go to the
     # sidecar, with obsid, in the same row order.
-    sidecar = pa.table({SIDECAR_KEY: columns[SIDECAR_KEY],
-                        **{name: columns.pop(name) for name in SSOBSERVATION_INTERNAL_DEFAULT}})
+    sidecar = pa.Table.from_arrays([columns[SIDECAR_KEY], *(columns.pop(c) for c in internal_columns)],
+                                   schema=sidecar_schema(internal_columns))
     table = ssobservation_table(columns, cast=False)   # (each was cast above)
     del columns
     print(f"[{time.perf_counter() - t_start:.1f} s] assembled", flush=True)
@@ -1025,11 +1207,14 @@ def build_ssobservation(input_dir, output_dir, max_objects=None, dia_sample_frac
     if max_objects is None and dia_sample_frac >= 1.0:
         assert table.num_rows == n_dia
 
-    path = f"{output_dir}/ssobservation.parquet"
-    write_ssobservation(table, path)
-    pq.write_table(sidecar, f"{output_dir}/{SIDECAR_FILE}", compression="zstd")
-    print(f"Wrote {path}: {table.num_rows:,} rows, {table.num_columns} columns "
-          f"(ephemerides {t_eph:.1f} s, total {time.perf_counter() - t_start:.1f} s).")
+    manifest = write_partitioned(table, sidecar, output_dir, part_rows=part_rows)
+    n_null_parts = sum(p["null_ssObjectId"] for p in manifest["parts"])
+    print(f"Wrote {len(manifest['parts'])} SSObservation parts ({n_null_parts} of NULL ssObjectId), "
+          f"{SIDECAR_FILE} ({', '.join(internal_columns) or 'obsid only'}) and "
+          f"{SSOBSERVATION_MANIFEST_FILE} to {output_dir}: {table.num_rows:,} rows, "
+          f"{table.num_columns} columns (ephemerides {t_eph:.1f} s, "
+          f"total {time.perf_counter() - t_start:.1f} s).")
+    return manifest
 
 
 def main():
@@ -1039,9 +1224,11 @@ def main():
         epilog=(
             "Reads dia_sources (from extract-submitted-sources), obs_sbn, "
             "numbered_identifications, current_identifications and mpc_orbits "
-            ".parquet files from the input directory and writes ssobservation.parquet "
+            ".parquet files from the input directory and writes the SSObservation "
             "(one row per dia_sources row, with the columns of the PPDB SSObservation "
-            "table) to the output directory. The ASSIST ephemeris files are taken "
+            "table) to the output directory as parts, SSObservation.partNNNN.parquet, "
+            "partitioned by ssObjectId, with " + SSOBSERVATION_MANIFEST_FILE + " and the sidecar of "
+            "internal columns, " + SIDECAR_FILE + ". The ASSIST ephemeris files are taken "
             "from the SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS environment variables."
         ),
     )
@@ -1078,7 +1265,20 @@ def main():
             "chunks per worker, to balance the load (default: %(default)s)."
         ),
     )
+    parser.add_argument(
+        "--part-rows", type=int, default=PART_ROWS_DEFAULT,
+        help=("Close a part at the first object boundary at or after this many rows; NULL-ssObjectId "
+              "rows are cut every this many rows (default: %(default)s)"),
+    )
+    parser.add_argument(
+        "--internal-columns", default=",".join(SSOBSERVATION_INTERNAL_DEFAULT),
+        help=("Comma-separated columns written to the sidecar instead of the delivered table, from "
+              f"{', '.join(SSOBSERVATION_INTERNAL_DTYPE)}; an empty string means none "
+              "(default: %(default)s)"),
+    )
     args = parser.parse_args()
+    if args.part_rows < 1:
+        parser.error("--part-rows must be at least 1")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     if args.chunk_factor < 1:
@@ -1088,7 +1288,8 @@ def main():
         build_ssobservation(
             args.input_dir, args.output_dir,
             max_objects=args.max_objects, dia_sample_frac=args.dia_sample_frac, seed=args.seed,
-            workers=args.workers, chunk_factor=args.chunk_factor,
+            workers=args.workers, chunk_factor=args.chunk_factor, part_rows=args.part_rows,
+            internal_columns=parse_internal_columns(args.internal_columns),
         )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

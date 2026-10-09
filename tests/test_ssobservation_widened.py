@@ -12,7 +12,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
-from ssp import ssobservation
+from ssp import ssobservation, ssobservation_parts
 from ssp.ssobservation import (
     EPHEMERIS_COLUMNS, MEASUREMENT_COLUMNS, along_cross_track, build_ssobservation, cast_column, sort_indices,
     ssobservation_schema, ssobservation_table,
@@ -234,14 +234,13 @@ def offline(monkeypatch):
 
 
 def read_output(path):
-    """ssobservation.parquet in ``path`` with the sidecar's internal columns
-    appended (the sidecar has the same obsid sequence)."""
-    t = pq.read_table(path / "ssobservation.parquet")
+    """The SSObservation built in ``path``, its parts concatenated, with the
+    sidecar's internal columns appended (read through ssp.ssobservation_parts;
+    the sidecar has the same obsid sequence)."""
     side = pq.read_table(path / SIDECAR_FILE)
     assert side.column_names == [SIDECAR_KEY, *SSOBSERVATION_INTERNAL_DEFAULT]
+    t = ssobservation_parts.read_ssobservation(path, internal=True)
     assert side[SIDECAR_KEY].equals(t[SIDECAR_KEY])
-    for c in SSOBSERVATION_INTERNAL_DEFAULT:
-        t = t.append_column(c, side[c])
     return t
 
 
@@ -272,7 +271,8 @@ def _by_obsid(table, obsid):
 
 def test_conformance(tmp_path, offline):
     sss, dia, _ = _build(tmp_path)
-    schema = pq.read_schema(tmp_path / "ssobservation.parquet")
+    assert not (tmp_path / "ssobservation.parquet").exists()
+    schema = ssobservation_parts.parquet_schema(tmp_path)
     assert schema.names == list(SSObservationDtype.names)
     assert schema.equals(ssobservation_schema())
     for f in schema:
@@ -286,7 +286,7 @@ def test_conformance(tmp_path, offline):
             assert f.type == pa.from_numpy_dtype(SSObservationDtype[f.name]), f.name
     for c in SSOBSERVATION_NONNULL:
         assert sss[c].null_count == 0, c
-    md = pq.ParquetFile(tmp_path / "ssobservation.parquet").metadata
+    md = pq.ParquetFile(ssobservation_parts.part_paths(tmp_path)[0]).metadata
     assert md.row_group(0).column(0).compression == "ZSTD"
     # one row per dia_sources row, obsid unique
     assert sss.num_rows == dia.num_rows == len(ROWS)
