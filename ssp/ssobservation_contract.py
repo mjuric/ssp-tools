@@ -102,12 +102,14 @@ SIDECAR_KEY = "obsid"
 # taken in part order. A part is cut from that order:
 #   - a part never splits an ssObjectId: each part's [min, max] range is
 #     disjoint from every other's and the ranges ascend with k;
-#   - a part closes at the first object boundary at or after part_rows
-#     rows (default PART_ROWS_DEFAULT; configurable), so a part has at
-#     least part_rows rows unless it is the last ranged part, and may have
-#     more (one object's rows are never split);
+#   - a ranged part closes at the first object boundary at or after
+#     part_rows rows (default PART_ROWS_DEFAULT; configurable), so a ranged
+#     part has at least part_rows rows unless it is the last ranged part,
+#     and may have more (one object's rows are never split);
 #   - rows with a NULL ssObjectId come after every ranged part, in their own
-#     part(s), cut every part_rows rows (these may split anywhere);
+#     part(s), cut every part_rows rows (these may split anywhere): every
+#     NULL part has exactly part_rows rows except the last, which has
+#     1..part_rows;
 #   - an empty table is one part with no rows (null_ssObjectId false,
 #     range null).
 # Each part has exactly the delivered schema (the columns of
