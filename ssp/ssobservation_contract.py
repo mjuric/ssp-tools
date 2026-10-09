@@ -139,6 +139,45 @@ SSOBSERVATION_MANIFEST_FIELDS = {
 PART_FIELDS = ("file", "rows", "ssObjectId_min", "ssObjectId_max", "null_ssObjectId", "bytes", "md5")
 #: The sidecar entry: columns lists the internal columns (not the key).
 SIDECAR_FIELDS = ("file", "key", "columns", "rows", "bytes", "md5")
+#: The manifest's schema.md5 is the md5 of tests/data/sdm_schemas/sso_base.yaml
+#: (the copy ssp/schema_ppdb.py is generated from), null where the source
+#: tree isn't available; ssp_tools_commit is ``git rev-parse HEAD`` of the
+#: source tree, null where it isn't available.
+
+# --------------------------------------------------------------------------
+# Interfaces between the work packages (W1, W2, W3)
+# --------------------------------------------------------------------------
+#
+# The builder (W1): ssp-build-ssobservation / python -m ssp.ssobservation
+#   writes into --output-dir the parts, SSOBSERVATION_MANIFEST_FILE and
+#   SIDECAR_FILE, under exactly the delivered names, and nothing else named
+#   SSObservation* or ssobservation*. New options:
+#     --part-rows N              (default PART_ROWS_DEFAULT)
+#     --internal-columns A,B,... (default SSOBSERVATION_INTERNAL_DEFAULT;
+#                                 an empty string means none: no column of
+#                                 SSOBSERVATION_INTERNAL_DTYPE is then
+#                                 produced, and the sidecar has only obsid)
+#   build_ssobservation(input_dir, output_dir, ...,
+#                       part_rows=PART_ROWS_DEFAULT,
+#                       internal_columns=SSOBSERVATION_INTERNAL_DEFAULT)
+#   A column in --internal-columns must be in SSOBSERVATION_INTERNAL_DTYPE
+#   (else the build fails before reading the inputs).
+#
+# Reading (everyone but W2's black-box checks): ssp.ssobservation_parts
+#   (read_ssobservation(path, columns=None, filters=None, internal=False),
+#   part_paths, sidecar_path, read_manifest, num_rows), with ``path`` the
+#   directory holding the manifest, or the manifest file.
+#
+# The build (W3): ssp-build-sso / ssp-sso-daily pass --part-rows and
+#   --internal-columns through to the builder (same names and meaning) and
+#   record them in report.json's steps.ssobservation; the step's outputs
+#   (every part, the manifest, the sidecar) go to RUN_DIR/delivery/; SSObject
+#   and NearbySSO read SSObservation through ssp.ssobservation_parts.
+#
+# The checks (W2): bench.ssobservation_validate's subcommands take the
+#   SSObservation directory (or its manifest) wherever they took the
+#   ssobservation.parquet path, and read internal columns from its sidecar;
+#   ssp.delivery_check.check_ssobservation_parts as in delivery_contract.
 
 # --------------------------------------------------------------------------
 # Shutter-motion-corrected times (docs/design/shutter-timing.md)

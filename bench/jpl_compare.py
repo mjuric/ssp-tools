@@ -70,7 +70,7 @@ import numpy as np
 FIXTURE = "/sdf/data/rubin/user/mjuric/nongrav/fixtures/2026-10-01"
 WORK = "/sdf/data/rubin/user/mjuric/nongrav/work/n5"
 CACHE = os.path.join(WORK, "cache")
-SSOBSERVATION = os.path.join(WORK, "ssobservation", "ssobservation.parquet")
+SSOBSERVATION = os.path.join(WORK, "sssource", "sssource.parquet")   # (fixture, pre-rename name)
 
 HORIZONS_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
 SBDB_URL = "https://ssd-api.jpl.nasa.gov/sbdb.api"

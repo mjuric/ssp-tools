@@ -90,7 +90,7 @@ Examples (the 2026-10-01 fixture)::
 
   F=/sdf/data/rubin/user/mjuric/nongrav/fixtures/2026-10-01
   python -m bench.nongrav_validate offsets new/ssobservation.parquet \\
-      $F/ref_gravity/ssobservation.parquet $F/in/mpc_orbits.parquet \\
+      $F/ref_gravity/sssource.parquet $F/in/mpc_orbits.parquet \\
       --objects $F/objects.txt --out offsets.txt
   python -m bench.nongrav_validate uncertainty $F/in/mpc_orbits.parquet \\
       --ssobservation new/ssobservation.parquet --objects $F/objects.txt \\

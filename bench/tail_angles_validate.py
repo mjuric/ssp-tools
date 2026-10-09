@@ -68,7 +68,7 @@ CACHE = os.path.join(WORK, "cache")
 FIXTURE = J.FIXTURE
 #: The fixture's reference SSObservation (midpointMjdTai of each object's
 #: rows).
-REF_SSOBSERVATION = os.path.join(FIXTURE, "ref_gravity", "ssobservation.parquet")
+REF_SSOBSERVATION = os.path.join(FIXTURE, "ref_gravity", "sssource.parquet")   # (fixture, pre-rename name)
 #: Horizons requests allowed for this WP, over all runs.
 BUDGET = 15
 
