@@ -163,3 +163,9 @@ DEADJOE
 
 # Project-specific: local copies of large data files (ASSIST ephemerides, etc.)
 /data/
+
+# Project map (drawn by the project-map agent)
+.project-map/
+
+# Agent worktrees (Claude Code)
+.claude/

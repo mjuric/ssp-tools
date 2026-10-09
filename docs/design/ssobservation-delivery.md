@@ -140,3 +140,64 @@ An end-to-end daily run, with every check, writing a partitioned delivery under 
 | 5 | Feature branch → master | owner approval |
 
 Follow-ups: a GitHub issue for NearbySSO's unassociated predictions (footprint test with a 30″ margin, the detector and an edge distance for unmatched rows, the key (`diaSourceId`, `designation`, `visit`), the option on by default, the σ ≤ 10″ cut).
+
+## Results (2026-10-08)
+
+**What was built.** The plan ran as designed, with three changes:
+- A0 also wrote the sidecar, so the suite stayed green after the two columns left the schema (see A1).
+- The WPs were regrouped by file: W1 the builder, W2 the checks and bench, W3 the build, readers and uploader.
+- `report.json` gained `manifest_md5`, from W3's question.
+
+Merges:
+- A0: `c5b4ed8` (rename and sidecar) and `8ffbf54` (contract, `ssp.ssobservation_parts`).
+- W1: #87. W3: #88. W2: #89.
+- #90: status-'I' rows with a designation (below).
+
+The schema rename is in lsst/sdm_schemas#549 at `27a404c`. The RFC drafts (PR #77) are updated.
+
+**Reviews.**
+- **W1.** The independent review found no correctness bugs:
+  - `part_bounds` matched a brute-force reference on ~370k cases;
+  - builds from the same inputs equal A0's output exactly, with byte-identical parts under every `--internal-columns` setting.
+
+  It did find robustness gaps, all fixed: stale files left by a rebuild, unchecked preconditions in `write_partitioned`, and the commit recorded from an enclosing checkout.
+- **W2.** The independent review found no false passes in the partitioning. It found gaps, all fixed:
+  - `midpointMjdTai_flag_degraded` was no longer compared with the input once it moved to the sidecar;
+  - manifest value types; stray files; crashes on badly typed inputs; the empty table failing conformance.
+
+  80 of 81 mutants are killed; the survivor can't change a result.
+- **W3.** Reviewed by the integrator; one fix round (`manifest_md5`).
+- **Full suite** on the integrated branch: 1175 passed. ruff is at the baseline.
+
+**Equivalence.** On the 2026-10-06 inputs (3,000 objects, 79,511 rows):
+- the parts concatenated equal master's SSSource column for column, minus the two internal columns;
+- the sidecar equals master's values of those columns, matched by `obsid`;
+- SSObject built from the parts is byte-identical to SSObject built from the single file.
+
+**Finding: status-'I' rows with a designation.** The MPC snapshot of 2026-10-08 has 4 `obs_sbn` rows with status 'I' that carry a provid (2015 GF54, from one Rubin submission of 2026-10-07, without a `trksub`).
+- The builder refused them, as master's would have.
+- **Owner decision (2026-10-08):** trust the status. They are kept unidentified (NULL `ssObjectId` and `designation`), with a warning that names them. More than `MAX_DESIGNATED_I_ROWS` (100) still fail the build (#90).
+
+**End-to-end run (A4).**
+- **Command:** `ssp-sso-daily /sdf/data/rubin/user/mjuric/ssobservation-delivery/daily --upload dev --dry-run`.
+- **Inputs:** extracted 2026-10-09 UTC in 1012 s (dia_sources 757 s). That run stopped on the 'I' rows.
+- **The build** was rerun at `ad8ab9c` from the same inputs (`--reuse-inputs ... --stamp 2026-10-09-r2`): deliverable, all 8 checks PASS, build 13.0 min.
+
+  | step | wall | peak RSS |
+  |---|---|---|
+  | mpc | 44 s | 7.3 GB |
+  | ssobservation | 222 s | 14.1 GB |
+  | ssobject | 86 s | 2.9 GB |
+  | nearbysso | 345 s | 11.7 GB |
+  | check | 58 s | 5.3 GB |
+
+- **The delivery,** `/sdf/data/rubin/user/mjuric/ssobservation-delivery/daily/2026-10-09-r2/run/delivery/`:
+  - SSObservation: 8,078,546 rows, 3.24 GB, in 6 parts:
+    - four of ~2.0M rows (0.80 GB each);
+    - a fifth ranged part of 14,564 rows;
+    - one of 63,849 NULL-`ssObjectId` rows.
+  - The manifest, and the sidecar (`matchMethod`, `midpointMjdTai_flag_degraded`; 19 MB).
+  - SSObject 298,117 rows; NearbySSO 1,295,205; mpc_orbits 1,576,334; current_identifications 2,100,962; numbered_identifications 896,611.
+  - The dry-run upload lists the parts, then the manifest, and not the sidecar.
+- **The delivery check** on W1's full build: 14 s and 2.6 GB. Conformance: 37 s and 6.3 GB.
+- **Remainder parts.** With parts closed at the first object boundary after 2M rows, the last ranged part is a small remainder (14,564 rows here). That is by the rules, and harmless for loading.
