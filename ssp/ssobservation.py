@@ -45,7 +45,7 @@ from .nearbysso import propagate as _propagate
 from . import ssobservation_ellipse as _ellipse
 from .delivery_contract import SHUTTER_INPUT_COLUMNS
 from .ssobservation_contract import (
-    ELLIPSE_COLUMNS, ID_SPLIT, MANIFEST_FORMAT_VERSION, MATCH_METHODS, MAX_DESIGNATED_I_ROWS,
+    ELLIPSE_COLUMNS, ID_SPLIT, MANIFEST_FORMAT_VERSION, MATCH_METHODS,
     PART_FILE_FORMAT, PART_ROWS_DEFAULT, SHUTTER_INTERNAL, SIDECAR_FILE, SIDECAR_KEY,
     SSOBSERVATION_DICTIONARY, SSOBSERVATION_INTERNAL_DEFAULT, SSOBSERVATION_INTERNAL_DTYPE,
     SSOBSERVATION_INTERNAL_NONNULL, SSOBSERVATION_MANIFEST_FILE, SSOBSERVATION_NONNULL,
@@ -965,29 +965,21 @@ def build_ssobservation(input_dir, output_dir, max_objects=None, dia_sample_frac
     util.assoc_validate_recorded(dia, assoc)
 
     # obs_sbn also holds observations of unidentified tracklets (status
-    # 'I', no provid nor permid). They are in SSObservation too -- they were
-    # sent to and accepted by the MPC -- with a NULL ssObjectId and
+    # 'I', the Isolated Tracklet File). They are in SSObservation too -- they
+    # were sent to and accepted by the MPC -- with a NULL ssObjectId and
     # designation, and NULL orbit-derived columns. Set them aside while
     # resolving the designations of the rest.
-    undesignated = assoc["mpc_provid"].isna() & assoc["mpc_permid"].isna()
-    # (status 'I', the Isolated Tracklet File, is unidentified by definition:
-    # an I row with a provid or permid is kept as unidentified, the status
-    # trusted; a few are tolerated, see MAX_DESIGNATED_I_ROWS)
-    designated_i = (assoc["mpc_status"] == "I").fillna(False) & ~undesignated
-    n_bad = int(designated_i.sum())
-    if n_bad > MAX_DESIGNATED_I_ROWS:
-        raise ValueError(f"obs_sbn: {n_bad:,} status 'I' rows have a provid or permid "
-                         f"(more than MAX_DESIGNATED_I_ROWS = {MAX_DESIGNATED_I_ROWS})")
-    if n_bad:
-        bad = assoc[designated_i]
-        print(f"WARNING: obs_sbn: {n_bad:,} status 'I' rows have a provid or permid; kept as "
-              f"unidentified (NULL ssObjectId and designation): "
-              f"{sorted(bad['mpc_obsid'].astype(str))[:20]} "
-              f"(designations {sorted(set(bad['mpc_provid'].dropna().astype(str)))[:10]})",
-              file=sys.stderr)
-        # (the designation is taken from the provid below: not for these)
-        assoc.loc[designated_i, ["mpc_provid", "mpc_permid"]] = None
-        undesignated = undesignated | designated_i
+    #
+    # Status 'I' alone makes a row unidentified: when the MPC rescinds an
+    # identification it sets the status to 'I' but may leave the provid (or
+    # permid) filled, and such a designation is not to be used.
+    status_i = (assoc["mpc_status"] == "I").fillna(False)
+    undesignated = status_i | (assoc["mpc_provid"].isna() & assoc["mpc_permid"].isna())
+    n_rescinded = int((status_i & (assoc["mpc_provid"].notna() | assoc["mpc_permid"].notna())).sum())
+    print(f"{int(status_i.sum()):,} status 'I' observations, {n_rescinded:,} of them with a "
+          f"rescinded identification (provid or permid set, not used)")
+    # (the designation is taken from the provid below: not for these)
+    assoc.loc[undesignated, ["mpc_provid", "mpc_permid"]] = None
     und = assoc[undesignated].reset_index(drop=True)
     assoc = assoc[~undesignated].reset_index(drop=True)
 
