@@ -54,3 +54,20 @@ def test_internal_needs_flag(tmp_path):
     _write(tmp_path)
     with pytest.raises(ValueError, match="internal=True"):
         P.read_ssobservation(tmp_path, columns=["matchMethod"])
+
+
+def test_either_layout(tmp_path):
+    """read_table/read_schema take the partitioned SSObservation (its
+    directory or manifest) or a single Parquet file, the same way."""
+    (tmp_path / "d").mkdir()
+    rows = _write(tmp_path / "d")
+    one = tmp_path / "ssobservation.parquet"
+    pq.write_table(P.read_ssobservation(tmp_path / "d"), one)
+    for src in (tmp_path / "d", tmp_path / "d" / SSOBSERVATION_MANIFEST_FILE, one):
+        assert P.is_partitioned(src) is (src != one)
+        assert P.read_schema(src).names == ["obsid", "ssObjectId", "midpointMjdTai"]
+        assert P.read_table(src)["obsid"].to_pylist() == [r[0] for r in rows]
+        t = P.read_table(src, columns=["obsid"], filters=[("ssObjectId", ">=", 5)])
+        assert t.to_pylist() == [{"obsid": "o3"}]
+    with pytest.raises(FileNotFoundError, match="not a partitioned SSObservation"):
+        P.is_partitioned(tmp_path)

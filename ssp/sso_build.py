@@ -5,6 +5,7 @@ See docs/design/sso-delivery.md ("Stage 2, build") and the contract,
 ssp/delivery_contract.py. Files in, files out: no database access.
 
     ssp-build-sso INPUTS_DIR RUN_DIR [--from STEP] [--workers N]
+                  [--part-rows N] [--internal-columns A,B,...]
 
 1. Validate ``INPUTS_DIR/manifest.json``: every input file present, with
    the manifest's row count and md5, and the required columns.
@@ -20,8 +21,14 @@ ssp/delivery_contract.py. Files in, files out: no database access.
      plus SSObservation's ``conformance`` and ``offsets``
      (bench/ssobservation_validate.py), into ``RUN_DIR/checks/``.
 
-   The delivered tables are ``RUN_DIR/delivery/<Table>.parquet``; the
-   builders' other outputs stay in ``RUN_DIR/work/``.
+   The delivered tables are ``RUN_DIR/delivery/<Table>.parquet``, except
+   SSObservation, delivered as parts, ``SSObservation.partNNNN.parquet``,
+   with ``SSObservation.manifest.json`` and the sidecar of internal
+   columns, ``SSObservation_internal.parquet`` (not uploaded; see
+   ssp.ssobservation_contract, "The partitioned delivery"). ``--part-rows``
+   and ``--internal-columns`` go to the ssobservation builder, and are
+   recorded in the report's ``steps.ssobservation``. The builders' other
+   outputs stay in ``RUN_DIR/work/``.
 3. ``RUN_DIR/report.json`` (REPORT_FIELDS), rewritten after every step, so
    a failed run shows how far it got. ``deliverable`` is true only if every
    step and check passed.
@@ -63,7 +70,14 @@ from .delivery_contract import (
     SHUTTER_INPUT_COLUMNS,
     delivery_schema,
 )
-from .ssobservation_contract import SIDECAR_FILE
+from .ssobservation_contract import (
+    PART_GLOB,
+    PART_ROWS_DEFAULT,
+    SIDECAR_FILE,
+    SSOBSERVATION_INTERNAL_DEFAULT,
+    SSOBSERVATION_INTERNAL_DTYPE,
+    SSOBSERVATION_MANIFEST_FILE,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -102,6 +116,83 @@ EXPECTED_CHECKS = (tuple(f"delivery:{t}" for t in DELIVERY_TABLES)
                    + tuple(f"ssobservation:{c}" for c in SSOBSERVATION_CHECKS))
 
 MPC_BATCH_ROWS = 131_072
+
+
+# --------------------------------------------------------------------------
+# The partitioned SSObservation (ssp.ssobservation_contract, "The partitioned
+# delivery")
+# --------------------------------------------------------------------------
+
+#: The delivered table that is parts, a manifest and a sidecar rather than
+#: one <Table>.parquet.
+PARTITIONED = "SSObservation"
+
+
+def parse_internal_columns(value):
+    """The internal columns of ``--internal-columns``: a comma-separated
+    string (empty: none) or a sequence; None gives the default,
+    SSOBSERVATION_INTERNAL_DEFAULT. Raises ValueError for a column that
+    cannot be internal (not in SSOBSERVATION_INTERNAL_DTYPE) or a repeat."""
+    if value is None:
+        return list(SSOBSERVATION_INTERNAL_DEFAULT)
+    if isinstance(value, str):
+        cols = [c.strip() for c in value.split(",") if c.strip()]
+    else:
+        cols = list(value)
+    bad = [c for c in cols if c not in SSOBSERVATION_INTERNAL_DTYPE]
+    if bad:
+        raise ValueError(f"internal columns {bad} cannot be internal; the columns that can be are "
+                         f"{list(SSOBSERVATION_INTERNAL_DTYPE)}")
+    if len(set(cols)) != len(cols):
+        raise ValueError(f"internal columns {cols} repeat a column")
+    return cols
+
+
+def ssobservation_files(directory):
+    """The names of the SSObservation files in ``directory``, as its
+    manifest lists them: the parts in part order, the sidecar, then the
+    manifest. Raises ValueError for a missing or unreadable manifest, or a
+    listed file that is not there. (It does not check the files' contents:
+    that is ssp.delivery_check's job.)"""
+    d = Path(directory)
+    mpath = d / SSOBSERVATION_MANIFEST_FILE
+    if not mpath.is_file():
+        raise ValueError(f"no {mpath}")
+    try:
+        with open(mpath) as f:
+            m = json.load(f)
+        names = [p["file"] for p in m["parts"]] + [m["sidecar"]["file"]]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ValueError(f"{mpath}: cannot read the parts and sidecar: {type(e).__name__}: {e}") from e
+    bad = [n for n in names if not isinstance(n, str) or not n or Path(n).name != n]
+    if bad or not names[:-1]:
+        raise ValueError(f"{mpath}: " + (f"file names {bad} are not plain names" if bad else "no parts"))
+    missing = [n for n in names if not (d / n).is_file()]
+    if missing:
+        raise ValueError(f"{mpath} lists files that are not in {d}: {missing}")
+    return names + [SSOBSERVATION_MANIFEST_FILE]
+
+
+def delivered_paths(run_dir, table):
+    """The files of delivered ``table`` now in RUN_DIR/delivery: its
+    <Table>.parquet, or for SSObservation every part (PART_GLOB), the
+    manifest and the sidecar there."""
+    d = Path(run_dir) / DELIVERY_DIR
+    if table == PARTITIONED:
+        return sorted(d.glob(PART_GLOB)) + [p for p in (d / SSOBSERVATION_MANIFEST_FILE, d / SIDECAR_FILE)
+                                            if p.exists()]
+    p = d / f"{table}.parquet"
+    return [p] if p.exists() else []
+
+
+def move_ssobservation(src_dir, dst_dir):
+    """Move the SSObservation files the builder wrote in ``src_dir`` (as its
+    manifest lists them) to ``dst_dir``, under their own names, the
+    manifest last. Raises ValueError, moving nothing, if one is missing."""
+    names = ssobservation_files(src_dir)
+    for n in names:
+        os.replace(Path(src_dir) / n, Path(dst_dir) / n)
+    return names
 
 
 class ManifestError(ValueError):
@@ -592,7 +683,7 @@ def step_check(run_dir, log=_log):
         for name in SSOBSERVATION_CHECKS:
             rep = checks / f"ssobservation-{name}.txt"
             cmd = [sys.executable, "-m", "bench.ssobservation_validate", name,
-                   str(delivery / "SSObservation.parquet"), "--out", str(rep)]
+                   str(delivery), "--out", str(rep)]
             log("$ " + " ".join(cmd))
             sys.stdout.flush()
             r = subprocess.run(cmd, cwd=REPO_ROOT, stdout=sys.stdout, stderr=sys.stderr)
@@ -656,8 +747,13 @@ def _entry_point(module):
     return [sys.executable, "-c", f"import sys; from {module} import main; sys.exit(main())"]
 
 
-def step_command(step, inputs_dir, run_dir, manifest, workers):
-    """(argv, {produced file: delivered file}) of ``step``."""
+def step_command(step, inputs_dir, run_dir, manifest, workers, options=None):
+    """(argv, {produced: delivered}) of ``step``. ``produced`` is a file,
+    moved to the delivered file; or (SSObservation) the builder's output
+    directory, whose parts, sidecar and manifest move into the delivered
+    directory (move_ssobservation). ``options``: the ssobservation step's
+    ``part_rows`` and ``internal_columns`` (default: the contract's)."""
+    options = options or {}
     inputs_dir, run_dir = Path(inputs_dir).resolve(), Path(run_dir).resolve()
     work = run_dir / WORK_DIR / step
     delivery = run_dir / DELIVERY_DIR
@@ -669,13 +765,15 @@ def step_command(step, inputs_dir, run_dir, manifest, workers):
         d = _ssobservation_input_dir(inputs_dir, run_dir, manifest)
         out = work / "out"
         out.mkdir(parents=True, exist_ok=True)
+        part_rows = options.get("part_rows", PART_ROWS_DEFAULT)
+        internal = parse_internal_columns(options.get("internal_columns"))
         return ([*_entry_point("ssp.ssobservation"), "--input-dir", str(d), "--output-dir", str(out),
-                 "--workers", str(workers)],
-                {out / "ssobservation.parquet": delivery / "SSObservation.parquet",
-                  out / SIDECAR_FILE: delivery / SIDECAR_FILE})
+                 "--workers", str(workers), "--part-rows", str(part_rows),
+                 "--internal-columns", ",".join(internal)],
+                {out: delivery})
     if step == "ssobject":
         out = work / "ssobject.parquet"
-        return ([*_entry_point("ssp.ssobject"), str(delivery / "SSObservation.parquet"),
+        return ([*_entry_point("ssp.ssobject"), str(delivery / SSOBSERVATION_MANIFEST_FILE),
                  str(builder_input(inputs_dir, run_dir, manifest, "mpc_orbits")), "--output", str(out),
                  "--workers", str(workers)], {out: delivery / "SSObject.parquet"})
     if step == "nearbysso":
@@ -735,7 +833,21 @@ def run_logged(cmd, log_path, env=None):
 # --------------------------------------------------------------------------
 
 def table_entry(run_dir, table):
-    path = Path(run_dir) / DELIVERY_DIR / f"{table}.parquet"
+    """The report's ``tables`` entry of ``table`` (REPORT_FIELDS): {file,
+    rows, md5, bytes}; for SSObservation {manifest, parts, sidecar, rows,
+    bytes}, the rows and bytes totals over the parts (each part's md5 is in
+    the manifest). Paths are relative to RUN_DIR."""
+    run_dir = Path(run_dir)
+    d = run_dir / DELIVERY_DIR
+    if table == PARTITIONED:
+        names = ssobservation_files(d)
+        parts = [d / n for n in names[:-2]]
+        return dict(manifest=str((d / names[-1]).relative_to(run_dir)),
+                    parts=[str(p.relative_to(run_dir)) for p in parts],
+                    sidecar=str((d / names[-2]).relative_to(run_dir)),
+                    rows=sum(pq.ParquetFile(p).metadata.num_rows for p in parts),
+                    bytes=sum(p.stat().st_size for p in parts))
+    path = d / f"{table}.parquet"
     return dict(file=str(path.relative_to(run_dir)), rows=pq.ParquetFile(path).metadata.num_rows,
                 md5=_md5(path), bytes=path.stat().st_size)
 
@@ -753,8 +865,7 @@ def _deliverable(report):
 def _clear_step_outputs(run_dir, steps):
     for step in steps:
         for table in STEP_TABLES[step]:
-            p = Path(run_dir) / DELIVERY_DIR / f"{table}.parquet"
-            if p.exists():
+            for p in delivered_paths(run_dir, table):
                 p.unlink()
         for p in (Path(run_dir) / WORK_DIR / step, *(
                 [Path(run_dir) / CHECKS_DIR] if step == "check" else [])):
@@ -766,11 +877,16 @@ def _clear_step_outputs(run_dir, steps):
 
 
 def _remove_strays(run_dir, log):
-    """Remove anything in RUN_DIR/delivery other than the delivered tables."""
+    """Remove anything in RUN_DIR/delivery other than the delivered tables
+    (for SSObservation: its manifest and the files it lists)."""
     d = Path(run_dir) / DELIVERY_DIR
     if not d.is_dir():
         return
-    keep = {f"{t}.parquet" for t in DELIVERY_TABLES}
+    keep = {f"{t}.parquet" for t in DELIVERY_TABLES if t != PARTITIONED}
+    try:
+        keep.update(ssobservation_files(d))
+    except ValueError:
+        pass
     for p in sorted(d.iterdir()):
         if p.name not in keep:
             log(f"WARNING: removing {p}, which is not a delivered table")
@@ -788,7 +904,7 @@ def real_uploads(report):
 
 
 def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, allow_mixed_commits=False,
-          log=_log):
+          part_rows=None, internal_columns=None, log=_log):
     """Run stage 2 (see the module docstring); return the report. A failed
     step or invalid inputs do not raise: see the report's ``deliverable``
     (and, for the inputs, ``error``).
@@ -798,11 +914,20 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
     history); or if ``from_step`` cannot rerun this RUN_DIR: no earlier
     report, other inputs, an earlier step that failed, a kept table missing
     or changed since, or kept steps built by another commit (unless
-    ``allow_mixed_commits``, recorded in the report as ``mixed_commits``).
+    ``allow_mixed_commits``, recorded in the report as ``mixed_commits``);
+    or if ``part_rows`` or ``internal_columns`` (the ssobservation step's
+    options; None: the contract's defaults, PART_ROWS_DEFAULT and
+    SSOBSERVATION_INTERNAL_DEFAULT) are invalid, or are given with a
+    ``from_step`` that keeps an ssobservation step built with others.
     """
     inputs_dir, run_dir = Path(inputs_dir), Path(run_dir)
     if from_step is not None and from_step not in BUILD_STEPS:
         raise ValueError(f"--from: unknown step {from_step!r} (one of {', '.join(BUILD_STEPS)})")
+    if part_rows is not None and (isinstance(part_rows, bool) or not isinstance(part_rows, int)
+                                  or part_rows < 1):
+        raise ValueError(f"--part-rows {part_rows!r}: must be a positive integer")
+    options = dict(part_rows=PART_ROWS_DEFAULT if part_rows is None else part_rows,
+                   internal_columns=parse_internal_columns(internal_columns))
     report_path = run_dir / REPORT_FILE
     start = BUILD_STEPS.index(from_step) if from_step else 0
     previous = None
@@ -849,6 +974,7 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
 
     if start > 0:
         _check_from(previous, manifest, run_dir, from_step, commit, allow_mixed_commits, report)
+        _check_kept_options(previous, from_step, part_rows, internal_columns, options)
         for s in BUILD_STEPS[:start]:
             report["steps"][s] = previous["steps"][s]
             for t in STEP_TABLES[s]:
@@ -865,6 +991,8 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
         log_path = run_dir / LOGS_DIR / f"{step}.log"
         entry = dict(status="running", started_utc=_utcnow(), wall_s=None, max_rss_gb=None,
                      log=str(log_path.relative_to(run_dir)), ssp_tools_commit=commit)
+        if step == "ssobservation":
+            entry.update(options)
         report["steps"][step] = entry
         save()
         (run_dir / WORK_DIR / step).mkdir(parents=True, exist_ok=True)
@@ -874,13 +1002,20 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
             if step == "check":
                 error = _inputs_changed(inputs_dir, manifest, workers)
             if error is None:
-                cmd, moves = step_command(step, inputs_dir, run_dir, manifest, workers)
+                cmd, moves = step_command(step, inputs_dir, run_dir, manifest, workers, options)
                 code, wall, rss = run_logged(cmd, log_path)
                 entry.update(wall_s=round(wall, 1), max_rss_gb=None if rss is None else round(rss, 3))
                 if code != 0:
                     error = f"exited {code}; see {log_path}"
                 else:
                     for src, dst in moves.items():
+                        if src.is_dir():        # (the partitioned SSObservation)
+                            try:
+                                move_ssobservation(src, dst)
+                            except ValueError as e:
+                                error = f"did not write a complete SSObservation: {e}"
+                                break
+                            continue
                         if not src.exists():
                             error = f"did not write {src}"
                             break
@@ -900,8 +1035,7 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
             entry["error"] = error
             for t in STEP_TABLES[step]:      # (a failed step delivers nothing)
                 report["tables"].pop(t, None)
-                p = run_dir / DELIVERY_DIR / f"{t}.parquet"
-                if p.exists():
+                for p in delivered_paths(run_dir, t):
                     p.unlink()
         log(f"[{step}] {entry['status']}" + (f": {error}" if error else "")
             + f" (wall {entry['wall_s']} s, max RSS {entry['max_rss_gb']} GB)")
@@ -935,6 +1069,9 @@ def _check_from(previous, manifest, run_dir, from_step, commit, allow_mixed_comm
         if entry.get("status") != "ok":
             raise ValueError(f"--from {from_step}: step {s} did not succeed in the earlier run")
         for t in STEP_TABLES[s]:
+            if t == PARTITIONED:
+                _check_kept_ssobservation(previous, run_dir, from_step, s, t)
+                continue
             path = run_dir / DELIVERY_DIR / f"{t}.parquet"
             if not path.exists():
                 raise ValueError(f"--from {from_step}: {t}, from step {s}, is missing")
@@ -952,6 +1089,40 @@ def _check_from(previous, manifest, run_dir, from_step, commit, allow_mixed_comm
         report["mixed_commits"] = dict(mixed, **{s: commit for s in BUILD_STEPS[start:]})
 
 
+def _check_kept_ssobservation(previous, run_dir, from_step, step, table):
+    """The kept partitioned SSObservation is complete, each part and the
+    sidecar has its manifest md5, and it is what the report recorded."""
+    d = run_dir / DELIVERY_DIR
+    try:
+        ssobservation_files(d)
+    except ValueError as e:
+        raise ValueError(f"--from {from_step}: {table}, from step {step}, is missing: {e}") from e
+    with open(d / SSOBSERVATION_MANIFEST_FILE) as f:
+        m = json.load(f)
+    for entry in [*m["parts"], m["sidecar"]]:
+        path = d / entry["file"]
+        if _md5(path) != entry.get("md5"):
+            raise ValueError(f"--from {from_step}: {path} has changed since step {step} wrote it "
+                             f"(md5 {entry.get('md5')} in the manifest)")
+    want = (previous.get("tables") or {}).get(table)
+    have = table_entry(run_dir, table)
+    if have != want:
+        raise ValueError(f"--from {from_step}: {table} has changed since step {step} wrote it: "
+                         f"{have} now, {want} in the report")
+
+
+def _check_kept_options(previous, from_step, part_rows, internal_columns, options):
+    """Refuse ssobservation options given with a --from that keeps an
+    ssobservation step built with other ones: they would not apply."""
+    if BUILD_STEPS.index(from_step) <= BUILD_STEPS.index("ssobservation"):
+        return
+    kept = previous["steps"]["ssobservation"]
+    for name, given in (("part_rows", part_rows), ("internal_columns", internal_columns)):
+        if given is not None and kept.get(name) != options[name]:
+            raise ValueError(f"--from {from_step}: the kept ssobservation step was built with {name} "
+                             f"{kept.get(name)!r}, not {options[name]!r}; rerun from ssobservation")
+
+
 def _default_workers():
     return max(1, min(32, len(os.sched_getaffinity(0))))
 
@@ -962,7 +1133,8 @@ def main(argv=None):
         description="Stage 2 of the SSO delivery: build the PPDB Solar System tables "
                     f"({', '.join(DELIVERY_TABLES)}) from the input files in INPUTS_DIR "
                     "(stage 1's, or any source honouring ssp/delivery_contract.py).",
-        epilog=f"Steps: {', '.join(BUILD_STEPS)}. Writes RUN_DIR/{DELIVERY_DIR}/<Table>.parquet, "
+        epilog=f"Steps: {', '.join(BUILD_STEPS)}. Writes RUN_DIR/{DELIVERY_DIR}/<Table>.parquet "
+               f"(SSObservation: {PART_GLOB}, {SSOBSERVATION_MANIFEST_FILE} and {SIDECAR_FILE}), "
                f"RUN_DIR/{LOGS_DIR}/<step>.log, RUN_DIR/{CHECKS_DIR}/ and RUN_DIR/{REPORT_FILE}. "
                "Needs SSP_ASSIST_PLANETS and SSP_ASSIST_ASTEROIDS for the ssobservation and nearbysso "
                "steps. Exits 0 only if the delivery is deliverable.",
@@ -978,10 +1150,24 @@ def main(argv=None):
     parser.add_argument("--allow-mixed-commits", action="store_true",
                         help="With --from, keep steps built by another ssp-tools commit (recorded in "
                              "the report as mixed_commits)")
+    parser.add_argument("--part-rows", type=int, default=None, metavar="N",
+                        help="SSObservation parts: close a part at the first object boundary at or after N "
+                             f"rows (default: {PART_ROWS_DEFAULT:,})")
+    parser.add_argument("--internal-columns", default=None, metavar="A,B,...",
+                        help="SSObservation columns written to the sidecar "
+                             f"({SIDECAR_FILE}, not uploaded) instead of the delivered table; '' for none "
+                             f"(default: {','.join(SSOBSERVATION_INTERNAL_DEFAULT)}; possible: "
+                             f"{', '.join(SSOBSERVATION_INTERNAL_DTYPE)})")
     parser.add_argument("--run-step", choices=("mpc", "check"), default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.workers < 1:
         parser.error("--workers must be at least 1")
+    if args.part_rows is not None and args.part_rows < 1:
+        parser.error("--part-rows must be at least 1")
+    try:
+        parse_internal_columns(args.internal_columns)
+    except ValueError as e:
+        parser.error(f"--internal-columns: {e}")
 
     if args.run_step == "mpc":
         step_mpc(args.inputs_dir, args.run_dir, workers=args.workers)
@@ -991,7 +1177,8 @@ def main(argv=None):
 
     try:
         report = build(args.inputs_dir, args.run_dir, from_step=args.from_step, workers=args.workers,
-                       force_rebuild=args.force_rebuild, allow_mixed_commits=args.allow_mixed_commits)
+                       force_rebuild=args.force_rebuild, allow_mixed_commits=args.allow_mixed_commits,
+                       part_rows=args.part_rows, internal_columns=args.internal_columns)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2

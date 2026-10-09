@@ -22,6 +22,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from ssp import sso_build as B
+from ssp import ssobservation_parts as SP
 from ssp.delivery_contract import (
     BUILD_STEPS,
     DELIVERY_TABLES,
@@ -30,6 +31,13 @@ from ssp.delivery_contract import (
     REQUIRED_INPUT_COLUMNS,
     SHUTTER_INPUT_COLUMNS,
     delivery_schema,
+)
+from ssp.ssobservation_contract import (
+    PART_FILE_FORMAT,
+    PART_ROWS_DEFAULT,
+    SIDECAR_FILE,
+    SSOBSERVATION_INTERNAL_DEFAULT,
+    SSOBSERVATION_MANIFEST_FILE,
 )
 
 SCHEMA = delivery_schema()
@@ -338,23 +346,74 @@ if out.endswith(".json"):
 pq.write_table(pa.table({"x": list(range(n))}), out)
 """
 
+#: The stand-in ssobservation builder: the partitioned layout of the
+#: contract, n rows (one object each) cut every part_rows rows, a sidecar
+#: of the internal columns and the manifest. ``break`` deletes the last
+#: part after writing the manifest (an incomplete output).
+FAKE_SSOBSERVATION = """
+import hashlib, json, sys, pyarrow as pa, pyarrow.parquet as pq
+from pathlib import Path
+from ssp.ssobservation_contract import PART_FILE_FORMAT, SIDECAR_FILE, SSOBSERVATION_MANIFEST_FILE
+out, fail, n, part_rows = Path(sys.argv[1]), sys.argv[2] == "1", int(sys.argv[3]), int(sys.argv[4])
+internal, broken = [c for c in sys.argv[5].split(",") if c], sys.argv[6] == "break"
+print("fake ssobservation writing", out, "part_rows", part_rows, "internal", internal)
+if fail:
+    sys.exit("fake failure")
+md5 = lambda p: hashlib.md5(p.read_bytes()).hexdigest()
+parts = []
+for k, a in enumerate(range(0, max(n, 1), part_rows)):
+    b = min(a + part_rows, n)
+    p = out / PART_FILE_FORMAT.format(k)
+    pq.write_table(pa.table({"ssObjectId": pa.array(range(a, b), pa.int64()),
+                             "obsid": [str(i) for i in range(a, b)]}), p)
+    parts.append(dict(file=p.name, rows=b - a, ssObjectId_min=a if b > a else None,
+                      ssObjectId_max=b - 1 if b > a else None, null_ssObjectId=False,
+                      bytes=p.stat().st_size, md5=md5(p)))
+side = out / SIDECAR_FILE
+pq.write_table(pa.table({"obsid": [str(i) for i in range(n)], **{c: [True] * n for c in internal}}), side)
+m = dict(table="SSObservation", format_version=1, part_rows=part_rows, rows=n, parts=parts,
+         sidecar=dict(file=side.name, key="obsid", columns=internal, rows=n, bytes=side.stat().st_size,
+                      md5=md5(side)))
+(out / SSOBSERVATION_MANIFEST_FILE).write_text(json.dumps(m))
+if broken:
+    (out / parts[-1]["file"]).unlink()
+"""
+
+
+def delivered_names(n_parts=1):
+    """The file names of a complete delivery, with SSObservation in
+    ``n_parts`` parts."""
+    return sorted([f"{t}.parquet" for t in DELIVERY_TABLES if t != "SSObservation"]
+                  + [PART_FILE_FORMAT.format(k) for k in range(n_parts)]
+                  + [SSOBSERVATION_MANIFEST_FILE, SIDECAR_FILE])
+
 
 @pytest.fixture
 def fake_steps(monkeypatch):
     """Replace the builder and check steps with stand-ins; the mpc step is
     real. ``fails`` lists the steps that fail; ``rows`` the rows written;
     ``checks`` the check results the fake check step writes, and
-    ``check_exit`` its exit code."""
+    ``check_exit`` its exit code; ``options`` the ssobservation options
+    each call was given; ``break_ssobservation`` makes the ssobservation
+    step leave a part out."""
     state = dict(fails=set(), rows=3, calls=[], checks={c: "PASS" for c in B.EXPECTED_CHECKS},
-                 check_exit=0)
+                 check_exit=0, options=[], break_ssobservation=False)
     real = B.step_command
 
-    def step_command(step, inputs_dir, run_dir, manifest, workers):
+    def step_command(step, inputs_dir, run_dir, manifest, workers, options=None):
         state["calls"].append(step)
+        state["options"].append(options)
         if step == "mpc":
-            return real(step, inputs_dir, run_dir, manifest, workers)
+            return real(step, inputs_dir, run_dir, manifest, workers, options)
         work = Path(run_dir).resolve() / "work" / step
         fail = "1" if step in state["fails"] else "0"
+        if step == "ssobservation":
+            out = work / "out"
+            out.mkdir(parents=True, exist_ok=True)
+            return ([sys.executable, "-c", FAKE_SSOBSERVATION, str(out), fail, str(state["rows"]),
+                     str(options["part_rows"]), ",".join(options["internal_columns"]),
+                     "break" if state["break_ssobservation"] else "-"],
+                    {out: Path(run_dir).resolve() / "delivery"})
         if step == "check":
             (Path(run_dir) / "checks").mkdir(exist_ok=True)
             out = Path(run_dir).resolve() / "checks" / "results.json"
@@ -386,17 +445,27 @@ def test_report_all_ok(tmp_path, fake_steps):
         datetime.datetime.fromisoformat(e["started_utc"])
     assert set(rep["tables"]) == set(DELIVERY_TABLES)
     for t, e in rep["tables"].items():
+        if t == "SSObservation":
+            continue
         p = tmp_path / "run" / e["file"]
         assert e["file"] == f"delivery/{t}.parquet"
         assert e["md5"] == B._md5(p) and e["bytes"] == p.stat().st_size
-    assert rep["tables"]["mpc_orbits"]["rows"] == 4 and rep["tables"]["SSObservation"]["rows"] == 3
+    # SSObservation: {manifest, parts, sidecar, rows, bytes} (REPORT_FIELDS)
+    e = rep["tables"]["SSObservation"]
+    assert e == dict(manifest=f"delivery/{SSOBSERVATION_MANIFEST_FILE}",
+                     parts=[f"delivery/{PART_FILE_FORMAT.format(0)}"], sidecar=f"delivery/{SIDECAR_FILE}",
+                     rows=3, bytes=(tmp_path / "run" / e["parts"][0]).stat().st_size)
+    assert rep["tables"]["mpc_orbits"]["rows"] == 4
+    st = rep["steps"]["ssobservation"]
+    assert st["part_rows"] == PART_ROWS_DEFAULT
+    assert st["internal_columns"] == list(SSOBSERVATION_INTERNAL_DEFAULT)
     assert rep["checks"] == {c: {"status": "PASS", "report": "checks/fake.txt"} for c in B.EXPECTED_CHECKS}
     assert rep["input_paths"]["obs_sbn"] == str((tmp_path / "in" / "obs_sbn.parquet").resolve())
     assert all(rep["steps"][s]["ssp_tools_commit"] == rep["ssp_tools_commit"] for s in BUILD_STEPS)
     assert rep["inputs"] == B.read_manifest(tmp_path / "in")
     assert json.loads((tmp_path / "run" / "report.json").read_text()) == rep
     delivered = sorted(os.listdir(tmp_path / "run" / "delivery"))
-    assert delivered == sorted(f"{t}.parquet" for t in DELIVERY_TABLES)
+    assert delivered == delivered_names()
 
 
 def test_failed_check_not_deliverable(tmp_path, fake_steps):
@@ -464,7 +533,7 @@ def test_failed_step_then_from(tmp_path, fake_steps):
         B.build(tmp_path / "in", run, from_step="nearbysso", log=_quiet)
 
     # --from ssobject: the earlier outputs and entries are kept
-    sss = run / "delivery" / "SSObservation.parquet"
+    sss = run / "delivery" / PART_FILE_FORMAT.format(0)
     mtime = sss.stat().st_mtime_ns
     fake_steps["fails"] = set()
     fake_steps["calls"].clear()
@@ -565,8 +634,18 @@ def test_from_refuses_missing_kept_table(tmp_path, fake_steps):
     write_inputs(tmp_path / "in")
     run = tmp_path / "run"
     B.build(tmp_path / "in", run, log=_quiet)
-    (run / "delivery" / "SSObservation.parquet").unlink()
+    (run / "delivery" / SSOBSERVATION_MANIFEST_FILE).unlink()
     with pytest.raises(ValueError, match="SSObservation, from step ssobservation, is missing"):
+        B.build(tmp_path / "in", run, from_step="ssobject", log=_quiet)
+
+
+@pytest.mark.parametrize("lose", ["part", "sidecar"])
+def test_from_refuses_incomplete_kept_ssobservation(tmp_path, fake_steps, lose):
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    B.build(tmp_path / "in", run, part_rows=2, log=_quiet)
+    (run / "delivery" / (PART_FILE_FORMAT.format(1) if lose == "part" else SIDECAR_FILE)).unlink()
+    with pytest.raises(ValueError, match="SSObservation, from step ssobservation, is missing.*lists files"):
         B.build(tmp_path / "in", run, from_step="ssobject", log=_quiet)
 
 
@@ -574,9 +653,27 @@ def test_from_refuses_changed_kept_table(tmp_path, fake_steps):
     write_inputs(tmp_path / "in")
     run = tmp_path / "run"
     B.build(tmp_path / "in", run, log=_quiet)
-    pq.write_table(pa.table({"x": [9, 9, 9, 9]}), run / "delivery" / "SSObservation.parquet")
-    with pytest.raises(ValueError, match="SSObservation.parquet has changed since step ssobservation"):
+    pq.write_table(pa.table({"x": [9, 9, 9, 9]}), run / "delivery" / PART_FILE_FORMAT.format(0))
+    with pytest.raises(ValueError, match=r"SSObservation.part0000.parquet has changed since step "
+                                         r"ssobservation wrote it \(md5 [0-9a-f]{32} in the manifest\)"):
         B.build(tmp_path / "in", run, from_step="check", log=_quiet)
+
+
+def test_from_refuses_changed_kept_manifest(tmp_path, fake_steps):
+    """A manifest edited to match a changed part still differs from the
+    report's record."""
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    B.build(tmp_path / "in", run, log=_quiet)
+    part = run / "delivery" / PART_FILE_FORMAT.format(0)
+    pq.write_table(pa.table({"x": [9, 9, 9, 9]}), part)
+    mp = run / "delivery" / SSOBSERVATION_MANIFEST_FILE
+    m = json.loads(mp.read_text())
+    m["parts"][0].update(md5=B._md5(part), bytes=part.stat().st_size, rows=4)
+    m["rows"] = 4
+    mp.write_text(json.dumps(m))
+    with pytest.raises(ValueError, match="SSObservation has changed since step ssobservation"):
+        B.build(tmp_path / "in", run, from_step="ssobject", log=_quiet)
 
 
 def test_from_mixed_commits(tmp_path, fake_steps, monkeypatch):
@@ -654,8 +751,165 @@ def test_stray_delivery_files_removed(tmp_path, fake_steps):
     msgs = []
     rep = B.build(tmp_path / "in", run, log=msgs.append)
     assert rep["deliverable"] is True
-    assert sorted(os.listdir(run / "delivery")) == sorted(f"{t}.parquet" for t in DELIVERY_TABLES)
+    assert sorted(os.listdir(run / "delivery")) == delivered_names()
     assert sum("WARNING: removing" in m for m in msgs) == 2
+
+
+def test_stray_ssobservation_part_removed_on_from(tmp_path, fake_steps):
+    """A part the manifest doesn't list (e.g. left by an older run) is a
+    stray: --from removes it, keeping the listed ones."""
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    B.build(tmp_path / "in", run, part_rows=2, log=_quiet)
+    (run / "delivery" / PART_FILE_FORMAT.format(7)).write_text("x")
+    msgs = []
+    rep = B.build(tmp_path / "in", run, from_step="ssobject", log=msgs.append)
+    assert rep["deliverable"] is True
+    assert sorted(os.listdir(run / "delivery")) == delivered_names(2)
+    assert sum("WARNING: removing" in m and "part0007" in m for m in msgs) == 1
+
+
+# ---------------------------------------------------------------------------
+# The partitioned SSObservation: the options and the step's outputs
+# ---------------------------------------------------------------------------
+
+def test_ssobservation_options_reach_the_builder(tmp_path):
+    """--part-rows and --internal-columns on the builder's command line
+    (the real step_command); the defaults when not given."""
+    m = write_inputs(tmp_path / "in")
+    argv, moves = B.step_command("ssobservation", tmp_path / "in", tmp_path / "run", m, 3,
+                                 dict(part_rows=7, internal_columns=["midpointMjdTai_flag_degraded"]))
+    assert argv[argv.index("--part-rows") + 1] == "7"
+    assert argv[argv.index("--internal-columns") + 1] == "midpointMjdTai_flag_degraded"
+    assert argv[argv.index("--workers") + 1] == "3"
+    out = (tmp_path / "run").resolve() / "work" / "ssobservation" / "out"
+    assert moves == {out: (tmp_path / "run").resolve() / "delivery"}
+    argv, _ = B.step_command("ssobservation", tmp_path / "in", tmp_path / "run", m, 1)
+    assert argv[argv.index("--part-rows") + 1] == str(PART_ROWS_DEFAULT)
+    assert argv[argv.index("--internal-columns") + 1] == ",".join(SSOBSERVATION_INTERNAL_DEFAULT)
+    argv, _ = B.step_command("ssobservation", tmp_path / "in", tmp_path / "run", m, 1,
+                             dict(part_rows=5, internal_columns=[]))
+    assert argv[argv.index("--internal-columns") + 1] == ""
+
+
+def test_ssobservation_consumers_get_the_delivery(tmp_path, monkeypatch):
+    """SSObject reads the manifest; the SSObservation checks get the
+    delivery directory."""
+    m = write_inputs(tmp_path / "in")
+    run = (tmp_path / "run").resolve()
+    argv, _ = B.step_command("ssobject", tmp_path / "in", tmp_path / "run", m, 1)
+    assert str(run / "delivery" / SSOBSERVATION_MANIFEST_FILE) in argv
+    assert not any(a.endswith("SSObservation.parquet") for a in argv)
+
+    from collections import namedtuple
+    R = namedtuple("CheckResult", "name ok detail")
+    monkeypatch.setattr(B, "check_delivery",
+                        lambda d, **k: {t: [R("x", True, "ok")] for t in DELIVERY_TABLES})
+    monkeypatch.setattr(B, "have_ssobservation_validate", lambda: True)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        Path(cmd[cmd.index("--out") + 1]).write_text("PASS\n")
+        return B.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(B.subprocess, "run", fake_run)
+    (run / "delivery").mkdir(parents=True)
+    assert B.step_check(run, log=_quiet) is True
+    assert [c[3:5] for c in cmds] == [[name, str(run / "delivery")] for name in B.SSOBSERVATION_CHECKS]
+
+
+def test_ssobservation_options_in_the_report(tmp_path, fake_steps):
+    """build(part_rows=, internal_columns=) and the CLI: passed to the step,
+    recorded in steps.ssobservation; the parts and totals in the report."""
+    write_inputs(tmp_path / "in")
+    rep = B.build(tmp_path / "in", tmp_path / "run", part_rows=2, internal_columns="matchMethod", log=_quiet)
+    assert rep["deliverable"] is True
+    opts = fake_steps["options"][fake_steps["calls"].index("ssobservation")]
+    assert opts == dict(part_rows=2, internal_columns=["matchMethod"])
+    st = rep["steps"]["ssobservation"]
+    assert st["status"] == "ok" and st["part_rows"] == 2 and st["internal_columns"] == ["matchMethod"]
+    e = rep["tables"]["SSObservation"]
+    assert e["parts"] == [f"delivery/{PART_FILE_FORMAT.format(k)}" for k in range(2)]
+    assert e["rows"] == 3 and e["bytes"] == sum((tmp_path / "run" / p).stat().st_size for p in e["parts"])
+    assert sorted(os.listdir(tmp_path / "run" / "delivery")) == delivered_names(2)
+    assert SP.num_rows(tmp_path / "run" / "delivery") == 3
+    assert json.loads((tmp_path / "run" / "report.json").read_text()) == rep
+
+    # the CLI, with no internal columns
+    fake_steps["options"].clear()
+    fake_steps["calls"].clear()
+    assert B.main([str(tmp_path / "in"), str(tmp_path / "run2"), "--part-rows", "1",
+                   "--internal-columns", ""]) == 0
+    st = json.loads((tmp_path / "run2" / "report.json").read_text())["steps"]["ssobservation"]
+    assert st["part_rows"] == 1 and st["internal_columns"] == []
+    assert fake_steps["options"][fake_steps["calls"].index("ssobservation")] == dict(part_rows=1,
+                                                                                     internal_columns=[])
+    assert len(SP.part_paths(tmp_path / "run2" / "delivery")) == 3
+
+
+@pytest.mark.parametrize("args, match", [
+    (["--internal-columns", "ra"], "cannot be internal"),
+    (["--internal-columns", "matchMethod,matchMethod"], "repeat"),
+    (["--part-rows", "0"], "at least 1"),
+])
+def test_ssobservation_bad_options(tmp_path, capsys, args, match):
+    with pytest.raises(SystemExit) as e:
+        B.main([str(tmp_path / "in"), str(tmp_path / "run"), *args])
+    assert e.value.code == 2 and re.search(match, capsys.readouterr().err)
+    with pytest.raises(ValueError, match="part-rows"):
+        B.build(tmp_path / "in", tmp_path / "run", part_rows=0)
+    assert not (tmp_path / "run").exists()
+
+
+def test_from_refuses_other_ssobservation_options(tmp_path, fake_steps):
+    """Options given with a --from that keeps the ssobservation step must be
+    the ones it was built with; from ssobservation on, they apply."""
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    B.build(tmp_path / "in", run, part_rows=2, log=_quiet)
+    with pytest.raises(ValueError, match="built with part_rows 2, not 5; rerun from ssobservation"):
+        B.build(tmp_path / "in", run, from_step="ssobject", part_rows=5, log=_quiet)
+    with pytest.raises(ValueError, match="internal_columns"):
+        B.build(tmp_path / "in", run, from_step="check", internal_columns="", log=_quiet)
+    rep = B.build(tmp_path / "in", run, from_step="ssobject", part_rows=2, log=_quiet)
+    assert rep["deliverable"] is True and rep["steps"]["ssobservation"]["part_rows"] == 2
+    rep = B.build(tmp_path / "in", run, from_step="ssobservation", part_rows=5, log=_quiet)
+    assert rep["deliverable"] is True and rep["steps"]["ssobservation"]["part_rows"] == 5
+    assert rep["tables"]["SSObservation"]["parts"] == [f"delivery/{PART_FILE_FORMAT.format(0)}"]
+
+
+def test_incomplete_ssobservation_fails_the_step(tmp_path, fake_steps):
+    """A builder whose manifest lists a part it didn't write: the step
+    fails, and nothing of SSObservation is delivered."""
+    write_inputs(tmp_path / "in")
+    fake_steps["break_ssobservation"] = True
+    rep = B.build(tmp_path / "in", tmp_path / "run", part_rows=2, log=_quiet)
+    st = rep["steps"]["ssobservation"]
+    assert st["status"] == "failed" and "did not write a complete SSObservation" in st["error"]
+    assert "SSObservation" not in rep["tables"]
+    assert sorted(os.listdir(tmp_path / "run" / "delivery")) == sorted(f"{t}.parquet" for t in B.MPC_TABLES)
+
+
+def test_ssobservation_without_manifest_fails_the_step(tmp_path, fake_steps, monkeypatch):
+    """The builder before the partitioned delivery (a single
+    ssobservation.parquet): the step fails clearly."""
+    write_inputs(tmp_path / "in")
+    inner = B.step_command
+
+    def sc(step, inputs_dir, run_dir, manifest, workers, options=None):
+        if step != "ssobservation":
+            return inner(step, inputs_dir, run_dir, manifest, workers, options)
+        out = Path(run_dir).resolve() / "work" / step / "out"
+        out.mkdir(parents=True, exist_ok=True)
+        return [sys.executable, "-c", FAKE, str(out / "ssobservation.parquet"), "0", "3"], {
+            out: Path(run_dir).resolve() / "delivery"}
+
+    monkeypatch.setattr(B, "step_command", sc)
+    rep = B.build(tmp_path / "in", tmp_path / "run", log=_quiet)
+    st = rep["steps"]["ssobservation"]
+    assert st["status"] == "failed" and f"no {(tmp_path / 'run').resolve()}" in st["error"]
+    assert SSOBSERVATION_MANIFEST_FILE in st["error"]
 
 
 @pytest.mark.parametrize("edit, match", [
@@ -795,8 +1049,14 @@ def test_e2e_subset(e2e):
     assert rep["tables"]["mpc_orbits"]["rows"] == tables["mpc_orbits"].num_rows
     assert rep["tables"]["NearbySSO"]["rows"] > 0
     for t in DELIVERY_TABLES:
-        s = pq.read_schema(d / "run" / "delivery" / f"{t}.parquet")
+        s = (SP.parquet_schema(d / "run" / "delivery") if t == "SSObservation"
+             else pq.read_schema(d / "run" / "delivery" / f"{t}.parquet"))
         assert s.names == [c["name"] for c in SCHEMA[t]], t
+    # the partitioned SSObservation: the report's parts are the manifest's
+    e = rep["tables"]["SSObservation"]
+    assert [Path(p).name for p in e["parts"]] == [p.name for p in SP.part_paths(d / "run" / "delivery")]
+    assert e["rows"] == SP.num_rows(d / "run" / "delivery")
+    assert rep["steps"]["ssobservation"]["part_rows"] == PART_ROWS_DEFAULT
     orb = pq.read_table(d / "run" / "delivery" / "mpc_orbits.parquet")
     assert orb["designation"].equals(orb["unpacked_primary_provisional_designation"])
     # NearbySSO's ssObjectId is SSObject's, by designation (M13: --ssobject)
@@ -813,7 +1073,7 @@ def test_e2e_subset(e2e):
 @needs_fixture
 def test_e2e_from_check(e2e):
     d, _, rep = e2e
-    sss = d / "run" / "delivery" / "SSObservation.parquet"
+    sss = d / "run" / "delivery" / SSOBSERVATION_MANIFEST_FILE
     mtime = sss.stat().st_mtime_ns
     rep2 = B.build(d / "in", d / "run", from_step="check", workers=E2E_WORKERS)
     for s in BUILD_STEPS[:-1]:
@@ -869,9 +1129,13 @@ def test_e2e_non_clickhouse_source(e2e, tmp_path):
     for s in BUILD_STEPS[:-1]:
         assert rep2["steps"][s]["status"] == "ok", (s, rep2["steps"][s])
     _expect_checks(rep2)
-    for t in DELIVERY_TABLES:
-        a = pq.read_table(d / "run" / "delivery" / f"{t}.parquet")
-        b = pq.read_table(tmp_path / "run" / "delivery" / f"{t}.parquet")
+    for t in [*DELIVERY_TABLES, SIDECAR_FILE]:
+        if t == "SSObservation":
+            a, b = (SP.read_ssobservation(r / "delivery") for r in (d / "run", tmp_path / "run"))
+        else:
+            name = t if t == SIDECAR_FILE else f"{t}.parquet"
+            a = pq.read_table(d / "run" / "delivery" / name)
+            b = pq.read_table(tmp_path / "run" / "delivery" / name)
         assert a.schema == b.schema, t
         if t == "NearbySSO":           # (its row order follows the DiaSources')
             a, b = (x.sort_by("diaSourceId") for x in (a, b))

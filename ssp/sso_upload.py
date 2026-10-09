@@ -9,15 +9,23 @@ lsst/dax_ppdb python/lsst/dax/ppdb/bigquery/sso_uploader.py:
 
 1. Refuse unless RUN_DIR/report.json says ``deliverable: true`` and every
    table to upload, RUN_DIR/delivery/<Table>.parquet, has the md5 (and
-   size) the report recorded.
+   size) the report recorded. SSObservation is partitioned
+   (ssp.ssobservation_contract, "The partitioned delivery"): its manifest,
+   SSObservation.manifest.json, must list the parts the report recorded,
+   with the report's total rows and bytes, and each part must have the
+   size and md5 the manifest gives.
 2. Upload each table to gs://<bucket>/<prefix>/<Table>.parquet, where the
    prefix is the UTC time to the millisecond, with if_generation_match=0
-   so nothing is ever overwritten. On any failure, including a failure to
-   publish, delete what this upload wrote and fail.
+   so nothing is ever overwritten; SSObservation as its parts, in part
+   order, then its manifest, each under its own name. The sidecar of
+   internal columns (SSObservation_internal.parquet) is never uploaded. On
+   any failure, including a failure to publish, delete every object this
+   upload wrote and fail.
 3. Publish one JSON message, {"bucket", "object_prefix",
-   "uploaded_tables"}, to projects/<project>/topics/<topic>, and wait (up
-   to PUBLISH_TIMEOUT_S) for its message id. If the wait times out, the
-   objects are kept: the message may have gone through.
+   "uploaded_tables", "files"}, to projects/<project>/topics/<topic>, and
+   wait (up to PUBLISH_TIMEOUT_S) for its message id. ``files`` is
+   {Table: [object names relative to the prefix]}. If the wait times out,
+   the objects are kept: the message may have gone through.
 4. Record the upload in report.json: ``upload`` (the last one) and
    ``uploads`` (all of them, dry runs included).
 
@@ -71,6 +79,10 @@ from .delivery_contract import (
     UPLOAD_MESSAGE_FIELDS,
     UPLOAD_PREFIX_FORMAT,
 )
+from .ssobservation_contract import SIDECAR_FILE, SSOBSERVATION_MANIFEST_FILE
+
+#: The delivered table that is uploaded as parts plus its manifest.
+PARTITIONED = "SSObservation"
 
 _LOG = logging.getLogger("ssp.sso_upload")
 
@@ -220,9 +232,55 @@ def read_report(run_dir):
         return json.load(f)
 
 
+def _verify_partitioned(run_dir, table, rec):
+    """The problems with partitioned ``table`` (SSObservation) against its
+    report entry ``rec`` and its manifest, and its files to upload: the
+    parts in part order, then the manifest."""
+    delivery = Path(run_dir) / DELIVERY_DIR
+    mpath = delivery / SSOBSERVATION_MANIFEST_FILE
+    if not rec or not rec.get("parts"):
+        return [f"{table}: no parts in the report"], []
+    if not mpath.is_file():
+        return [f"{table}: {mpath} is missing"], []
+    try:
+        with open(mpath) as f:
+            m = json.load(f)
+        parts = [(p["file"], p["bytes"], p["md5"]) for p in m["parts"]]
+        rows = m["rows"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return [f"{table}: cannot read {mpath}: {type(e).__name__}: {e}"], []
+    problems = []
+    names = [f for f, _, _ in parts]
+    if [Path(f).name for f in rec["parts"]] != names:
+        problems.append(f"{table}: the manifest lists the parts {names}, the report {rec['parts']}")
+    if rec.get("rows") is not None and rows != rec["rows"]:
+        problems.append(f"{table}: the manifest says {rows} rows, the report {rec['rows']}")
+    if rec.get("bytes") is not None and sum(b for _, b, _ in parts) != rec["bytes"]:
+        problems.append(f"{table}: the manifest's parts are {sum(b for _, b, _ in parts)} bytes, the "
+                        f"report says {rec['bytes']}")
+    paths = []
+    for name, size, md5 in parts:
+        if not isinstance(name, str) or Path(name).name != name or name == SIDECAR_FILE:
+            problems.append(f"{table}: the manifest lists {name!r}, not a part")
+            continue
+        path = delivery / name
+        if not path.is_file():
+            problems.append(f"{table}: {path} is missing")
+        elif path.stat().st_size != size:
+            problems.append(f"{table}: {path} is {path.stat().st_size} bytes, the manifest says {size}")
+        else:
+            got = md5_file(path)
+            if got != md5:
+                problems.append(f"{table}: {path} has md5 {got}, the manifest says {md5}")
+        paths.append(path)
+    return problems, paths + [mpath]
+
+
 def verify_delivery(run_dir, report, tables):
-    """Refuse unless the report is deliverable and each table's file matches
-    it. Returns {Table: Path}, in the order of ``tables``."""
+    """Refuse unless the report is deliverable and each table's files match
+    it. Returns {Table: [Path, ...]}, in the order of ``tables``: a table's
+    one file, or SSObservation's parts in part order and then its
+    manifest (never the sidecar)."""
     if report.get("deliverable") is not True:
         failed = [s for s, v in (report.get("steps") or {}).items()
                   if isinstance(v, dict) and v.get("status") != "ok"]
@@ -234,6 +292,10 @@ def verify_delivery(run_dir, report, tables):
     recorded = report.get("tables") or {}
     file_map, problems = {}, []
     for t in tables:
+        if t == PARTITIONED:
+            p, file_map[t] = _verify_partitioned(run_dir, t, recorded.get(t))
+            problems += p
+            continue
         path = Path(run_dir) / DELIVERY_DIR / f"{t}.parquet"
         rec = recorded.get(t)
         if not rec or not rec.get("md5"):
@@ -246,7 +308,7 @@ def verify_delivery(run_dir, report, tables):
             md5 = md5_file(path)
             if md5 != rec["md5"]:
                 problems.append(f"{t}: {path} has md5 {md5}, the report says {rec['md5']}")
-        file_map[t] = path
+        file_map[t] = [path]
     if problems:
         raise SSOUploadError("the delivery doesn't match its report; refusing to upload:\n  "
                              + "\n  ".join(problems))
@@ -286,14 +348,25 @@ def generate_prefix(now=None):
     return now.astimezone(timezone.utc).strftime(UPLOAD_PREFIX_FORMAT)[:-3]
 
 
-def message_body(bucket_name, object_prefix, tables):
-    """The Pub/Sub message, as the bytes published."""
-    data = dict(zip(UPLOAD_MESSAGE_FIELDS, (bucket_name, object_prefix, list(tables))))
+def object_names(file_map):
+    """{Table: [object name relative to the prefix, ...]} of ``file_map``
+    ({Table: [Path, ...]}): each file under its own name."""
+    return {t: [Path(p).name for p in paths] for t, paths in file_map.items()}
+
+
+def message_body(bucket_name, object_prefix, file_map):
+    """The Pub/Sub message, as the bytes published: the delivery
+    contract's UPLOAD_MESSAGE_FIELDS, with ``files`` the object names of
+    each table (object_names)."""
+    data = dict(zip(UPLOAD_MESSAGE_FIELDS,
+                    (bucket_name, object_prefix, list(file_map), object_names(file_map))))
     return json.dumps(data).encode("utf-8")
 
 
 def planned_objects(bucket_name, object_prefix, file_map):
-    return {t: f"gs://{bucket_name}/{posixpath.join(object_prefix, f'{t}.parquet')}" for t in file_map}
+    """{Table: [gs:// URI, ...]}, in upload order."""
+    return {t: [f"gs://{bucket_name}/{posixpath.join(object_prefix, n)}" for n in names]
+            for t, names in object_names(file_map).items()}
 
 
 def _storage_client():
@@ -310,7 +383,8 @@ def _publisher_client():
 
 
 def upload(cfg, file_map, object_prefix=None, publish_timeout=PUBLISH_TIMEOUT_S):
-    """Upload ``file_map`` ({Table: Path}) and publish the message.
+    """Upload ``file_map`` ({Table: [Path, ...]}, each file under its own
+    name) and publish the message.
 
     Returns (object_prefix, message_id). On any failure, deletes the objects
     this call uploaded and raises SSOUploadError -- except when the publish
@@ -324,6 +398,8 @@ def upload(cfg, file_map, object_prefix=None, publish_timeout=PUBLISH_TIMEOUT_S)
 
     bucket_name, topic, project = cfg["bucket_name"], cfg["topic"], cfg["project"]
     object_prefix = object_prefix or generate_prefix()
+    if any(Path(p).name == SIDECAR_FILE for paths in file_map.values() for p in paths):
+        raise SSOUploadError(f"{SIDECAR_FILE} (internal columns) is never uploaded")
     try:
         bucket = _storage_client().bucket(bucket_name)
     except Exception as e:      # e.g. GoogleAuthError: no application-default credentials
@@ -331,18 +407,21 @@ def upload(cfg, file_map, object_prefix=None, publish_timeout=PUBLISH_TIMEOUT_S)
 
     uploaded = []
     try:
-        for table, path in file_map.items():
-            name = posixpath.join(object_prefix, f"{table}.parquet")
-            try:
-                _LOG.info("uploading %s to gs://%s/%s", path, bucket_name, name)
-                bucket.blob(name).upload_from_filename(str(path), if_generation_match=0)
-            except PreconditionFailed as e:
-                raise SSOUploadError(f"gs://{bucket_name}/{name} already exists; "
-                                     "a naming collision for this upload prefix") from e
-            except Exception as e:      # GoogleAPIError, GoogleAuthError, OSError, ...
-                raise SSOUploadError(f"failed to upload {path} to gs://{bucket_name}/{name}: {e!r}") from e
-            uploaded.append(name)
-        _LOG.info("uploaded %d tables to gs://%s/%s", len(uploaded), bucket_name, object_prefix)
+        for table, paths in file_map.items():
+            for path in paths:
+                name = posixpath.join(object_prefix, Path(path).name)
+                try:
+                    _LOG.info("uploading %s to gs://%s/%s", path, bucket_name, name)
+                    bucket.blob(name).upload_from_filename(str(path), if_generation_match=0)
+                except PreconditionFailed as e:
+                    raise SSOUploadError(f"gs://{bucket_name}/{name} already exists; "
+                                         "a naming collision for this upload prefix") from e
+                except Exception as e:      # GoogleAPIError, GoogleAuthError, OSError, ...
+                    raise SSOUploadError(f"failed to upload {path} to gs://{bucket_name}/{name}: "
+                                         f"{e!r}") from e
+                uploaded.append(name)
+        _LOG.info("uploaded %d tables (%d objects) to gs://%s/%s", len(file_map), len(uploaded),
+                  bucket_name, object_prefix)
 
         data = message_body(bucket_name, object_prefix, file_map)
         topic_path = f"projects/{project}/topics/{topic}"
@@ -415,8 +494,9 @@ def run(config, run_dir, tables=None, dry_run=False, force=False, allow_partial=
     if dry_run:
         record["object_prefix"] = generate_prefix()
         print(f"dry run: config {cfg_path}; nothing is uploaded or published", file=out)
-        for t, uri in planned_objects(cfg["bucket_name"], record["object_prefix"], file_map).items():
-            print(f"  {file_map[t]} -> {uri}  (if_generation_match=0)", file=out)
+        for t, uris in planned_objects(cfg["bucket_name"], record["object_prefix"], file_map).items():
+            for path, uri in zip(file_map[t], uris):
+                print(f"  {path} -> {uri}  (if_generation_match=0)", file=out)
         print(f"  publish to projects/{cfg['project']}/topics/{cfg['topic']}:", file=out)
         print(f"    {message_body(cfg['bucket_name'], record['object_prefix'], file_map).decode()}",
               file=out)
@@ -438,8 +518,9 @@ def run(config, run_dir, tables=None, dry_run=False, force=False, allow_partial=
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="ssp-upload-sso",
-        description="Upload a checked SSO delivery (RUN_DIR/delivery/<Table>.parquet) to the PPDB's "
-                    "SSO ingestion bucket and announce it on Pub/Sub (DM-55678).",
+        description="Upload a checked SSO delivery (RUN_DIR/delivery/<Table>.parquet; SSObservation as "
+                    "its parts and manifest, never its sidecar) to the PPDB's SSO ingestion bucket and "
+                    "announce it on Pub/Sub (DM-55678).",
         epilog=f"Named configs: {_named_configs()} in {CONFIG_DIR}. "
                "Credentials: Google application-default credentials "
                "(GOOGLE_APPLICATION_CREDENTIALS or gcloud auth application-default login). "

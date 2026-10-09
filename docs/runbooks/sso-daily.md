@@ -44,8 +44,8 @@ The run happens in `WORK_DIR/<UTC date>/`. `--stamp NAME` uses a different name,
 |---|---|
 | `stage0.log` | stage 0: the builder's output (it also appends to `CT/build.log`) |
 | `inputs/` | stage 1: `obs_sbn`, `mpc_orbits`, `current_identifications`, `numbered_identifications` (raw MPC, one snapshot), `dia_sources`, `ppdb_dia_sources` and `manifest.json` |
-| `run/delivery/` | stage 2: `<Table>.parquet` for the six tables |
-| `run/report.json` | the steps (status, time, peak memory of the largest process, commit), the tables (rows, md5), the checks, `deliverable`, and the uploads |
+| `run/delivery/` | stage 2: `<Table>.parquet` for five of the six tables; SSObservation as parts, a manifest and a sidecar (below) |
+| `run/report.json` | the steps (status, time, peak memory of the largest process, commit; for `ssobservation` also `part_rows` and `internal_columns`), the tables (rows, md5; for SSObservation the manifest, the parts, the sidecar and the total rows and bytes), the checks, `deliverable`, and the uploads |
 | `run/checks/`, `run/logs/` | the check reports and each step's log |
 | `daily.log` | the commands run, their durations and exit codes |
 
@@ -54,6 +54,28 @@ The run happens in `WORK_DIR/<UTC date>/`. `--stamp NAME` uses a different name,
 - `--skip-stage0` runs the extract on the correction table as it is (testing).
 - `--reuse-inputs DIR` skips stage 0 too: there is no extract to feed.
 - `--stage0-workers N` (default and maximum 32) sets the builder's worker processes.
+- `--part-rows N` and `--internal-columns A,B,...` go to `ssp-build-sso` (below). Without them, its defaults apply.
+
+## The partitioned SSObservation
+
+SSObservation is delivered as a series of Parquet parts, with a manifest describing them, and a sidecar of internal columns (`docs/design/ssobservation-delivery.md`; the rules are in `ssp/ssobservation_contract.py`, "The partitioned delivery"):
+
+```
+run/delivery/SSObservation.part0000.parquet   ssObjectId range 1
+run/delivery/SSObservation.part0001.parquet   ...
+run/delivery/SSObservation.partNNNN.parquet   the rows with a NULL ssObjectId, last
+run/delivery/SSObservation.manifest.json      the parts: rows, ssObjectId range, bytes, md5; the totals; the sidecar
+run/delivery/SSObservation_internal.parquet   the sidecar: obsid + the internal columns (NOT uploaded)
+```
+
+- **Parts.** Rows are in (`ssObjectId`, `midpointMjdTai`, `obsid`) order across the parts taken in order. A part holds whole objects: it closes at the first object boundary at or after `--part-rows` rows (default 2,000,000), so its `ssObjectId` range is disjoint from the others'. The rows the MPC hasn't linked to an object (NULL `ssObjectId`) come last, in their own part(s). Every part has exactly the Felis schema of SSObservation. BigQuery loads them with `uris = ['gs://.../SSObservation.part*.parquet']`.
+- **The manifest** is written last; the delivery check (`ssp.delivery_check`) checks every part, and the sidecar, against it.
+- **The sidecar** holds the internal columns: computed by the build, kept for our own use, but not in the Felis schema or the delivered table. One row per SSObservation row, in the same order, keyed by `obsid`. It stays in `run/delivery/` but is **never uploaded**. The default internal columns are `matchMethod` and `midpointMjdTai_flag_degraded`.
+- **Options** (`ssp-build-sso` and `ssp-sso-daily`, passed to the builder and recorded in `report.json`'s `steps.ssobservation`):
+  - `--part-rows N`: the part size (default 2,000,000).
+  - `--internal-columns A,B,...`: the internal columns (default `matchMethod,midpointMjdTai_flag_degraded`; `''` for none, which leaves the sidecar with `obsid` only). Only columns the build computes and that aren't in the Felis schema can be internal: a column returning to the delivered table goes back into `sso_base.yaml` first.
+  - With `--from` a later step, these must be those the kept `ssobservation` step was built with (or not given); rerun `--from ssobservation` to change them.
+- **Reading it.** `ssp.ssobservation_parts.read_ssobservation(RUN_DIR/delivery)` gives the parts as one table (`internal=True` joins the sidecar). `ssp-build-ssobject` and the bench tools take the delivery directory or the manifest wherever they took `SSObservation.parquet`; a single SSObservation Parquet file from before the partitioned delivery still works.
 
 ## Stage 0: the shutter-timing correction table
 
@@ -101,6 +123,7 @@ ssp-extract-sso-inputs INPUTS_DIR              # --force to replace, --only/--sk
 ssp-build-sso INPUTS_DIR RUN_DIR --workers 32  # --from STEP to resume
 python -m ssp.delivery_check RUN_DIR/delivery  # the schema check alone
 ssp-upload-sso dev RUN_DIR --dry-run           # prints the planned objects and the Pub/Sub message
+ssp-build-ssobject RUN_DIR/delivery RUN_DIR/delivery/mpc_orbits.parquet -o ssobject.parquet  # SSObject alone
 ```
 
 - **Stage 1 is atomic.**
@@ -111,7 +134,7 @@ ssp-upload-sso dev RUN_DIR --dry-run           # prints the planned objects and 
   - It re-hashes the inputs before checking.
   - `deliverable` is true only if every step and every expected check passed.
   - It refuses to rebuild a run that has been uploaded, unless `--force-rebuild`.
-- **Stage 3 refuses** unless `report.json` is deliverable and every file matches its md5.
+- **Stage 3 refuses** unless `report.json` is deliverable and every file matches its md5: for SSObservation, the manifest must list the parts, rows and bytes the report recorded, and every part must have the manifest's size and md5.
   - It never overwrites an object, and removes its own uploads on any failure.
   - It refuses a second real upload of a run unless `--force`, and a partial table set unless `--allow-partial`.
   - Inputs from another source (not ClickHouse or the MPC replica) can replace stage 1, provided they honour `ssp/delivery_contract.py`'s `INPUT_FILES` and `MANIFEST_FIELDS`.
@@ -121,7 +144,7 @@ ssp-upload-sso dev RUN_DIR --dry-run           # prints the planned objects and 
 - **Configs** are in `config/sso-upload/`; pass the name or the path.
   - **`dev`:** bucket `ppdb-dev-sso-ingest`, topic `load-sso-topic`, project `ppdb-dev-5c07`.
   - **`int`, `prod`:** commented templates from `lsst/idf_deploy`. The int project `ppdb-int-6c62` and all the prod names need confirming.
-- **Layout:** `gs://<bucket>/<YYYYMMDDTHHMMSSmmm>/<Table>.parquet`, then a Pub/Sub message `{"bucket", "object_prefix", "uploaded_tables"}`. This is the contract of `lsst/dax_ppdb` `bigquery/sso_uploader.py`.
+- **Layout:** `gs://<bucket>/<YYYYMMDDTHHMMSSmmm>/<Table>.parquet`; SSObservation as its parts, in order, then `SSObservation.manifest.json`, each under its own name (never the sidecar). Then a Pub/Sub message `{"bucket", "object_prefix", "uploaded_tables", "files"}`, `files` being `{Table: [object names relative to the prefix]}`. The rest is the contract of `lsst/dax_ppdb` `bigquery/sso_uploader.py`; the parts and `files` are new with the partitioned SSObservation and are with the PPDB loader owners for review.
 - **NearbySSO is built and staged but not uploaded.** The loader (`lsst-dm/ppdb-cloud-functions` `load_sso`) fails the *whole* load when an unknown table is listed. NearbySSO joins the configs' `tables` once `dax_ppdb`'s `SSO_TABLES` and `load_sso` add it.
 - **Upload at most once per load window.** `load_sso` starts Dataflow under a fixed job name, `load-sso`, so a message that arrives while a load is running is acknowledged and dropped. Check that the previous load has finished before `--force`.
 - **The PPDB dataset must match the schema.** The loader writes into BigQuery tables built from the deployed `ppdb.yaml`, so SSObservation and the new columns load only once DM-55375 (lsst/sdm_schemas#549) is merged and the dataset rebuilt.
@@ -133,6 +156,7 @@ ssp-upload-sso dev RUN_DIR --dry-run           # prints the planned objects and 
 3. Rebuilding the PPDB dataset from DM-55375's `ppdb.yaml`.
 4. Confirming the int project id (`ppdb-int-6c62`) and the prod names.
 5. Whether naive (UTC wall-time) Parquet timestamps, which match the MPC's `timestamp without time zone`, load correctly into the PPDB's TIMESTAMP columns.
+6. The partitioned SSObservation: the manifest's format and the message's `files` field (review).
 
 ## A reference run
 
@@ -179,7 +203,7 @@ Since `docs/design/nongrav.md`, the ephemerides apply the MPC's non-gravitationa
 SSObservation and NearbySSO have two new columns, `ephAntiSunPA` and `ephAntiMotionPA` (`docs/design/tail-angles.md`), from sdm_schemas `tickets/DM-55375` f2541a5. Nothing changes in the run itself. To check a delivery's angles:
 
 ```bash
-python -m bench.tail_angles_validate consistency RUN_DIR/delivery/SSObservation.parquet RUN_DIR/delivery/NearbySSO.parquet \
+python -m bench.tail_angles_validate consistency RUN_DIR/delivery RUN_DIR/delivery/NearbySSO.parquet \
     --dia-sources INPUTS_DIR/ppdb_dia_sources.parquet
 ```
 

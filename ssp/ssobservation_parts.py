@@ -92,3 +92,36 @@ def read_ssobservation(path, columns=None, filters=None, internal=False):
         if columns is not None:
             t = t.select(list(columns))
     return t
+
+
+# --------------------------------------------------------------------------
+# Either layout: the partitioned delivery, or a single Parquet file (the
+# layout before the partitioned delivery; old fixtures and run outputs)
+# --------------------------------------------------------------------------
+
+def is_partitioned(path):
+    """True if ``path`` is a partitioned SSObservation (a directory holding
+    the manifest, or the manifest file); False for a single Parquet file."""
+    p = Path(path)
+    if p.is_dir():
+        if not (p / SSOBSERVATION_MANIFEST_FILE).is_file():
+            raise FileNotFoundError(f"{p}: no {SSOBSERVATION_MANIFEST_FILE} "
+                                    "(not a partitioned SSObservation)")
+        return True
+    return p.suffix == ".json"
+
+
+def read_schema(path):
+    """The Arrow schema of the SSObservation at ``path``: partitioned (see
+    is_partitioned), or a single Parquet file."""
+    return parquet_schema(path) if is_partitioned(path) else pq.read_schema(path)
+
+
+def read_table(path, columns=None, filters=None):
+    """The SSObservation at ``path`` as one table: partitioned (the parts
+    concatenated, read_ssobservation), or a single Parquet file. ``columns``
+    and ``filters`` as for pyarrow.parquet.read_table; delivered columns
+    only."""
+    if is_partitioned(path):
+        return read_ssobservation(path, columns=columns, filters=filters)
+    return pq.read_table(path, columns=columns, filters=filters)

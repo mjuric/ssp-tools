@@ -2,7 +2,8 @@
 
     ssp-sso-daily WORK_DIR [--upload CONFIG] [--dry-run] [--reuse-inputs DIR]
                   [--stamp STAMP] [--correction-table DIR] [--skip-stage0]
-                  [--stage0-workers N]
+                  [--stage0-workers N] [--part-rows N]
+                  [--internal-columns A,B,...]
 
 runs, in a fresh dated directory DAY = WORK_DIR/<stamp> (default: today's
 UTC date, YYYY-MM-DD):
@@ -12,8 +13,15 @@ UTC date, YYYY-MM-DD):
                                               --skip-stage0 or --reuse-inputs)
     ssp-extract-sso-inputs DAY/inputs --correction-table CT
                                              (skipped with --reuse-inputs DIR)
-    ssp-build-sso DAY/inputs DAY/run         (or DIR in place of DAY/inputs)
+    ssp-build-sso DAY/inputs DAY/run [--part-rows N]
+                  [--internal-columns A,B,...]
+                                             (or DIR in place of DAY/inputs)
     ssp-upload-sso CONFIG DAY/run [--dry-run]   (only with --upload)
+
+--part-rows and --internal-columns go to ssp-build-sso as given (and so
+to the SSObservation builder); without them, its defaults
+(ssp.ssobservation_contract PART_ROWS_DEFAULT and
+SSOBSERVATION_INTERNAL_DEFAULT) apply.
 
 CT, the shutter-timing correction table, defaults to
 DEFAULT_CORRECTION_TABLE. Stage 0 brings it up to date
@@ -46,6 +54,8 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .ssobservation_contract import PART_ROWS_DEFAULT, SSOBSERVATION_INTERNAL_DEFAULT
 
 _LOG = logging.getLogger("ssp.sso_daily")
 
@@ -89,8 +99,10 @@ def utc_stamp():
 
 
 def plan(day, upload=None, dry_run=False, reuse_inputs=None, correction_table=DEFAULT_CORRECTION_TABLE,
-         skip_stage0=False, stage0_workers=STAGE0_WORKERS):
-    """The commands to run, as [(stage, argv)]."""
+         skip_stage0=False, stage0_workers=STAGE0_WORKERS, part_rows=None, internal_columns=None):
+    """The commands to run, as [(stage, argv)]. ``part_rows`` and
+    ``internal_columns`` (a comma-separated string; '' for none) go to
+    ssp-build-sso when given (not None)."""
     inputs = Path(reuse_inputs) if reuse_inputs else day / "inputs"
     run_dir = day / "run"
     cmds = []
@@ -100,7 +112,12 @@ def plan(day, upload=None, dry_run=False, reuse_inputs=None, correction_table=DE
                                     "--refresh-recent", str(REFRESH_RECENT),
                                     "--workers", str(stage0_workers)]))
         cmds.append(("extract", [EXTRACT, str(inputs), "--correction-table", str(correction_table)]))
-    cmds.append(("build", [BUILD, str(inputs), str(run_dir)]))
+    build = [BUILD, str(inputs), str(run_dir)]
+    if part_rows is not None:
+        build += ["--part-rows", str(part_rows)]
+    if internal_columns is not None:
+        build += ["--internal-columns", internal_columns]
+    cmds.append(("build", build))
     if upload:
         cmds.append(("upload", [UPLOAD, str(upload), str(run_dir)] + (["--dry-run"] if dry_run else [])))
     return cmds
@@ -131,8 +148,11 @@ def _stage0_failure(day, rc, correction_table):
 
 
 def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None,
-        correction_table=DEFAULT_CORRECTION_TABLE, skip_stage0=False, stage0_workers=STAGE0_WORKERS):
+        correction_table=DEFAULT_CORRECTION_TABLE, skip_stage0=False, stage0_workers=STAGE0_WORKERS,
+        part_rows=None, internal_columns=None):
     """Run the stages. Returns the exit status (0, or the first failure's)."""
+    if part_rows is not None and int(part_rows) < 1:
+        raise SystemExit(f"ssp-sso-daily: --part-rows {part_rows}: must be at least 1")
     if not 1 <= int(stage0_workers) <= MAX_STAGE0_WORKERS:
         raise SystemExit(f"ssp-sso-daily: --stage0-workers {stage0_workers}: must be in "
                          f"1..{MAX_STAGE0_WORKERS} (shared-node limit)")
@@ -153,7 +173,8 @@ def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None,
         _log(day, "stage0: skipped (--reuse-inputs: no extract)")
     elif skip_stage0:
         _log(day, f"stage0: skipped (--skip-stage0); the extract reads {correction_table} as it is")
-    stages = plan(day, upload, dry_run, reuse_inputs, correction_table, skip_stage0, stage0_workers)
+    stages = plan(day, upload, dry_run, reuse_inputs, correction_table, skip_stage0, stage0_workers,
+                  part_rows, internal_columns)
     for stage, argv in stages:
         argv = [resolve_command(argv[0])] + argv[1:]
         redirect = f" > {day / STAGE0_LOG} 2>&1" if stage == "stage0" else ""
@@ -205,11 +226,19 @@ def main(argv=None):
                              "(testing)")
     parser.add_argument("--stage0-workers", type=int, default=STAGE0_WORKERS, metavar="N",
                         help=f"stage 0's worker processes (default and maximum {MAX_STAGE0_WORKERS})")
+    parser.add_argument("--part-rows", type=int, default=None, metavar="N",
+                        help="passed to ssp-build-sso: SSObservation parts close at the first object "
+                             f"boundary at or after N rows (default: {PART_ROWS_DEFAULT:,})")
+    parser.add_argument("--internal-columns", default=None, metavar="A,B,...",
+                        help="passed to ssp-build-sso: the SSObservation columns written to the sidecar "
+                             "(not uploaded) instead of the delivered table; '' for none (default: "
+                             f"{','.join(SSOBSERVATION_INTERNAL_DEFAULT)})")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     return run(args.work_dir, upload=args.upload, dry_run=args.dry_run,
                reuse_inputs=args.reuse_inputs, stamp=args.stamp, correction_table=args.correction_table,
-               skip_stage0=args.skip_stage0, stage0_workers=args.stage0_workers)
+               skip_stage0=args.skip_stage0, stage0_workers=args.stage0_workers,
+               part_rows=args.part_rows, internal_columns=args.internal_columns)
 
 
 if __name__ == "__main__":
