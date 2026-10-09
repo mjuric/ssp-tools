@@ -27,6 +27,7 @@ from ssp import ssobservation, util
 from ssp.delivery_contract import SHUTTER_INPUT_COLUMNS
 from ssp.ssobservation import build_ssobservation, observer_states
 from ssp.ssobservation_contract import SHUTTER_INTERNAL, SSObservationDtype
+from ssp.ssobservation_parts import read_ssobservation
 
 from test_ssobservation_widened import (
     _by_obsid, _fake_ephemerides, _FakeEllipse, _same, make_inputs, read_output,
@@ -85,7 +86,7 @@ def test_copies_corrected_time_and_flags(tmp_path, offline, capsys):
     for c in SHUTTER_INTERNAL:
         assert c not in sss.column_names
     assert "dropped" not in err
-    assert pq.read_table(tmp_path / "ssobservation.parquet").column_names == list(SSObservationDtype.names)
+    assert read_ssobservation(tmp_path).column_names == list(SSObservationDtype.names)
 
 
 def test_unknown_column_still_warned(tmp_path, offline, capsys):
