@@ -39,7 +39,7 @@ INPUT_FILES = {
                     "extract-submitted-sources output (ssp.SubmittableSources), with "
                     "shutter-corrected times (ssp.ssobservation_contract, 'Shutter-motion')"),
     "ppdb_dia_sources": ("ppdb_dia_sources.parquet",
-                         "PPDB DiaSource: diaSourceId, visit, midpointMjdTai, ra, dec"),
+                         "PPDB DiaSource: diaSourceId, visit, detector, midpointMjdTai, ra, dec"),
 }
 
 #: The four MPC files must come from one consistent snapshot (one database
@@ -56,7 +56,7 @@ REQUIRED_INPUT_COLUMNS = {
     "numbered_identifications": ["packed_primary_provisional_designation"],
     "dia_sources": ["obsid", "diaSourceId", "processing", "measuredOn", "midpointMjdTai",
                     "ra", "dec"],
-    "ppdb_dia_sources": ["diaSourceId", "visit", "midpointMjdTai", "ra", "dec"],
+    "ppdb_dia_sources": ["diaSourceId", "visit", "detector", "midpointMjdTai", "ra", "dec"],
 }
 
 #: INPUTS_DIR/manifest.json, written last by stage 1 (or by whatever else

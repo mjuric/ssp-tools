@@ -149,3 +149,8 @@ Dependencies outside this repository:
 - Corrected times at those positions: OK 2,550,074, DEGRADED 404,422, OMITTED 29,409 (beyond 100 px), NOT_BUILT 0.
 - Findings folded in: 172 detectors appear in the store, not 189 (hence the revised missing-detector rule); the store holds every visit, so each slice reads only its PPDB visits' rows (half the memory); the build stalls under Python 3.14, so WP environments pin Python 3.12.
 
+
+**Wave 1 (2026-10-11):**
+- The contract (`ssp/nearbysso/_contract.py`, "Unmatched predictions, detector placement and corrected times"): `PLACEMENT_MARGIN_ARCSEC`, `NEARBYSSO_DTYPE_NEXT` (17 columns), `NEARBYSSO_KEY`, `NEARBYSSO_NONNULL_NEXT`, `NEARBYSSO_UNMATCHED_NULL`, the sidecar (`NEARBYSSO_SIDECAR_FILE`, `_DTYPE`, `_NONNULL`), the time rules and `PLACEMENT_REPORT_FIELDS`. The `*_NEXT` names replace the current ones when U3 switches the output. Checked against sdm_schemas `6d7c9a1`: column order, non-null columns and key match.
+- The schema copies (`tests/data/sdm_schemas/`, `ssp/schema_ppdb.py`) move to `6d7c9a1` with U3, which changes NearbySSO's output; before that they would fail five tests.
+- U1 (`detector` in `ppdb_dia_sources`): in the TAP query (int64), the ClickHouse query (`toInt64(detector)`) and `REQUIRED_INPUT_COLUMNS`. On data-int: 17,863,456 rows in 321 s; the other five columns equal the earlier file and `detector` equals the 2026-10-09 full export (2..186). ClickHouse: 13,086,925 rows, other columns unchanged.

@@ -1034,7 +1034,7 @@ def subset_tables():
     pf = pq.ParquetFile(FIXTURE / "mpc_orbits.parquet")
     orb = pa.Table.from_batches([cut(b) for b in pf.iter_batches(batch_size=200_000)], schema=pf.schema_arrow)
     ppdb = dia.filter(pc.equal(dia["measuredOn"], "difference")).select(
-        ["diaSourceId", "visit", "midpointMjdTai", "ra", "dec"])
+        ["diaSourceId", "visit", "detector", "midpointMjdTai", "ra", "dec"])
     return dict(obs_sbn=obs, dia_sources=dia, mpc_orbits=orb, current_identifications=cut(cur),
                 numbered_identifications=cut(num), ppdb_dia_sources=ppdb)
 
