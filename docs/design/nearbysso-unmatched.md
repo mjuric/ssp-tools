@@ -37,7 +37,8 @@ Related:
 | Corrected PPDB times | Detected per visit: DiaSource `midpointMjdTai` within 1 ms of the header midpoint for all of a visit's DiaSources = uncorrected. Otherwise matched rows use their DiaSource's own time. No per-source comparison with our table. |
 | TAP extract | Gains `detector` (6 columns). No other new columns. |
 | Missing WCSs | Never inferred. Counted; rescued later (#96). |
-| WCS store | visit-table's store at `/sdf/home/m/mjuric/ssp_daily_data/visit-table/wcs/`, refreshed hourly by ssp-daily, read only through visit-table's reader. |
+| WCS store | visit-table's store at `/sdf/home/m/mjuric/ssp_daily_data/visit-table/wcs/`, refreshed hourly by ssp-daily, read only through visit-table's reader. ssp-tools assumes it is current: no freshness checks; what is missing today is picked up by tomorrow's rebuild. |
+| Validation | Don't re-validate what is validated upstream (visit-table's placement accuracy, `at_source_time`'s moves); check only what is new here. |
 
 ## Outputs
 
@@ -65,7 +66,7 @@ Related:
 - in visits with a detector missing its WCS (rule below);
 - matched rows without a WCS.
 
-Also the visits whose PPDB times are corrected, and the WCS snapshot used.
+Also the visits whose PPDB times are corrected, and the WCS store snapshot the build read.
 
 ## Inputs
 
@@ -75,26 +76,10 @@ Also the visits whose PPDB times are corrected, and the WCS snapshot used.
 - Read with `visit_table.locate.WcsStore([...per-night files...])` and `store.locator(visit)` (rejected detectors left out), plus the nearest-detector mode of visit-table #22.
 - Stack-free; pinned at a visit-table tag.
 
-**Recorded at extract.** `ssp-extract-sso-inputs` records in `manifest.json` a `wcs_store` entry:
-- the store path (through the symlink);
-- visit-table's model version;
-- the snapshot number N;
-- for every night of `ppdb_dia_sources`, the night's file and sha256 as `_state.json` names them.
-
-**Extract fails** (exit 1, no manifest; ssp-daily's hourly retry picks it up), naming the nights, if any `ppdb_dia_sources` night is:
-- absent from snapshot N's `files` (not processed yet);
-- in its `heldNights` (waiting for its correction table);
-- named in `_state.json` with a file or sha256 different from snapshot N's (the store is mid-update).
-
-**Build fails** ("re-extract") if any recorded night's file is missing, or its sha256 differs from the manifest. The build opens exactly the recorded files.
-
-**Not failures:**
-- a visit missing from a present night;
-- a detector without a WCS or rejected.
-
-Both are counted, and handled as below and in #96.
-
-**One shared check.** These checks are one function, `ssp.export.wcs_store.check(store, nights)`, used by both stages and callable by ssp-daily before a run.
+**Its state is not ssp-tools' concern** (owner, 2026-10-11). ssp-daily keeps it current. The build opens whatever nights the store has for the nights it covers, and checks nothing about the store's freshness:
+- a night not in the store yet, a held night, a visit missing from a night, a detector without a WCS or rejected: all handled as "no WCS" (below and #96) and counted;
+- NearbySSO is rebuilt from scratch every day, so whatever is missing today is picked up tomorrow;
+- the run report records the store snapshot the build read, so a delivery's WCSs can be identified, and the "no WCS" counts make a stalled store visible.
 
 **The correction table** (already an input to the extract; path in the manifest's `shutter_timing` entry) becomes an input to the NearbySSO build as well, through `ssp.export.submittable.Corrections` (shutter-timing v0.5.0's API).
 
@@ -122,18 +107,11 @@ Everything below runs in NearbySSO's matching pass. It already works per slice o
 
 ## Validation
 
-- **Placement** against the Rubin stack (`SkyWcs.skyToPixel` from the AST in the store), on a sample of real predictions per night, including gaps, the margin and overlaps: detector agreement, (x, y) to < 0.01 px on the detector. Off-detector positions are checked against the edge-plus-Jacobian definition.
+- **Placement** is visit-table's (validated there against the stack: 0 detector mismatches, ≤ 0.005 mas). Here only a spot check that NearbySSO calls it correctly: a few visits' predictions placed again independently, through `VisitLocator`.
 - **Matched rows' `detector`** against their DiaSource's detector: they agree, except predictions near an edge, which are counted and listed.
 - **Times** against `Corrections` at the same pixels: bit-identical. The uncorrected/corrected visit test checked on fabricated corrected times (a copy of an input with its DiaSource times replaced by our table's).
-- **Moves** against an exact evaluation at t (`compute_ephemerides_one`) on the fast/pole/opposition set of WP S3, as `docs/design/nearbysso.md` records for `at_source_time`. `eph_x`/`eph_y` against a fresh placement at the moved position.
+- **Moves** are `at_source_time`'s, validated in `docs/design/nearbysso.md`. New here: `eph_x`/`eph_y` after the linear pixel correction, against a fresh placement at the moved position.
 - **The sidecar** is checked by the delivery check: same row count and key order as NearbySSO, the columns' types and nulls (as SSObservation's sidecar).
-- **The WCS-store checks** on a copied store with:
-  - a night removed;
-  - a night held;
-  - `_state.json` out of step with the snapshot;
-  - a file changed after the extract.
-
-  Each fails at the right stage with the right message.
 - **End to end** on the 2026-10-09 inputs (TAP extract with `detector`):
   - matched and unmatched row counts, NearbySSO's wall time and memory against today's (379 s, 11.9 GB);
   - every check passes;
@@ -144,9 +122,9 @@ Everything below runs in NearbySSO's matching pass. It already works per slice o
 | Wave | Work | Who |
 |---|---|---|
 | 0 | This design; owner approval | integrator |
-| 1 | **The contract:** `ssp/nearbysso/_contract.py` additions (sidecar dtype, key, report fields, margin, the uncorrected test), `ssp/delivery_contract.py` (the `wcs_store` manifest entry, `detector` in `ppdb_dia_sources`). **Schema:** NearbySSO in sdm_schemas #549 (`visit`, `detector`, nullability, key; the Felis question), copies and `ssp/schema_ppdb.py`. | integrator |
+| 1 | **The contract:** `ssp/nearbysso/_contract.py` additions (sidecar dtype, key, report fields, margin, the uncorrected test), `ssp/delivery_contract.py` (`detector` in `ppdb_dia_sources`). **Schema:** NearbySSO in sdm_schemas #549 (`visit`, `detector`, nullability, key; the Felis question), copies and `ssp/schema_ppdb.py`. | integrator |
 | 1 | **U0, the speed gate:** on the 2026-10-09 inputs, measure the extra cost of (a) the rates of change at every candidate visit, (b) placing every eligible prediction with today's `VisitLocator` (whichDetector + pixels; the gap mode comes later), (c) the time lookup. If the total exceeds ~10% of NearbySSO's time, stop and report. | WP agent |
-| 2 | **U1, inputs:** `detector` in the TAP and ClickHouse extracts; `ssp.export.wcs_store.check` and the `wcs_store` manifest entry; the build-side verification. | WP agent |
+| 2 | **U1, inputs:** `detector` in the TAP and ClickHouse extracts (small; may be folded into the contract wave). | integrator |
 | 2 | **U2, time and moves:** per-visit uncorrected test; `Corrections` at predicted pixels; rates of change everywhere; `at_source_time` for all rows; the pixel correction. | WP agent |
 | 3 | **U3, placement and rows:** the WCS footprint; nearest-detector placement (needs visit-table #22's tag); the missing-detector rules; unmatched rows; NearbySSO's 17 columns; the sidecar; the report. | WP agent |
 | 3 | **U4, checks:** the delivery check and bench for the new NearbySSO and its sidecar, written black-box from this design and the contract. | WP agent |
@@ -156,5 +134,5 @@ Everything below runs in NearbySSO's matching pass. It already works per slice o
 Dependencies outside this repository:
 - visit-table's first tag (the reader, packaged);
 - visit-table #22 (the gap mode) before U3's placement;
-- ssp-daily keeping the WCS store current;
+- ssp-daily keeping the WCS store current (not checked here);
 - sdm_schemas #549.
