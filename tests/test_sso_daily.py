@@ -22,7 +22,7 @@ sys.exit(int(os.environ.get("STUB_FAIL_" + os.path.basename(sys.argv[0]).replace
 def stubs(tmp_path, monkeypatch):
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    for name in (D.STAGE0, D.EXTRACT, D.BUILD, D.UPLOAD):
+    for name in (D.EXTRACT, D.BUILD, D.UPLOAD):
         p = bindir / name
         p.write_text(STUB.format(python=sys.executable))
         p.chmod(0o755)
@@ -42,7 +42,6 @@ def test_all_three_in_order(stubs, tmp_path):
     assert D.main([str(w), "--upload", "dev", "--dry-run", "--stamp", "2026-10-01"]) == 0
     day = w / "2026-10-01"
     assert stubs() == [
-        f"shutter-timing-table --out {CT} --refresh-recent 3 --workers 32",
         f"ssp-extract-sso-inputs {day}/inputs --correction-table {CT}",
         f"ssp-build-sso {day}/inputs {day}/run",
         f"ssp-upload-sso dev {day}/run --dry-run",
@@ -55,8 +54,7 @@ def test_default_stamp_is_utc_date(stubs, tmp_path):
     assert D.main([str(w)]) == 0
     day = w / datetime.now(timezone.utc).strftime("%Y-%m-%d")
     assert day.is_dir()
-    assert stubs() == [f"shutter-timing-table --out {CT} --refresh-recent 3 --workers 32",
-                       f"ssp-extract-sso-inputs {day}/inputs --correction-table {CT}",
+    assert stubs() == [f"ssp-extract-sso-inputs {day}/inputs --correction-table {CT}",
                        f"ssp-build-sso {day}/inputs {day}/run"]
 
 
@@ -70,20 +68,20 @@ def test_no_upload_without_config(stubs, tmp_path):
 def test_stops_at_first_failure(stubs, tmp_path, monkeypatch):
     fail(monkeypatch, D.EXTRACT, 5)
     assert D.main([str(tmp_path / "w"), "--upload", "dev", "--stamp", "a"]) == 5
-    assert [c.split()[0] for c in stubs()] == [D.STAGE0, D.EXTRACT]
+    assert [c.split()[0] for c in stubs()] == [D.EXTRACT]
     assert "stopping: extract failed" in (tmp_path / "w" / "a" / "daily.log").read_text()
 
 
 def test_build_failure_skips_upload(stubs, tmp_path, monkeypatch):
     fail(monkeypatch, D.BUILD)
     assert D.main([str(tmp_path / "w"), "--upload", "dev", "--stamp", "a"]) == 3
-    assert [c.split()[0] for c in stubs()] == [D.STAGE0, D.EXTRACT, D.BUILD]
+    assert [c.split()[0] for c in stubs()] == [D.EXTRACT, D.BUILD]
 
 
 def test_upload_failure_is_the_exit_status(stubs, tmp_path, monkeypatch):
     fail(monkeypatch, D.UPLOAD, 1)
     assert D.main([str(tmp_path / "w"), "--upload", "dev", "--stamp", "a"]) == 1
-    assert [c.split()[0] for c in stubs()] == [D.STAGE0, D.EXTRACT, D.BUILD, D.UPLOAD]
+    assert [c.split()[0] for c in stubs()] == [D.EXTRACT, D.BUILD, D.UPLOAD]
 
 
 def test_ssobservation_options_passed_to_build(stubs, tmp_path):
@@ -143,20 +141,19 @@ def test_stamp_pinned_to_utc(monkeypatch):
 def test_local_bin_searched_before_path(stubs, tmp_path, monkeypatch):
     local = tmp_path / "venvbin"
     local.mkdir()
-    for name in (D.STAGE0, D.EXTRACT, D.BUILD):
+    for name in (D.EXTRACT, D.BUILD):
         p = local / name
         p.write_text(STUB.format(python=sys.executable).replace("os.path.basename(sys.argv[0])]",
                                                                "'local:' + os.path.basename(sys.argv[0])]"))
         p.chmod(0o755)
     monkeypatch.setattr(D, "_local_bin", lambda: local)
     assert D.main([str(tmp_path / "w"), "--stamp", "a"]) == 0
-    assert [c.split()[0] for c in stubs()] == ["local:" + D.STAGE0, "local:" + D.EXTRACT,
-                                               "local:" + D.BUILD]
+    assert [c.split()[0] for c in stubs()] == ["local:" + D.EXTRACT, "local:" + D.BUILD]
 
 
 def test_signal_maps_to_128_plus(stubs, tmp_path, monkeypatch):
     bindir = tmp_path / "bin"
-    (bindir / D.STAGE0).write_text("#!/bin/sh\nkill -TERM $$\n")
+    (bindir / D.EXTRACT).write_text("#!/bin/sh\nkill -TERM $$\n")
     assert D.main([str(tmp_path / "w"), "--stamp", "a"]) == 128 + 15
     assert "killed by signal 15" in (tmp_path / "w" / "a" / "daily.log").read_text()
 
@@ -169,69 +166,18 @@ def test_bad_stamp(stubs, tmp_path, stamp):
 
 
 # --------------------------------------------------------------------------
-# Stage 0: the shutter-timing correction table
+# The correction table: read as it is (ssp-daily keeps it up to date)
 # --------------------------------------------------------------------------
-
-def test_stage0_runs_first_and_its_output_goes_to_the_run_dir(stubs, tmp_path):
-    w = tmp_path / "w"
-    assert D.main([str(w), "--stamp", "a"]) == 0
-    day = w / "a"
-    calls = stubs()
-    assert calls[0] == f"shutter-timing-table --out {CT} --refresh-recent 3 --workers 32"
-    assert calls[1].endswith(f"--correction-table {CT}")
-    assert (day / D.STAGE0_LOG).read_text() == "stub shutter-timing-table output\n"
-    log = (day / "daily.log").read_text()
-    assert f"> {day / D.STAGE0_LOG} 2>&1" in log
-    assert "stage0: exit 0 after" in log
-
 
 def test_correction_table_option(stubs, tmp_path):
     ct = tmp_path / "ct"
-    assert D.main([str(tmp_path / "w"), "--stamp", "a", "--correction-table", str(ct),
-                   "--stage0-workers", "8"]) == 0
-    calls = stubs()
-    assert calls[0] == f"shutter-timing-table --out {ct} --refresh-recent 3 --workers 8"
-    assert calls[1] == f"ssp-extract-sso-inputs {tmp_path}/w/a/inputs --correction-table {ct}"
+    assert D.main([str(tmp_path / "w"), "--stamp", "a", "--correction-table", str(ct)]) == 0
+    assert stubs() == [f"ssp-extract-sso-inputs {tmp_path}/w/a/inputs --correction-table {ct}",
+                       f"ssp-build-sso {tmp_path}/w/a/inputs {tmp_path}/w/a/run"]
 
 
-@pytest.mark.parametrize("n", ["0", "33"])
-def test_stage0_workers_limit(stubs, tmp_path, n):
-    with pytest.raises(SystemExit, match="shared-node"):
-        D.main([str(tmp_path / "w"), "--stamp", "a", "--stage0-workers", n])
-    assert stubs() == []
-
-
-def test_skip_stage0(stubs, tmp_path):
-    assert D.main([str(tmp_path / "w"), "--stamp", "a", "--skip-stage0"]) == 0
-    assert [c.split()[0] for c in stubs()] == [D.EXTRACT, D.BUILD]
-    assert stubs()[0].endswith(f"--correction-table {CT}")
-    assert "stage0: skipped (--skip-stage0)" in (tmp_path / "w" / "a" / "daily.log").read_text()
-    assert not (tmp_path / "w" / "a" / D.STAGE0_LOG).exists()
-
-
-def test_reuse_inputs_skips_stage0(stubs, tmp_path):
-    inputs = tmp_path / "old"
-    inputs.mkdir()
-    assert D.main([str(tmp_path / "w"), "--stamp", "a", "--reuse-inputs", str(inputs)]) == 0
-    assert [c.split()[0] for c in stubs()] == [D.BUILD]
-    assert "stage0: skipped (--reuse-inputs" in (tmp_path / "w" / "a" / "daily.log").read_text()
-
-
-@pytest.mark.parametrize("rc, words", [(2, "refused"), (3, "mixed"), (1, "the builder failed")])
-def test_stage0_failure_stops_the_run(stubs, tmp_path, monkeypatch, capsys, rc, words):
-    fail(monkeypatch, D.STAGE0, rc)
-    assert D.main([str(tmp_path / "w"), "--upload", "dev", "--stamp", "a"]) == rc
-    assert [c.split()[0] for c in stubs()] == [D.STAGE0]
-    log = (tmp_path / "w" / "a" / "daily.log").read_text()
-    assert f"stage0: shutter-timing-table exit {rc}: " in log and words in log
-    assert D.RUNBOOK in log and '"Stage 0"' in log
-    assert "stage0: | stub shutter-timing-table output" in log     # the builder's last lines
-    assert "stopping: stage0 failed" in log
-    err = capsys.readouterr().err
-    assert f"exit {rc}" in err and D.RUNBOOK in err
-
-
-def test_stage0_missing(stubs, tmp_path):
-    (tmp_path / "bin" / D.STAGE0).unlink()
-    assert D.main([str(tmp_path / "w"), "--stamp", "a"]) == 127
+@pytest.mark.parametrize("opt", [["--skip-stage0"], ["--stage0-workers", "8"]])
+def test_stage0_options_gone(stubs, tmp_path, opt):
+    with pytest.raises(SystemExit):
+        D.main([str(tmp_path / "w"), "--stamp", "a"] + opt)
     assert stubs() == []

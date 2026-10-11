@@ -95,9 +95,9 @@ SHUTTER_INPUT_COLUMNS = ["midpointMjdTaiVisit", "midpointMjdTai_flag",
 # than ssp.ssobservation_contract.MAX_NOT_BUILT_VISITS of them fail the
 # extract.
 #
-# ssp-sso-daily runs a stage 0 before the extract: shutter-timing-table
-# --out <corrections dir> (resumes; at most 32 workers); a calibration
-# mismatch stops the run with a clear message.
+# The extract only reads the correction table; ssp-daily builds it
+# (shutter-timing-table, hourly). A table the extract can't use (missing,
+# mixed calibrations, unknown format, failing integrity) fails the extract.
 
 #: dia_sources is derived from obs_sbn: its manifest entry records the md5 of
 #: the obs_sbn it was built from (``obs_sbn_md5``), and every stage refuses

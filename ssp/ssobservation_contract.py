@@ -201,7 +201,7 @@ SIDECAR_FIELDS = ("file", "key", "columns", "rows", "bytes", "md5")
 #                                 'corrected' or 'both' (each within DT_MS)
 # A NOT_BUILT visit (status 3) gets the visit's time and midpointMjdTai_flag
 # True, with a warning naming it; more than MAX_NOT_BUILT_VISITS distinct
-# NOT_BUILT visits fail the extract (a stale or skipped stage 0).
+# NOT_BUILT visits fail the extract (a stale correction table).
 # The flags are non-null for every row (False/False for a status-0 correction).
 #
 # SSObservation copies midpointMjdTai and the two flags (block 4) and computes
