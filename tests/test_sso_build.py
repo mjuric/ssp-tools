@@ -1162,3 +1162,18 @@ def test_e2e_non_clickhouse_source(e2e, tmp_path):
         if t == "NearbySSO":           # (its row order follows the DiaSources')
             a, b = (x.sort_by("diaSourceId") for x in (a, b))
         assert a.to_pandas().equals(b.to_pandas()), t     # (NaN == NaN)
+
+
+def test_nearbysso_gets_the_correction_table_and_wcs_store(tmp_path):
+    """NearbySSO's correction table is the one the extract used (the
+    manifest's shutter_timing entry), 'none' without one; the WCS store is
+    the production one."""
+    from ssp.nearbysso.placement import DEFAULT_WCS_STORE
+
+    m = write_inputs(tmp_path / "in")
+    argv, _ = B.step_command("nearbysso", tmp_path / "in", tmp_path / "run", m, 1)
+    assert argv[argv.index("--correction-table") + 1] == "none"
+    assert argv[argv.index("--wcs-store") + 1] == DEFAULT_WCS_STORE
+    m = dict(m, shutter_timing=dict(table_dir="/some/table", table_format=2))
+    argv, _ = B.step_command("nearbysso", tmp_path / "in", tmp_path / "run", m, 1)
+    assert argv[argv.index("--correction-table") + 1] == "/some/table"

@@ -212,10 +212,13 @@ def _sorted_by(a, b):
     return True
 
 
-def read_dia(path, t_lo_mjd=None, t_hi_mjd=None):
+def read_dia(path, t_lo_mjd=None, t_hi_mjd=None, extra=()):
     """The ``DIA_COLUMNS`` of the DiaSources with
     ``t_lo_mjd <= midpointMjdTai < t_hi_mjd`` (either bound optional), as
     a dict of NumPy arrays sorted by (visit, diaSourceId).
+
+    ``extra``: more integer columns to read along (e.g. ``detector``), as
+    int64 with -1 for a null; a null in them drops no row.
 
     Reads only those columns, with the time filter pushed down to Parquet
     (row groups outside the range are skipped by their statistics). ``path``
@@ -240,13 +243,16 @@ def read_dia(path, t_lo_mjd=None, t_hi_mjd=None):
         expr = e if expr is None else expr & e
     n = dset.count_rows(filter=expr)
 
-    dtypes = {c: np.float64 for c in DIA_COLUMNS} | {"diaSourceId": np.int64, "visit": np.int64}
-    dia = {c: np.empty(n, dtype=dtypes[c]) for c in DIA_COLUMNS}
+    extra = [c for c in extra if c not in DIA_COLUMNS]
+    columns = DIA_COLUMNS + extra
+    dtypes = ({c: np.float64 for c in DIA_COLUMNS} | {"diaSourceId": np.int64, "visit": np.int64}
+              | {c: np.int64 for c in extra})
+    dia = {c: np.empty(n, dtype=dtypes[c]) for c in columns}
     m = 0
     n_null = n_bad = 0
     pool = pa.default_memory_pool()
     batches = dset.to_batches(
-        columns=DIA_COLUMNS, filter=expr, batch_size=1 << 20, batch_readahead=2, fragment_readahead=2,
+        columns=columns, filter=expr, batch_size=1 << 20, batch_readahead=2, fragment_readahead=2,
         fragment_scan_options=ds.ParquetFragmentScanOptions(pre_buffer=False))
     for i, batch in enumerate(batches):
         if i % 8 == 7:
@@ -261,6 +267,8 @@ def read_dia(path, t_lo_mjd=None, t_hi_mjd=None):
             batch = batch.filter(valid)
             n_null += k0 - batch.num_rows
         cols = {c: batch.column(c).to_numpy(zero_copy_only=False) for c in DIA_COLUMNS}
+        for c in extra:
+            cols[c] = pc.fill_null(batch.column(c).cast(pa.int64()), -1).to_numpy(zero_copy_only=False)
         good = (np.isfinite(cols["ra"]) & np.isfinite(cols["dec"]) & np.isfinite(cols["midpointMjdTai"])
                 & (np.abs(cols["dec"]) <= 90.0))
         if not good.all():
@@ -269,7 +277,7 @@ def read_dia(path, t_lo_mjd=None, t_hi_mjd=None):
         k = cols["ra"].size
         if m + k > n:
             raise RuntimeError("read_dia: the dataset changed while being read")
-        for c in DIA_COLUMNS:
+        for c in columns:
             dia[c][m:m + k] = cols[c]
         m += k
         cols = None
@@ -277,7 +285,7 @@ def read_dia(path, t_lo_mjd=None, t_hi_mjd=None):
         warnings.warn(f"read_dia: dropped {n_null} DiaSources with nulls in {DIA_COLUMNS} and {n_bad} "
                       "with a non-finite ra, dec or midpointMjdTai, or |dec| > 90", stacklevel=2)
     if m < n:
-        dia = {c: dia[c][:m].copy() for c in DIA_COLUMNS}
+        dia = {c: dia[c][:m].copy() for c in columns}
     batch = None
     pool.release_unused()
 
@@ -286,7 +294,7 @@ def read_dia(path, t_lo_mjd=None, t_hi_mjd=None):
         if not _sorted_by(visit, sid):
             order = np.lexsort((sid, visit))
             del visit, sid          # (or the old columns outlive the gather)
-            for c in DIA_COLUMNS:
+            for c in columns:
                 dia[c] = dia[c][order]
     return dia
 
