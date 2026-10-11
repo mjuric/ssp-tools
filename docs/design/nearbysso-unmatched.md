@@ -39,6 +39,8 @@ Related:
 | Missing WCSs | Never inferred. Counted; rescued later (#96). |
 | Missing detectors (revised 2026-10-11, after U0) | The only rule: keep a prediction if it lands on a detector with a WCS, or within 30″ of one; drop everything else. A prediction on a missing detector (no WCS, rejected, or one of the 17 never processed) is dropped automatically, since most of its area is more than 30″ from any placed detector. No reference set of expected detectors. Accepted edge case: a prediction on a missing detector within 30″ of a neighbour's edge is kept and assigned to the neighbour like a gap prediction, with `eph_x`/`eph_y` outside its pixel range. Handling missing detectors more carefully is for later (#96). |
 | Matched rows far from any WCS (2026-10-11, after U2) | A matched row whose prediction is more than 30″ from every detector with a WCS (its DiaSource's detector has none) is treated as a matched row in a visit with no WCS: its DiaSource's `detector`, NULL `eph_x`/`eph_y`/`ephDetectorEdgeDist`, the visit's time flagged `no_wcs`, counted in `matched_without_wcs`. (14 rows on the 2026-10-09 inputs.) |
+| NearbySSO size (2026-10-11, after U3) | Accepted: 3,437,970 rows on the 2026-10-09 inputs (1,713,936 matched, 1,724,034 unmatched), above U0's ~2.98M estimate, which was made on predictions selected by off-centre DiaSource footprints. |
+| Visit footprint (2026-10-11, after U3) | To become the visit's boresight plus a fixed LSSTCam radius (plus 30″), instead of the corners of the detectors with a WCS. The boresight to be published by visit-table as VisitDetector columns named after ConsDB's, and returned by its reader (design pending the owner's approval there). Until then, the corner footprint (with the DiaSource widening guard, never triggered on real data). U3 merged with the corner footprint meanwhile. |
 | Times beyond 100 px (2026-10-11, after U0) | shutter-timing gives no corrected time more than 100 px off a detector (`OFF_DETECTOR_OMIT_PIX`); the 30″ margin is ~150 px. Accepted: those rows keep the visit's time, with `midpointMjdTai_flag` true (≤ ~0.1″ error for fast objects over 0.25 s). |
 | WCS store | visit-table's store at `/sdf/home/m/mjuric/ssp_daily_data/visit-table/wcs/`, refreshed hourly by ssp-daily, read only through visit-table's reader. ssp-tools assumes it is current: no freshness checks; what is missing today is picked up by tomorrow's rebuild. |
 | Reviews | No mutation testing (2026-10-11): probes, comparison with the stack and with exact evaluation, real-data checks. |
@@ -157,4 +159,28 @@ Dependencies outside this repository:
 - The schema copies (`tests/data/sdm_schemas/`, `ssp/schema_ppdb.py`) move to `6d7c9a1` with U3, which changes NearbySSO's output; before that they would fail five tests.
 - U1 (`detector` in `ppdb_dia_sources`): in the TAP query (int64), the ClickHouse query (`toInt64(detector)`) and `REQUIRED_INPUT_COLUMNS`. On data-int: 17,863,456 rows in 321 s; the other five columns equal the earlier file and `detector` equals the 2026-10-09 full export (2..186). ClickHouse: 13,086,925 rows, other columns unchanged.
 - Sequencing (owner, 2026-10-11): U2 and U3 both need the placement and edit the same part of `build.py`, so they wait for visit-table #22's tag and then run one after the other (U2, then U3), not in parallel.
+
+**U2, time and moves (PR #99, 2026-10-11):**
+- Every matched row is placed with `VisitLocator.place` and moved to the shutter-corrected time at its predicted pixel.
+- 2026-10-09 inputs:
+  - all 5,919 visits uncorrected in the PPDB and with a WCS;
+  - 1,713,922 rows corrected; 14 flagged `no_wcs`: DiaSources on detectors missing from the store, more than 30″ from any placed detector (owner rule);
+  - |Δt| p50 0.073 s, max 1.2 s; moves ≤ 0.047″ (0.23 px);
+  - 442 s and 10.7 GB, against 414 s and 12.2 GB before.
+- Independent review: no wrong numbers. Times equal `corrected_midpoints` to 1 ULP; fresh placement agrees to 1e-9 px. Fixed: correction-table provenance from the forked workers, and the no-WCS visit count.
+
+**U3, placement and rows (PR #100, 2026-10-11):**
+- 2026-10-09 inputs:
+  - 4,121,214 eligible predictions (WCS footprint);
+  - 1,713,936 matched rows (unchanged), 1,724,034 unmatched rows, 684,276 dropped beyond 30″, 0 in visits without a WCS;
+  - flagged: 35,798 unmatched rows beyond 100 px, 14 matched `no_wcs`;
+  - 439 s and 12.3 GB; NearbySSO 217 MB, sidecar 113 MB; the delivery check passes.
+- Why U0's estimate was low:
+  - U0 placed only the predictions the build already selected, through each visit's DiaSource circle: the mean direction of its DiaSources, radius to the farthest.
+  - That circle was more than 0.1° smaller than the field, or more than 0.3° off its centre, in 2,320 of 5,919 visits: those with few or clustered DiaSources.
+  - So U0 missed parts of the focal plane. On U0's own predictions, U0's method and `place()` agree exactly.
+- Independent review: no data-changing bugs.
+  - About 3,900 real rows recomputed exactly: 0 detector or kept/dropped mismatches, times bit-identical, positions ≤ 0.06 mas, pixels ≤ 3e-4 px.
+  - Brute-force completeness on 320 object-nights: 0 missing or extra rows.
+  - Fixed: a diagnostic double count of orphans beyond the margin.
 
