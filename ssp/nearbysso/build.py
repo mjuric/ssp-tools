@@ -815,7 +815,16 @@ def time_rows(vis, vi, state, hcause, ps, dots, pl, t_src, dia_det, ra_src, dec_
     visit_ids = vis["visit"]
     detector = np.where(has, pl["detector"], dia_det)
     t_visit = vis["t_tai_mjd"][vi]
-    t_row, cause = _place.row_times(state[vi], hcause[vi], t_visit, t_src, has, visit_ids[vi], detector,
+    # the time a flagged row keeps: the visit's; in a visit whose PPDB times
+    # are corrected (no single visit time), its header midpoint from the
+    # exposure log (owner, 2026-10-11)
+    t_keep = t_visit.copy()
+    c = np.flatnonzero(state[vi] == _place.VISIT_CORRECTED)
+    if c.size:
+        h, _ = _place.header_midpoints(corr, visit_ids[vi][c])
+        ok = np.isfinite(h)
+        t_keep[c[ok]] = h[ok]
+    t_row, cause = _place.row_times(state[vi], hcause[vi], t_keep, t_src, has, visit_ids[vi], detector,
                                     pl["x"], pl["y"], pl["bbox"], corr)
     pub = at_source_time(ps, dots, t_visit, t_row, ra_src, dec_src, sep)
     x, y, edge = _place.move_pixels(pl["x"], pl["y"], pl["edge"], pl["jacobian"], pl["bbox"], ps["ra"],

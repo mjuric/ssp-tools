@@ -748,6 +748,21 @@ def test_unmatched_rows_corrected_times(tmp_path, uscene, table):
 
 
 @needs_fixture
+def test_flagged_rows_in_corrected_visit_keep_header_midpoint(tmp_path, uscene, table):
+    """In a visit whose PPDB times are corrected (here all shifted by
+    0.2 s), an unmatched row without a correction ("in", beyond 100 px)
+    keeps the visit's header midpoint, not its DiaSources' time."""
+    dia = [(s, v, t + (0.2 * S if v == V_OK else 0.0), ra, dec, det)
+           for s, v, t, ra, dec, det in uscene["dia"]]
+    res, vis, p = pass3_raw(tmp_path, dia, uscene["preds"], uscene["store"], table, name="shifted")
+    *_, u_idx, u_pub, u_place, (state, _, _) = _unpack(res)
+    assert state[list(vis["visit"]).index(V_OK)] == P.VISIT_CORRECTED
+    i = [uscene["names"][o] for o in p["orbit"][u_idx]].index("in")
+    assert _cause(u_place["time_cause"][i]) == "beyond_100px" and u_place["midpointMjdTai_flag"][i]
+    assert u_place["midpointMjdTai"][i] == HEADER[V_OK]
+
+
+@needs_fixture
 def test_orphan_rows_are_unmatched_rows(tmp_path, uscene, table):
     """``orphan_rows`` (a prediction left the nearest of nothing by the
     parent's reduction) makes the row ``place_and_time`` makes of the same

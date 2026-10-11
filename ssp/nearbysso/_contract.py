@@ -398,7 +398,9 @@ NEARBYSSO_SIDECAR_NONNULL = frozenset({"designation", "visit", "midpointMjdTai",
 #   corrected times) matched rows take their DiaSource's midpointMjdTai and
 #   unmatched rows the corrected midpoint as above.
 #   midpointMjdTai_flag is True where a row keeps the visit's time because
-#   there is no correction for its position. The causes, as the run
+#   there is no correction for its position (in a visit whose PPDB times
+#   are corrected, "the visit's time" is its header midpoint; owner,
+#   2026-10-11). The causes, as the run
 #   report's uncorrected_rows names them (ssp.nearbysso.placement.
 #   TIME_CAUSES): no_table, outside_coverage, not_built, omitted,
 #   beyond_100px, no_wcs.
