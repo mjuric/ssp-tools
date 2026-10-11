@@ -537,3 +537,17 @@ def test_correction_error_is_extract_error(tmp_path, monkeypatch):
     args.ch_host = "h"
     with pytest.raises(M.ExtractError, match="shutter-motion correction: 12 visits"):
         M.extract_dia_sources(tmp_path / "obs.parquet", tmp_path / "dia.parquet", args)
+
+
+def test_tap_options():
+    """ppdb_dia_sources comes from the data-int PPDB TAP service by default;
+    --tap-url none keeps the ClickHouse query."""
+    args = M.build_parser().parse_args(["d"])
+    args.ch_host = "h"
+    assert M.tap_url(args) == "https://data-int.lsst.cloud/api/ppdbtap"
+    assert args.tap_token == "~/.data-int.token"
+    assert M.ppdb_source(args).startswith("PPDB TAP https://data-int.lsst.cloud/api/ppdbtap: SELECT ")
+    args = M.build_parser().parse_args(["d", "--tap-url", "none"])
+    args.ch_host = "h"
+    assert M.tap_url(args) is None
+    assert M.ppdb_source(args) == f"ClickHouse h:8123: {M.PPDB_SQL}"

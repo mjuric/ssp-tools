@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssp"
-version = "0.1.0"
+version = "0.2.0"
 description = "LSST Daily Data Products Pipeline - Streaming export of Postgres tables to Parquet via Arrow"
 authors = [
   { name = "LSST DDP Team" }
@@ -24,6 +24,8 @@ dependencies = [
   "pyyaml>=6.0",
   "tqdm>=4.0",
   "clickhouse-connect>=0.15.1",
+  "pyvo>=1.5",
+  "requests>=2.28",
   "cdshealpix>=0.8.1",
   "shutter-timing[s3]",
 ]
