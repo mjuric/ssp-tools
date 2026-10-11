@@ -1038,3 +1038,79 @@ def test_same_orbits_null_designation():
     sss["designation"] = pd.array([ROCK, None], dtype="str")
     rows, summ = V.compare_to_ssobservation(nss[:1], sss, dia, lookup, sigma_fn)
     assert rows["status"].tolist() == ["match", "filtered:not_in_orbits"] and summ["n_fail"] == 0
+
+
+# --------------------------------------------------------------------------
+# unmatched predictions, placement and corrected times (the new subcommands'
+# pure parts, on the small delivery of tests/nearbysso_delivery_fixture.py)
+# --------------------------------------------------------------------------
+
+def _report(**over):
+    pl = dict(matched_rows=3, unmatched_rows=4, dropped_beyond_margin=10, dropped_no_wcs_visit=0,
+              matched_without_wcs=1, uncorrected_rows={"beyond_100px": 1, "no_wcs": 1},
+              ppdb_corrected_visits=0, wcs_snapshot=7)
+    pl.update(over)
+    return {"placement": pl}
+
+
+def _failed(problems):
+    return [name for name, ok, _ in problems if not ok]
+
+
+def test_report_counts(tmp_path):
+    from nearbysso_delivery_fixture import write_nearbysso
+
+    write_nearbysso(tmp_path)
+    nss, side = tmp_path / "NearbySSO.parquet", tmp_path / "NearbySSO_internal.parquet"
+    assert _failed(V.report_problems(_report(), nss, side)) == []
+    assert _failed(V.report_problems(_report(matched_rows=4), nss, side)) == ["matched_rows == the files'"]
+    f = _failed(V.report_problems(_report(uncorrected_rows={"beyond_100px": 2, "no_wcs": 1}), nss, side))
+    assert f == ["uncorrected_rows: {cause: rows}, summing to the flagged rows"]
+    f = _failed(V.report_problems(_report(matched_without_wcs=0), nss, side))
+    assert "matched_without_wcs == the files'" in f
+    rep = _report()
+    del rep["placement"]["wcs_snapshot"]
+    f = _failed(V.report_problems(rep, nss, side))
+    assert f == ["every PLACEMENT_REPORT_FIELDS entry present", "wcs_snapshot recorded (an integer)"]
+
+
+def test_read_rows_aligned(tmp_path):
+    import pyarrow.parquet as pq
+    from nearbysso_delivery_fixture import ROWS, sidecar_table, take, write_nearbysso
+
+    write_nearbysso(tmp_path)
+    nss = tmp_path / "NearbySSO.parquet"
+    side = tmp_path / "NearbySSO_internal.parquet"
+    df = V.read_rows(nss, side, ("detector",), visits={ROWS["visit"][2]})
+    assert df["row"].tolist() == [2, 5, 6] and df["matched"].tolist() == [True, False, False]
+    assert df["diaSourceId"].tolist() == [105, -1, -1] and df["placed"].tolist() == [False, True, True]
+    pq.write_table(take(sidecar_table(), [1, 0, 2, 3, 4, 5, 6]), side)
+    with pytest.raises(ValueError, match="diaSourceId differs"):
+        V.read_rows(nss, side)
+
+
+def test_bbox_off_and_kink():
+    b = np.array([[-0.5, -0.5, 4071.5, 3999.5]] * 4)
+    x = np.array([100.0, 4171.5, 2000.0, 1000.0])
+    y = np.array([100.0, 2000.0, -30.5, 1000.4])
+    assert V.bbox_off(b, x, y).tolist() == [0.0, 100.0, 30.0, 0.0]
+    k = V.bbox_kink(b, x, y)
+    assert k[0] == 0.0 and np.isnan(k[1]) and np.isnan(k[2]) and k[3] == pytest.approx(0.4)
+
+
+def test_visit_test_counts():
+    pv = pd.DataFrame({"uncorrected": pd.array([True, False, None, True], dtype="boolean")})
+    assert V.visit_test_counts(pv) == (2, 1, 1)
+
+
+def test_back_moved_inverts_the_move():
+    c = dict(ephRa=[10.0, 359.9999], ephDec=[60.0, -10.0], ephRateRa=[1.0, -2.0], ephRateDec=[0.5, 0.25],
+             dt_s=[0.5, -1.0])
+    a = {k: np.array(v) for k, v in c.items()}
+    ra, dec = V.back_moved(pd.DataFrame(c))
+    dt = a["dt_s"] / 86400
+    assert dec == pytest.approx(a["ephDec"] - a["ephRateDec"] * dt, abs=1e-12)
+    dra = (a["ephRa"] - ra + 180) % 360 - 180
+    assert dra * np.cos(np.radians(a["ephDec"])) == pytest.approx(a["ephRateRa"] * dt, abs=1e-12)
+    assert V.move_arcsec(pd.DataFrame(c)) == pytest.approx(
+        np.hypot(a["ephRateRa"], a["ephRateDec"]) * 3600 * np.abs(a["dt_s"]) / 86400)
