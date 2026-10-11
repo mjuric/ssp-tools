@@ -33,8 +33,10 @@ Two of its behaviours matter here, both seen in the full export of 2026-10-09 (`
 | Date | Topic | Decision |
 |---|---|---|
 | 2026-10-10 | Source | A new option runs the `ppdb_dia_sources` query on a TAP endpoint. **The data-int PPDB TAP service is the default.** |
-| *proposed* | Option | `--ppdb-tap URL`, default `https://data-int.lsst.cloud/api/ppdbtap`. `--ppdb-tap none` keeps today's ClickHouse query, following `--correction-table none`. |
-| *proposed* | Token | `--ppdb-tap-token FILE`, default `~/.data-int.token`, mode 600 required (like `~/.chpass`). There is no flag that takes the token itself, and the token is never logged or written to the manifest. |
+| 2026-10-10 | Option | `--tap-url URL`, default `https://data-int.lsst.cloud/api/ppdbtap`. `--tap-url none` keeps today's ClickHouse query, following `--correction-table none`. |
+| *proposed* | Token | `--tap-token FILE`, default `~/.data-int.token`, mode 600 required (like `~/.chpass`). There is no flag that takes the token itself, and the token is never logged or written to the manifest. The `--tap-` prefix follows the per-source groups `--ch-*` and `--mpc-*`. |
+| *proposed* | Tuning | No more options: the chunk size, concurrent jobs and hang timeout are constants (below). |
+| 2026-10-10 | Testing | Keep it simple: no fake TAP server or network-free unit tests. One real run against data-int, with the checks below. |
 | *proposed* | Fallback | None. If TAP fails, the step fails and names the cause. It never falls back to ClickHouse silently: that would change NearbySSO's input without anyone noticing. |
 | *proposed* | Consistency | The extract fixes the set of visits first. A chunk whose row count changes between that count and its fetch (late-arriving DiaSources) is fetched again once, then fails. Visits that arrive after the count are left for the next day's run. |
 
@@ -57,18 +59,18 @@ The manifest entry gains the details of where the file came from:
 
 ## Approach
 
-All of this lives in a new module, `ssp/export/ppdb_tap.py`. `export_ppdb` dispatches on `--ppdb-tap`.
+All of this lives in a new module, `ssp/export/ppdb_tap.py`. `export_ppdb` dispatches on `--tap-url`.
 
 1. **The visit counts.** A sync query, `SELECT visit, COUNT(*) AS n FROM ppdb.DiaSource GROUP BY visit` (Parquet), gives the visits and their counts. A NULL visit fails the step: NearbySSO can't use a row without one.
-2. **The chunks.** Contiguous visit ranges of about `--ppdb-tap-chunk-rows` rows each, 1,000,000 by default (the size that went through on 2026-10-09).
+2. **The chunks.** Contiguous visit ranges of about `CHUNK_ROWS` = 1,000,000 rows each (the size that went through on 2026-10-09).
    - Each chunk is one async job: `SELECT diaSourceId, visit, midpointMjdTai, ra, dec FROM ppdb.DiaSource WHERE visit BETWEEN lo AND hi`.
-   - At most `--ppdb-tap-jobs` jobs run at once, 4 by default and at most 8.
+   - At most `MAX_JOBS` = 4 jobs run at once.
    - Each result streams to `INPUTS_DIR/.partial/ppdb_tap/part-NNNN.parquet`.
 3. **The job lifecycle.** POST `/async` (`MAXREC` above the chunk), then PHASE=RUN, then poll every 5 s, then GET `results/result`, then DELETE the job.
    - Every job is deleted, also on failure or interruption (`finally`), so none are left on the server.
-4. **Hangs.** A job still QUEUED or EXECUTING after `--ppdb-tap-job-timeout`, 900 s by default, is aborted (PHASE=ABORT) and deleted.
-   - It is retried once, as two half-range jobs.
-   - If those fail too, the step fails. The message gives the job URLs and phases, for a report to the operators, and the step doesn't retry in a loop.
+4. **Hangs.** A job still QUEUED or EXECUTING after `JOB_TIMEOUT_S` = 900 s is aborted (PHASE=ABORT) and deleted.
+   - It is retried once.
+   - If that fails too, the step fails. The message gives the job URLs and phases, for a report to the operators, and the step doesn't retry in a loop.
    - Errors (ERROR, HTTP 5xx) get the same single retry.
    - HTTP 401/403 fails at once: "the token in FILE was refused (expired?)".
 5. **Checks per chunk.** The rows equal the sum of the step-1 counts for its visits. Every visit is inside its range. The schema is the five columns with the types above, cast exactly (an overflowing or lossy cast fails). There are no NULLs.
@@ -86,47 +88,37 @@ Expected cost: 5 columns rather than `SELECT *`, so far less to move than the 20
 ## Shared-resource etiquette (added to CLAUDE.md)
 
 PPDB TAP (data-int):
-- at most 8 concurrent jobs, 4 by default;
+- at most 4 concurrent jobs;
 - delete every job;
 - abort hung jobs, and report them to the operators rather than retry in a loop;
 - the token comes only from the file the owner designates.
 
 ## Validation
 
-- **Unit tests,** network-free, with a fake TAP server: `http.server` in a thread that speaks the UWS subset above and serves Parquet. They cover:
-  - chunking: ranges, the last chunk, a single visit larger than a chunk;
-  - the job lifecycle, including deleting jobs after failures;
-  - a hung job, aborted, then split and retried, then failing with the job URLs;
-  - ERROR, 5xx and 401;
-  - count drift: fetched again once, then failing;
-  - NULL visit, duplicate `diaSourceId`, wrong types, missing visit;
-  - the token never appearing in logs, the manifest or the exception text;
-  - the token file's mode;
-  - `--ppdb-tap none` giving today's ClickHouse path, unchanged;
-  - the manifest entry.
-
-  Each test is checked to fail against a deliberate break.
-- **Independent review** by a fresh agent: probes, mutation testing, and an alternative implementation of the chunk and count logic to compare against.
-- **Real data:**
+No fake TAP server or network-free unit tests (owner, 2026-10-10). The checks of steps 5 and 6 run on every extract. They are validated once, on real data:
+- **The extract:**
   - Run `ssp-extract-sso-inputs DIR --only ppdb_dia_sources` against data-int, on a copy of the 2026-10-09 inputs.
   - Compare with the 2026-10-09 TAP export (`DiaSource.parquet`, same columns). They should be equal, apart from visits added since.
   - Compare with the ClickHouse file, and report the difference by night.
-  - Record wall time, peak RSS and job count.
+  - Record wall time, peak RSS and job count, and that no jobs were left on the server.
+- **`--tap-url none`:** gives today's ClickHouse file. Same md5, if ClickHouse hasn't changed in between.
 - **NearbySSO on the new input:**
   - rebuild NearbySSO from the 2026-10-09 inputs with the TAP `ppdb_dia_sources`, and run every check;
   - record how the row count changes (more visits, so more NearbySSO rows);
   - the other tables must be byte-identical.
+- **The existing suite** still passes. The only new test checks that the new options are parsed (`--tap-url none` and the defaults).
 
 ## Implementation plan
 
-| Wave | Work | Who |
+| Step | Work | Who |
 |---|---|---|
 | 0 | This design; owner approval | integrator |
-| 1 | The contract: the option names and defaults, the check rules and the manifest field, as constants in `ssp/delivery_contract.py`; `requests` in the dependencies; the CLAUDE.md etiquette | integrator |
-| 2 | **T1:** `ssp/export/ppdb_tap.py` and its wiring into `ssp-extract-sso-inputs`, with the fake-server tests | WP agent |
-| 3 | Independent review of T1; fixes until clean | review agent, then T1 |
-| 4 | The real-data checks and the NearbySSO rebuild; the runbook (`docs/runbooks/sso-daily.md`: the token, the option, failures); results recorded here; ssp-daily told about the new default (the token on its node, network access to data-int) | integrator |
-| 5 | Feature branch → master | owner approval |
+| 1 | `ssp/export/ppdb_tap.py` and its wiring into `ssp-extract-sso-inputs`; `requests` in the dependencies; the CLAUDE.md etiquette | integrator |
+| 2 | The real-data checks and the NearbySSO rebuild; the runbook (`docs/runbooks/sso-daily.md`: the token, the option, failures); results recorded here | integrator |
+| 3 | Tell ssp-daily about the new default (the token on its node, network access to data-int) | integrator |
+| 4 | Branch → master | owner approval |
+
+A single module, so no work packages and no separate review agent.
 
 ## Out of scope
 
