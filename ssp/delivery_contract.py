@@ -91,9 +91,9 @@ SHUTTER_INPUT_COLUMNS = ["midpointMjdTaiVisit", "midpointMjdTai_flag",
 # with the correction, a candidate's time passes if |obstime - visit time|
 # or |obstime - corrected time| is within DT_MS (10 ms); the minute-bucket
 # position fallback covers both times. The correction is applied before
-# matching. NOT_BUILT visits: the visit time, flagged, with a warning; more
-# than ssp.ssobservation_contract.MAX_NOT_BUILT_VISITS of them fail the
-# extract.
+# matching. NOT_BUILT visits: the visit time, flagged, with a warning,
+# counted and listed in the manifest; they never fail the extract (a later
+# day's rebuild fixes them once the table covers them).
 #
 # The extract only reads the correction table; ssp-daily builds it
 # (shutter-timing-table, hourly). A table the extract can't use (missing,

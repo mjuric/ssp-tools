@@ -9,9 +9,9 @@ EXECUTING indefinitely on data-int, DM-56627):
 
 1. a sync ``GROUP BY visit`` count fixes the visits and their row counts;
 2. each chunk is one job; its rows must equal the counted rows of its
-   visits (fetched again once if they differ: DiaSources that arrived in
-   between), with the five columns cast exactly to their types and no
-   NULLs;
+   visits (a difference fails the step: the PPDB changed during the
+   extract, and a rerun picks it up), with the five columns cast exactly
+   to their types and no NULLs;
 3. a job still QUEUED or EXECUTING after JOB_TIMEOUT_S is aborted and
    retried once; an ERROR phase or an HTTP error is retried once too, a
    refused token never;
@@ -208,7 +208,7 @@ def export(out_path, tap_url=DEFAULT_TAP_URL, token_file=DEFAULT_TOKEN_FILE, log
     # 2-3. the chunks
     parts = out_path.parent / (out_path.stem + ".parts")
     parts.mkdir(exist_ok=True)
-    refetched, retried = [], []
+    retried = []
 
     def one(k):
         lo, hi, rows = chunks[k]
@@ -231,14 +231,12 @@ def export(out_path, tap_url=DEFAULT_TAP_URL, token_file=DEFAULT_TOKEN_FILE, log
             v = t["visit"].to_numpy()
             if len(t) and (v.min() < lo or v.max() > hi):
                 raise PPDBTapError(f"{label}: rows outside the visit range")
-            if len(t) == rows:
-                pq.write_table(t, dst)
-                log(f"{label}: {len(t):,} rows in {time.monotonic() - t1:.0f} s")
-                return len(t)
-            if attempt == 2:
-                raise PPDBTapError(f"{label}: {len(t):,} rows, {rows:,} counted, also when fetched again")
-            log(f"{label}: {len(t):,} rows, {rows:,} counted; fetching it again")
-            refetched.append(k)
+            if len(t) != rows:
+                raise PPDBTapError(f"{label}: got {len(t):,} rows, {rows:,} counted: the PPDB changed "
+                                   f"during the extract; rerun")
+            pq.write_table(t, dst)
+            log(f"{label}: {len(t):,} rows in {time.monotonic() - t1:.0f} s")
+            return len(t)
 
     for k in range(len(chunks)):
         one(k)
@@ -260,4 +258,4 @@ def export(out_path, tap_url=DEFAULT_TAP_URL, token_file=DEFAULT_TOKEN_FILE, log
     parts.rmdir()
     return {"url": tap.url, "count_star": int(counts.sum()), "visits": len(visits),
             "visit_min": int(visits[0]), "visit_max": int(visits[-1]), "chunks": len(chunks),
-            "refetched_chunks": len(refetched), "retried_jobs": len(retried)}
+            "retried_jobs": len(retried)}
