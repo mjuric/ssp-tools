@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssp"
-version = "0.1.0"
+version = "0.2.0"
 description = "LSST Daily Data Products Pipeline - Streaming export of Postgres tables to Parquet via Arrow"
 authors = [
   { name = "LSST DDP Team" }
