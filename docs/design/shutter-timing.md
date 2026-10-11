@@ -2,6 +2,8 @@
 
 > **Renamed (2026-10-08):** the PPDB table called SSSource here is now **SSObservation**, and the code names follow it (`ssp.ssobservation`, `ssp-build-ssobservation`, `SSOBSERVATION_*`); see `docs/design/ssobservation-delivery.md`. This document keeps the names it was written with.
 
+> **Table format 2 (2026-10-10):** shutter-timing is now pinned at **v0.5.0**, whose correction table is format 2 (one `shutter_motions_<day_obs>.parquet` per night), at a new path. The table layout, path and pin described below are those of v0.4.0; see "shutter-timing v0.5.0: table format 2 (2026-10-10)" at the end.
+
 ## Context
 
 A DiaSource's `midpointMjdTai` is the visit's midpoint. LSSTCam's shutter blades take a finite time to cross the focal plane, so each source's actual exposure midpoint differs from it by up to 0.24 s, depending on where on the focal plane it lies. For a fast-moving object, that time error becomes an along-track position error.
@@ -142,3 +144,18 @@ The MPC holds the pipeline's visit times, i.e. (MJD-BEG + MJD-END)/2. For the 23
   - Over all rows the correction is ~0.4 mas, small next to the ~50 mas scatter.
 
 **Stage 0 ownership (owner decision, 2026-10-06):** the SSP daily run (`ssp-sso-daily`'s stage 0) owns the production correction table `/sdf/data/rubin/user/mjuric/shutter-timing/corrections` for now. Other builds should go through the shutter-timing session, coordinated with the daily run; the builder's lock prevents concurrent builds. The released raws end on 2026-07-14 (the telescope was shut down by a storm), so the table is current, and the first stage 0 run should find nothing to add. The embargo/LFA path of v0.3.0 will first be exercised when observing resumes; check that run.
+
+## shutter-timing v0.5.0: table format 2 (2026-10-10)
+
+shutter-timing v0.5.0 (its `docs/design/atomic-nights.md`) changes the table's layout, not its values: the calibration is still `b8554546ab84`.
+- **Layout.** Each night is **one** file, `shutter_motions_<day_obs>.parquet`: its rows are the corrections (the same `CORRECTION_TABLE_DTYPE`), and the night's exposure log is in the file's Parquet metadata. A night is replaced atomically, so a reader never sees half of a rebuild. The format-1 pair `corrections_`/`exposures_<day_obs>.parquet` is gone.
+- **Compatibility.** v0.5.0 refuses a format-1 directory (`TableFormatError`, naming `shutter-timing-table --convert-from OLD_DIR --out NEW_DIR`); v0.4.0 finds no nights in a format-2 directory. So the pin and the table move together.
+- **Path (owner decision, 2026-10-10).** `DEFAULT_CORRECTION_TABLE` (in `ssp/export/submittable.py` and `ssp/sso_daily.py`) is `/sdf/home/m/mjuric/ssp_daily_data/shutter-timing`, written through the `ssp_daily_data` symlink and never resolved, so that it can be repointed. The format-1 table at `/sdf/data/rubin/user/mjuric/shutter-timing/corrections` is no longer read.
+- **ssp-tools reads the table only through shutter-timing's API.** `Corrections.first_night` comes from `shutter_timing.table.table_calibrations` (the earliest built night), and `Corrections.night_log` from `shutter_timing.table.read_night` (which, unlike `read_exposure_log`, tells a night that isn't built from an empty one). Behaviour is unchanged for the same table content; the one difference is that a table shutter-timing refuses (e.g. a format-1 directory, an unreadable night) now fails when `Corrections` is created, rather than at the first lookup, still as `CorrectionError`.
+- **Builder exit code 4** (finished, failed exposures remain) is new; ssp-tools no longer runs the builder (stage 0 was removed from `ssp-sso-daily` in PR #92), so nothing here handles it.
+- **Tests.** The fixture `correction-table-v1` is format 1. `tests/test_submittable_shutter.py` copies it and converts it with shutter-timing's own converter (`shutter_timing.table.convert`, as `--convert-from`), editing the format-1 exposure log before the conversion where a test needs a perturbed header midpoint, and damaging the converted night files' metadata for the error tests. New tests: a format-1 directory is refused with the conversion named, and `night_log` agrees with the format-1 file it was converted from.
+
+**Check on real data (2026-10-10):**
+- The table: `/sdf/home/m/mjuric/ssp_daily_data/shutter-timing`, converted from the production format-1 table with v0.5.0's `--convert-from` (385 nights, 65 s; calibration `b8554546ab84`).
+- `Corrections` on it against master's logic on the format-1 table: the same `first_night` (20250403), and byte-identical night logs (`visit` and the guard's columns) on all 385 nights (216,634 entries).
+- `ssp-extract-sso-inputs --only dia_sources` on the 2026-10-09 inputs (the same obs_sbn), with this table, against that run's output (v0.4.0, format 1): `dia_sources.parquet` and `dia_sources.unresolved.parquet` are **byte-identical** (md5 `17dceb2b…`, 8,078,546 rows). The correction counts are identical (ok 5,011,026; degraded 3,065,175; omitted 37; outside coverage 2,308; the rest 0). The manifest differs only in the table's path and `table_format` (1 → 2); `package_version` stays 0.4.0, the version that built the nights. 18.5 min wall, 28 GB peak RSS; the lookups took 34 s.

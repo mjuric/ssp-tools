@@ -1,7 +1,12 @@
 """The shutter-motion correction in extract-submitted-sources (WP S1 of
 docs/design/shutter-timing.md), against the read-only fixture correction
 table (no network: the view is a synthetic table behind a fake fetch).
-Skipped without the fixture or the shutter_timing package."""
+Skipped without the fixture or the shutter_timing package.
+
+The fixture is a format-1 table; shutter_timing (v0.5.0) reads only format
+2, so each test session converts a copy of it with shutter_timing's own
+converter (``shutter_timing.table.convert``, as ``shutter-timing-table
+--convert-from``) and the tests read that (``TABLE``)."""
 
 import json
 import os
@@ -23,9 +28,35 @@ pytest.importorskip("shutter_timing.corrections")
 
 FIXTURE = Path(os.environ.get("SSP_SHUTTER_FIXTURE",
                               "/sdf/data/rubin/user/mjuric/shutter-timing/fixtures/correction-table-v1"))
-TABLE = FIXTURE / "table"
-pytestmark = pytest.mark.skipif(not (TABLE / "manifest.json").exists(),
+TABLE_V1 = FIXTURE / "table"                # format 1, read-only
+pytestmark = pytest.mark.skipif(not (TABLE_V1 / "manifest.json").exists(),
                                 reason=f"no fixture correction table at {FIXTURE}")
+TABLE = None                                # the converted (format-2) fixture; set by _table
+
+
+def _convert(dst, edit=None):
+    """A format-2 copy of the fixture in ``dst/table``: the format-1 files
+    are copied to ``dst/v1``, ``edit(v1_dir)`` is applied to them, and the
+    copy is converted by shutter_timing. Returns the table directory."""
+    from shutter_timing.table import convert
+
+    v1 = dst / "v1"
+    shutil.copytree(TABLE_V1, v1)
+    v1.chmod(0o755)
+    for p in v1.iterdir():
+        p.chmod(0o644)
+    if edit is not None:
+        edit(v1)
+    convert(v1, dst / "table")
+    return dst / "table"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _table(tmp_path_factory):
+    global TABLE
+    TABLE = _convert(tmp_path_factory.mktemp("fixture"))
+    yield
+    TABLE = None
 
 MAS = 1 / 3.6e6
 MS = 1e-3 / 86400            # one ms in days
@@ -44,10 +75,10 @@ def examples():
     return json.loads((FIXTURE / "examples.json").read_text())
 
 
-def reference(visit, detector, x, y, table_dir=TABLE):
+def reference(visit, detector, x, y, table_dir=None):
     from shutter_timing.corrections import corrected_midpoints
     return corrected_midpoints(np.atleast_1d(visit), np.atleast_1d(detector), np.atleast_1d(x),
-                               np.atleast_1d(y), table_dir=table_dir, require_uniform=True)
+                               np.atleast_1d(y), table_dir=table_dir or TABLE, require_uniform=True)
 
 
 def utc(tai_mjd):
@@ -108,11 +139,11 @@ def fake_fetch(view, log=None):
     return fetch
 
 
-def run(tmp_path, obs_rows, view_rows, table=TABLE, **kw):
+def run(tmp_path, obs_rows, view_rows, table=None, **kw):
     pq.write_table(obs_table(obs_rows), tmp_path / "obs.parquet")
     report = {}
     rc = S.extract(tmp_path / "obs.parquet", tmp_path / "dia.parquet", fake_fetch(view_table(view_rows)),
-                   correction_table=table, report=report, **kw)
+                   correction_table=table or TABLE, report=report, **kw)
     assert rc == 0
     out = {r["obsid"]: r for r in pq.read_table(tmp_path / "dia.parquet").to_pylist()}
     unres = {r["obsid"]: r for r in pq.read_table(tmp_path / "dia.unresolved.parquet").to_pylist()}
@@ -136,10 +167,12 @@ def test_lookup_matches_examples():
         else:
             assert t == e["t_mid_mjd_tai"]
     p = corr.provenance()
-    # fixture-specific provenance
+    # fixture-specific provenance (the conversion keeps the build's
+    # calibration and version; the format is the converted table's, 2)
     x = examples()
+    assert x["table_format"] == 1
     assert (p["calibration_id"], p["table_format"], p["package_version"]) == (
-        x["calibration_id"], x["table_format"], x["package_version"])
+        x["calibration_id"], 2, x["package_version"])
     assert corr.calls == 1          # one call for the batch
 
 
@@ -325,7 +358,8 @@ def test_outside_coverage(tmp_path):
     table) get the visit time, flagged, are never looked up, and do not
     count toward the NOT_BUILT limit."""
     first = S.Corrections(TABLE).first_night
-    assert first == min(int(p.name[12:20]) for p in TABLE.glob("corrections_*.parquet"))
+    assert first == min(int(p.name[16:24]) for p in TABLE.glob("shutter_motions_*.parquet"))
+    assert first == min(int(p.name[12:20]) for p in TABLE_V1.glob("corrections_*.parquet"))
     early = [(first // 100 - 1) * 100 + 1 + k for k in range(5)]     # five nights in the month before
     visits = [d * 100000 + 7 for d in early]
     t0 = 60800.0
@@ -455,10 +489,10 @@ def _late(tmp_path, shift_s):
     """A fixture copy where V0 is a late-readout visit: header midpoint (=
     pipeline time) ``shift_s`` after the corrected time of (D0, X0, Y0).
     Returns (table, corrected time, pipeline time)."""
-    table = _copy_table(tmp_path)
-    tc = reference(V0, D0, X0, Y0, table_dir=table).t_mid_mjd_tai[0]
+    tc = reference(V0, D0, X0, Y0).t_mid_mjd_tai[0]
     tp = tc + shift_s / 86400
-    _set_header(table, V0, tp)
+    table = _copy_table(tmp_path, header=(V0, tp))
+    assert reference(V0, D0, X0, Y0, table_dir=table).t_mid_mjd_tai[0] == tc   # the rows are unchanged
     return table, tc, tp
 
 
@@ -571,8 +605,8 @@ def test_exposure_log():
 
 
 def _set_header(table, visit, value):
-    """Set ``visit``'s header_mid_mjd_tai in the exposure log of a table copy,
-    keeping the file's metadata."""
+    """Set ``visit``'s header_mid_mjd_tai in the exposure log of a format-1
+    table copy, keeping the file's metadata (see _copy_table)."""
     p = table / f"exposures_{visit // 100000}.parquet"
     t = pq.read_table(p)
     md = t.schema.metadata
@@ -586,8 +620,7 @@ def _set_header(table, visit, value):
 def test_time_mismatch(tmp_path, capsys):
     """A pipeline time that disagrees with the (perturbed) header midpoint:
     the visit time, flagged, warned about, counted and listed."""
-    table = _copy_table(tmp_path)
-    _set_header(table, V0, VISIT_T[V0] + 0.1 / 86400)
+    table = _copy_table(tmp_path, header=(V0, VISIT_T[V0] + 0.1 / 86400))
     tv = VISIT_T[V0]
     src = dict(visit=V0, detector=D0, x=X0, y=Y0)
     view = [dict(id=1, ra=10.0, midpointMjdTai=tv, **src),
@@ -611,9 +644,8 @@ def test_large_consistent_offset_is_corrected(tmp_path):
     both 1.5 s after the table's visit midpoint. The correction is applied
     however large, and the position pass finds a row submitted at the
     corrected time."""
-    table = _copy_table(tmp_path)
     late = VISIT_T[V0] + 1.5 / 86400
-    _set_header(table, V0, late)
+    table = _copy_table(tmp_path, header=(V0, late))
     tc = reference(V0, D0, X0, Y0, table_dir=table).t_mid_mjd_tai[0]
     assert (late - tc) * 86400 > 1.2
     src = dict(visit=V0, detector=D0, x=X0, y=Y0)
@@ -651,13 +683,11 @@ def test_no_usable_id(tmp_path):
 # Errors
 #
 
-def _copy_table(tmp_path):
-    dst = tmp_path / "table"
-    shutil.copytree(TABLE, dst)
-    dst.chmod(0o755)
-    for p in dst.iterdir():
-        p.chmod(0o644)
-    return dst
+def _copy_table(tmp_path, header=None):
+    """A format-2 copy of the fixture (in ``tmp_path/table``); ``header``:
+    ``(visit, value)`` sets that visit's header_mid_mjd_tai in its night's
+    exposure log (before the conversion)."""
+    return _convert(tmp_path, edit=None if header is None else (lambda v1: _set_header(v1, *header)))
 
 
 def _set_metadata(path, **kv):
@@ -684,16 +714,51 @@ def _one(tmp_path, table, visit=V0, visit_type=pa.int64()):
 def test_table_errors(tmp_path, damage, error):
     table = _copy_table(tmp_path)
     if damage == "calibration":     # another night on another calibration: a mixed table
-        for f in ("corrections_20250810.parquet", "exposures_20250810.parquet"):
-            _set_metadata(table / f, calibration_id="0123456789ab")
+        _set_metadata(table / "shutter_motions_20250810.parquet", calibration_id="0123456789ab")
     elif damage == "format":
-        for f in ("corrections_20260105.parquet", "exposures_20260105.parquet"):
-            _set_metadata(table / f, table_format="99")
-    else:                           # the night's log without its rows
-        (table / "corrections_20260105.parquet").unlink()
+        _set_metadata(table / "shutter_motions_20260105.parquet", table_format="99")
+    else:                           # the night's rows without its exposure log
+        p = table / "shutter_motions_20260105.parquet"
+        t = pq.read_table(p)
+        md = {k: v for k, v in t.schema.metadata.items() if k != b"exposure_log"}
+        pq.write_table(t.replace_schema_metadata(md), p)
     with pytest.raises(S.CorrectionError, match=error):
         _one(tmp_path, table)
     assert not (tmp_path / "dia.parquet").exists()
+
+
+def test_format_1_table_refused(tmp_path):
+    """A format-1 directory (shutter-timing before v0.5.0) is refused, with
+    the conversion named, before anything is written."""
+    with pytest.raises(S.CorrectionError, match="TableFormatError.*--convert-from"):
+        S.Corrections(TABLE_V1)
+    with pytest.raises(S.CorrectionError, match="TableFormatError"):
+        _one(tmp_path, TABLE_V1)
+    assert not (tmp_path / "dia.parquet").exists()
+
+
+def test_night_log(tmp_path):
+    """The night's exposure log, sorted by visit: all of its entries
+    (skipped and failed exposures too); empty for a night that is not
+    built, an error if it is required."""
+    from shutter_timing.table import read_exposure_log
+
+    corr = S.Corrections(TABLE)
+    log = read_exposure_log(TABLE, days=[20260105])
+    v, cols = corr.night_log(20260105)
+    o = np.argsort(log["visit"])
+    assert len(v) == len(log) == 3 and list(v) == sorted(log["visit"])
+    for c in S.GUARD_LOG_COLUMNS:
+        assert np.array_equal(cols[c], log[c][o], equal_nan=True) and cols[c].dtype == np.float64
+    # against the format-1 file it was converted from
+    t = pq.read_table(TABLE_V1 / "exposures_20260105.parquet").sort_by("visit")
+    assert list(v) == t["visit"].to_pylist()
+    for c in S.GUARD_LOG_COLUMNS:
+        assert np.array_equal(cols[c], t[c].to_numpy(), equal_nan=True)
+    v, cols = corr.night_log(20260106)
+    assert len(v) == 0 and all(len(a) == 0 for a in cols.values())
+    with pytest.raises(S.CorrectionError, match="not built"):
+        corr.night_log(20260106, required=True)
 
 
 def test_value_errors(tmp_path):
@@ -766,8 +831,7 @@ def test_time_mismatch_on_degraded(tmp_path):
     corr = S.Corrections(TABLE)
     corr.lookup(view, np.array([0]))
     assert list(corr.status) == [S.DEGRADED]
-    table = _copy_table(tmp_path)
-    _set_header(table, V1, VISIT_T[V1] + 0.1 / 86400)
+    table = _copy_table(tmp_path, header=(V1, VISIT_T[V1] + 0.1 / 86400))
     corr = S.Corrections(table)
     corr.lookup(view, np.array([0]))
     assert list(corr.status) == [S.TIME_MISMATCH] and np.isnan(corr.t[0])
