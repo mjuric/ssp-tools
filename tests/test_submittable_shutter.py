@@ -22,7 +22,6 @@ from astropy.time import Time
 
 from ssp.delivery_contract import SHUTTER_INPUT_COLUMNS, SHUTTER_MANIFEST_FIELD
 from ssp.export import submittable as S
-from ssp.ssobservation_contract import MAX_NOT_BUILT_VISITS
 
 pytest.importorskip("shutter_timing.corrections")
 
@@ -316,31 +315,45 @@ def test_position_pass_fetches_corrected_match_across_a_minute(tmp_path):
     assert len(got) == 0
 
 
-def test_not_built_limit(tmp_path, capsys):
-    """NOT_BUILT visits get the visit time, flagged, with a warning; more
-    than max_not_built_visits of them fail the extract, writing nothing."""
+def test_not_built(tmp_path, capsys):
+    """NOT_BUILT visits get the visit time, flagged, with a warning naming
+    them, and are counted and listed in the report."""
     nb = [2026010600001, 2026010600002, 2026010500999]       # no night; a visit missing from its log
     view = [dict(id=i, ra=10.0 + i, midpointMjdTai=61046.27 + i / 86400, visit=v, detector=94, x=2000.0,
                  y=2000.0) for i, v in enumerate(nb)]
     obs = [dict(obsid=f"o{i}", obssubid=str(i), ra=10.0 + i, dec=1.0, obstime=utc(61046.27 + i / 86400),
                 band="Lr", mag=20.0) for i in range(len(nb))]
-    with pytest.raises(S.CorrectionError, match="stale or failing"):
-        run(tmp_path, obs, view, max_not_built_visits=2)
-    assert not (tmp_path / "dia.parquet").exists()
-    out, _, rep = run(tmp_path, obs, view, max_not_built_visits=3)
+    out, _, rep = run(tmp_path, obs, view)
     assert rep["not_built_visits"] == sorted(nb) and rep["status"]["not_built"] == 3
     assert all(r["midpointMjdTai_flag"] and r["midpointMjdTai"] == r["midpointMjdTaiVisit"]
                for r in out.values())
-    assert "warning" in capsys.readouterr().err
-    # the default is the contract's
-    assert S.Corrections(TABLE).max_not_built_visits == MAX_NOT_BUILT_VISITS
+    err = capsys.readouterr().err
+    assert "warning" in err and all(str(v) in err for v in nb)
     import argparse
     p = argparse.ArgumentParser()
     S.add_correction_args(p)
     a = p.parse_args([])
-    assert a.max_not_built_visits == MAX_NOT_BUILT_VISITS
+    assert not hasattr(a, "max_not_built_visits")
     assert S.correction_table(a) == S.DEFAULT_CORRECTION_TABLE
     assert S.correction_table(p.parse_args(["--correction-table", "none"])) is None
+    with pytest.raises(SystemExit):
+        p.parse_args(["--max-not-built-visits", "3"])
+
+
+def test_many_not_built_do_not_fail(tmp_path, capsys):
+    """However many visits are NOT_BUILT (here 25, more than the former
+    limit of 20), the extract goes on: all flagged, counted and listed."""
+    nb = [2026010600001 + k for k in range(25)]
+    view = [dict(id=i, ra=10.0 + i, midpointMjdTai=61046.27 + i / 86400, visit=v, detector=94, x=2000.0,
+                 y=2000.0) for i, v in enumerate(nb)]
+    obs = [dict(obsid=f"o{i}", obssubid=str(i), ra=10.0 + i, dec=1.0, obstime=utc(61046.27 + i / 86400),
+                band="Lr", mag=20.0) for i in range(len(nb))]
+    out, unres, rep = run(tmp_path, obs, view)
+    assert not unres and len(out) == len(nb)
+    assert rep["not_built_visits"] == nb and rep["status"]["not_built"] == len(nb)
+    assert all(r["midpointMjdTai_flag"] and r["midpointMjdTai"] == r["midpointMjdTaiVisit"]
+               for r in out.values())
+    assert f"{len(nb)} visit(s) not built" in capsys.readouterr().err
 
 
 def test_not_built_counts_written_rows_only(tmp_path):
@@ -349,14 +362,14 @@ def test_not_built_counts_written_rows_only(tmp_path):
             dict(id=1, processing="NV-S", ra=10.0, dec=1.0 + 500 * MAS, midpointMjdTai=VISIT_T[V0],
                  visit=2026010600001, detector=94, x=2000.0, y=2000.0)]
     obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(VISIT_T[V0]), band="Lr", mag=20.0)]
-    out, _, rep = run(tmp_path, obs, view, max_not_built_visits=0)
+    out, _, rep = run(tmp_path, obs, view)
     assert out["o"]["processing"] == "AP-DS" and rep["not_built_visits"] == []
 
 
 def test_outside_coverage(tmp_path):
     """Visits on nights before the table's first night (read from the
-    table) get the visit time, flagged, are never looked up, and do not
-    count toward the NOT_BUILT limit."""
+    table) get the visit time, flagged, are never looked up, and are not
+    counted as NOT_BUILT."""
     first = S.Corrections(TABLE).first_night
     assert first == min(int(p.name[16:24]) for p in TABLE.glob("shutter_motions_*.parquet"))
     assert first == min(int(p.name[12:20]) for p in TABLE_V1.glob("corrections_*.parquet"))
@@ -370,7 +383,7 @@ def test_outside_coverage(tmp_path):
     obs = [dict(obsid=f"o{i}", obssubid=str(i), ra=10.0 + i, obstime=utc(t0 + i), **common)
            for i in range(len(visits))]
     obs.append(dict(obsid="c", obssubid="99", ra=30.0, obstime=utc(VISIT_T[V0]), **common))
-    out, _, rep = run(tmp_path, obs, view, max_not_built_visits=0)
+    out, _, rep = run(tmp_path, obs, view)
     for i in range(len(visits)):
         r = out[f"o{i}"]
         assert r["midpointMjdTai_flag"] and not r["midpointMjdTai_flag_degraded"]
@@ -403,7 +416,7 @@ def test_outside_coverage_never_looked_up(monkeypatch):
 
 def test_empty_table_has_no_coverage(tmp_path):
     """A table directory without nights: no first night; everything is
-    NOT_BUILT (and the limit applies)."""
+    NOT_BUILT."""
     corr = S.Corrections(tmp_path)
     assert corr.first_night is None
     view = view_table([dict(id=1, ra=1.0, midpointMjdTai=0.0, visit=2024112800001, detector=1, x=1.0, y=1.0)])
@@ -412,7 +425,7 @@ def test_empty_table_has_no_coverage(tmp_path):
 
 
 def test_warnings_list_at_most_20_visits(capsys):
-    corr = S.Corrections(TABLE, max_not_built_visits=1000)
+    corr = S.Corrections(TABLE)
     visits = np.arange(25) + 2026010600001
     nan = np.full(25, np.nan)
     nb, tm = corr.check(visits, np.full(25, S.NOT_BUILT), nan, nan)
@@ -853,7 +866,7 @@ def test_first_night_is_in_coverage():
 
 def test_not_built_loser_within_3_mas_does_not_count(tmp_path):
     """NOT_BUILT candidates that pass the position test (so are looked up)
-    but lose -- on time, or on rank -- do not count toward the limit."""
+    but lose -- on time, or on rank -- are not counted."""
     tv = VISIT_T[V0]
     nb = dict(visit=2026010600001, detector=94, x=2000.0, y=2000.0)
     view = [dict(id=1, ra=10.0, midpointMjdTai=tv, visit=V0, detector=D0, x=X0, y=Y0),
@@ -862,7 +875,7 @@ def test_not_built_loser_within_3_mas_does_not_count(tmp_path):
             # same position and time, wrong band: passes but loses the rank
             dict(id=1, processing="DP2-DS", ra=10.0, band="z", midpointMjdTai=tv, **nb)]
     obs = [dict(obsid="o", obssubid="1", ra=10.0, dec=1.0, obstime=utc(tv), band="Lr", mag=20.0)]
-    out, _, rep = run(tmp_path, obs, view, max_not_built_visits=0)
+    out, _, rep = run(tmp_path, obs, view)
     assert out["o"]["processing"] == "AP-DS" and out["o"]["n_pass"] == 2
     assert rep["not_built_visits"] == [] and rep["status"]["not_built"] == 0
     # and both losers were indeed looked up (NOT_BUILT)

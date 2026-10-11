@@ -522,9 +522,9 @@ def test_shutter_entry_from_reused_dia_sources(tmp_path, stubs):
 
 def test_correction_defaults():
     from ssp.export.submittable import DEFAULT_CORRECTION_TABLE
-    from ssp.ssobservation_contract import MAX_NOT_BUILT_VISITS
     a = M.build_parser().parse_args(["x"])
-    assert (a.correction_table, a.max_not_built_visits) == (DEFAULT_CORRECTION_TABLE, MAX_NOT_BUILT_VISITS)
+    assert a.correction_table == DEFAULT_CORRECTION_TABLE
+    assert not hasattr(a, "max_not_built_visits")
 
 
 def test_correction_error_is_extract_error(tmp_path, monkeypatch):
@@ -533,7 +533,7 @@ def test_correction_error_is_extract_error(tmp_path, monkeypatch):
     def boom(*a, **kw):
         raise S.CorrectionError("12 visits are not built")
     monkeypatch.setattr(S, "extract", boom)
-    args = M.build_parser().parse_args([str(tmp_path), "--max-not-built-visits", "3"])
+    args = M.build_parser().parse_args([str(tmp_path)])
     args.ch_host = "h"
     with pytest.raises(M.ExtractError, match="shutter-motion correction: 12 visits"):
         M.extract_dia_sources(tmp_path / "obs.parquet", tmp_path / "dia.parquet", args)

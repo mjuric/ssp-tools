@@ -200,8 +200,9 @@ SIDECAR_FIELDS = ("file", "key", "columns", "rows", "bytes", "md5")
 #   obstime_basis                 how the obs_sbn row's time matched: 'visit',
 #                                 'corrected' or 'both' (each within DT_MS)
 # A NOT_BUILT visit (status 3) gets the visit's time and midpointMjdTai_flag
-# True, with a warning naming it; more than MAX_NOT_BUILT_VISITS distinct
-# NOT_BUILT visits fail the extract (a stale correction table).
+# True, with a warning naming it, and is counted and listed in the manifest;
+# however many there are, the extract goes on (owner decision 2026-10-11:
+# a later day's rebuild fixes them once the table covers them).
 # The flags are non-null for every row (False/False for a status-0 correction).
 #
 # SSObservation copies midpointMjdTai and the two flags (block 4) and computes
@@ -209,12 +210,9 @@ SIDECAR_FIELDS = ("file", "key", "columns", "rows", "bytes", "md5")
 # obstime_basis are internal: not published, dropped without a warning.
 SHUTTER_INTERNAL = ("midpointMjdTaiVisit", "obstime_basis", "dt_corrected_ms")
 
-#: The default limit on NOT_BUILT visits in one extract (configurable).
-MAX_NOT_BUILT_VISITS = 20
-
 #: Visits on nights before the correction table's first night are outside
 #: its coverage (e.g. ComCam): the visit time, midpointMjdTai_flag True, not
-#: counted toward MAX_NOT_BUILT_VISITS; counted separately in the manifest.
+#: NOT_BUILT; counted separately in the manifest.
 #: The correction is applied (however large) only where the pipeline's
 #: visit time equals the exposure log's header midpoint header_mid_mjd_tai
 #: ((MJD-BEG + MJD-END)/2, from the night's exposure log in the table) to
