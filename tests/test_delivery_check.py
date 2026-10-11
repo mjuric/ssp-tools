@@ -18,6 +18,7 @@ from ssp.ssobservation_contract import (
     SSOBSERVATION_MANIFEST_FIELDS,
     SSOBSERVATION_MANIFEST_FILE,
 )
+from nearbysso_delivery_fixture import write_nearbysso
 from ssobs_parts_fixture import read_manifest, refresh, rename_part, write_manifest, write_parts
 
 N = 6
@@ -82,13 +83,15 @@ def test_pass_dictionary_and_large_string(tmp_path, table):
 
 
 def write_delivery(d, skip=()):
-    """Every delivery table: SSObservation partitioned, the rest single
-    files."""
+    """Every delivery table: SSObservation partitioned, NearbySSO with its
+    sidecar (tests/nearbysso_delivery_fixture.py), the rest single files."""
     for table in DELIVERY_TABLES:
         if table in skip:
             continue
         if table == "SSObservation":
             write_ss(d)
+        elif table == "NearbySSO":
+            write_nearbysso(d)
         else:
             write(d, table, make_table(table))
 
