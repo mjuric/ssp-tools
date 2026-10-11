@@ -23,7 +23,7 @@ Related:
 | Unmatched predictions | Rows of the official NearbySSO table, with NULL `diaSourceId`, `ephOffset` and `diaDistanceRank`. |
 | New official columns | Only `visit` and `detector`, both non-null. Everything else (placement, time, flags) goes to a sidecar. |
 | Sidecar | `NearbySSO_internal.parquet`: an exact 1:1 join to NearbySSO (one row per row, same order, by the key), never uploaded. Not extra rows. |
-| Key | (`diaSourceId`, `designation`, `visit`) with `diaSourceId` nullable; a surrogate `nearbySsoId` if Felis refuses a nullable key column. sdm_schemas #549, with the owner's OK. |
+| Key | (`diaSourceId`, `designation`, `visit`) with `diaSourceId` nullable (sdm_schemas #549, `6d7c9a1`). Felis accepts it. Postgres would refuse a NULL in a key column; BigQuery (the PPDB) doesn't enforce keys, so it works there. Fallback if a nullable key is ever a problem: `diaSourceId` = 0 as a sentinel. No surrogate key (owner, 2026-10-11). |
 | `detector` | The detector the prediction falls on, or the nearest one for gaps and the margin. For a matched row in a visit with no WCS: its DiaSource's detector. |
 | Placement | The prediction's position (also for matched rows), through the visit-table WCSs. |
 | Margin | 30″ around the detectors. Beyond it, no unmatched row. |
