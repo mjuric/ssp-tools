@@ -248,7 +248,8 @@ id are searched for by position and time, with the same acceptance rule.
 Shutter-motion correction (`docs/design/shutter-timing.md`): each candidate's
 corrected exposure midpoint is looked up in the correction table
 (`--correction-table DIR`, default
-`/sdf/data/rubin/user/mjuric/shutter-timing/corrections`; `none` turns it
+`/sdf/home/m/mjuric/ssp_daily_data/shutter-timing`, a format-2 table of
+shutter-timing v0.5.0; `none` turns it
 off) before matching, and the time test passes within 10 ms of either the
 visit time or the corrected time. The output's `midpointMjdTai` is the
 corrected time (the visit's is kept as `midpointMjdTaiVisit`), with

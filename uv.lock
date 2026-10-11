@@ -1876,8 +1876,8 @@ wheels = [
 
 [[package]]
 name = "shutter-timing"
-version = "0.4.0"
-source = { git = "https://github.com/mjuric/shutter-timing?tag=v0.4.0#c1abce69f7d055c9982d1041e7f5904c6db97f67" }
+version = "0.5.0"
+source = { git = "https://github.com/mjuric/shutter-timing?tag=v0.5.0#d50968f452999d49307566055567db359708f245" }
 dependencies = [
     { name = "astropy" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -1975,7 +1975,7 @@ requires-dist = [
     { name = "rebound", marker = "extra == 'all'" },
     { name = "rebound", marker = "extra == 'assist'" },
     { name = "scipy", specifier = ">=1.7" },
-    { name = "shutter-timing", extras = ["s3"], git = "https://github.com/mjuric/shutter-timing?tag=v0.4.0" },
+    { name = "shutter-timing", extras = ["s3"], git = "https://github.com/mjuric/shutter-timing?tag=v0.5.0" },
     { name = "tqdm", specifier = ">=4.0" },
 ]
 provides-extras = ["dev", "assist", "upload", "all"]

@@ -217,7 +217,7 @@ MAX_NOT_BUILT_VISITS = 20
 #: counted toward MAX_NOT_BUILT_VISITS; counted separately in the manifest.
 #: The correction is applied (however large) only where the pipeline's
 #: visit time equals the exposure log's header midpoint header_mid_mjd_tai
-#: ((MJD-BEG + MJD-END)/2, from the table's exposures_<day_obs>.parquet) to
+#: ((MJD-BEG + MJD-END)/2, from the night's exposure log in the table) to
 #: within this [s]; otherwise the visit time, midpointMjdTai_flag True, a
 #: warning, counted in the manifest as time_mismatch (docs/design/
 #: shutter-timing.md, "Visit-time guard").

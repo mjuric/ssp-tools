@@ -57,8 +57,10 @@ EXTRACT = "ssp-extract-sso-inputs"
 BUILD = "ssp-build-sso"
 UPLOAD = "ssp-upload-sso"
 
-#: The production correction table (docs/design/shutter-timing.md).
-DEFAULT_CORRECTION_TABLE = "/sdf/data/rubin/user/mjuric/shutter-timing/corrections"
+#: The production correction table (docs/design/shutter-timing.md; table
+#: format 2). Named through the ssp_daily_data symlink, never resolved, so
+#: that it can be repointed.
+DEFAULT_CORRECTION_TABLE = "/sdf/home/m/mjuric/ssp_daily_data/shutter-timing"
 
 
 def _local_bin():

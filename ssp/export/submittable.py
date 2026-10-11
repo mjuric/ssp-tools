@@ -41,7 +41,6 @@ from __future__ import annotations
 import argparse
 import io
 import os
-import re
 import stat
 import sys
 import threading
@@ -80,10 +79,12 @@ MAX_WORKERS = 8
 SEP_MAS = 3.0
 DT_MS = 10.0
 
-# The shutter-motion correction table, kept up to date by ssp-daily
-# (shutter-timing-table, hourly). "none" on the command line disables the
-# correction.
-DEFAULT_CORRECTION_TABLE = "/sdf/data/rubin/user/mjuric/shutter-timing/corrections"
+# The shutter-motion correction table (format 2: one
+# shutter_motions_<day_obs>.parquet per night), kept up to date by ssp-daily
+# (shutter-timing-table, hourly). Named through the ssp_daily_data symlink,
+# never resolved, so that it can be repointed. "none" on the command line
+# disables the correction.
+DEFAULT_CORRECTION_TABLE = "/sdf/home/m/mjuric/ssp_daily_data/shutter-timing"
 
 # The position pass's time window must also fetch candidates whose
 # *corrected* time is within DT_MS of the obs_sbn time, so it is widened by a
@@ -693,10 +694,9 @@ def run_queries(tasks, host, port, database, user, workers):
 #
 
 
-#: Exposure-log columns (exposures_<day_obs>.parquet) read per visit: the
-#: guard's header midpoint, and the table's visit midpoint (for the
-#: position window). shutter_timing's public API does not return them: read
-#: from the table's files.
+#: Exposure-log columns read per visit (from the night's exposure log,
+#: shutter_timing.table.read_night): the guard's header midpoint, and the
+#: table's visit midpoint (for the position window).
 GUARD_LOG_COLUMNS = ("header_mid_mjd_tai", "t_mid_visit_mjd_tai")
 
 
@@ -749,14 +749,16 @@ class Corrections:
     CorrectionError.
 
     Nights before the table's first night (``first_night``, its earliest
-    ``corrections_<day_obs>.parquet``) are outside its coverage (e.g.
+    built night, from ``shutter_timing.table.table_calibrations``) are
+    outside its coverage (e.g.
     ComCam): OUTSIDE_COVERAGE, never looked up. ``guard`` (default
     VISIT_TIME_GUARD) is applied to the corrected sources (see
     header_guard): ALREADY_CORRECTED (``t`` is the pipeline's time),
     TIME_MISMATCH (not applied), LARGE_SHIFT (applied, degraded). It sees
-    the visit's row of the night's exposure log (shutter_timing's API does
-    not return it). ``dshift``: corrected - pipeline time [s], where
-    compared.
+    the visit's row of the night's exposure log
+    (``shutter_timing.table.read_night``). ``dshift``: corrected - pipeline
+    time [s], where compared. A table shutter_timing refuses (e.g. a
+    format-1 directory, an unreadable night) raises CorrectionError here.
     """
 
     def __init__(self, table_dir, max_not_built_visits=MAX_NOT_BUILT_VISITS, guard=VISIT_TIME_GUARD):
@@ -766,8 +768,9 @@ class Corrections:
                                   f"shutter-timing-table --out {self.table_dir} builds it)")
         self.max_not_built_visits = max_not_built_visits
         self.guard = guard
-        nights = [int(m.group(1)) for p in self.table_dir.iterdir()
-                  if (m := re.fullmatch(r"corrections_(\d{8})\.parquet", p.name))]
+        from shutter_timing.table import table_calibrations
+
+        nights = [d for days in self._table_call(table_calibrations).values() for d in days]
         self.first_night = min(nights) if nights else None
         self.t = np.zeros(0)
         self.dvis = np.zeros(0)
@@ -784,21 +787,35 @@ class Corrections:
         self.dshift = np.concatenate([self.dshift, np.full(k, np.nan)])
         self.status = np.concatenate([self.status, np.full(k, NOT_LOOKED_UP, np.uint8)])
 
+    def _table_call(self, fn, *args, **kw):
+        """``fn(self.table_dir, *args, **kw)`` (a shutter_timing.table
+        reader), its table errors raised as CorrectionError."""
+        from shutter_timing import TableFormatError, TableIntegrityError
+
+        try:
+            return fn(self.table_dir, *args, **kw)
+        except (TableFormatError, TableIntegrityError, OSError, ValueError) as e:
+            raise CorrectionError(f"the correction table {self.table_dir}: {type(e).__name__}: {e}") from e
+
     def night_log(self, day_obs, required=False):
         """The night's exposure log: ``(sorted visits, {GUARD_LOG_COLUMNS:
         values})``, cached; empty if the night is not built (an error if
         ``required``)."""
         if day_obs not in self._logs:
-            path = self.table_dir / f"exposures_{day_obs}.parquet"
-            if not path.exists() and not required:
+            from shutter_timing.table import read_night
+
+            # read_night (rather than read_exposure_log) tells a night that
+            # is not built (None) from one with an empty log
+            night = self._table_call(read_night, int(day_obs), columns=["visit"])
+            if night is None:
+                if required:
+                    raise CorrectionError(f"the correction table {self.table_dir}: night {day_obs} "
+                                          f"is not built (no exposure log)")
                 return np.zeros(0, np.int64), {c: np.zeros(0) for c in GUARD_LOG_COLUMNS}
-            try:
-                t = pq.read_table(path, columns=["visit", *GUARD_LOG_COLUMNS])
-            except (OSError, KeyError, pa.ArrowInvalid) as e:
-                raise CorrectionError(f"cannot read the exposure log {path}: {e}") from e
-            v = t["visit"].to_numpy()
+            log = night[1]
+            v = log["visit"].astype(np.int64)
             o = np.argsort(v)
-            self._logs[day_obs] = (v[o], {c: _f64(t, c)[o] for c in GUARD_LOG_COLUMNS})
+            self._logs[day_obs] = (v[o], {c: log[c].astype(np.float64)[o] for c in GUARD_LOG_COLUMNS})
         return self._logs[day_obs]
 
     def window_shift(self, mjd_night):
