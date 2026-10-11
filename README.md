@@ -256,9 +256,9 @@ corrected time (the visit's is kept as `midpointMjdTaiVisit`), with
 `midpointMjdTai_flag` (not corrected: the table omits the visit, or hasn't
 built it yet), `midpointMjdTai_flag_degraded`, `obstime_basis` (`visit`,
 `corrected`, `both`) and `dt_corrected_ms`. Visits the table hasn't built
-are warned about; more than `--max-not-built-visits` (default 20) fail the
-extract. Visits on nights before the table's first night (ComCam) are
-outside its coverage: flagged, not counted toward that limit. A correction
+are flagged, warned about and counted in the manifest; a later day's
+rebuild fixes them. Visits on nights before the table's first night
+(ComCam) are outside its coverage: flagged, and counted separately. A correction
 is applied only where the visit time equals the table's exposure-log header
 midpoint to within 1 ms; elsewhere the visit time is kept, flagged, with a
 warning.

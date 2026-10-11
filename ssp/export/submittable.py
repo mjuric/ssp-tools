@@ -55,8 +55,7 @@ import pyarrow.parquet as pq
 from astropy.time import Time
 
 from ssp.delivery_contract import SHUTTER_INPUT_COLUMNS, SHUTTER_MANIFEST_FIELD
-from ssp.ssobservation_contract import (MATCH_METHODS, MAX_CORRECTION_S, MAX_HEADER_MISMATCH_S,
-                                        MAX_NOT_BUILT_VISITS)
+from ssp.ssobservation_contract import MATCH_METHODS, MAX_CORRECTION_S, MAX_HEADER_MISMATCH_S
 
 # The ClickHouse ("River") server has moved more than once (sdfiana035 ->
 # 172.24.10.116 on 2026-10-04 -> sdfiana032 on 2026-10-05). Its operators keep
@@ -761,12 +760,11 @@ class Corrections:
     format-1 directory, an unreadable night) raises CorrectionError here.
     """
 
-    def __init__(self, table_dir, max_not_built_visits=MAX_NOT_BUILT_VISITS, guard=VISIT_TIME_GUARD):
+    def __init__(self, table_dir, guard=VISIT_TIME_GUARD):
         self.table_dir = Path(table_dir)
         if not self.table_dir.is_dir():
             raise CorrectionError(f"the correction table {self.table_dir} does not exist (ssp-daily's "
                                   f"shutter-timing-table --out {self.table_dir} builds it)")
-        self.max_not_built_visits = max_not_built_visits
         self.guard = guard
         from shutter_timing.table import table_calibrations
 
@@ -941,8 +939,9 @@ class Corrections:
 
     def check(self, visits, status, dvis, dshift):
         """Warn about the NOT_BUILT, TIME_MISMATCH and LARGE_SHIFT visits of
-        the output rows (at most WARN_VISITS named); fail if more than
-        ``max_not_built_visits`` are NOT_BUILT. Returns the NOT_BUILT and
+        the output rows (at most WARN_VISITS named). NOT_BUILT visits never
+        fail the extract: they are flagged, and a later day's rebuild fixes
+        them once the table covers them. Returns the NOT_BUILT and
         TIME_MISMATCH visits, sorted."""
         visits, status, dvis, dshift = (np.asarray(a) for a in (visits, status, dvis, dshift))
         big = status == LARGE_SHIFT
@@ -953,12 +952,6 @@ class Corrections:
                   f"{MAX_CORRECTION_S:g} s (largest |shift| per visit); applied, marked degraded: "
                   f"{_some([f'{v} ({ds[v]:.3f} s)' for v in tl])}", file=sys.stderr, flush=True)
         nb = np.unique(visits[status == NOT_BUILT]).tolist()
-        if len(nb) > self.max_not_built_visits:
-            raise CorrectionError(
-                f"{len(nb)} visits are not built in the correction table {self.table_dir} (more than "
-                f"--max-not-built-visits {self.max_not_built_visits}): is the table build (ssp-daily's "
-                f"shutter-timing-table --out {self.table_dir}) stale or failing? Nights affected: "
-                f"{_some(sorted({v // 100000 for v in nb}))}")
         if nb:
             print(f"warning: {len(nb)} visit(s) not built in the correction table (their night has no "
                   f"table, or the visit is not in its exposure log, e.g. a raw that arrived late); "
@@ -1137,19 +1130,18 @@ def _counts(values):
 
 
 def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250_000, correction_table=None,
-            max_not_built_visits=MAX_NOT_BUILT_VISITS, report=None):
+            report=None):
     """Resolve the X05 rows of ``obs_path`` against the view and write
     ``out_path`` and ``<stem>.unresolved.parquet``. ``fetch`` runs a list
     of query tasks (see ``run_queries``). Returns the exit code.
 
     ``correction_table``: the shutter-motion correction table directory
     (None: no correction, the uncorrected extract). With it, the extract
-    raises CorrectionError (writing nothing) if the table cannot be used or
-    more than ``max_not_built_visits`` of the written rows' visits are not
-    built in it, and fills ``report`` (a dict, if given) with the
+    raises CorrectionError (writing nothing) if the table cannot be used,
+    and fills ``report`` (a dict, if given) with the
     manifest's SHUTTER_MANIFEST_FIELD entry."""
     timings = {}
-    corr = Corrections(correction_table, max_not_built_visits) if correction_table is not None else None
+    corr = Corrections(correction_table) if correction_table is not None else None
     t0 = time.time()
 
     tbl = pq.read_table(obs_path, columns=OBS_COLUMNS)
@@ -1284,14 +1276,10 @@ def extract(obs_path, out_path, fetch, database=DEFAULT_DATABASE, chunk_size=250
 
 
 def add_correction_args(parser):
-    """--correction-table and --max-not-built-visits (shared with
-    ssp-extract-sso-inputs)."""
+    """--correction-table (shared with ssp-extract-sso-inputs)."""
     parser.add_argument("--correction-table", default=DEFAULT_CORRECTION_TABLE, metavar="DIR",
                         help="The shutter-motion correction table (shutter-timing-table's --out); "
                              "'none' for no correction (default: %(default)s)")
-    parser.add_argument("--max-not-built-visits", type=int, default=MAX_NOT_BUILT_VISITS, metavar="N",
-                        help="Fail if more than N visits of the extracted rows are not built in the "
-                             "correction table (default: %(default)s)")
 
 
 def correction_table(args):
@@ -1331,7 +1319,7 @@ def main():
 
     try:
         rc = extract(args.obs_sbn, args.output, fetch, database=args.database, chunk_size=args.chunk_size,
-                     correction_table=correction_table(args), max_not_built_visits=args.max_not_built_visits)
+                     correction_table=correction_table(args))
     except CorrectionError as e:
         print(f"extract-submitted-sources: error: shutter-motion correction: {e}; nothing written",
               file=sys.stderr)

@@ -211,7 +211,7 @@ def extract_dia_sources(obs_path, out_path, args):
     report = {}
     try:
         rc = S.extract(obs_path, out_path, fetch, correction_table=S.correction_table(args),
-                       max_not_built_visits=args.max_not_built_visits, report=report)
+                       report=report)
     except S.CorrectionError as e:
         raise ExtractError(f"dia_sources: shutter-motion correction: {e}") from None
     if rc != 0:
