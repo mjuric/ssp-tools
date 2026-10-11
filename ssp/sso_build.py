@@ -68,8 +68,10 @@ from .delivery_contract import (
     REPORT_FILE,
     REQUIRED_INPUT_COLUMNS,
     SHUTTER_INPUT_COLUMNS,
+    SHUTTER_MANIFEST_FIELD,
     delivery_schema,
 )
+from .nearbysso.placement import DEFAULT_WCS_STORE
 from .ssobservation_contract import (
     PART_GLOB,
     PART_ROWS_DEFAULT,
@@ -747,6 +749,14 @@ def _entry_point(module):
     return [sys.executable, "-c", f"import sys; from {module} import main; sys.exit(main())"]
 
 
+def nearbysso_correction_table(manifest):
+    """The correction table NearbySSO's times come from: the one the
+    extract used (the manifest's SHUTTER_MANIFEST_FIELD entry, its
+    ``table_dir``), or 'none' if the inputs were extracted without one."""
+    entry = (manifest or {}).get(SHUTTER_MANIFEST_FIELD[0]) or {}
+    return str(entry.get("table_dir") or "none")
+
+
 def step_command(step, inputs_dir, run_dir, manifest, workers, options=None):
     """(argv, {produced: delivered}) of ``step``. ``produced`` is a file,
     moved to the delivered file; or (SSObservation) the builder's output
@@ -782,7 +792,9 @@ def step_command(step, inputs_dir, run_dir, manifest, workers, options=None):
                  str(input_path(inputs_dir, manifest, "ppdb_dia_sources")),
                  "--orbits", str(builder_input(inputs_dir, run_dir, manifest, "mpc_orbits")),
                  "--ssobject", str(delivery / "SSObject.parquet"), "--output", str(out),
-                 "--workers", str(workers)], {out: delivery / "NearbySSO.parquet"})
+                 "--workers", str(workers), "--correction-table", nearbysso_correction_table(manifest),
+                 "--wcs-store", options.get("wcs_store", DEFAULT_WCS_STORE)],
+                {out: delivery / "NearbySSO.parquet"})
     raise ValueError(f"unknown step {step!r}")
 
 
