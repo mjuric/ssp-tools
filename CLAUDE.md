@@ -43,7 +43,8 @@ The rules here are for development in ssp-tools, by Claude sessions and their su
 
 **5. Review.**
 - The integrator reviews every WP.
-- WPs with non-trivial logic get an **independent review**, by a fresh agent that tries to break them: probes, mutation testing, comparison against brute force or a reference. Small WPs get a light review.
+- WPs with non-trivial logic get an **independent review**, by a fresh agent that tries to break them: probes, comparison against brute force or a reference, and real-data checks. Small WPs get a light review.
+- **No mutation testing** (owner, 2026-10-11): neither systematic mutation runs nor breaking the code by hand to prove a test catches it. It takes a lot of time and tokens. Reviews look for bugs directly instead.
 - Fixes go back to the WP's author, round after round, until the review is clean.
 - Findings that change a design assumption go to the owner before going further.
 

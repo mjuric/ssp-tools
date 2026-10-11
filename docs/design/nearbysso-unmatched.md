@@ -40,6 +40,7 @@ Related:
 | Missing detectors (revised 2026-10-11, after U0) | The only rule: keep a prediction if it lands on a detector with a WCS, or within 30″ of one; drop everything else. A prediction on a missing detector (no WCS, rejected, or one of the 17 never processed) is dropped automatically, since most of its area is more than 30″ from any placed detector. No reference set of expected detectors. Accepted edge case: a prediction on a missing detector within 30″ of a neighbour's edge is kept and assigned to the neighbour like a gap prediction, with `eph_x`/`eph_y` outside its pixel range. Handling missing detectors more carefully is for later (#96). |
 | Times beyond 100 px (2026-10-11, after U0) | shutter-timing gives no corrected time more than 100 px off a detector (`OFF_DETECTOR_OMIT_PIX`); the 30″ margin is ~150 px. Accepted: those rows keep the visit's time, with `midpointMjdTai_flag` true (≤ ~0.1″ error for fast objects over 0.25 s). |
 | WCS store | visit-table's store at `/sdf/home/m/mjuric/ssp_daily_data/visit-table/wcs/`, refreshed hourly by ssp-daily, read only through visit-table's reader. ssp-tools assumes it is current: no freshness checks; what is missing today is picked up by tomorrow's rebuild. |
+| Reviews | No mutation testing (2026-10-11): probes, comparison with the stack and with exact evaluation, real-data checks. |
 | Validation | Don't re-validate what is validated upstream (visit-table's placement accuracy, `at_source_time`'s moves); check only what is new here. |
 
 ## Outputs
@@ -131,7 +132,7 @@ Everything below runs in NearbySSO's matching pass. It already works per slice o
 | 2 | **U2, time and moves:** per-visit uncorrected test; `Corrections` at predicted pixels; rates of change everywhere; `at_source_time` for all rows; the pixel correction. | WP agent |
 | 3 | **U3, placement and rows:** the WCS footprint; nearest-detector placement (needs visit-table #22's tag); the 30″ rule; unmatched rows; NearbySSO's 17 columns; the sidecar; the report. | WP agent |
 | 3 | **U4, checks:** the delivery check and bench for the new NearbySSO and its sidecar, written black-box from this design and the contract. | WP agent |
-| 4 | Independent reviews of U2 and U3 (probes, mutation tests, comparison with the stack and with exact evaluation) | review agents |
+| 4 | Independent reviews of U2 and U3 (probes, comparison with the stack and with exact evaluation) | review agents |
 | 5 | End-to-end run, results recorded here, runbook; feature branch → master | integrator; owner approval |
 
 Dependencies outside this repository:
