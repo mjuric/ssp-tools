@@ -19,6 +19,7 @@ from astropy.time import Time
 
 from ssp.nearbysso import build as B
 from ssp.nearbysso import visits as V
+from ssp.nearbysso._contract import NEARBYSSO_UNMATCHED_NULL
 from ssp.nearbysso._contract import (MATCH_RADIUS_ARCSEC, MATCH_RADIUS_COMET_ARCSEC, NEARBYSSO_DTYPE,
                                      ORBIT_DTYPE, VISIT_DTYPE, match_radius)
 
@@ -32,7 +33,8 @@ def _write_dia(path, visit, t, ra, dec, sid=None):
     sid = np.arange(1, n + 1, dtype=np.int64) if sid is None else sid
     pq.write_table(pa.table(dict(diaSourceId=np.asarray(sid, np.int64), visit=np.asarray(visit, np.int64),
                                  midpointMjdTai=np.asarray(t, float), ra=np.asarray(ra, float),
-                                 dec=np.asarray(dec, float))), path, row_group_size=7)
+                                 dec=np.asarray(dec, float), detector=np.asarray(sid, np.int64) % 189)),
+                   path, row_group_size=7)
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +216,7 @@ def _pass3(path, preds, slice_days, read_workers, orbit_radius=None, full=False)
     vstart = np.r_[0, np.cumsum([v.size for v in vis_parts])].astype(np.int64)
     p, poff, _ = B.sort_predictions([preds.copy()], visits.size)
     B._W.update(dia_path=path, slices=slices, threads=1, visits=visits, vstart=vstart, preds=p, poff=poff,
-                orbit_radius=np.asarray(orbit_radius, float))
+                orbit_radius=np.asarray(orbit_radius, float), dia_extra=("detector",))
     try:
         res = B._map(B._match_slice, [(s, s + 1) for s in range(len(slices))], read_workers, "test",
                      unit="slices")
@@ -390,7 +392,8 @@ def test_write_parquet_null_ssobjectid(tmp_path):
     from ssp.schema_ppdb import NearbySSODtype
     assert t.column_names == list(NearbySSODtype.names)          # the schema's order
     assert t.schema.field("diaDistanceRank").type == pa.int16()
-    assert not t.schema.field("diaDistanceRank").nullable
+    # (nullable as in the schema: all but visit, detector and designation)
+    assert [f.name for f in t.schema if not f.nullable] == ["visit", "detector", "designation"]
     assert t["ssObjectId"].to_pylist() == [11, None, 33]
     assert t.schema.field("ssObjectId").type == pa.int64()
     assert t.schema.field("designation").type == pa.string()
@@ -401,11 +404,18 @@ def test_write_parquet_null_ssobjectid(tmp_path):
     for c in ("ephAntiSunPA", "ephAntiMotionPA"):
         assert t.schema.field(c).type == pa.float32() and t.schema.field(c).nullable
         assert t[c].null_count == 0
-    assert not t.schema.field("ephRaErr").nullable
+    assert t["diaSourceId"].null_count == t["ephOffset"].null_count == t["diaDistanceRank"].null_count == 0
     rows["ephAntiSunPA"] = [1.5, np.nan, 359.0]
-    B.write_parquet(rows, has, tmp_path / "n2.parquet")
+    B.write_parquet(rows, has, tmp_path / "n2.parquet", unmatched=np.array([False, True, False]))
     t = pq.read_table(tmp_path / "n2.parquet")
     assert t["ephAntiSunPA"].to_pylist() == [1.5, None, 359.0]
+    # unmatched rows: NULL diaSourceId, ephOffset, diaDistanceRank only
+    for c in t.column_names:
+        want = [False, True, False] if c in NEARBYSSO_UNMATCHED_NULL else None
+        if want is not None:
+            assert t[c].is_null().to_pylist() == want, c
+        elif c not in ("ssObjectId", "ephAntiSunPA"):
+            assert t[c].null_count == 0, c
 
 
 def test_ssobject_ids(tmp_path):
@@ -708,8 +718,10 @@ def synth(tmp_path_factory, orbits, ephem):
     r = next(x for x, tr in zip(rows, truth) if tr[3] == last_first and tr[2] == "hit")
     rep_row = pd.DataFrame([(hit0[0], r[1], r[2], r[3], r[4] + 0.7 / 3600)], columns=dia.columns)
     path = d / "dia.parquet"
-    pq.write_table(pa.Table.from_pandas(pd.concat([dia, rep_row]).sample(frac=1.0, random_state=1),
-                                        preserve_index=False), path, row_group_size=500)
+    full = pd.concat([dia, rep_row])
+    full["detector"] = full["diaSourceId"] % 189         # (rows without a WCS take it)
+    pq.write_table(pa.Table.from_pandas(full.sample(frac=1.0, random_state=1), preserve_index=False), path,
+                   row_group_size=500)
     truth = pd.DataFrame(truth, columns=["diaSourceId", "designation", "kind", "visit"])
     truth = truth.set_index("diaSourceId")
     return path, dia.set_index("diaSourceId"), truth

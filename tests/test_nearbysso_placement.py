@@ -181,7 +181,17 @@ def run_pass3(tmp_path, dia, preds, store, table, dots=None, name="dia"):
     """``build._match_slice`` on the DiaSources ``dia`` (rows of (id, visit,
     t, ra, dec, detector)) in one slice, for ``preds`` (PRED_DTYPE, their
     ``visit`` the index of the sorted distinct visits); then the parent's
-    reduction. Returns (ids, pub, place, visit stats, visits)."""
+    reduction. Returns (ids, pub, place, visit stats, visits, the matched
+    rows' predictions)."""
+    res, vis, p = pass3_raw(tmp_path, dia, preds, store, table, dots, name)
+    ids, k, sep, rank, _, _, pub, place, vstats = res[:9]
+    o = np.argsort(ids, kind="stable")
+    return ids[o], pub[o], place[o], vstats, vis, p[k[o]]
+
+
+def pass3_raw(tmp_path, dia, preds, store, table, dots=None, name="dia", dia_extra=("detector",)):
+    """``run_pass3``'s ``build._match_slice`` result for its one slice, the
+    visits and the sorted predictions."""
     from ssp.export.submittable import Corrections
 
     path = tmp_path / f"{name}.parquet"
@@ -203,14 +213,12 @@ def run_pass3(tmp_path, dia, preds, store, table, dots=None, name="dia"):
     corr = None if table is None else Corrections(table, guard=None)
     B._W.update(dia_path=path, slices=slices, threads=1, visits=vis, vstart=np.array([0, vis.size]), preds=p,
                 poff=poff, orbit_radius=np.full(int(p["orbit"].max()) + 1, MATCH_RADIUS_ARCSEC), dots=dd,
-                dia_extra=("detector",), corrections=corr, wcs_store=None if store is None else str(store))
+                dia_extra=dia_extra, corrections=corr, wcs_store=None if store is None else str(store))
     try:
         (res,), _, _ = B._match_slice(0, 1)
     finally:
         B._W.clear()
-    ids, k, sep, rank, _, _, pub, place, vstats = res
-    o = np.argsort(ids, kind="stable")
-    return ids[o], pub[o], place[o], vstats, vis, p[k[o]]
+    return res, vis, p
 
 
 # ---------------------------------------------------------------------------
@@ -612,3 +620,351 @@ def test_visit_with_only_rejected_detectors_has_no_wcs(tmp_path, scene, table):
     for n in ("ppdb1", "ppdb2"):
         assert not pl[n]["has_wcs"] and _cause(pl[n]["time_cause"]) == "no_wcs"
     assert vstats["without_wcs"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Unmatched predictions (WP U3)
+# ---------------------------------------------------------------------------
+
+#: (name, visit, detector, x, y, its DiaSources' offsets north of it ["]).
+#: Every prediction is a distinct orbit, in this (designation) order.
+U_PLAN = [
+    ("m1", V_OK, 94, 1000.0, 1500.0, [0.5]),         # matched
+    ("lose", V_OK, None, None, None, []),            # 1.5" south of m1: m1's DiaSource 2" away, not nearest
+    ("two", V_OK, 95, 2000.0, 2000.0, [0.5, -0.7]),  # the nearest of two DiaSources: two matched rows
+    ("on", V_OK, 95, 3000.0, 1000.0, []),            # nothing near: unmatched, on 95
+    ("gap", V_OK, 94, BBOX[2] + 52.0, 2500.0, []),   # unmatched, in the gap
+    ("in", V_OK, 96, BBOX[2] + 140.0, 2000.0, []),   # ~28" off 96: unmatched, in the margin
+    ("out", V_OK, 96, BBOX[2] + 160.0, 2000.0, []),  # ~32" off 96: dropped beyond the margin
+    ("m_nowcs", V_NOWCS, 94, 2000.0, 2000.0, [0.5]),  # matched, in a visit without a WCS
+    ("u_nowcs", V_NOWCS, 95, 1000.0, 1000.0, []),    # dropped: a visit without a WCS
+]
+
+
+@pytest.fixture(scope="module")
+def uscene(tmp_path_factory):
+    """Matched and unmatched predictions in V_OK (with a WCS) and V_NOWCS
+    (without), at their visits' header times; see U_PLAN."""
+    d = tmp_path_factory.mktemp("uscene")
+    vis = {V_OK: Visit(V_OK, 150.0, -10.0), V_NOWCS: Visit(V_NOWCS, 300.0, 30.0)}
+    store = write_store(d / "wcs", [vis[V_OK]])
+    order = sorted(vis)
+    p = np.zeros(len(U_PLAN), dtype=B.PRED_DTYPE)
+    dia, sid = [], 1000
+    for i, (name, v, det, x, y, offs) in enumerate(U_PLAN):
+        if name == "lose":
+            ra, dec = _north(p["ra"][0], p["dec"][0], -1.5)
+            ra, dec = np.array([ra]), np.array([dec])
+        else:
+            ra, dec = vis[v].pix2sky(det, x, y)
+        p["visit"][i], p["orbit"][i] = order.index(v), i
+        p["ra"][i], p["dec"][i] = ra[0], dec[0]
+        p["rate_ra"][i], p["rate_dec"][i] = 150.0, -90.0
+        p["ra_err"][i] = p["dec_err"][i] = 1e-5
+        for off in offs:
+            sra, sdec = _north(ra[0], dec[0], off)
+            dia.append((sid, v, HEADER[v], sra, sdec, det))
+            sid += 1
+    names = [n for n, *_ in U_PLAN]
+    return dict(vis=vis, store=store, dia=dia, preds=p, names=names)
+
+
+def _unpack(res):
+    ids, k, sep, rank, _, _, pub, place, vstats, (u_idx, u_pub, u_place), states = res
+    return ids, k, sep, rank, pub, place, vstats, u_idx, u_pub, u_place, states
+
+
+def test_unmatched_rows(tmp_path, uscene):
+    """Which predictions are matched rows, unmatched rows, or dropped: an
+    unmatched row is a prediction that is the nearest of no DiaSource (also
+    one that matched a DiaSource another prediction is nearer to), on a
+    detector or within the margin of one; the margin cut; visits without a
+    WCS; the unmatched rows' order, placement, time and NULLs."""
+    from ssp.nearbysso._contract import PLACEMENT_MARGIN_ARCSEC
+
+    res, vis, p = pass3_raw(tmp_path, uscene["dia"], uscene["preds"], uscene["store"], None)
+    ids, k, sep, rank, pub, place, vstats, u_idx, u_pub, u_place, _ = _unpack(res)
+    names = uscene["names"]
+    assert sorted(names[o] for o in p["orbit"][k]) == ["m1", "m_nowcs", "two", "two"]
+    assert [names[o] for o in p["orbit"][u_idx]] == ["lose", "on", "gap", "in"]
+    assert (np.diff(u_idx) > 0).all()                       # (visit, designation) order
+    assert vstats["predictions"] == len(names) and vstats["unmatched"] == 4
+    assert vstats["dropped_beyond_margin"] == 1 and vstats["dropped_no_wcs_visit"] == 1
+    assert vstats["beyond_margin"] == 0
+    # "lose" did match m1's DiaSource (within the radius), m1 is nearer
+    assert (sep[p["orbit"][k] == names.index("m1")] < 1.0).all()
+
+    # the placement, as visit-table's locator gives it, independently
+    loc = WcsStore([str(uscene["store"] / "day_obs=20260105.parquet")]).locator(V_OK)
+    q = loc.place(p["ra"][u_idx], p["dec"][u_idx])
+    assert u_place["has_wcs"].all() and (u_place["dia_detector"] == -1).all()
+    np.testing.assert_array_equal(u_place["detector"], q.detector)
+    np.testing.assert_array_equal(u_place["eph_x"], q.x)
+    np.testing.assert_array_equal(u_place["eph_y"], q.y)
+    np.testing.assert_allclose(u_place["ephDetectorEdgeDist"], q.edgeDistance, atol=1e-4)
+    by = {names[o]: r for o, r in zip(p["orbit"][u_idx], u_place)}
+    assert by["on"]["detector"] == 95 and by["in"]["detector"] == 96
+    assert BBOX[0] < by["on"]["eph_x"] < BBOX[2] and not BBOX[0] < by["gap"]["eph_x"] < BBOX[2]
+    assert -PLACEMENT_MARGIN_ARCSEC < by["in"]["ephDetectorEdgeDist"] < -20.0
+    i_out = names.index("out")
+    out = loc.place(uscene["preds"]["ra"][i_out:i_out + 1], uscene["preds"]["dec"][i_out:i_out + 1])
+    assert -40.0 < out.edgeDistance[0] < -PLACEMENT_MARGIN_ARCSEC
+    # no table: the visit's time, flagged, not moved; no DiaSource, no offset
+    assert (u_place["time_cause"] == P.CAUSE_NO_TABLE).all() and u_place["midpointMjdTai_flag"].all()
+    assert (u_place["midpointMjdTai"] == HEADER[V_OK]).all()
+    assert np.isnan(u_pub["sep"]).all() and (u_pub["dt"] == 0).all()
+    np.testing.assert_array_equal(u_pub["ra"], p["ra"][u_idx])
+    # the matched row in the visit without a WCS: its DiaSource's detector
+    m = place[p["orbit"][k] == names.index("m_nowcs")]
+    assert not m["has_wcs"][0] and m["detector"][0] == 94
+
+
+def test_matched_row_without_any_detector_fails(tmp_path, uscene):
+    """A matched row with no WCS and no DiaSource detector: the build
+    fails, never inferring one."""
+    with pytest.raises(ValueError, match="without a detector"):
+        pass3_raw(tmp_path, uscene["dia"], uscene["preds"], uscene["store"], None, dia_extra=())
+
+
+@needs_fixture
+def test_unmatched_rows_corrected_times(tmp_path, uscene, table):
+    """Unmatched rows get the corrected time at their pixel, as matched
+    rows do, and are moved there."""
+    res, vis, p = pass3_raw(tmp_path, uscene["dia"], uscene["preds"], uscene["store"], table)
+    _, _, _, _, _, _, _, u_idx, u_pub, u_place, _ = _unpack(res)
+    loc = WcsStore([str(uscene["store"] / "day_obs=20260105.parquet")]).locator(V_OK)
+    q = loc.place(p["ra"][u_idx], p["dec"][u_idx])
+    t, st = corrected(table, np.full(u_idx.size, V_OK), q.detector, q.x, q.y)
+    # ("in" is more than 100 px off its detector: the visit's time, flagged)
+    names = [uscene["names"][o] for o in p["orbit"][u_idx]]
+    ok = np.array([n != "in" for n in names])
+    assert (st[ok] <= 1).all() and _cause(u_place["time_cause"][~ok][0]) == "beyond_100px"
+    assert (u_place["time_cause"][ok] == P.CAUSE_CORRECTED).all()
+    assert list(u_place["midpointMjdTai_flag"]) == list(~ok)
+    np.testing.assert_array_equal(u_place["midpointMjdTai"][ok], t[ok])
+    assert u_place["midpointMjdTai"][~ok][0] == HEADER[V_OK]
+    assert (u_pub["dt"][ok] != 0).all() and np.isnan(u_pub["sep"]).all()
+    assert (u_place["move_px"][ok] > 0).all()
+
+
+@needs_fixture
+def test_orphan_rows_are_unmatched_rows(tmp_path, uscene, table):
+    """``orphan_rows`` (a prediction left the nearest of nothing by the
+    parent's reduction) makes the row ``place_and_time`` makes of the same
+    prediction when it is unmatched: the same bytes."""
+    i = uscene["names"].index("m1")
+    res, vis, p = pass3_raw(tmp_path, uscene["dia"], uscene["preds"], uscene["store"], table)
+    *_, (state, hcause, _) = _unpack(res)
+    # m1's DiaSource moved 20" away: m1 is unmatched
+    dia = [(s, v, t, *(_north(ra, dec, 20.0) if s == 1000 else (ra, dec)), det)
+           for s, v, t, ra, dec, det in uscene["dia"]]
+    res2, _, p2 = pass3_raw(tmp_path, dia, uscene["preds"], uscene["store"], table, name="moved")
+    _, _, _, _, _, _, _, u_idx, u_pub, u_place, _ = _unpack(res2)
+    j = np.flatnonzero(p2["orbit"][u_idx] == i)
+    assert j.size == 1
+    from ssp.export.submittable import Corrections
+    k = np.flatnonzero(p["orbit"] == i)
+    idx, o_pub, o_place, far, nowcs = B.orphan_rows(
+        dict(preds=p, dots=None, corrections=Corrections(table, guard=None), wcs_store=str(uscene["store"])),
+        vis, state, hcause, k)
+    assert list(idx) == list(k) and far == nowcs == 0
+    assert o_pub.tobytes() == u_pub[j].tobytes() and o_place.tobytes() == u_place[j].tobytes()
+    # dropped ones are counted, not returned
+    for name, want in (("out", (1, 0)), ("u_nowcs", (0, 1))):
+        k = np.flatnonzero(p["orbit"] == uscene["names"].index(name))
+        idx, *_, far, nowcs = B.orphan_rows(dict(preds=p, dots=None, corrections=None,
+                                                 wcs_store=str(uscene["store"])), vis, state, hcause, k)
+        assert idx.size == 0 and (far, nowcs) == want, name
+
+
+def test_wcs_footprint_selects_candidates(tmp_path):
+    """The visit footprint is the WCS's plus the margin: an object on a
+    detector far from every DiaSource is a candidate, which the DiaSource
+    footprint missed; a DiaSource beyond the WCS footprint (on a detector
+    without one) widens it; a visit without a WCS keeps its DiaSources'."""
+    from test_nearbysso_visits import great_circle_path, make_track
+
+    from ssp.nearbysso import visits as V
+
+    v1, v2, v3 = 2026010500301, 2026010500302, 2026010500303
+    layout = {v1: Visit(v1, 150.0, -10.0), v2: Visit(v2, 160.0, -10.0)}
+    store = write_store(tmp_path / "wcs", list(layout.values()))
+    # DiaSources: v1's near its centre; v2's also one 0.5 deg beyond its
+    # detectors; v3 (no WCS) near (170, -10)
+    src = {v1: [(150.0, -10.0), (150.01, -10.01)], v2: [(160.0, -10.0), (160.0, -9.3)],
+           v3: [(170.0, -10.0), (170.02, -10.0)]}
+    ra = np.array([r for v in sorted(src) for r, _ in src[v]])
+    dec = np.array([d for v in sorted(src) for _, d in src[v]])
+    vis = np.zeros(3, dtype=VISIT_DTYPE)
+    vis["visit"] = sorted(src)
+    vis["night"] = vis["visit"] // 100000
+    vis["t"] = 26356.0
+    vis["dia_start"], vis["dia_end"] = [0, 2, 4], [2, 4, 6]
+    uv = V._unit_vectors(ra, dec)
+    for j in range(3):
+        c = uv[2 * j:2 * j + 2].mean(axis=0)
+        vis["center"][j] = c / np.linalg.norm(c)
+        vis["radius"][j] = V._angle(uv[2 * j:2 * j + 2], vis["center"][j]).max() + 1e-9
+    before = vis.copy()
+    has, widened = P.wcs_footprints(str(store), vis, ra, dec)
+    assert list(has) == [True, True, False] and list(widened) == [False, True, False]
+    assert vis[2].tobytes() == before[2].tobytes()
+    from visit_table.locate import footprints
+    fp = footprints([str(store / "day_obs=20260105.parquet")]).to_pandas().set_index("visitId")
+    np.testing.assert_allclose(np.degrees(vis["radius"][0]), fp.loc[v1, "radius"] + 30.0 / 3600, rtol=1e-12)
+    np.testing.assert_allclose(V._unit_vectors(fp.loc[v1, "ra"], fp.loc[v1, "dec"]), vis["center"][0])
+    assert np.degrees(vis["radius"][1]) > fp.loc[v2, "radius"] + 0.3       # (enclosing (160, -9.3))
+    # a stationary object on v1's detector 96, ~0.3 deg from its DiaSources
+    on96 = layout[v1].pix2sky(96, np.array([3000.0]), np.array([2000.0]))
+    pos = great_circle_path(np.array(on96[0][0]), np.array(on96[1][0]), 90.0, 0.0, 26356.0)
+    tr = make_track(pos, np.array([26356.0]), delta=1e6)
+    margin = B.candidate_margin("2020 AA1")
+    assert list(V.VisitIndex(before).candidates(tr, margin)) == []
+    assert list(V.VisitIndex(vis).candidates(tr, margin)) == [0]
+    # no store, or none of its nights: nothing changes
+    for d in (None, str(tmp_path / "empty")):
+        v = before.copy()
+        assert not P.wcs_footprints(d, v, ra, dec)[0].any() and v.tobytes() == before.tobytes()
+
+
+@needs_assist
+def test_build_unmatched_rows_and_sidecar(tmp_path, synth, orbits):  # noqa: F811
+    """build() with a WCS store over the synthetic visits (three detectors
+    at each visit's DiaSource centre): the matched rows as without a store
+    (but their placed detector), then the unmatched rows by (visit,
+    designation) with NULL diaSourceId, ephOffset and diaDistanceRank; the
+    duplicate orbit DUP, which ties 2007 VY347 and loses by designation,
+    an unmatched row wherever 2007 VY347's row is on a detector; the
+    sidecar row for row; the report's placement counts add up."""
+    from test_nearbysso_build import DUP
+
+    from ssp.nearbysso import visits as V
+    from ssp.nearbysso._contract import (NEARBYSSO_DTYPE, NEARBYSSO_KEY, NEARBYSSO_SIDECAR_DTYPE,
+                                         NEARBYSSO_SIDECAR_FILE, NEARBYSSO_SIDECAR_NONNULL,
+                                         NEARBYSSO_UNMATCHED_NULL, PLACEMENT_REPORT_FIELDS)
+
+    vis = V.build_visits(V.read_dia(synth[0]))
+    ra = np.degrees(np.arctan2(vis["center"][:, 1], vis["center"][:, 0])) % 360.0
+    dec = np.degrees(np.arcsin(vis["center"][:, 2]))
+    store = write_store(tmp_path / "wcs", [Visit(int(v), float(a), float(b))
+                                           for v, a, b in zip(vis["visit"], ra, dec)])
+    ref = tmp_path / "ref" / "n.parquet"
+    ref.parent.mkdir()
+    B.build(synth[0], orbits, ref, verbose=False, workers=1)
+    out = tmp_path / "out" / "n.parquet"
+    out.parent.mkdir()
+    rep, rows, place = B.build(synth[0], orbits, out, verbose=False, workers=1, wcs_store=store,
+                               return_rows=True)
+    t, r0 = pq.read_table(out), pq.read_table(ref)
+    assert t.column_names == list(NEARBYSSO_DTYPE.names)
+    pl = rep["placement"]
+    assert set(pl) == set(PLACEMENT_REPORT_FIELDS)
+    assert all(pl[f] is not None for f in pl if f != "wcs_snapshot")
+    nm, nu = pl["matched_rows"], pl["unmatched_rows"]
+    assert nm == r0.num_rows and nu > 0 and t.num_rows == nm + nu == rep["output_rows"]
+    # the matched rows: as without a store, but the detector
+    m = t.slice(0, nm)
+    for c in t.column_names:
+        if c != "detector":
+            assert m[c].equals(r0[c]), c
+    assert (place["has_wcs"][:nm]).any()
+    # the unmatched rows: their NULLs, their order
+    u = t.slice(nm)
+    for c in t.column_names:
+        if c in NEARBYSSO_UNMATCHED_NULL:
+            assert u[c].null_count == nu, c
+        elif c != "ssObjectId":            # (no SSObject table: all NULL)
+            assert u[c].null_count == 0, c
+    assert m["diaSourceId"].null_count == 0
+    uv = u["visit"].to_numpy()
+    ud = np.array(u["designation"].to_pylist())
+    o = np.lexsort((ud, uv))
+    assert (o == np.arange(nu)).all()
+    assert place["has_wcs"][nm:].all() and (place["ephDetectorEdgeDist"][nm:] >= -30.0).all()
+    # DUP: an unmatched row wherever 2007 VY347 has a matched row on a detector
+    md = np.array(m["designation"].to_pylist())
+    on = (md == "2007 VY347") & place["has_wcs"][:nm]
+    want = set(m["visit"].to_numpy()[on].tolist())
+    got = set(uv[ud == DUP].tolist())
+    assert want and want <= got
+    assert DUP not in set(md)
+    # the counts add up: every eligible prediction is a matched row's, an
+    # unmatched row or dropped
+    dg = rep["placement_diagnostics"]
+    matched_preds = len(set(zip(m["visit"].to_pylist(), md.tolist())))
+    assert dg["eligible_predictions"] == rep["predictions"]
+    assert (matched_preds + nu + pl["dropped_beyond_margin"] + pl["dropped_no_wcs_visit"]
+            == rep["predictions"])
+    assert pl["dropped_beyond_margin"] > 0 and pl["dropped_no_wcs_visit"] == 0
+    assert dg["orphaned_predictions"] == 0
+    assert dg["footprint"]["visits_wcs"] == vis.size
+    # the sidecar: next to NearbySSO, row for row, keyed alike
+    s = pq.read_table(out.parent / NEARBYSSO_SIDECAR_FILE)
+    assert s.column_names == list(NEARBYSSO_SIDECAR_DTYPE.names) and s.num_rows == t.num_rows
+    assert rep["sidecar"] == dict(file=NEARBYSSO_SIDECAR_FILE, rows=t.num_rows)
+    for c in NEARBYSSO_KEY:
+        assert s[c].equals(t[c]), c
+    for c in s.column_names:
+        assert s.schema.field(c).nullable == (c not in NEARBYSSO_SIDECAR_NONNULL)
+        if c in NEARBYSSO_SIDECAR_NONNULL:
+            assert s[c].null_count == 0, c
+    nowcs = ~place["has_wcs"]
+    for c in ("eph_x", "eph_y", "ephDetectorEdgeDist"):
+        assert s[c].is_null().to_numpy(zero_copy_only=False).tolist() == nowcs.tolist(), c
+    np.testing.assert_array_equal(s["midpointMjdTai"].to_numpy(), place["midpointMjdTai"])
+    np.testing.assert_array_equal(s["midpointMjdTai_flag"].to_numpy(zero_copy_only=False),
+                                  place["midpointMjdTai_flag"])
+    np.testing.assert_array_equal(rows["detector"], t["detector"].to_numpy())
+    assert sorted(f.name for f in out.parent.iterdir()) == sorted(
+        [NEARBYSSO_SIDECAR_FILE, "n.parquet", "n.report.json"])
+
+
+@needs_assist
+def test_orphan_beyond_margin_counted_once(tmp_path, monkeypatch):
+    """A prediction beyond the margin that a slice kept as the nearest of a
+    repeated diaSourceId, whose copy in another night (slice) is nearer to
+    another prediction, is orphaned by the reduction across slices: it is
+    counted in dropped_beyond_margin (orphan_rows), not also in
+    matched_beyond_margin, which counts the final matched rows."""
+    from ssp.nearbysso._contract import ORBIT_DTYPE
+
+    vis = {V_OK: Visit(V_OK, 150.0, -10.0), V_NOWCS: Visit(V_NOWCS, 300.0, 30.0)}
+    store = write_store(tmp_path / "wcs", [vis[V_OK]])
+    # (designation, visit, detector, x, y): far is ~120" off 96 (beyond the
+    # margin); y is in V_NOWCS (another night, so another slice)
+    plan = [("A on", V_OK, 94, 1000.0, 1500.0), ("B far", V_OK, 96, BBOX[2] + 600.0, 2000.0),
+            ("C y", V_NOWCS, 94, 2000.0, 2000.0)]
+    pos = {d: tuple(float(a[0]) for a in vis[v].pix2sky(det, x, y)) for d, v, det, x, y in plan}
+    dia = [(1000, V_OK, *_north(*pos["A on"], 0.5), 94),
+           (5000, V_OK, *_north(*pos["B far"], 0.5), 96),        # B's, 0.5" away ...
+           (5000, V_NOWCS, *_north(*pos["C y"], 0.2), 94)]       # ... and C's, 0.2" away: C wins
+    path = tmp_path / "dia.parquet"
+    pq.write_table(pa.table(dict(diaSourceId=[r[0] for r in dia], visit=[r[1] for r in dia],
+                                 midpointMjdTai=[HEADER[r[1]] for r in dia], ra=[r[2] for r in dia],
+                                 dec=[r[3] for r in dia], detector=[r[4] for r in dia])), path)
+    orb = np.zeros(len(plan), dtype=ORBIT_DTYPE)
+    orb["designation"] = [d for d, *_ in plan]
+    orb["q"] = 2.0
+
+    def process_orbit(i, w, eph, stage_t):
+        d, v = plan[i][0], plan[i][1]
+        p = np.zeros(1, dtype=B.PRED_DTYPE)
+        p["visit"] = int(np.flatnonzero(w["visits"]["visit"] == v)[0])
+        p["orbit"] = i
+        p["ra"], p["dec"] = pos[d]
+        p["ra_err"] = p["dec_err"] = 1e-5
+        c = dict.fromkeys(B._COUNTS, 0)
+        c.update(with_candidates=1, candidate_visits=1, eligible=1)
+        return p, c, np.zeros(1, dtype=B.DOT_DTYPE)
+
+    monkeypatch.setattr(B, "process_orbit", process_orbit)
+    monkeypatch.setattr(B, "open_ephem", lambda: None)
+    rep, rows, place = B.build(path, orb, tmp_path / "n.parquet", verbose=False, workers=1, slice_days=1,
+                               wcs_store=store, return_rows=True)
+    assert len(rep["slices"]) == 2
+    pl, dg = rep["placement"], rep["placement_diagnostics"]
+    assert list(rows["designation"]) == ["A on", "C y"] and list(rows["diaSourceId"]) == [1000, 5000]
+    assert pl["matched_rows"] == 2 and pl["unmatched_rows"] == 0
+    assert dg["orphaned_predictions"] == 1 and pl["dropped_beyond_margin"] == 1
+    assert dg["matched_beyond_margin"] == 0
+    assert pl["matched_without_wcs"] == 1               # (C, in a visit without a WCS)

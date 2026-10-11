@@ -129,7 +129,9 @@ REPORT_FIELDS = {
     "inputs": "the input manifest, as read",
     "ssp_tools_commit": "git commit of the code that built the delivery",
     "steps": "{step: {status: 'ok'|'failed'|'skipped', started_utc, wall_s, max_rss_gb, log}}",
-    "tables": "{Table: {file, rows, md5, bytes}} for every delivered table; for SSObservation "
+    "tables": "{Table: {file, rows, md5, bytes}} for every delivered table; NearbySSO's also "
+              "{sidecar, sidecar_md5, sidecar_bytes} (ssp.nearbysso._contract.NEARBYSSO_SIDECAR_FILE, "
+              "next to it, never uploaded); for SSObservation "
               "{manifest, manifest_md5, parts: [file, ...], sidecar, rows, bytes} (rows and bytes "
               "are totals over the parts, not counting the manifest or the sidecar; each part's md5 "
               "is in the manifest, and the manifest's own md5 is manifest_md5)",

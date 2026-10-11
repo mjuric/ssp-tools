@@ -222,6 +222,26 @@ def test_null_key(tmp_path):
     assert "NULLs in id (1)" in rs["primary key"].detail
 
 
+def test_nearbysso_key_with_null_dia_source_id(tmp_path):
+    """NearbySSO's key (diaSourceId, designation, visit) has a nullable
+    diaSourceId (its unmatched rows): NULL there passes, NULL counting as a
+    value for uniqueness; NULL in visit (nullable: false) does not."""
+    t = make_table("NearbySSO")
+    t = replace(t, "diaSourceId", pa.array([1, 2, None, None, None, 3], pa.int64()))
+    t = replace(t, "visit", pa.array([7, 7, 7, 8, 7, 7], pa.int64()))
+    rs = results("NearbySSO", write(tmp_path, "NearbySSO", t))
+    assert failed(rs) == []
+    assert "NULL only in nullable diaSourceId (3)" in rs["primary key"].detail
+    t = replace(t, "designation", pa.array(["a", "b", "c", "c", "c", "d"]))       # (NULL, c, 7) twice
+    rs = results("NearbySSO", write(tmp_path, "NearbySSO", t))
+    assert failed(rs) == ["primary key"]
+    assert "1 duplicate rows over 1 key values" in rs["primary key"].detail
+    t = replace(t, "visit", pa.array([7, 7, 7, 8, None, 7], pa.int64()))
+    rs = results("NearbySSO", write(tmp_path, "NearbySSO", t))
+    assert failed(rs) == ["nulls", "primary key"]
+    assert "NULLs in visit (1)" in rs["primary key"].detail
+
+
 def test_composite_primary_key(tmp_path):
     sd = tmp_path / "schema"
     shutil.copytree(SCHEMA_DIR, sd)

@@ -607,6 +607,27 @@ def test_sidecar_never_uploaded(fakes, tmp_path):
     assert file_map == {"SSObservation": [run / C.DELIVERY_DIR / n for n in files_of("SSObservation")]}
 
 
+def test_nearbysso_sidecar_never_uploaded(fakes, tmp_path):
+    """NearbySSO's sidecar, next to it in the delivery, is never picked,
+    even with NearbySSO uploaded (--include-unsupported), and upload()
+    refuses it."""
+    from ssp.nearbysso._contract import NEARBYSSO_SIDECAR_FILE
+    st, pub = fakes
+    run = make_run(tmp_path)
+    side = run / C.DELIVERY_DIR / NEARBYSSO_SIDECAR_FILE
+    side.write_bytes(b"PAR1 sidecar PAR1")
+    file_map = U.verify_delivery(run, report(run), list(C.DELIVERY_TABLES))
+    assert file_map["NearbySSO"] == [run / C.DELIVERY_DIR / "NearbySSO.parquet"]
+    assert side not in [p for paths in file_map.values() for p in paths]
+    with pytest.raises(U.SSOUploadError, match="never uploaded"):
+        U.upload(U.load_config("dev")[1], {"NearbySSO": [side]})
+    assert st.calls == [] and pub.published == []
+    rec = U.run("dev", run, tables=list(C.DELIVERY_TABLES), include_unsupported=True)
+    assert "NearbySSO" in rec["tables"]
+    assert not any(NEARBYSSO_SIDECAR_FILE in name for name in st.objects)
+    assert any(name.endswith("/NearbySSO.parquet") for name in st.objects)
+
+
 def test_nearbysso_not_needed_by_default(no_remote, tmp_path):
     run = make_run(tmp_path, tables=FIVE)       # no NearbySSO in the delivery
     assert U.run("dev", run, dry_run=True)["tables"] == ordered(FIVE)
