@@ -28,6 +28,7 @@ dependencies = [
   "requests>=2.28",
   "cdshealpix>=0.8.1",
   "shutter-timing[s3]",
+  "visit-table",
 ]
 
 [project.optional-dependencies]
@@ -64,7 +65,8 @@ ssp-upload-sso = "ssp.sso_upload:main"
 ssp-sso-daily = "ssp.sso_daily:main"
 
 [tool.pytest.ini_options]
-addopts = "-q"
+# Parallel by default (pytest-xdist, in the dev extra); `-n 0` runs serially.
+addopts = "-q -n 32"
 python_files = ["test_*.py", "*_test.py", "tests/test_*.py"]
 
 [tool.setuptools]
@@ -109,3 +111,6 @@ convention = "numpy"
 # Shutter-motion corrections (docs/design/shutter-timing.md). A private
 # repository for now: install over HTTPS with the gh credential helper.
 shutter-timing = { git = "https://github.com/mjuric/shutter-timing", tag = "v0.5.0" }
+# Stack-free WCS store reader and detector placement (visit_table.locate;
+# docs/design/nearbysso-unmatched.md).
+visit-table = { git = "https://github.com/mjuric/visit-table", tag = "v0.2.0" }
