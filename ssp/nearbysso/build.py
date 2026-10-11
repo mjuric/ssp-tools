@@ -810,9 +810,11 @@ def place_and_time(w, vis, v0, ps, dots, t_src, det_src, r, ra_src, dec_src, sep
     place["has_wcs"] = has
     place["move_px"] = np.hypot(x - pl["x"], y - pl["y"])
     corrected = np.flatnonzero(state == _place.VISIT_CORRECTED)
+    # (as place_rows sees them: a visit with only rejected detectors has
+    # no locator, so no WCS)
     with_wcs = np.zeros(vis.size, bool)
     if store is not None:
-        with_wcs = np.isin(visit_ids, store.visits)
+        with_wcs = np.isin(visit_ids, store.visit[~store.rejected])
     vstats = dict(visits=int(vis.size), uncorrected=int((state == _place.VISIT_UNCORRECTED).sum()),
                   corrected=int(corrected.size),
                   unverified={_place.TIME_CAUSES[c]: int(n) for c, n in
@@ -821,7 +823,12 @@ def place_and_time(w, vis, v0, ps, dots, t_src, det_src, r, ra_src, dec_src, sep
                   else None,
                   without_wcs=int((~with_wcs).sum()), beyond_margin=int(pl["beyond_margin"].sum()),
                   wcs_files=len(_place.wcs_paths(w["wcs_store"], vis["night"])) if w.get("wcs_store") else 0,
-                  wcs_read_s=t_read)
+                  wcs_read_s=t_read,
+                  # (the lookups run in this process: the parent's Corrections
+                  # never sees what they read)
+                  corrections=None if corr is None else dict(
+                      formats=sorted(corr.formats), calibrations=sorted(corr.calibrations),
+                      versions=sorted(corr.versions)))
     return pub, place, vstats
 
 
@@ -891,6 +898,19 @@ def _source_time_stats(pub, p, orbit_radius):
                       f"their visit's time (up to {st['max_abs_dt_s']:.1f} s); their values are moved there "
                       "to first order only", stacklevel=3)
     return st
+
+
+def merged_provenance(corr, vstats):
+    """``corr.provenance()`` with what the slices' lookups read (their
+    ``vstats["corrections"]``) merged in: they run in pass-3 workers, so
+    this process's ``corr`` never saw them."""
+    for v in vstats:
+        c = v.get("corrections")
+        if c is not None:
+            corr.formats.update(c["formats"])
+            corr.calibrations.update(c["calibrations"])
+            corr.versions.update(c["versions"])
+    return corr.provenance()
 
 
 def _quantiles(x):
@@ -1034,7 +1054,12 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     correction table for their times (``ssp.export.submittable.
     Corrections``); None for neither (the CLI defaults to the production
     ones). Without a WCS store no row is placed; without a correction table
-    every row keeps its DiaSource's own time, flagged (``placement``).
+    every row keeps its DiaSource's own time, flagged (``placement``). The
+    two fail differently: a WCS store that is missing (a warning), or lacks
+    a night, visit or detector, means rows without a WCS, flagged and
+    counted; a correction table that is given but missing or unusable
+    (``CorrectionError``) aborts the build, as it does the extract: the
+    times never silently degrade.
 
     An existing output and report are removed first, and both are written
     to temporary files renamed into place, so a failed run leaves neither
@@ -1267,7 +1292,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
             f"not the header midpoint (corrected): matched rows take their DiaSource's own time; the first, "
             f"visit {first[0]}, by up to {first[1] * 1e3:.3f} ms")
     if corr is not None:
-        rep["correction_table"] = corr.provenance()
+        rep["correction_table"] = merged_provenance(corr, vstats)
     sso_id, has_sso = ssobject_ids(ssobject_path, rows["designation"])
     rows["ssObjectId"] = sso_id
     tim["reduce"] = time.perf_counter() - t
@@ -1392,10 +1417,12 @@ def main():
     )
     parser.add_argument("--wcs-store", default=_place.DEFAULT_WCS_STORE, metavar="DIR",
                         help="The visit-table WCS store (its wcs/ directory) to place the rows on detectors "
-                             "with; 'none' for no placement (default: %(default)s)")
+                             "with; 'none' for no placement. Missing nights, visits or detectors are rows "
+                             "without a WCS, flagged and counted (default: %(default)s)")
     parser.add_argument("--correction-table", default=DEFAULT_CORRECTION_TABLE, metavar="DIR",
                         help="The shutter-timing correction table for the rows' corrected times; 'none' for "
-                             "none (every row keeps its DiaSource's time, flagged) (default: %(default)s)")
+                             "none (every row keeps its DiaSource's time, flagged). A missing or unusable "
+                             "table aborts the build (default: %(default)s)")
     parser.add_argument("--reraise", action="store_true",
                         help="Re-raise exceptions instead of exiting gracefully (for debugging)")
     args = parser.parse_args()

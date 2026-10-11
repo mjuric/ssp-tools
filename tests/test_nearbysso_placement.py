@@ -113,7 +113,7 @@ class Visit:
             u, v = u - (e * fx - b * fy) / det, v - (-c * fx + a * fy) / det
         return _inv_gnomonic(u * SCALE, v * SCALE, tra, tdec)
 
-    def rows(self):
+    def rows(self, rejected=False):
         out = []
         for d, (tra, tdec, cx, cy) in self.det.items():
             bx = [BBOX[0], BBOX[2], BBOX[2], BBOX[0]]
@@ -121,15 +121,17 @@ class Visit:
             ra, dec = self.pix2sky(d, bx, by)
             out.append(dict(visitId=self.visit, detector=d, bbox=list(BBOX),
                             corners=np.column_stack([ra, dec]).ravel().tolist(), tangent=[tra, tdec],
-                            scale=SCALE, cx=cx.tolist(), cy=cy.tolist(), rejected=False))
+                            scale=SCALE, cx=cx.tolist(), cy=cy.tolist(), rejected=rejected))
         return out
 
 
-def write_store(path, visits, snapshot=7):
+def write_store(path, visits, snapshot=7, rejected=()):
+    """The store of ``visits``, with every detector of the visits in
+    ``rejected`` rejected."""
     path.mkdir(parents=True, exist_ok=True)
     by_night = {}
     for v in visits:
-        by_night.setdefault(v.visit // 100000, []).extend(v.rows())
+        by_night.setdefault(v.visit // 100000, []).extend(v.rows(rejected=v.visit in rejected))
     schema = pa.schema([("visitId", pa.int64()), ("detector", pa.int64()),
                         ("bbox", pa.list_(pa.field("element", pa.float64()), 4)),
                         ("corners", pa.list_(pa.float64())), ("tangent", pa.list_(pa.float64())),
@@ -548,3 +550,65 @@ def test_beyond_margin_is_no_wcs(tmp_path, scene, table):
                        pp["near"]["ra"][None].repeat(2), pp["near"]["dec"][None].repeat(2),
                        margin_arcsec=-near.edgeDistance[0])
     assert out["has_wcs"].all() and not out["beyond_margin"].any()
+
+
+@needs_fixture
+def test_correction_provenance_from_forked_workers(tmp_path, scene, table):
+    """The lookups run in the pass-3 workers (forked, read_workers > 1):
+    the report's correction-table provenance records what they read."""
+    from ssp.export.submittable import Corrections
+
+    from ssp.nearbysso._contract import MATCH_RADIUS_ARCSEC as R
+
+    path = tmp_path / "dia.parquet"
+    sid, visit, t, ra, dec, det = map(np.array, zip(*scene["dia"]))
+    pq.write_table(pa.table(dict(diaSourceId=sid.astype(np.int64), visit=visit.astype(np.int64),
+                                 midpointMjdTai=t.astype(float), ra=ra.astype(float), dec=dec.astype(float),
+                                 detector=det.astype(np.int64))), path)
+    nights, tmin, tmax, nsrc = B.night_ranges(path)
+    slices = B.plan_slices(nights, tmin, tmax, 1, nsrc)
+    assert len(slices) >= 3
+    parts = []
+    for sl in slices:
+        d = B._read_slice(path, sl)
+        u, start = np.unique(d["visit"], return_index=True)
+        v = np.zeros(u.size, dtype=VISIT_DTYPE)
+        v["visit"], v["night"] = u, u // 100000
+        v["dia_start"], v["dia_end"] = start, np.r_[start[1:], d["visit"].size]
+        v["t_tai_mjd"] = [np.median(d["midpointMjdTai"][a:b]) for a, b in zip(v["dia_start"], v["dia_end"])]
+        parts.append(v)
+    vis = np.concatenate(parts)
+    vstart = np.r_[0, np.cumsum([v.size for v in parts])].astype(np.int64)
+    p, poff, _ = B.sort_predictions([scene["preds"].copy()], vis.size)
+    corr = Corrections(table, guard=None)
+    B._W.update(dia_path=path, slices=slices, threads=1, visits=vis, vstart=vstart, preds=p, poff=poff,
+                orbit_radius=np.full(int(p["orbit"].max()) + 1, R), dots=None, dia_extra=("detector",),
+                corrections=corr, wcs_store=str(scene["store"]))
+    try:
+        assert B._pooled(2, len(slices))
+        res = B._map(B._match_slice, [(s, s + 1) for s in range(len(slices))], 2, "test", unit="slices")
+    finally:
+        B._W.clear()
+    vstats = [r[8] for chunk, _, _ in res for r in chunk]
+    assert corr.calibrations == set()                   # (this process looked nothing up)
+    prov = B.merged_provenance(corr, vstats)
+    want = Corrections(table, guard=None)
+    from shutter_timing.corrections import corrected_midpoints
+    r = corrected_midpoints([V_OK], [94], [2000.0], [2000.0], table_dir=table)
+    assert prov["table_format"] == r.table_format == 2
+    assert prov["calibration_id"] == r.calibration_id != "unknown"
+    assert prov["package_version"] == r.package_version != "unknown"
+    assert want.provenance()["calibration_id"] == "unknown"     # (no lookup: nothing recorded)
+
+
+@needs_fixture
+def test_visit_with_only_rejected_detectors_has_no_wcs(tmp_path, scene, table):
+    """A visit whose detectors are all rejected has no locator: its rows
+    are unplaced and the visit is counted without a WCS."""
+    store = write_store(tmp_path / "wcs", [v for k, v in scene["vis"].items() if k != V_NOWCS],
+                        rejected=(V_OK2,))
+    ids, pub, place, vstats, _, _ = run_pass3(tmp_path, scene["dia"], scene["preds"], store, table)
+    pl = _by_name(scene, ids, place)
+    for n in ("ppdb1", "ppdb2"):
+        assert not pl[n]["has_wcs"] and _cause(pl[n]["time_cause"]) == "no_wcs"
+    assert vstats["without_wcs"] == 2
