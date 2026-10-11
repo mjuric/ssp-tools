@@ -291,7 +291,7 @@ def test_not_built_limit(tmp_path, capsys):
                  y=2000.0) for i, v in enumerate(nb)]
     obs = [dict(obsid=f"o{i}", obssubid=str(i), ra=10.0 + i, dec=1.0, obstime=utc(61046.27 + i / 86400),
                 band="Lr", mag=20.0) for i in range(len(nb))]
-    with pytest.raises(S.CorrectionError, match="stage 0"):
+    with pytest.raises(S.CorrectionError, match="stale or failing"):
         run(tmp_path, obs, view, max_not_built_visits=2)
     assert not (tmp_path / "dia.parquet").exists()
     out, _, rep = run(tmp_path, obs, view, max_not_built_visits=3)

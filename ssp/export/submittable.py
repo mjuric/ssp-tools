@@ -80,8 +80,9 @@ MAX_WORKERS = 8
 SEP_MAS = 3.0
 DT_MS = 10.0
 
-# The shutter-motion correction table, built daily by stage 0
-# (shutter-timing-table). "none" on the command line disables the correction.
+# The shutter-motion correction table, kept up to date by ssp-daily
+# (shutter-timing-table, hourly). "none" on the command line disables the
+# correction.
 DEFAULT_CORRECTION_TABLE = "/sdf/data/rubin/user/mjuric/shutter-timing/corrections"
 
 # The position pass's time window must also fetch candidates whose
@@ -761,8 +762,8 @@ class Corrections:
     def __init__(self, table_dir, max_not_built_visits=MAX_NOT_BUILT_VISITS, guard=VISIT_TIME_GUARD):
         self.table_dir = Path(table_dir)
         if not self.table_dir.is_dir():
-            raise CorrectionError(f"the correction table {self.table_dir} does not exist (stage 0, "
-                                  f"shutter-timing-table --out {self.table_dir}, builds it)")
+            raise CorrectionError(f"the correction table {self.table_dir} does not exist (ssp-daily's "
+                                  f"shutter-timing-table --out {self.table_dir} builds it)")
         self.max_not_built_visits = max_not_built_visits
         self.guard = guard
         nights = [int(m.group(1)) for p in self.table_dir.iterdir()
@@ -938,8 +939,8 @@ class Corrections:
         if len(nb) > self.max_not_built_visits:
             raise CorrectionError(
                 f"{len(nb)} visits are not built in the correction table {self.table_dir} (more than "
-                f"--max-not-built-visits {self.max_not_built_visits}): is stage 0 (shutter-timing-table "
-                f"--out {self.table_dir}) stale, skipped or failing? Nights affected: "
+                f"--max-not-built-visits {self.max_not_built_visits}): is the table build (ssp-daily's "
+                f"shutter-timing-table --out {self.table_dir}) stale or failing? Nights affected: "
                 f"{_some(sorted({v // 100000 for v in nb}))}")
         if nb:
             print(f"warning: {len(nb)} visit(s) not built in the correction table (their night has no "
