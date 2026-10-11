@@ -39,6 +39,7 @@ Two of its behaviours matter here, both seen in the full export of 2026-10-09 (`
 | 2026-10-10 | Testing | Keep it simple: no fake TAP server or network-free unit tests. One real run against data-int, with the checks below. |
 | *proposed* | Fallback | None. If TAP fails, the step fails and names the cause. It never falls back to ClickHouse silently: that would change NearbySSO's input without anyone noticing. |
 | *proposed* | Consistency | The extract fixes the set of visits first. A chunk whose row count changes between that count and its fetch (late-arriving DiaSources) is fetched again once, then fails. Visits that arrive after the count are left for the next day's run. |
+| 2026-10-11 | Consistency (revised, owner) | No refetch: a chunk whose row count differs from the step-1 count fails the step at once, naming the chunk, its visit range, and the rows got vs counted (the PPDB changed during the extract; rerun). ssp-tools rebuilds daily, so a rerun or the next day's run picks it up. The one retry of a failed or hung job stays. `refetched_chunks` is dropped from the manifest. |
 
 ## Output
 
@@ -51,11 +52,11 @@ The manifest entry gains the details of where the file came from:
   "file": "ppdb_dia_sources.parquet", "rows": ..., "md5": ..., "extracted_utc": ...,
   "source": "PPDB TAP https://data-int.lsst.cloud/api/ppdbtap: SELECT diaSourceId, visit, midpointMjdTai, ra, dec FROM ppdb.DiaSource",
   "ppdb_tap": {"url": ..., "visits": 5919, "visit_min": ..., "visit_max": ..., "chunks": 18,
-               "count_star": 17863456, "refetched_chunks": 0}
+               "count_star": 17863456, "retried_jobs": 0}
 }
 ```
 
-`source` stays a string. A ClickHouse-sourced entry keeps exactly today's form.
+(2026-10-11: `refetched_chunks` removed with the refetch; `retried_jobs` counts retried jobs.) `source` stays a string. A ClickHouse-sourced entry keeps exactly today's form.
 
 ## Approach
 
@@ -75,6 +76,7 @@ All of this lives in a new module, `ssp/export/ppdb_tap.py`. `export_ppdb` dispa
    - HTTP 401/403 fails at once: "the token in FILE was refused (expired?)".
 5. **Checks per chunk.** The rows equal the sum of the step-1 counts for its visits. Every visit is inside its range. The schema is the five columns with the types above, cast exactly (an overflowing or lossy cast fails). There are no NULLs.
    - If the count differs, the chunk is fetched again once (data that arrived in between). If it still differs, the step fails.
+   - *Owner decision 2026-10-11:* no refetch. A count difference fails the step at once ("the PPDB changed during the extract; rerun"); see the revised Consistency decision.
 6. **Assembly.** Concatenate the parts, then check:
    - `diaSourceId` is unique;
    - the total equals the sum of the step-1 counts;

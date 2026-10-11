@@ -28,7 +28,8 @@ Design: `docs/design/sso-delivery.md` (the stages), `docs/design/sssource-widene
   - The machine must reach data-int.lsst.cloud over HTTPS (SDF's proxy, from the environment, is fine).
   - `--tap-url none` reads ClickHouse `ppdb.DiaSource` instead. That copy lacks many PPDB visits (`docs/design/ppdb-tap.md`), so use it only when TAP is down, and say so in the run's notes.
   - The step fetches visit ranges of about 1M rows as async jobs, one at a time, and deletes every job. A job that hangs for 5 min is aborted and retried once. If it fails again, the step fails and names the job URLs: add them to DM-56627 (concurrent jobs hang on data-int) or report them to the PPDB TAP operators, rather than retrying in a loop.
-  - The manifest's `files.ppdb_dia_sources.ppdb_tap` records the service, the visits (count, first, last), the chunks, and the chunks fetched again or retried.
+  - A chunk whose rows differ from the visit count taken at the start fails the step ("the PPDB changed during the extract; rerun"): rerun with `--force --only ppdb_dia_sources`.
+  - The manifest's `files.ppdb_dia_sources.ppdb_tap` records the service, the visits (count, first, last), the chunks, and the jobs retried.
 - **Uploads:** Google application-default credentials for the `sso-uploader` service account, which has object-user access on the bucket and publish access on the topic (`lsst/idf_deploy` `services/sso-uploader.tf`). **Not yet issued to SSP**; ask the DM-55678 owners.
 - **Machine:** about 30 GB of RAM (the extract peaks at 28 GB), and 32 or more cores for the build.
   - Disk: about 5.5 GB for the inputs and about 5.5 GB for the delivery, per day.
