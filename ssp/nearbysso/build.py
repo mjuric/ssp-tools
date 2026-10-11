@@ -729,8 +729,8 @@ def _match_slice(s0, s1):
     within PLACEMENT_MARGIN_ARCSEC of one: their prediction indices, in
     order, their published values and their placement), and its visits'
     time states and header causes (``visit_states``; for the parent's
-    ``orphan_rows``); then (seconds reading, indexing, matching, placing and
-    timing) and the peak RSS."""
+    ``orphan_rows``) and whether each has a WCS; then (seconds reading,
+    indexing, matching, placing and timing) and the peak RSS."""
     w = _W
     preds, vstart, poff, orbit_radius = w["preds"], w["vstart"], w["poff"], w["orbit_radius"]
     out, tim = [], np.zeros(4)
@@ -864,7 +864,7 @@ def place_and_time(w, vis, v0, p0, p1, km, t_src, det_src, r, ra_src, dec_src, s
     Returns (the matched rows' ``PUB_DTYPE`` and ``ROW_PLACE_DTYPE``, the
     slice's visit statistics (a dict), the unmatched rows (their prediction
     indices, in order, ``PUB_DTYPE``, ``ROW_PLACE_DTYPE``), and the slice's
-    visits' (time state, header cause))."""
+    visits' (time state, header cause, whether it has a WCS))."""
     preds, dots_all = w["preds"], w.get("dots")
     visit_ids = vis["visit"]
     corr = w.get("corrections")
@@ -903,7 +903,8 @@ def place_and_time(w, vis, v0, p0, p1, km, t_src, det_src, r, ra_src, dec_src, s
                   corrected_first=(int(visit_ids[corrected[0]]), float(dev[corrected[0]])) if corrected.size
                   else None,
                   without_wcs=int((~with_wcs).sum()),
-                  # matched rows beyond the margin (rows without a WCS)
+                  # the slice's matched rows beyond the margin (rows without a
+                  # WCS), before the reduction across slices
                   beyond_margin=int(pl_all["beyond_margin"][km - p0].sum()),
                   predictions=int(p1 - p0), unmatched=int(nu),
                   dropped_beyond_margin=int((dropped & pl_all["beyond_margin"]).sum()),
@@ -915,7 +916,7 @@ def place_and_time(w, vis, v0, p0, p1, km, t_src, det_src, r, ra_src, dec_src, s
                   corrections=None if corr is None else dict(
                       formats=sorted(corr.formats), calibrations=sorted(corr.calibrations),
                       versions=sorted(corr.versions)))
-    return pub[:nm], place[:nm], vstats, (p0 + um, pub[nm:], place[nm:]), (state, hcause)
+    return pub[:nm], place[:nm], vstats, (p0 + um, pub[nm:], place[nm:]), (state, hcause, with_wcs)
 
 
 def orphan_rows(w, visits, state, hcause, idx):
@@ -1041,7 +1042,8 @@ def _quantiles(x):
 _N_DETECTOR_EXAMPLES = 20
 
 
-def placement_report(place, pub, p, n_matched, vstats, snapshot, orphans=(0, 0, 0), footprint=None):
+def placement_report(place, pub, p, n_matched, vstats, snapshot, orphans=(0, 0, 0), footprint=None,
+                     visit_has_wcs=None):
     """The run report's ``placement`` (the contract's
     PLACEMENT_REPORT_FIELDS) and ``placement_diagnostics`` (visit counts,
     footprints, times, moves, and the matched rows placed on another
@@ -1050,10 +1052,15 @@ def placement_report(place, pub, p, n_matched, vstats, snapshot, orphans=(0, 0, 
     ``p``, the first ``n_matched`` of them matched, the slices' visit
     statistics ``vstats``, the WCS store's ``snapshot``, the parent's
     orphaned predictions (``orphan_rows``: rows, dropped beyond the
-    margin, dropped in visits without a WCS) and the visits' ``footprint``
-    statistics (pass 1)."""
+    margin, dropped in visits without a WCS), the visits' ``footprint``
+    statistics (pass 1) and whether each visit (by ``p["visit"]``) has a
+    WCS, ``visit_has_wcs``: a matched row without a WCS in a visit with one
+    is beyond the margin (counted from the final rows, so not a row the
+    reduction across slices dropped)."""
     cause = place["time_cause"]
     m = slice(0, n_matched)
+    if visit_has_wcs is None:
+        visit_has_wcs = np.zeros(int(p["visit"].max()) + 1 if len(p) else 0, bool)
     flagged = {_place.TIME_CAUSES[c]: int((cause == c).sum())
                for c in range(_place.FIRST_FLAGGED, len(_place.TIME_CAUSES))}
     rep = dict(matched_rows=int(n_matched), unmatched_rows=int(place.size - n_matched),
@@ -1085,7 +1092,7 @@ def placement_report(place, pub, p, n_matched, vstats, snapshot, orphans=(0, 0, 
         footprint=footprint,
         eligible_predictions=int(sum(v["predictions"] for v in vstats)),
         orphaned_predictions=int(sum(orphans)),
-        matched_beyond_margin=int(sum(v["beyond_margin"] for v in vstats)),
+        matched_beyond_margin=int((~place["has_wcs"][m] & visit_has_wcs[p["visit"][m]]).sum()),
         wcs_files=int(sum(v["wcs_files"] for v in vstats)),
         time_causes=causes(cause), time_causes_matched=causes(cause[m]),
         time_causes_unmatched=causes(cause[n_matched:]),
@@ -1415,6 +1422,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
                else np.zeros(0, _place.ROW_PLACE_DTYPE))
     v_state = np.concatenate([r[10][0] for r in per_slice]) if per_slice else np.zeros(0, np.uint8)
     v_hcause = np.concatenate([r[10][1] for r in per_slice]) if per_slice else np.zeros(0, np.uint8)
+    v_has_wcs = np.concatenate([r[10][2] for r in per_slice]) if per_slice else np.zeros(0, bool)
     n_matches = int(sum(r[4] for r in per_slice))
     n_comet_matches = int(sum(r[5] for r in per_slice))
     del per_slice
@@ -1490,7 +1498,8 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
                       "exception in the second evaluation); their rows keep their visit's values",
                       stacklevel=2)
     rep["placement"], rep["placement_diagnostics"] = placement_report(
-        place, pub, p_all, nm, vstats, snapshot, orphans=orphan_stats, footprint=footprint)
+        place, pub, p_all, nm, vstats, snapshot, orphans=orphan_stats, footprint=footprint,
+        visit_has_wcs=v_has_wcs)
     del p_all
     if rep["placement"]["ppdb_corrected_visits"]:
         first = rep["placement_diagnostics"]["ppdb_corrected_first"]

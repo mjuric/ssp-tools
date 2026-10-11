@@ -754,7 +754,7 @@ def test_orphan_rows_are_unmatched_rows(tmp_path, uscene, table):
     prediction when it is unmatched: the same bytes."""
     i = uscene["names"].index("m1")
     res, vis, p = pass3_raw(tmp_path, uscene["dia"], uscene["preds"], uscene["store"], table)
-    *_, (state, hcause) = _unpack(res)
+    *_, (state, hcause, _) = _unpack(res)
     # m1's DiaSource moved 20" away: m1 is unmatched
     dia = [(s, v, t, *(_north(ra, dec, 20.0) if s == 1000 else (ra, dec)), det)
            for s, v, t, ra, dec, det in uscene["dia"]]
@@ -917,3 +917,54 @@ def test_build_unmatched_rows_and_sidecar(tmp_path, synth, orbits):  # noqa: F81
     np.testing.assert_array_equal(rows["detector"], t["detector"].to_numpy())
     assert sorted(f.name for f in out.parent.iterdir()) == sorted(
         [NEARBYSSO_SIDECAR_FILE, "n.parquet", "n.report.json"])
+
+
+@needs_assist
+def test_orphan_beyond_margin_counted_once(tmp_path, monkeypatch):
+    """A prediction beyond the margin that a slice kept as the nearest of a
+    repeated diaSourceId, whose copy in another night (slice) is nearer to
+    another prediction, is orphaned by the reduction across slices: it is
+    counted in dropped_beyond_margin (orphan_rows), not also in
+    matched_beyond_margin, which counts the final matched rows."""
+    from ssp.nearbysso._contract import ORBIT_DTYPE
+
+    vis = {V_OK: Visit(V_OK, 150.0, -10.0), V_NOWCS: Visit(V_NOWCS, 300.0, 30.0)}
+    store = write_store(tmp_path / "wcs", [vis[V_OK]])
+    # (designation, visit, detector, x, y): far is ~120" off 96 (beyond the
+    # margin); y is in V_NOWCS (another night, so another slice)
+    plan = [("A on", V_OK, 94, 1000.0, 1500.0), ("B far", V_OK, 96, BBOX[2] + 600.0, 2000.0),
+            ("C y", V_NOWCS, 94, 2000.0, 2000.0)]
+    pos = {d: tuple(float(a[0]) for a in vis[v].pix2sky(det, x, y)) for d, v, det, x, y in plan}
+    dia = [(1000, V_OK, *_north(*pos["A on"], 0.5), 94),
+           (5000, V_OK, *_north(*pos["B far"], 0.5), 96),        # B's, 0.5" away ...
+           (5000, V_NOWCS, *_north(*pos["C y"], 0.2), 94)]       # ... and C's, 0.2" away: C wins
+    path = tmp_path / "dia.parquet"
+    pq.write_table(pa.table(dict(diaSourceId=[r[0] for r in dia], visit=[r[1] for r in dia],
+                                 midpointMjdTai=[HEADER[r[1]] for r in dia], ra=[r[2] for r in dia],
+                                 dec=[r[3] for r in dia], detector=[r[4] for r in dia])), path)
+    orb = np.zeros(len(plan), dtype=ORBIT_DTYPE)
+    orb["designation"] = [d for d, *_ in plan]
+    orb["q"] = 2.0
+
+    def process_orbit(i, w, eph, stage_t):
+        d, v = plan[i][0], plan[i][1]
+        p = np.zeros(1, dtype=B.PRED_DTYPE)
+        p["visit"] = int(np.flatnonzero(w["visits"]["visit"] == v)[0])
+        p["orbit"] = i
+        p["ra"], p["dec"] = pos[d]
+        p["ra_err"] = p["dec_err"] = 1e-5
+        c = dict.fromkeys(B._COUNTS, 0)
+        c.update(with_candidates=1, candidate_visits=1, eligible=1)
+        return p, c, np.zeros(1, dtype=B.DOT_DTYPE)
+
+    monkeypatch.setattr(B, "process_orbit", process_orbit)
+    monkeypatch.setattr(B, "open_ephem", lambda: None)
+    rep, rows, place = B.build(path, orb, tmp_path / "n.parquet", verbose=False, workers=1, slice_days=1,
+                               wcs_store=store, return_rows=True)
+    assert len(rep["slices"]) == 2
+    pl, dg = rep["placement"], rep["placement_diagnostics"]
+    assert list(rows["designation"]) == ["A on", "C y"] and list(rows["diaSourceId"]) == [1000, 5000]
+    assert pl["matched_rows"] == 2 and pl["unmatched_rows"] == 0
+    assert dg["orphaned_predictions"] == 1 and pl["dropped_beyond_margin"] == 1
+    assert dg["matched_beyond_margin"] == 0
+    assert pl["matched_without_wcs"] == 1               # (C, in a visit without a WCS)
