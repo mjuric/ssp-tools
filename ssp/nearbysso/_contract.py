@@ -358,10 +358,14 @@ NEARBYSSO_UNMATCHED_NULL = ("diaSourceId", "ephOffset", "diaDistanceRank")
 # Row order: matched rows by diaSourceId (as today), then the unmatched rows
 #   by (visit, designation).
 #
-# detector: where the prediction falls (at its corrected time, see below)
-#   on a placed detector; else the nearest placed detector by distance to
-#   its outline in the visit's tangent plane (gaps, the margin). A matched
-#   row in a visit with no WCS takes its DiaSource's detector.
+# detector: where the prediction falls at its visit's time on a placed
+#   detector; else the nearest placed detector by distance to its outline
+#   in the visit's tangent plane (gaps, the margin). Placement is not
+#   redone after the move to the row's time (below), so a prediction in a
+#   gap keeps its detector even if the move crosses the gap's midline. A
+#   matched row in a visit with no WCS, or more than
+#   PLACEMENT_MARGIN_ARCSEC from every placed detector (owner, 2026-10-11),
+#   takes its DiaSource's detector, with NULL placement.
 
 #: The sidecar: one row per NearbySSO row, same order, an exact 1:1 join by
 #: NEARBYSSO_KEY; written next to NearbySSO.parquet and never uploaded.
@@ -394,8 +398,10 @@ NEARBYSSO_SIDECAR_NONNULL = frozenset({"designation", "visit", "midpointMjdTai",
 #   corrected times) matched rows take their DiaSource's midpointMjdTai and
 #   unmatched rows the corrected midpoint as above.
 #   midpointMjdTai_flag is True where a row keeps the visit's time because
-#   there is no correction for its position (NOT_BUILT, outside coverage,
-#   beyond 100 px off the detector, no WCS).
+#   there is no correction for its position. The causes, as the run
+#   report's uncorrected_rows names them (ssp.nearbysso.placement.
+#   TIME_CAUSES): no_table, outside_coverage, not_built, omitted,
+#   beyond_100px, no_wcs.
 #
 # Every published value of a row moves from the visit's time to its time
 #   with at_source_time (ephOffset re-measured); eph_x/eph_y move linearly
