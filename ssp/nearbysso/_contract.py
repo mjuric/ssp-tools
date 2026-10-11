@@ -276,10 +276,14 @@ class CoarseTrack(NamedTuple):
 # --------------------------------------------------------------------------
 
 #: One row per DiaSource with an eligible prediction within the radius,
-#: nearest only. The draft NearbySSO schema (sdm_schemas
-#: u/mjuric/ppdb-sso-ng) plus the error ellipse.
+#: nearest only, plus one per unmatched eligible prediction on the focal
+#: plane (see "Unmatched predictions, detector placement and corrected
+#: times" below). The NearbySSO schema (sso_base.yaml NearbySSO, sdm_schemas
+#: 6d7c9a1) plus the error ellipse.
 NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
-    ("diaSourceId", "i8"),
+    ("diaSourceId", "i8"),       # NULL on unmatched rows
+    ("visit", "i8"),
+    ("detector", "i2"),
     ("ssObjectId", "i8"),        # written null where the object has no SSObject row
     ("designation", "U16"),
     ("ephRa", "f8"),
@@ -287,8 +291,8 @@ NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
     ("ephDec", "f8"),            #   as DiaSource's ra/raErr/dec/decErr/ra_dec_Cov
     ("ephDecErr", "f4"),
     ("ephRa_ephDec_Cov", "f4"),  # [deg^2]
-    ("ephOffset", "f4"),         # [arcsec]
-    ("diaDistanceRank", "i2"),   # see below
+    ("ephOffset", "f4"),         # [arcsec]; NULL on unmatched rows
+    ("diaDistanceRank", "i2"),   # see below; NULL on unmatched rows
     ("ephVmag", "f4"),
     ("ephRateRa", "f4"),         # [deg/day]
     ("ephRateDec", "f4"),
@@ -331,9 +335,8 @@ NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
 # (docs/design/nearbysso-unmatched.md)
 # --------------------------------------------------------------------------
 #
-# The constants below are the next NearbySSO. The ``*_NEXT`` names become
-# the current ones (NEARBYSSO_DTYPE, ...) when WP U3 switches the output;
-# until then the delivered NearbySSO is the one above.
+# NEARBYSSO_DTYPE above is this NearbySSO (WP U3 switched the output to it;
+# the ``*_NEXT`` names it had until then are gone).
 
 #: Predictions within this distance [arcsec] of a placed detector's outline
 #: (or on one) are kept; the rest are dropped. A prediction on a detector
@@ -342,18 +345,12 @@ NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
 #: neighbour like a gap prediction (owner, 2026-10-11).
 PLACEMENT_MARGIN_ARCSEC = 30.0
 
-#: The next NearbySSO (sso_base.yaml NearbySSO, sdm_schemas 6d7c9a1):
-#: ``visit`` and ``detector`` after ``diaSourceId``; ``diaSourceId``,
-#: ``ephOffset`` and ``diaDistanceRank`` NULL for unmatched rows.
-NEARBYSSO_DTYPE_NEXT = np.dtype(
-    [NEARBYSSO_DTYPE.descr[0], ("visit", "i8"), ("detector", "i2")] + NEARBYSSO_DTYPE.descr[1:])
-
 #: Its primary key; diaSourceId is nullable in it (BigQuery does not
 #: enforce keys; owner, 2026-10-11).
 NEARBYSSO_KEY = ("diaSourceId", "designation", "visit")
 
-#: Columns of the next NearbySSO that are never NULL.
-NEARBYSSO_NONNULL_NEXT = frozenset({"visit", "detector", "designation"})
+#: Columns of NearbySSO that are never NULL.
+NEARBYSSO_NONNULL = frozenset({"visit", "detector", "designation"})
 
 #: Columns NULL exactly on unmatched rows (no DiaSource).
 NEARBYSSO_UNMATCHED_NULL = ("diaSourceId", "ephOffset", "diaDistanceRank")

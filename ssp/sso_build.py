@@ -71,6 +71,7 @@ from .delivery_contract import (
     SHUTTER_MANIFEST_FIELD,
     delivery_schema,
 )
+from .nearbysso._contract import NEARBYSSO_SIDECAR_FILE
 from .nearbysso.placement import DEFAULT_WCS_STORE
 from .ssobservation_contract import (
     PART_GLOB,
@@ -129,6 +130,10 @@ MPC_BATCH_ROWS = 131_072
 #: one <Table>.parquet.
 PARTITIONED = "SSObservation"
 
+#: Delivered tables with a sidecar next to their <Table>.parquet (never
+#: uploaded): NearbySSO's placement and times, row for row.
+TABLE_SIDECARS = {"NearbySSO": NEARBYSSO_SIDECAR_FILE}
+
 
 def parse_internal_columns(value):
     """The internal columns of ``--internal-columns``: a comma-separated
@@ -183,8 +188,8 @@ def delivered_paths(run_dir, table):
     if table == PARTITIONED:
         return sorted(d.glob(PART_GLOB)) + [p for p in (d / SSOBSERVATION_MANIFEST_FILE, d / SIDECAR_FILE)
                                             if p.exists()]
-    p = d / f"{table}.parquet"
-    return [p] if p.exists() else []
+    paths = [d / f"{table}.parquet"] + ([d / TABLE_SIDECARS[table]] if table in TABLE_SIDECARS else [])
+    return [p for p in paths if p.exists()]
 
 
 def move_ssobservation(src_dir, dst_dir):
@@ -794,7 +799,8 @@ def step_command(step, inputs_dir, run_dir, manifest, workers, options=None):
                  "--ssobject", str(delivery / "SSObject.parquet"), "--output", str(out),
                  "--workers", str(workers), "--correction-table", nearbysso_correction_table(manifest),
                  "--wcs-store", options.get("wcs_store", DEFAULT_WCS_STORE)],
-                {out: delivery / "NearbySSO.parquet"})
+                {out: delivery / "NearbySSO.parquet",
+                 work / NEARBYSSO_SIDECAR_FILE: delivery / NEARBYSSO_SIDECAR_FILE})
     raise ValueError(f"unknown step {step!r}")
 
 
@@ -846,9 +852,11 @@ def run_logged(cmd, log_path, env=None):
 
 def table_entry(run_dir, table):
     """The report's ``tables`` entry of ``table`` (REPORT_FIELDS): {file,
-    rows, md5, bytes}; for SSObservation {manifest, parts, sidecar, rows,
-    bytes}, the rows and bytes totals over the parts (each part's md5 is in
-    the manifest). Paths are relative to RUN_DIR."""
+    rows, md5, bytes}, and for a table with a sidecar (TABLE_SIDECARS:
+    NearbySSO) also {sidecar, sidecar_md5, sidecar_bytes}; for
+    SSObservation {manifest, parts, sidecar, rows, bytes}, the rows and
+    bytes totals over the parts (each part's md5 is in the manifest). Paths
+    are relative to RUN_DIR."""
     run_dir = Path(run_dir)
     d = run_dir / DELIVERY_DIR
     if table == PARTITIONED:
@@ -860,8 +868,13 @@ def table_entry(run_dir, table):
                     rows=sum(pq.ParquetFile(p).metadata.num_rows for p in parts),
                     bytes=sum(p.stat().st_size for p in parts))
     path = d / f"{table}.parquet"
-    return dict(file=str(path.relative_to(run_dir)), rows=pq.ParquetFile(path).metadata.num_rows,
-                md5=_md5(path), bytes=path.stat().st_size)
+    entry = dict(file=str(path.relative_to(run_dir)), rows=pq.ParquetFile(path).metadata.num_rows,
+                 md5=_md5(path), bytes=path.stat().st_size)
+    if table in TABLE_SIDECARS:
+        side = d / TABLE_SIDECARS[table]
+        entry.update(sidecar=str(side.relative_to(run_dir)), sidecar_md5=_md5(side),
+                     sidecar_bytes=side.stat().st_size)
+    return entry
 
 
 def _deliverable(report):
@@ -894,7 +907,7 @@ def _remove_strays(run_dir, log):
     d = Path(run_dir) / DELIVERY_DIR
     if not d.is_dir():
         return
-    keep = {f"{t}.parquet" for t in DELIVERY_TABLES if t != PARTITIONED}
+    keep = {f"{t}.parquet" for t in DELIVERY_TABLES if t != PARTITIONED} | set(TABLE_SIDECARS.values())
     try:
         keep.update(ssobservation_files(d))
     except ValueError:
@@ -1091,6 +1104,12 @@ def _check_from(previous, manifest, run_dir, from_step, commit, allow_mixed_comm
             if _md5(path) != want:
                 raise ValueError(f"--from {from_step}: {path} has changed since step {s} wrote it "
                                  f"(md5 {want} in the report)")
+            if t in TABLE_SIDECARS:
+                side = run_dir / DELIVERY_DIR / TABLE_SIDECARS[t]
+                want = (previous.get("tables") or {}).get(t, {}).get("sidecar_md5")
+                if not side.exists() or _md5(side) != want:
+                    raise ValueError(f"--from {from_step}: {side}, from step {s}, is missing or has changed "
+                                     f"(md5 {want} in the report)")
         built_by = entry.get("ssp_tools_commit", previous.get("ssp_tools_commit"))
         if built_by != commit:
             mixed[s] = built_by

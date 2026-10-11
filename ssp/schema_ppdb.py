@@ -348,9 +348,16 @@ SSObservationDtype = np.dtype([
 # NearbySSO: For each DiaSource, the nearest known Solar System object whose predicted position (from
 # mpc_orbits) is within the object's matching radius (5 arcsec; 15 arcsec for comets and interstellar
 # objects, i.e. designations starting C/, P/, D/ or I/), and whose predicted 1-sigma uncertainty is small
-# enough for the association to be meaningful. Regenerated daily (RFC-1188).
+# enough for the association to be meaningful; and, with a NULL diaSourceId, every such prediction that
+# matched no DiaSource but falls on a detector of the visit, or within 30 arcsec of one. Predicted values are
+# evaluated at the shutter-corrected mid-exposure time of the prediction's position on the detector.
+# Regenerated daily (RFC-1188).
 NearbySSODtype = np.dtype([
-    ('diaSourceId', '<i8'),         # Unique identifier of the DiaSource.
+    ('diaSourceId', '<i8'),         # Unique identifier of the matched DiaSource; NULL for a prediction that
+                                    # matched no DiaSource.
+    ('visit', '<i8'),               # Id of the visit the prediction is for.
+    ('detector', '<i2'),            # Id of the detector the predicted position falls on, or the nearest
+                                    # detector when it falls in a gap between detectors or just outside th...
     ('ssObjectId', '<i8'),          # Id of the SSObject found within a matching radius of this source, if
                                     # any; NULL if the object has no SSObject row.
     ('designation', '<U16'),        # The primary provisional designation in unpacked form (e.g. 2008 AB).
@@ -362,7 +369,8 @@ NearbySSODtype = np.dtype([
                                     # covariance.
     ('ephRa_ephDec_Cov', '<f4'),    # [deg**2] Covariance between ephRa (on the sky) and ephDec; with
                                     # ephRaErr and ephDecErr, the predicted position's error ellipse, in t...
-    ('ephOffset', '<f4'),           # [arcsec] Total observed versus predicted angular separation on the sky.
+    ('ephOffset', '<f4'),           # [arcsec] Total observed versus predicted angular separation on the sky;
+                                    # NULL for a prediction that matched no DiaSource.
     ('diaDistanceRank', '<i2'),     # Rank of this DiaSource by its separation from the object's predicted
                                     # position, among all DiaSources of the same visit within the object's...
     ('ephVmag', '<f4'),             # [mag] Predicted magnitude in V band, computed from mpc_orbits data

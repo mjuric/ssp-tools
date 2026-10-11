@@ -8,7 +8,9 @@ builders. Per table it checks
   * the columns: exactly the schema's, in its order;
   * the types: each Arrow type compatible with the Felis datatype;
   * NULLs: none in ``nullable: false`` columns;
-  * the primary key (ppdb.yaml's ``primaryKey``): unique and non-NULL;
+  * the primary key (ppdb.yaml's ``primaryKey``): unique, NULL counting
+    as a value, and non-NULL in its ``nullable: false`` columns (NearbySSO's
+    key has a nullable diaSourceId, NULL on its unmatched rows);
   * char lengths: string values no longer than the column's ``length``.
 
 SSObservation is delivered as parts plus a manifest and a sidecar
@@ -238,11 +240,15 @@ def check_table(table, parquet_path, schema_dir=SCHEMA_DIR):
     res.append(CheckResult("char lengths", not too_long, "; ".join(too_long) if too_long
                            else f"{len(sized)} sized string columns within length"))
 
-    res.append(_check_key(pf, primary_keys(schema_dir).get(table, []), got, nrows))
+    keys = primary_keys(schema_dir).get(table, [])
+    res.append(_check_key(pf, keys, got, nrows,
+                          nullable=[k for k in keys if spec.get(k, {}).get("nullable", True) is not False]))
     return res
 
 
-def _check_key(pf, keys, got, nrows):
+def _check_key(pf, keys, got, nrows, nullable=()):
+    """The key ``keys`` unique (NULL counting as a value, as BigQuery
+    compares it), and without NULLs but in its ``nullable`` columns."""
     if not keys:
         return CheckResult("primary key", False, "the schema gives no primaryKey")
     label = ", ".join(keys)
@@ -252,10 +258,14 @@ def _check_key(pf, keys, got, nrows):
     t = pf.read(columns=keys)
     t = pa.table({k: _decoded(t[k]) for k in keys})
     problems = []
-    nulls = {k: t[k].null_count for k in keys if t[k].null_count}
+    nulls = {k: t[k].null_count for k in keys if t[k].null_count and k not in nullable}
     if nulls:
         problems.append("NULLs in " + ", ".join(f"{k} ({n:,})" for k, n in nulls.items()))
-        t = t.drop_null()
+        valid = pc.is_valid(t[next(iter(nulls))])
+        for k in nulls:
+            valid = pc.and_(valid, pc.is_valid(t[k]))
+        t = t.filter(valid)
+    # (group_by takes NULL as one key value)
     counts = t.group_by(keys).aggregate([([], "count_all")])
     ndup = len(t) - len(counts)
     if ndup:
@@ -265,6 +275,10 @@ def _check_key(pf, keys, got, nrows):
         problems.append(f"{ndup:,} duplicate rows over {len(dup):,} key values, e.g. {ex}")
     if problems:
         return CheckResult("primary key", False, f"({label}): " + "; ".join(problems))
+    allowed = [k for k in keys if k in nullable and t[k].null_count]
+    if allowed:
+        return CheckResult("primary key", True, f"({label}): {nrows:,} unique; NULL only in nullable "
+                           + ", ".join(f"{k} ({t[k].null_count:,})" for k in allowed))
     return CheckResult("primary key", True, f"({label}): {nrows:,} unique, non-NULL")
 
 
