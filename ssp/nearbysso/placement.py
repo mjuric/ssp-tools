@@ -32,6 +32,7 @@ import os
 import numpy as np
 
 from ..ssobservation_contract import MAX_HEADER_MISMATCH_S
+from ._contract import PLACEMENT_MARGIN_ARCSEC
 
 #: The production WCS store (visit-table's ``wcs/``, refreshed hourly by
 #: ssp-daily). Named through the ssp_daily_data symlink, never resolved.
@@ -66,7 +67,9 @@ VISIT_CORRECTED = 2
 #: - omitted: the table has no time there (a skipped or failed exposure, a
 #:   detector not in the table, a NaN header midpoint);
 #: - beyond_100px: more than OFF_DETECTOR_OMIT_PIX off the detector;
-#: - no_wcs: the visit has no WCS, so no pixel to look up.
+#: - no_wcs: not placed (the visit has no WCS, or the prediction is more
+#:   than PLACEMENT_MARGIN_ARCSEC from every detector with one), so no pixel
+#:   to look up.
 TIME_CAUSES = ("corrected", "ppdb", "no_table", "outside_coverage", "not_built", "omitted", "beyond_100px",
                "no_wcs")
 (CAUSE_CORRECTED, CAUSE_PPDB, CAUSE_NO_TABLE, CAUSE_OUTSIDE_COVERAGE, CAUSE_NOT_BUILT, CAUSE_OMITTED,
@@ -87,7 +90,7 @@ ROW_PLACE_DTYPE = np.dtype([
     ("midpointMjdTai", "f8"),         # TAI MJD the row's values are evaluated at
     ("midpointMjdTai_flag", "?"),     # time_cause >= FIRST_FLAGGED
     ("time_cause", "u1"),             # index into TIME_CAUSES
-    ("has_wcs", "?"),                 # the visit has a WCS (the row is placed)
+    ("has_wcs", "?"),                 # placed: a WCS, and within the margin of a detector
     ("move_px", "f4"),                # [px] |(eph_x, eph_y) - the placement at the visit's time|
 ])
 
@@ -127,17 +130,20 @@ def open_store(store_dir, nights, visits):
     return WcsStore(paths, visits=np.asarray(visits, np.int64))
 
 
-def place_rows(store, visit, ra, dec):
+def place_rows(store, visit, ra, dec, margin_arcsec=PLACEMENT_MARGIN_ARCSEC):
     """Place each row's prediction (``ra``, ``dec`` [deg], at its visit's
     time) on the detectors of its ``visit`` (``VisitLocator.place``).
     Returns a dict of arrays: ``has_wcs``, ``detector`` (-1 without a WCS),
     ``x``, ``y``, ``edge`` [arcsec], ``jacobian`` (N, 2, 2) [px/deg, RA in
     plain degrees] and the placed detector's ``bbox`` (N, 4) (NaN without a
-    WCS). A visit the store doesn't have (KeyError) has no WCS."""
+    WCS), and ``beyond_margin`` (bool). A visit the store doesn't have
+    (KeyError) has no WCS; so has a prediction more than ``margin_arcsec``
+    from every detector with a WCS (edge distance < -margin_arcsec; owner,
+    2026-10-11): it is not placed, and flagged ``beyond_margin``."""
     n = len(visit)
     out = dict(has_wcs=np.zeros(n, bool), detector=np.full(n, -1, np.int64), x=np.full(n, np.nan),
                y=np.full(n, np.nan), edge=np.full(n, np.nan), jacobian=np.full((n, 2, 2), np.nan),
-               bbox=np.full((n, 4), np.nan))
+               bbox=np.full((n, 4), np.nan), beyond_margin=np.zeros(n, bool))
     if store is None or not n:
         return out
     visit = np.asarray(visit, np.int64)
@@ -151,12 +157,15 @@ def place_rows(store, visit, ra, dec):
         except KeyError:
             continue
         pl = loc.place(ra[i], dec[i])
+        far = ~(pl.edgeDistance >= -margin_arcsec)
+        out["beyond_margin"][i[far]] = True
+        k, i = ~far, i[~far]
         out["has_wcs"][i] = True
-        out["detector"][i] = pl.detector
-        out["x"][i], out["y"][i], out["edge"][i] = pl.x, pl.y, pl.edgeDistance
-        out["jacobian"][i] = pl.jacobian
+        out["detector"][i] = pl.detector[k]
+        out["x"][i], out["y"][i], out["edge"][i] = pl.x[k], pl.y[k], pl.edgeDistance[k]
+        out["jacobian"][i] = pl.jacobian[k]
         by_id = np.argsort(loc.detector, kind="stable")
-        j = by_id[np.searchsorted(loc.detector[by_id], pl.detector)]
+        j = by_id[np.searchsorted(loc.detector[by_id], pl.detector[k])]
         out["bbox"][i] = loc.bbox[j]
     return out
 

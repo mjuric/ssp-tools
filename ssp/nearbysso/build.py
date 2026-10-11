@@ -772,7 +772,8 @@ def place_and_time(w, vis, v0, ps, dots, t_src, det_src, r, ra_src, dec_src, sep
        (``placement.visit_time_states``, against the correction table's
        header midpoints, ``w["corrections"]``);
     2. each prediction placed at its visit's time on the slice's WCSs
-       (``w["wcs_store"]``; ``placement.place_rows``); without a WCS the
+       (``w["wcs_store"]``; ``placement.place_rows``); without a WCS, or
+       more than PLACEMENT_MARGIN_ARCSEC from every detector with one, the
        row takes its DiaSource's detector, and NaN pixels;
     3. each row's time (``placement.row_times``);
     4. its published values moved there (``at_source_time``), and its
@@ -818,7 +819,7 @@ def place_and_time(w, vis, v0, ps, dots, t_src, det_src, r, ra_src, dec_src, sep
                               zip(*np.unique(hcause[state == _place.VISIT_UNVERIFIED], return_counts=True))},
                   corrected_first=(int(visit_ids[corrected[0]]), float(dev[corrected[0]])) if corrected.size
                   else None,
-                  without_wcs=int((~with_wcs).sum()),
+                  without_wcs=int((~with_wcs).sum()), beyond_margin=int(pl["beyond_margin"].sum()),
                   wcs_files=len(_place.wcs_paths(w["wcs_store"], vis["night"])) if w.get("wcs_store") else 0,
                   wcs_read_s=t_read)
     return pub, place, vstats
@@ -937,6 +938,7 @@ def placement_report(place, pub, p, vstats, snapshot):
         visits_unverified=dict(unverified),
         ppdb_corrected_first=min(firsts) if firsts else None,
         visits_without_wcs=int(sum(v["without_wcs"] for v in vstats)),
+        matched_beyond_margin=int(sum(v["beyond_margin"] for v in vstats)),
         wcs_files=int(sum(v["wcs_files"] for v in vstats)),
         time_causes={c: int((cause == i).sum()) for i, c in enumerate(_place.TIME_CAUSES)},
         abs_dt_s=_quantiles(dt_s), abs_dt_s_corrected=_quantiles(dt_s[corrected]),

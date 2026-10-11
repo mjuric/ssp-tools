@@ -266,7 +266,8 @@ def scene(tmp_path_factory):
     plan = [("outside", V_OUTSIDE, 95, 1500.0, 1800.0, 0.0),
             ("on", V_OK, 94, 1000.0, 1500.0, 0.0),
             ("gap", V_OK, 94, gap_x, 2500.0, 0.0),
-            ("far", V_OK, 96, BBOX[2] + 600.0, 2000.0, 0.0),
+            ("far", V_OK, 96, BBOX[2] + 600.0, 2000.0, 0.0),      # ~120" off: beyond the margin
+            ("near", V_OK, 96, BBOX[2] + 125.0, 2000.0, 0.0),     # ~25": in it, > 100 px off
             ("edge", V_OK, 95, 3.0, 2000.0, 0.0),
             ("ppdb1", V_OK2, 94, 2000.0, 2000.0, 0.0),
             ("ppdb2", V_OK2, 95, 500.0, 3000.0, 0.0),
@@ -306,7 +307,8 @@ def test_times_and_causes(tmp_path, scene, table):
     assert len(ids) == len(scene["dia"])
     pl = _by_name(scene, ids, place)
     pp = _by_name(scene, ids, p)
-    want = dict(outside="outside_coverage", on="corrected", gap="corrected", far="beyond_100px",
+    want = dict(outside="outside_coverage", on="corrected", gap="corrected", far="no_wcs",
+                near="beyond_100px",
                 edge="corrected", ppdb1="corrected", ppdb2="corrected", failed="omitted", early="not_built",
                 mid="not_built", late="not_built", nowcs="no_wcs")
     assert {n: _cause(r["time_cause"]) for n, r in pl.items()} == want
@@ -325,7 +327,7 @@ def test_times_and_causes(tmp_path, scene, table):
     t, st = corrected(table, V_OK, pl["gap"]["detector"], pl["gap"]["eph_x"], pl["gap"]["eph_y"])
     assert st[0] == 1                                                          # DEGRADED, not flagged
     # the flagged: the visit's time, or (unverified) the DiaSource's
-    for n in ("far", "nowcs", "outside", "failed", "mid"):
+    for n in ("far", "near", "nowcs", "outside", "failed", "mid"):
         assert pl[n]["midpointMjdTai"] == scene["t_vis"][int(pl[n]["visit"])], n
     for n, dt in (("early", -0.3), ("late", 0.3)):
         assert pl[n]["midpointMjdTai"] == scene["t_vis"][V_ABSENT] + dt * S
@@ -516,3 +518,33 @@ def test_row_times_reuses_corrections(table):
     assert (st == 0).all() and (c2 == P.CAUSE_CORRECTED).all()
     np.testing.assert_array_equal(t2, want)
     assert (t1 != t2).all()
+
+
+@needs_fixture
+def test_beyond_margin_is_no_wcs(tmp_path, scene, table):
+    """A matched row whose prediction is more than PLACEMENT_MARGIN_ARCSEC
+    from every detector with a WCS is a row without a WCS (owner,
+    2026-10-11): its DiaSource's detector, NaN placement, the visit's time,
+    flagged no_wcs, counted; one within the margin keeps the nearest
+    detector's placement."""
+    from ssp.nearbysso._contract import PLACEMENT_MARGIN_ARCSEC
+
+    ids, pub, place, vstats, _, p = run_pass3(tmp_path, scene["dia"], scene["preds"], scene["store"], table)
+    pl, pp = _by_name(scene, ids, place), _by_name(scene, ids, p)
+    loc = WcsStore([str(scene["store"] / "day_obs=20260105.parquet")]).locator(V_OK)
+    far, near = (loc.place(pp[n]["ra"][None], pp[n]["dec"][None]) for n in ("far", "near"))
+    assert far.edgeDistance[0] < -PLACEMENT_MARGIN_ARCSEC < near.edgeDistance[0] < -20.0
+    r = pl["far"]
+    assert not r["has_wcs"] and r["detector"] == r["dia_detector"] == 96
+    assert np.isnan(r["eph_x"]) and np.isnan(r["eph_y"]) and np.isnan(r["ephDetectorEdgeDist"])
+    assert _cause(r["time_cause"]) == "no_wcs" and r["midpointMjdTai_flag"]
+    assert r["midpointMjdTai"] == HEADER[V_OK]
+    r = pl["near"]
+    assert r["has_wcs"] and r["detector"] == near.detector[0] and r["eph_x"] == near.x[0]
+    assert abs(r["ephDetectorEdgeDist"] - near.edgeDistance[0]) < 1e-4
+    assert vstats["beyond_margin"] == 1
+    # exactly at the margin: kept (the margin is inclusive)
+    out = P.place_rows(WcsStore([str(scene["store"] / "day_obs=20260105.parquet")]), np.array([V_OK] * 2),
+                       pp["near"]["ra"][None].repeat(2), pp["near"]["dec"][None].repeat(2),
+                       margin_arcsec=-near.edgeDistance[0])
+    assert out["has_wcs"].all() and not out["beyond_margin"].any()
