@@ -24,6 +24,7 @@ The meeting also proposed keeping unassociated predictions in NearbySSO (rows wi
 | Which tables | SSObservation only; the other tables stay single files. |
 | Upload | No GCS upload (no credentials yet). A delivery under `/sdf/data/rubin/user/mjuric/...` for the loader owners suffices. Uploads stay dry-run. |
 | NearbySSO unassociated predictions | Deferred; recorded in an issue. |
+| `obssubid` (2026-10-10) | Added to SSObservation, after `obsid`: obs_sbn's `obssubid` as submitted, NULL where the MPC record has none (see "Addendum: obssubid"). |
 
 ## Outputs
 
@@ -203,3 +204,21 @@ The schema rename is in lsst/sdm_schemas#549 at `27a404c`. The RFC drafts (PR #7
   - The dry-run upload lists the parts, then the manifest, and not the sidecar.
 - **The delivery check** on W1's full build: 14 s and 2.6 GB. Conformance: 37 s and 6.3 GB.
 - **Remainder parts.** With parts closed at the first object boundary after 2M rows, the last ranged part is a small remainder (14,564 rows here). That is by the rules, and harmless for loading.
+
+## Addendum: obssubid (2026-10-10)
+
+**Owner decision (2026-10-10):** SSObservation carries obs_sbn's `obssubid`, the observer's identifier of the observation as submitted.
+- It can't be rebuilt from the other columns for every row. A plain id match is `LSST-<processing>-<diaSourceId>`, but the two rows of a trailed source carry `-A`/`-B` suffixes, and rows matched by position have an obsSubID that didn't parse or verify.
+- **Schema:** `obssubid`, `char(32)`, nullable, `meta.id`, after `obsid` (lsst/sdm_schemas#549, `fd56595`). SSObservation goes from 180 to 181 columns. The name is obs_sbn's, like its neighbours `trksub`, `trkid` and `submission_id`.
+- **Build:** the column was already in `dia_sources.parquet` (the extract's trimmed copy of obs_sbn's value; no obs_sbn value has surrounding whitespace). It moves from `DIA_DROPPED` to `LINK_COLUMNS` and is copied like the other block-1 columns.
+- **Checks:** the bench's block-1 comparison against `dia_sources` covers it. `check_counts` also checks it against obs_sbn directly, NULL where obs_sbn's is NULL.
+
+- **Real-data check** (the 2026-10-09 inputs, rebuilt into `/sdf/data/rubin/user/mjuric/ssobservation-delivery/obssubid-check`, 244 s at 32 workers):
+  - 8,078,546 rows; conformance PASS (39 checks); counts PASS (5 checks), including `obssubid` against obs_sbn.
+  - Every other column, and the sidecar, equals the `status-i-check` build of the same inputs exactly.
+  - The parts grow by about 1.9% (e.g. 804 MB → 819 MB).
+  - By `matchMethod`: `obssubid` 8,075,444, `position` 3,062, `obssubid_trail` 40.
+- **The 5 NULL rows** are not Rubin pipeline submissions. They are third-party submissions of Rubin (X05) measurements of the comet P/2026 N2:
+  - two MPC submissions of 2026-07-17 and 2026-07-18, both with `trksub` RMM2026;
+  - the second one's `remarks` cite "Rubin/Fink alert diaSourceId=…".
+  - All five matched AP DiaSources by position. For the two that cite a diaSourceId, the match is that same DiaSource.

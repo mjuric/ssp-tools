@@ -11,6 +11,8 @@ import numpy as np
 SSObservationDtype = np.dtype([
     ('obsid', '<U32'),              # MPC's unique identifier of the observation (obs_sbn.obsid): the obs_sbn
                                     # row this SSObservation row is. The primary key.
+    ('obssubid', '<U32'),           # Observer-assigned identifier of the observation, as submitted
+                                    # (obs_sbn.obssubid), e.g. LSST-<processing>-<id>, with a -A or -B suf...
     ('trksub', '<U8'),              # Observer-assigned tracklet identifier, as submitted (obs_sbn.trksub).
     ('trkid', '<U16'),              # MPC-assigned tracklet identifier (obs_sbn.trkid).
     ('submission_id', '<U32'),      # Identifier of the MPC submission this observation arrived in

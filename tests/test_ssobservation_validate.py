@@ -52,6 +52,7 @@ def _values():
     d.update(
         obsid=[f"obs{k:03d}" for k in range(N)],
         status=["p", "P", "p", "p", "p", "I"],
+        obssubid=[f"LSST-{p}-{i}" for p, i in zip(PROCESSING[:-1], IDS[:-1])] + [None],
         primary=[True] * N,
         matchMethod=["obssubid", "obssubid_trail", "position", "obssubid", "obssubid", "position"],
         ssObjectId=[1, 1, 2, 2, None, None],
@@ -145,8 +146,8 @@ def dia_from(t):
     """A dia_sources.parquet as the extractor writes it: view types (wide),
     the view's id as diaSourceId, parentId."""
     cols = {"obsid": t["obsid"]}
-    for c in ("trksub", "trkid", "submission_id", "primary", "measuredOn", "processing", "processingTable",
-              *B[4]):
+    for c in ("obssubid", "trksub", "trkid", "submission_id", "primary", "measuredOn", "processing",
+              "processingTable", *B[4]):
         a = V._flat(t[c])
         if pa.types.is_floating(a.type):
             a = a.cast(pa.float64())
@@ -169,8 +170,8 @@ def dia_from(t):
 # --------------------------------------------------------------------------
 
 def test_blocks_match_design():
-    assert len(NAMES) == 182
-    assert [len(B[k]) for k in (1, 2, 3, 4, 6)] == [6, 2, 7, 127, 40]
+    assert len(NAMES) == 183
+    assert [len(B[k]) for k in (1, 2, 3, 4, 6)] == [7, 2, 7, 127, 40]
     assert B[4][0] == "visit" and B[4][-1] == "glint_trail"
     assert set(ELLIPSE_COLUMNS) <= set(B[6])
 
@@ -556,8 +557,9 @@ def test_identical_orbits(tmp_path):
 def _obs_sbn(t, extra=0):
     obsid = t["obsid"].to_pylist() + [f"zz{k}" for k in range(extra)]
     status = [str(s) for s in V.to_np(t["status"])[0]] + ["p"] * extra
+    obssubid = t["obssubid"].to_pylist() + [f"LSST-AP-DS-9{k}" for k in range(extra)]
     return pa.table({"obsid": obsid + ["other"], "stn": ["X05"] * len(obsid) + ["I41"],
-                     "status": status + ["p"]})
+                     "status": status + ["p"], "obssubid": obssubid + ["other"]})
 
 
 def test_counts_pass(tmp_path, good):
@@ -569,6 +571,7 @@ def test_counts_pass(tmp_path, good):
     text = rep.text()
     assert "#7 rows (designated, no SSObject): 1 rows of 1 objects: 2025 MH352 (1)" in text
     assert "I rows: 1" in text and "X05 rows it did not resolve: 2" in text
+    assert "obssubid agrees with obs_sbn (NULL where it is NULL): 1 NULL" in text
     assert V.check_counts(good, ob).ok           # without dia_sources
 
 
@@ -579,6 +582,12 @@ def test_counts_fail(tmp_path, good):
     st[0] = "P"
     bad = obs.set_column(2, "status", pa.array(st))
     assert "status agrees with obs_sbn" in failed(V.check_counts(good, write(bad, tmp_path / "o1.parquet")))
+    for k, v in ((0, "LSST-AP-DS-102"), (0, None), (5, "LSST-AP-DS-606")):
+        sub = obs["obssubid"].to_pylist()
+        sub[k] = v
+        bad = obs.set_column(3, "obssubid", pa.array(sub, pa.string()))
+        assert "obssubid agrees with obs_sbn (NULL where it is NULL)" in failed(
+            V.check_counts(good, write(bad, tmp_path / "o0.parquet"))), (k, v)
     bad = obs.filter(pa.array([o != "obs002" for o in obs["obsid"].to_pylist()]))
     assert "every SSObservation row is an obs_sbn X05 row" in failed(
         V.check_counts(good, write(bad, tmp_path / "o2.parquet")))

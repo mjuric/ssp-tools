@@ -255,9 +255,9 @@ ELLIPSE_COLUMNS = ("ephRaErr", "ephDecErr", "ephRa_ephDec_Cov")
 # "No orbit" means ephRa/ephDec are NULL; the columns computed from the
 #   observed position alone (ecl*, gal*, elongation) are still filled.
 #
-# Block 1 (obs_sbn): obsid, trksub, trkid, submission_id and primary from
-#   dia_sources.parquet (the extractor's own); status from obs_sbn, joined
-#   on obsid. matchMethod from dia_sources.parquet (WP1).
+# Block 1 (obs_sbn): obsid, obssubid, trksub, trkid, submission_id and
+#   primary from dia_sources.parquet (the extractor's own); status from
+#   obs_sbn, joined on obsid. matchMethod from dia_sources.parquet (WP1).
 # Block 2: ssObjectId is NULL unless the row's object has an SSObject row,
 #   i.e. NULL for status-'I' rows (no designation) and for designated objects
 #   missing from mpc_orbits (issue #7). designation is the MPC's primary
