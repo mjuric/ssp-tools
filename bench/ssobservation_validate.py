@@ -1008,7 +1008,7 @@ def check_primary(t, rep):
 # --------------------------------------------------------------------------
 
 #: Block-1 columns copied from dia_sources (status comes from obs_sbn).
-COPIED_BLOCK1 = ("trksub", "trkid", "submission_id", "primary")
+COPIED_BLOCK1 = ("obssubid", "trksub", "trkid", "submission_id", "primary")
 #: dia_sources' names of the view's id and parentId.
 DIA_ID, DIA_PARENT = "diaSourceId", "parentId"
 
@@ -1244,10 +1244,10 @@ def check_regression(new, ref, rep=None):
     cols = [c for c in cols if c in new_names]
 
     extra_ref = [c for c in ("designation", "ssObjectId", "primary", "processing", "submission_id", "trksub",
-                             "trkid", "diaSourceId", "sourceId") if c in ref_names]
+                             "trkid", "obssubid", "diaSourceId", "sourceId") if c in ref_names]
     rt = ref.read(["obsid", *cols, *extra_ref])
     nt = _read(new, ["obsid", *cols, "designation", "ssObjectId", "primary", "processing", "submission_id",
-                     "trksub", "trkid", *ID_COLUMNS, "measuredOn"])
+                     "trksub", "trkid", "obssubid", *ID_COLUMNS, "measuredOn"])
     r_obsid, n_obsid = to_np(rt["obsid"])[0], to_np(nt["obsid"])[0]
     idx = _obsid_index(r_obsid, n_obsid)
     n_new_only = int(np.sum(idx < 0))
@@ -1302,7 +1302,8 @@ def check_regression(new, ref, rep=None):
                    if mism.any() else ""))
 
     # other columns the reference carries
-    other = [c for c in ("primary", "processing", "submission_id", "trksub", "trkid") if c in rt.column_names]
+    other = [c for c in ("primary", "processing", "submission_id", "trksub", "trkid", "obssubid")
+             if c in rt.column_names and c in nt.column_names]
     compare_columns(rep, nt, rt, other, keys, f"other reference columns equal ({', '.join(other)})",
                     src_missing="info")
     if "diaSourceId" in rt.column_names and "measuredOn" in nt.column_names:
@@ -1428,9 +1429,9 @@ def check_ellipse(ssobservation, nearbysso, orbits_a, orbits_b, processing="AP-D
 
 def check_counts(ssobservation, obs_sbn, dia_sources=None, station="X05", rep=None):
     rep = rep or Report(f"SSObservation counts: {ssobservation} vs {obs_sbn}")
-    ss = _read(ssobservation, ["obsid", "status", "ssObjectId", "designation", "primary", "processing",
-                          "measuredOn", "matchMethod"])
-    ob = pq.read_table(obs_sbn, columns=["obsid", "stn", "status"])
+    ss = _read(ssobservation, ["obsid", "status", "obssubid", "ssObjectId", "designation", "primary",
+                               "processing", "measuredOn", "matchMethod"])
+    ob = pq.read_table(obs_sbn, columns=["obsid", "stn", "status", "obssubid"])
     stn = to_np(ob["stn"])[0]
     x05 = ob.filter(pa.array(stn == station))
     rep.info(f"obs_sbn: {len(ob):,} rows, {len(x05):,} {station}; SSObservation: {len(ss):,} rows")
@@ -1461,6 +1462,14 @@ def check_counts(ssobservation, obs_sbn, dia_sources=None, station="X05", rep=No
     rep.check("status agrees with obs_sbn", not mism.any(),
               f"{int(mism.sum()):,} differ ({_examples(ss_obsid[keep], mism, st[keep], want)})"
               if mism.any() else "")
+    if "obssubid" in ss.column_names:
+        so, sov, _ = to_np(ss["obssubid"])
+        wo, wov, _ = to_np(x05["obssubid"])
+        wo, wov = wo[idx[keep]], wov[idx[keep]]
+        mism = (sov[keep] != wov) | (sov[keep] & (so[keep] != wo))
+        rep.check("obssubid agrees with obs_sbn (NULL where it is NULL)", not mism.any(),
+                  f"{int(mism.sum()):,} differ ({_examples(ss_obsid[keep], mism, so[keep], wo)})"
+                  if mism.any() else f"{int((~sov[keep]).sum()):,} NULL")
 
     sid, has_sid, _ = to_np(ss["ssObjectId"])
     designated = _designated(ss)

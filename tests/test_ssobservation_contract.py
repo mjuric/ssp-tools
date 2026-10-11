@@ -15,7 +15,7 @@ def _table(name):
 def test_ssobservation_columns_match_schema():
     cols = _table("SSObservation")["columns"]
     assert list(C.SSObservationDtype.names) == [c["name"] for c in cols]
-    assert len(cols) == 182
+    assert len(cols) == 183
     assert {c["name"] for c in cols if c.get("nullable") is False} == C.SSOBSERVATION_NONNULL
     assert _table("SSObservation")["primaryKey"] == "#SSObservation.obsid"
 

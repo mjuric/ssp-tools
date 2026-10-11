@@ -60,7 +60,7 @@ _NAMES = SSObservationDtype.names
 
 #: Block 1 columns copied from dia_sources.parquet (status comes from
 #: obs_sbn, matchMethod from dia_sources.parquet or _derive_match_method).
-LINK_COLUMNS = ("obsid", "trksub", "trkid", "submission_id", "primary")
+LINK_COLUMNS = ("obsid", "obssubid", "trksub", "trkid", "submission_id", "primary")
 #: Block 3 columns copied from dia_sources.parquet (the ids are split, see
 #: ID_SPLIT).
 MEASURED_ON_COLUMNS = ("measuredOn", "processing", "processingTable")
@@ -91,7 +91,7 @@ MEASURED_EPH_COLUMNS = ("elongation", "eclLambda", "eclBeta", "galLon", "galLat"
 #: stay in dia_sources.parquet), and the shutter correction's internal
 #: columns (SHUTTER_INTERNAL: midpointMjdTaiVisit, obstime_basis). All are
 #: dropped without a warning.
-DIA_DROPPED = VIEW_DROPPED + ("parentId", "obssubid", "match", "sep_mas", "dt_ms", "dmag", "band_ok",
+DIA_DROPPED = VIEW_DROPPED + ("parentId", "match", "sep_mas", "dt_ms", "dmag", "band_ok",
                               "n_pass", "ambiguous") + SHUTTER_INTERNAL
 
 

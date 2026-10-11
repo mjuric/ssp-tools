@@ -477,11 +477,12 @@ def test_internal_columns_not_produced(tmp_path, offline, monkeypatch):  # noqa:
 
 
 def test_match_inputs_not_needed_without_match_method(tmp_path, offline):  # noqa: F811
-    # without matchMethod configured, neither it nor match/obssubid (what it
-    # is derived from) is needed in dia_sources.parquet
+    # without matchMethod configured, neither it nor match (what it is
+    # derived from, with obssubid, a column of its own) is needed in
+    # dia_sources.parquet
     dia, _ = make_inputs(tmp_path)
     assert "matchMethod" not in dia.column_names
-    pq.write_table(dia.drop_columns(["match", "obssubid"]), tmp_path / "dia_sources.parquet")
+    pq.write_table(dia.drop_columns(["match"]), tmp_path / "dia_sources.parquet")
     with pytest.raises(ValueError, match="lacks"):
         build_ssobservation(tmp_path, tmp_path)
     m = build_ssobservation(tmp_path, tmp_path, internal_columns=("midpointMjdTai_flag_degraded",))
