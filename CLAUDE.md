@@ -84,6 +84,9 @@ The rules here are for development in ssp-tools, by Claude sessions and their su
   - Credentials come from `~/.chpass` through `ssp.export.submittable.credentials`.
   - Admin (`default`) access is the owner's to use, not ours.
 - **MPC replica** (`mpcorb-db.slac.stanford.edu`, `mpc_sbn`, user `rubin`): read-only, in one transaction when tables must be consistent.
+- **PPDB TAP service** (`https://data-int.lsst.cloud/api/ppdbtap`; `ssp.export.ppdb_tap`): **one async job at a time** (concurrent jobs can hang: DM-56627), and delete every job.
+  - The bearer token comes only from `~/.data-int.token`, the file the owner designated. Don't look for other tokens.
+  - Abort a hung job (EXECUTING with no progress) and report it to the service's operators, with the job URL. Don't retry in a loop.
 - **JPL Horizons and SBDB:** strictly serial, at least 1 s apart, a small total budget, never in parallel or in CI.
 - **Never submit anything to the MPC.**
 - **Shared nodes:** keep workers at or under the stated limit, 32 unless told otherwise. Check `uptime` before heavy runs.

@@ -64,11 +64,11 @@ All of this lives in a new module, `ssp/export/ppdb_tap.py`. `export_ppdb` dispa
 1. **The visit counts.** A sync query, `SELECT visit, COUNT(*) AS n FROM ppdb.DiaSource GROUP BY visit` (Parquet), gives the visits and their counts. A NULL visit fails the step: NearbySSO can't use a row without one.
 2. **The chunks.** Contiguous visit ranges of about `CHUNK_ROWS` = 1,000,000 rows each (the size that went through on 2026-10-09).
    - Each chunk is one async job: `SELECT diaSourceId, visit, midpointMjdTai, ra, dec FROM ppdb.DiaSource WHERE visit BETWEEN lo AND hi`.
-   - At most `MAX_JOBS` = 4 jobs run at once.
+   - One job at a time (see "Concurrent jobs hang" below).
    - Each result streams to `INPUTS_DIR/.partial/ppdb_tap/part-NNNN.parquet`.
 3. **The job lifecycle.** POST `/async` (`MAXREC` above the chunk), then PHASE=RUN, then poll every 5 s, then GET `results/result`, then DELETE the job.
    - Every job is deleted, also on failure or interruption (`finally`), so none are left on the server.
-4. **Hangs.** A job still QUEUED or EXECUTING after `JOB_TIMEOUT_S` = 900 s is aborted (PHASE=ABORT) and deleted.
+4. **Hangs.** A job still QUEUED or EXECUTING after `JOB_TIMEOUT_S` = 300 s is aborted (PHASE=ABORT) and deleted.
    - It is retried once.
    - If that fails too, the step fails. The message gives the job URLs and phases, for a report to the operators, and the step doesn't retry in a loop.
    - Errors (ERROR, HTTP 5xx) get the same single retry.
@@ -81,17 +81,26 @@ All of this lives in a new module, `ssp/export/ppdb_tap.py`. `export_ppdb` dispa
    - every counted visit is present.
 
    Then sort by (`visit`, `diaSourceId`) and write zstd to `.partial/ppdb_dia_sources.parquet`. The existing step machinery moves it into place with the manifest.
-7. **HTTP.** `requests`, now a direct dependency (it is already installed, through astroquery). SDF's proxy settings come from the environment as usual. `bypass_proxy` is for ClickHouse only.
+7. **HTTP.** pyvo for the TAP and UWS calls (owner, 2026-10-10); it was already installed through astroquery, and is now a direct dependency, with `requests`. pyvo's `fetch_result()` reads only VOTable, so the Parquet result is downloaded from the job's `result_uri` on the same session. The count query (step 1) is a small sync VOTable query. SDF's proxy settings come from the environment as usual. `bypass_proxy` is for ClickHouse only.
 
 Expected cost: 5 columns rather than `SELECT *`, so far less to move than the 2026-10-09 export. That export's DiaSource took about 10–20 min across 4 jobs. The real-data check (below) measures it.
 
 ## Shared-resource etiquette (added to CLAUDE.md)
 
 PPDB TAP (data-int):
-- at most 4 concurrent jobs;
+- one job at a time;
 - delete every job;
 - abort hung jobs, and report them to the operators rather than retry in a loop;
 - the token comes only from the file the owner designates.
+
+## Concurrent jobs hang (2026-10-11)
+
+The first implementation ran 4 jobs at a time. Its first run against data-int took 130 s; the next two hung, with all 4 jobs in EXECUTING ("Bytes processed: 0") for more than 5 and 10 minutes.
+- It reproduces with plain curl: three particular chunks (visits 2026-01-17 to 2026-02-19), run together, leave 2 of the 3 in EXECUTING indefinitely. Run one at a time, each completes in about 10 s.
+- It isn't BigQuery's result cache, the result size, or the client (pyvo or curl).
+- Reported as DM-56627, with the reproducer attached.
+
+**Owner decision (2026-10-11):** one job at a time, `JOB_TIMEOUT_S` 300 s, one retry. The previous 2026-10-09 hangs (`SELECT *`, 2M rows) fit the same pattern.
 
 ## Validation
 
@@ -113,7 +122,7 @@ No fake TAP server or network-free unit tests (owner, 2026-10-10). The checks of
 | Step | Work | Who |
 |---|---|---|
 | 0 | This design; owner approval | integrator |
-| 1 | `ssp/export/ppdb_tap.py` and its wiring into `ssp-extract-sso-inputs`; `requests` in the dependencies; the CLAUDE.md etiquette | integrator |
+| 1 | `ssp/export/ppdb_tap.py` and its wiring into `ssp-extract-sso-inputs`; pyvo and `requests` in the dependencies; the CLAUDE.md etiquette | integrator |
 | 2 | The real-data checks and the NearbySSO rebuild; the runbook (`docs/runbooks/sso-daily.md`: the token, the option, failures); results recorded here | integrator |
 | 3 | Tell ssp-daily about the new default (the token on its node, network access to data-int) | integrator |
 | 4 | Branch → master | owner approval |
@@ -124,3 +133,19 @@ A single module, so no work packages and no separate review agent.
 
 - The other PPDB tables over TAP.
 - Using the TAP data for the (visit, detector) work of #86. This design leaves that open; the visit counts from step 1 could feed it later.
+
+## Results (2026-10-11)
+
+**The extract** (`ssp-extract-sso-inputs --only ppdb_dia_sources`, data-int, one job at a time, pyvo):
+- 17,863,456 rows, 5,919 visits (2025102400199..2026071300816), 18 chunks; no retries or refetches. Counting took 8 s; the whole step 227 s; peak RSS 5.0 GB. No jobs left on the server.
+- The file (md5 `cb74473e…`) is byte-identical to the first, 4-jobs-at-a-time run without pyvo, and equal row for row to the 2026-10-09 full TAP export's five columns.
+- `--tap-url none` reproduces the 2026-10-09 ClickHouse file byte for byte (md5 `931d2810…`, 13 s).
+
+**Against ClickHouse `ppdb.DiaSource`** (the 2026-10-09 file):
+- 4,782,407 DiaSources only in the PPDB, on 26 nights from 2026-05-21 to 2026-07-13.
+- 3,650 only in ClickHouse, on 2026-02-18, 19, 22 and 23.
+- ClickHouse holds 2,226 `diaSourceId`s twice (4,452 rows; 2026-02-19, 22 and 23); for each, one copy equals the PPDB's row. The 13,078,823 DiaSources present once in both are identical in all five columns.
+
+**The build** (`ssp-build-sso` on the 2026-10-09 inputs with the TAP `ppdb_dia_sources`, 32 workers): deliverable, all 8 checks PASS, 13.6 min.
+- NearbySSO: 1,295,205 → **1,713,936 rows** (+32%), from the visits ClickHouse lacked. The step took 379 s (345 s before), 11.9 GB peak RSS (11.7).
+- SSObject, `mpc_orbits`, `current_identifications` and `numbered_identifications` are byte-identical to the 2026-10-09 delivery. SSObservation's parts equal the `obssubid` check build of the same inputs (it differs from the 2026-10-09 delivery only by that new column).

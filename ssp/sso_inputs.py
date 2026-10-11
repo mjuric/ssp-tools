@@ -25,8 +25,9 @@ extract"). The steps:
     step run, or a reused one) therefore also runs ``dia_sources``, unless
     ``dia_sources`` is itself reused.
 ``ppdb_dia_sources``
-    The five ``ppdb.DiaSource`` columns NearbySSO reads, one read-only
-    query.
+    The five ``ppdb.DiaSource`` columns NearbySSO reads: from the PPDB's TAP
+    service (``--tap-url``, data-int by default; ssp.export.ppdb_tap), or
+    with ``--tap-url none`` one read-only ClickHouse query.
 
 Nothing in INPUTS_DIR changes until every step has succeeded: the steps
 write under ``INPUTS_DIR/.partial/`` (the MPC export's temporary CSVs
@@ -85,6 +86,7 @@ MPC_DBNAME = "mpc_sbn"
 MPC_USER = "rubin"
 
 from ssp.export.submittable import current_host  # noqa: E402 (the ClickHouse host, see there)
+from ssp.export import ppdb_tap  # noqa: E402
 CH_PORT = 8123
 CH_DATABASE = "ssp"     # the database the ~/.chpass line is for
 
@@ -217,8 +219,25 @@ def extract_dia_sources(obs_path, out_path, args):
     return report.get(SHUTTER_MANIFEST_FIELD[0])
 
 
+def tap_url(args):
+    """--tap-url, or None for 'none' (ClickHouse)."""
+    return None if args.tap_url.strip().lower() in ("", "none") else args.tap_url
+
+
+def ppdb_source(args):
+    if tap_url(args):
+        return f"PPDB TAP {tap_url(args)}: {ppdb_tap.SELECT}"
+    return f"{ch_source(args)}: {PPDB_SQL}"
+
+
 def export_ppdb(out_path, args):
-    """The five ``ppdb.DiaSource`` columns, streamed to ``out_path``."""
+    """The five ``ppdb.DiaSource`` columns, written to ``out_path``.
+    Returns the manifest's ``ppdb_tap`` details (None from ClickHouse)."""
+    if tap_url(args):
+        try:
+            return ppdb_tap.export(out_path, tap_url(args), args.tap_token)
+        except ppdb_tap.PPDBTapError as e:
+            raise ExtractError(f"ppdb_dia_sources: {e}") from None
     import clickhouse_connect
 
     from ssp.export.submittable import bypass_proxy, credentials
@@ -485,9 +504,11 @@ def _run(args, out):
             files["dia_sources"]["obs_sbn_md5"] = obs_md5
         elif step == "ppdb_dia_sources":
             staged["ppdb_dia_sources"] = tmp / INPUT_FILES["ppdb_dia_sources"][0]
-            export_ppdb(staged["ppdb_dia_sources"], args)
+            details = export_ppdb(staged["ppdb_dia_sources"], args)
             files["ppdb_dia_sources"] = describe("ppdb_dia_sources", staged["ppdb_dia_sources"],
-                                                 f"{ch_source(args)}: {PPDB_SQL}", iso(started))
+                                                 ppdb_source(args), iso(started))
+            if details:
+                files["ppdb_dia_sources"]["ppdb_tap"] = details
         timings[step] = time.time() - t0
         for name in STEPS[step]:
             print(f"{name}: {files[name]['rows']:,} rows, md5 {files[name]['md5']}", flush=True)
@@ -568,6 +589,12 @@ def build_parser():
     g.add_argument("--workers", type=int, default=MAX_WORKERS,
                    help=f"Concurrent extract-submitted-sources queries, at most {MAX_WORKERS} "
                         "(the server is shared; default: %(default)s)")
+    g = p.add_argument_group("PPDB TAP (ppdb_dia_sources)")
+    g.add_argument("--tap-url", default=ppdb_tap.DEFAULT_TAP_URL,
+                   help="The PPDB TAP service to read ppdb.DiaSource from; 'none' reads ClickHouse "
+                        "ppdb.DiaSource instead (default: %(default)s)")
+    g.add_argument("--tap-token", default=ppdb_tap.DEFAULT_TOKEN_FILE, metavar="FILE",
+                   help="The file holding its bearer token, mode 0600 (default: %(default)s)")
     add_correction_args(p.add_argument_group("Shutter-motion correction (dia_sources)"))
     return p
 
