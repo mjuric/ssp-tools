@@ -946,6 +946,28 @@ def test_same_orbits_asteroid_row_at_10_flagged():
     assert V.beyond_radius(nss).tolist() == [True, False]
 
 
+def test_beyond_radius_allows_the_move_to_the_row_time():
+    """ephOffset is measured again at the row's own time (the sidecar's):
+    a row matched at the DiaSource's (visit) time may end beyond the radius
+    by up to |rate| |dt|. 0.1 deg/d over 0.116 s is 0.48 mas."""
+    nss, sss, dia, lookup, sigma_fn = _radius_case([(1, ROCK, 5.0), (2, ROCK, 5.0)])
+    dt = 0.116 / 86400
+    nss = nss.assign(ephOffset=np.float32(5.0 + 1e-4 + 0.4e-3),        # beyond by 0.4 mas
+                     ephRateRa=np.float32(0.1), ephRateDec=np.float32(0.0))
+    nss.loc[1, "ephOffset"] = np.float32(5.0 + 1e-4 + 0.6e-3)          # beyond the move (0.49 mas)
+    # without the row time (no sidecar): strict, both flagged
+    assert V.beyond_radius(nss, allow_arcsec=V.move_allowance_arcsec(nss, dia)).tolist() == [True, True]
+    timed = nss.assign(midpointMjdTai=60800.0 - dt)
+    move = V.move_allowance_arcsec(timed, dia)
+    assert move[0] == pytest.approx((0.1 * dt * 3.6e6 * 1.02 + 0.05) / 1e3, rel=1e-4)   # MJD rounding
+    assert V.beyond_radius(timed, allow_arcsec=move).tolist() == [False, True]
+    _, summ = V.compare_to_ssobservation(timed, sss, dia, lookup, sigma_fn)
+    assert summ["n_nearbysso_beyond_radius"] == 1 and summ["nearbysso_beyond_radius"] == [2]
+    assert summ["n_nearbysso_beyond_radius_by_move"] == 1
+    _, summ = V.compare_to_ssobservation(nss, sss, dia, lookup, sigma_fn)
+    assert summ["n_nearbysso_beyond_radius"] == 2
+
+
 def test_same_orbits_comet_at_20_beyond_radius():
     nss, sss, dia, lookup, sigma_fn = _radius_case([(1, COMET, 20.0)])
     rows, summ = V.compare_to_ssobservation(nss[:0], sss, dia, lookup, sigma_fn)

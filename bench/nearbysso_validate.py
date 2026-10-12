@@ -948,7 +948,12 @@ def compare_to_ssobservation(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
     in_sss = np.isin(nss["diaSourceId"].to_numpy(), d["diaSourceId"].to_numpy())
     # NearbySSO rows beyond their own object's match radius (wrong,
     # whatever SSObservation says)
-    beyond = beyond_radius(nss, radius)
+    move = move_allowance_arcsec(nss, dia)
+    beyond = beyond_radius(nss, radius, move)
+    radius_plain = radius_of(nss["designation"].to_numpy(), radius) + OFFSET_EPS
+    off = nss["ephOffset"].to_numpy(np.float64) if "ephOffset" in nss else np.full(len(nss), np.nan)
+    with np.errstate(invalid="ignore"):
+        moved_beyond = (np.nan_to_num(off) > radius_plain) & ~beyond
     counts = pd.Series(status).value_counts().to_dict()
     ms = d[same]
     summary = {
@@ -958,6 +963,8 @@ def compare_to_ssobservation(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
         "n_nearbysso_not_in_ssobservation": int((~in_sss).sum()),
         "n_nearbysso_beyond_radius": int(beyond.sum()),
         "nearbysso_beyond_radius": nss.loc[beyond, "diaSourceId"].head(10).tolist(),
+        "n_nearbysso_beyond_radius_by_move": int(moved_beyond.sum()),
+        "max_move_allowance_mas": float(np.max(move)) * 1e3 if len(move) else 0.0,
         "status_counts": {k: int(v) for k, v in sorted(counts.items())},
         "n_identical": int(identical.sum()),
         "max_d_pos_mas": float(np.nanmax(ms["d_pos_mas"])) if len(ms) else np.nan,
@@ -976,15 +983,44 @@ def compare_to_ssobservation(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
     return d, summary
 
 
-def beyond_radius(nss, radius=None):
+def move_allowance_arcsec(nss, dia):
+    """Per NearbySSO row, the motion [arcsec] between the DiaSource's time
+    (``dia``'s midpointMjdTai, the visit-time prediction the match used)
+    and the row's own time (``nss``'s midpointMjdTai, from the sidecar):
+    |rate| |t_row - t_DiaSource| (1 + REL_MARGIN) + ABS_MARGIN_MAS, as
+    bench/time_shift.py's rule for "beyond the match radius". 0 where
+    either time is unknown (no sidecar: strict) or they are equal.
+    ephOffset is measured again at the row's time
+    (docs/design/nearbysso-unmatched.md, "Times"), so a row matched within
+    the radius at the visit's time may end just beyond it."""
+    nss = pd.DataFrame(nss)
+    n = len(nss)
+    if not n or "midpointMjdTai" not in nss or dia is None or "midpointMjdTai" not in dia:
+        return np.zeros(n)
+    t_dia = (pd.DataFrame(dia).drop_duplicates("diaSourceId").set_index("diaSourceId")["midpointMjdTai"])
+    ids = nss["diaSourceId"]
+    t_d = np.full(n, np.nan)
+    have = ids.notna().to_numpy()
+    if have.any():
+        t_d[have] = t_dia.reindex(ids[have].astype("int64").to_numpy()).to_numpy(np.float64)
+    dt = TS.dt_days(nss["midpointMjdTai"].to_numpy(np.float64), t_d)
+
+    def f(c):
+        return nss[c].to_numpy(np.float64) if c in nss else np.full(n, np.nan)
+    return TS.position_mas(TS.rate_deg_day(f("ephRateRa"), f("ephRateDec")), dt) / 1e3
+
+
+def beyond_radius(nss, radius=None, allow_arcsec=None):
     """Mask of NearbySSO rows whose ephOffset exceeds their object's match
-    radius (`radius_of`) by more than OFFSET_EPS: rows that shouldn't
+    radius (`radius_of`) by more than OFFSET_EPS (+ ``allow_arcsec``, the
+    move to the row's time, `move_allowance_arcsec`): rows that shouldn't
     exist (all False if there's no ephOffset)."""
     nss = pd.DataFrame(nss)
     if "ephOffset" not in nss or not len(nss):
         return np.zeros(len(nss), bool)
     off = nss["ephOffset"].to_numpy(np.float64)
-    return np.nan_to_num(off, nan=0.0) > radius_of(nss["designation"].to_numpy(), radius) + OFFSET_EPS
+    allow = 0.0 if allow_arcsec is None else np.asarray(allow_arcsec, np.float64)
+    return np.nan_to_num(off, nan=0.0) > radius_of(nss["designation"].to_numpy(), radius) + OFFSET_EPS + allow
 
 
 def report_comparison(rep, summary, tol=None):
@@ -996,7 +1032,11 @@ def report_comparison(rep, summary, tol=None):
            if summary.get("n_nearbysso_unmatched") else ""))
     rep(f"NearbySSO rows with ephOffset beyond their object's match radius: "
         f"{summary['n_nearbysso_beyond_radius']:,}"
-        + (f" (e.g. {summary['nearbysso_beyond_radius']})" if summary['n_nearbysso_beyond_radius'] else ""))
+        + (f" (e.g. {summary['nearbysso_beyond_radius']})" if summary['n_nearbysso_beyond_radius'] else "")
+        + (f"; beyond it only by the move from the DiaSource's time to the row's (allowed: |rate| |dt| "
+           f"(1 + {TS.REL_MARGIN}) + {TS.ABS_MARGIN_MAS} mas, max {summary['max_move_allowance_mas']:.3g} "
+           f"mas): {summary['n_nearbysso_beyond_radius_by_move']:,}"
+           if "n_nearbysso_beyond_radius_by_move" in summary else ""))
     rep("status of each SSObservation row:")
     for k, v in summary["status_counts"].items():
         rep(f"  {k:32s} {v:>10,}")

@@ -194,8 +194,11 @@ SUNGRAZER_Q_AU = 0.02
 #: observation), so a miss within 2% of a cut is explained by the cut.
 CUT_BORDER_REL = 0.02
 #: (visit, ra, dec) matching of SSObservation rows without a diaSourceId to the
-#: NearbySSO input: both copy the same measurement, so any real difference
-#: is float rounding; 1 mas is far below the source density.
+#: NearbySSO input; 1 mas is far below the source density. Such a row is a
+#: Source (measuredOn = science), a measurement of its own, not a copy of
+#: the DiaSource: on the 2026-10-11 delivery its ra/dec differ from the
+#: DiaSource's by up to 0.998 mas (230 rows of NV-S and AP-S), so the
+#: ephOffset comparison allows that separation (``allow_offset_radec``).
 POSITION_MATCH_MAS = 1.0
 #: A miss SSObservation's ellipse doesn't explain is asked of propagate.coarse
 #: at these offsets [days] from the observation: NearbySSO gates on the
@@ -815,10 +818,19 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     rep.check("no NearbySSO row names an orbit the filter drops", not dropped,
               f"{len(named)} objects named" + (f"; dropped by the filter: {dropped[:10]}" if dropped else ""))
     if "ephOffset" in nss:
+        # ephOffset is measured again at the row's own time (the sidecar's)
+        # while the match used the visit-time prediction: allow the move
+        # between the two (0 without a sidecar)
+        from bench.nearbysso_validate import move_allowance_arcsec
+        move = move_allowance_arcsec(nss, dia)
         with np.errstate(invalid="ignore"):
-            far = nss["ephOffset"].to_numpy(np.float64) > match_radius(nd) + OFFSET_TOL_ARCSEC
+            off = nss["ephOffset"].to_numpy(np.float64, na_value=np.nan)
+            far = off > match_radius(nd) + OFFSET_TOL_ARCSEC + move
+            n_moved = int(((off > match_radius(nd) + OFFSET_TOL_ARCSEC) & ~far).sum())
         rep.check("no NearbySSO row beyond its object's match radius", not far.any(),
-                  f"{int(far.sum())} rows" + (": " + "; ".join(
+                  f"{int(far.sum())} rows; {n_moved} beyond it only by the move from the DiaSource's time to "
+                  f"the row's (allowed, max {1e3 * float(np.max(move, initial=0.0)):.3g} mas)"
+                  + (": " + "; ".join(
                       f"{d} {o:.3f}\"" for d, o in zip(nd[far][:5], nss["ephOffset"].to_numpy()[far][:5]))
                       if far.any() else ""))
 
@@ -873,8 +885,19 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
                        "allow_vmag": TS.vmag_allowance(dt, rate, f("topoRange"), f("topoRangeRate"),
                                                        f("helioRange"), f("helioRangeRate"))})
     match = has & (nss_des == des)
+    # the two ephOffsets are measured against different coordinates where
+    # the SSObservation row is a Source (measuredOn = science) mapped to
+    # the DiaSource by position: SSObservation against the Source's
+    # ra/dec, NearbySSO against the DiaSource's, up to POSITION_MATCH_MAS
+    # apart; they then differ by up to that separation (0 where the
+    # coordinates are the same, as for rows mapped by diaSourceId)
+    dpos = dia.drop_duplicates("diaSourceId").set_index("diaSourceId")
     with np.errstate(invalid="ignore"):
-        df["pos_mas"] = np.where(match, sky_sep_arcsec(f("ephRa"), f("ephDec"), col("ephRa"), col("ephDec"))
+        radec = sky_sep_arcsec(f("ra"), f("dec"), dpos["ra"].reindex(dsid[in_input]).to_numpy(np.float64),
+                               dpos["dec"].reindex(dsid[in_input]).to_numpy(np.float64))
+    df["allow_offset_radec"] = np.nan_to_num(radec, nan=0.0)
+    with np.errstate(invalid="ignore"):
+        df["pos_mas"] =np.where(match, sky_sep_arcsec(f("ephRa"), f("ephDec"), col("ephRa"), col("ephDec"))
                                  * 1000.0, np.nan)
         # where dt != 0: what's left once the motion over dt is taken out
         mean_ra = np.where(np.isfinite(col("ephRateRa")), (f("ephRateRa") + col("ephRateRa")) / 2,
@@ -995,13 +1018,14 @@ def _nearbysso_gates(df, rep):
             ("ephRateRa", "rate_ra", RATE_TOL_DEG_DAY, allow("allow_rate")),
             ("ephRateDec", "rate_dec", RATE_TOL_DEG_DAY, allow("allow_rate")),
             ("ephVmag", "vmag", VMAG_TOL, allow("allow_vmag")),
-            ("ephOffset", "offset", OFFSET_TOL_ARCSEC, allow("allow_pos_mas") / 1e3)):
+            ("ephOffset", "offset", OFFSET_TOL_ARCSEC,
+             allow("allow_pos_mas") / 1e3 + allow("allow_offset_radec"))):
         v = m[col].to_numpy(dtype=np.float64)
         bad = np.isfinite(v) & (v > tol + extra)
         worst = m.iloc[int(np.nanargmax(v))] if np.isfinite(v).any() else None
         rep.check(f"matched rows agree: {name}", not bad.any(),
                   f"{len(m):,} rows, max {np.nanmax(v) if np.isfinite(v).any() else float('nan'):.3g} "
-                  f"(tol {tol:g}" + (" + the time-shift allowance" if np.any(extra) else "")
+                  f"(tol {tol:g}" + (" + the allowances" if np.any(extra) else "")
                   + (f"; {int(bad.sum())} beyond, worst {worst['designation']}" if bad.any() else "") + ")")
     night = df[df["status"].str.contains("within the night", regex=False)]
     if len(night):
