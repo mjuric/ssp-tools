@@ -135,48 +135,46 @@ def open_store(store_dir, nights, visits):
 def wcs_footprints(store_dir, visits, ra, dec, margin_arcsec=PLACEMENT_MARGIN_ARCSEC):
     """Set, in place, the ``center`` and ``radius`` of each visit of
     ``visits`` (VISIT_DTYPE, ``build_visits`` of the visit-sorted
-    DiaSources at ``ra``, ``dec`` [deg]) that has a WCS to its WCS
-    footprint (``visit_table.locate.footprints``: the centre of its
-    detectors' corners and the radius to the farthest one, rejected
-    detectors left out, as ``WcsStore.locator``) plus ``margin_arcsec``
-    (design step 1). Where some of the visit's DiaSources lie farther out
-    (on a detector without a WCS), the radius grows to enclose them too, so
-    that no prediction a DiaSource could match is lost. Visits without a
-    WCS keep their DiaSource footprint. Returns (per visit: whether it has a
-    WCS footprint, whether its DiaSources widened it)."""
+    DiaSources at ``ra``, ``dec`` [deg]) that has a WCS to its field
+    (``visit_table.locate.footprints``: the fitted boresight with the
+    LSSTCam field radius, else the commanded boresight with a larger one)
+    plus ``margin_arcsec`` (design step 1). The field holds the whole
+    science array, so no DiaSource should lie outside it; any that does is
+    counted, not used to widen the field. Visits without a WCS keep their
+    DiaSource footprint. Returns per visit: whether it has a WCS footprint,
+    whether its centre is the fitted boresight, and the number of its
+    DiaSources outside the footprint."""
     from .visits import _unit_vectors
 
     n = len(visits)
     has = np.zeros(n, bool)
-    widened = np.zeros(n, bool)
+    fitted = np.zeros(n, bool)
+    outside = np.zeros(n, np.int64)
     if store_dir is None or not n:
-        return has, widened
+        return has, fitted, outside
     paths = wcs_paths(store_dir, visits["night"])
     if not paths:
-        return has, widened
+        return has, fitted, outside
     from visit_table.locate import footprints
     fp = footprints(paths, visits=np.asarray(visits["visit"], np.int64))
     fid = fp["visitId"].to_numpy()
     if not fid.size:
-        return has, widened
+        return has, fitted, outside
     j = np.minimum(np.searchsorted(visits["visit"], fid), n - 1)
     hit = visits["visit"][j] == fid
     j = j[hit]
     has[j] = True
-    center = visits["center"].copy()
-    center[j] = _unit_vectors(fp["ra"].to_numpy()[hit], fp["dec"].to_numpy()[hit])
-    radius = np.radians(fp["radius"].to_numpy()[hit] + margin_arcsec / 3600.0)
-    # the farthest DiaSource of each visit from its (new) centre (the chord,
-    # accurate at small angles; 1e-9 rad for rounding, as build_visits)
+    fitted[j] = fp["fitted"].to_numpy(zero_copy_only=False)[hit]
+    visits["center"][j] = _unit_vectors(fp["ra"].to_numpy()[hit], fp["dec"].to_numpy()[hit])
+    visits["radius"][j] = np.radians(fp["radius"].to_numpy()[hit] + margin_arcsec / 3600.0)
+    # DiaSources outside the footprint (the chord, accurate at small angles)
     starts, ends = visits["dia_start"], visits["dia_end"]
     uv = _unit_vectors(np.asarray(ra, np.float64), np.asarray(dec, np.float64))
-    uv -= np.repeat(center, ends - starts, axis=0)
-    chord = np.maximum.reduceat(np.linalg.norm(uv, axis=1), starts)
-    dia_r = 2.0 * np.arcsin(np.minimum(chord / 2.0, 1.0)) + 1e-9
-    widened[j] = dia_r[j] > radius
-    visits["center"][j] = center[j]
-    visits["radius"][j] = np.maximum(radius, dia_r[j])
-    return has, widened
+    uv -= np.repeat(visits["center"], ends - starts, axis=0)
+    r = 2.0 * np.arcsin(np.minimum(np.linalg.norm(uv, axis=1) / 2.0, 1.0))
+    out = r > np.repeat(visits["radius"], ends - starts)
+    outside[j] = np.add.reduceat(out.astype(np.int64), starts)[j]
+    return has, fitted, outside
 
 
 def place_rows(store, visit, ra, dec, margin_arcsec=PLACEMENT_MARGIN_ARCSEC):

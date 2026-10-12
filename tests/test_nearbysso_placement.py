@@ -125,22 +125,27 @@ class Visit:
         return out
 
 
-def write_store(path, visits, snapshot=7, rejected=()):
-    """The store of ``visits``, with every detector of the visits in
-    ``rejected`` rejected."""
+def write_store(path, visits, snapshot=7, rejected=(), unfitted=()):
+    """The store of ``visits`` (format 2), with every detector of the visits
+    in ``rejected`` rejected; the boresight is (ra0, dec0), commanded and
+    fitted, except that visits in ``unfitted`` have no fit."""
     path.mkdir(parents=True, exist_ok=True)
     by_night = {}
     for v in visits:
-        by_night.setdefault(v.visit // 100000, []).extend(v.rows(rejected=v.visit in rejected))
+        fit = None if v.visit in unfitted else (v.ra0, v.dec0)
+        rows = [dict(r, s_ra=v.ra0, s_dec=v.dec0, astrom_ra=fit and fit[0], astrom_dec=fit and fit[1])
+                for r in v.rows(rejected=v.visit in rejected)]
+        by_night.setdefault(v.visit // 100000, []).extend(rows)
     schema = pa.schema([("visitId", pa.int64()), ("detector", pa.int64()),
                         ("bbox", pa.list_(pa.field("element", pa.float64()), 4)),
                         ("corners", pa.list_(pa.float64())), ("tangent", pa.list_(pa.float64())),
                         ("scale", pa.float64()), ("cx", pa.list_(pa.float64())),
                         ("cy", pa.list_(pa.float64())),
-                        ("rejected", pa.bool_())])
+                        ("rejected", pa.bool_()), ("s_ra", pa.float64()), ("s_dec", pa.float64()),
+                        ("astrom_ra", pa.float64()), ("astrom_dec", pa.float64())])
     for night, rows in by_night.items():
         pq.write_table(pa.Table.from_pylist(rows, schema=schema), path / f"day_obs={night}.parquet")
-    state = dict(modelVersion="cubic-gnomonic-1", formatVersion=1,
+    state = dict(modelVersion="cubic-gnomonic-1", formatVersion=2,
                  nights={str(n): dict(fromSnapshot=snapshot - (i % 2)) for i, n in enumerate(by_night)})
     (path / "_state.json").write_text(json.dumps(state))
     return path
@@ -793,20 +798,23 @@ def test_orphan_rows_are_unmatched_rows(tmp_path, uscene, table):
 
 
 def test_wcs_footprint_selects_candidates(tmp_path):
-    """The visit footprint is the WCS's plus the margin: an object on a
-    detector far from every DiaSource is a candidate, which the DiaSource
-    footprint missed; a DiaSource beyond the WCS footprint (on a detector
-    without one) widens it; a visit without a WCS keeps its DiaSources'."""
+    """The visit footprint is the field about the boresight plus the
+    margin: an object on a detector far from every DiaSource is a
+    candidate, which the DiaSource footprint missed; a visit without a fit
+    takes the commanded boresight's larger field; a DiaSource beyond the
+    field is counted, not used to widen it; a visit without a WCS keeps its
+    DiaSources'."""
     from test_nearbysso_visits import great_circle_path, make_track
+    from visit_table.locate import FIELD_RADIUS, FIELD_RADIUS_COMMANDED
 
     from ssp.nearbysso import visits as V
 
     v1, v2, v3 = 2026010500301, 2026010500302, 2026010500303
     layout = {v1: Visit(v1, 150.0, -10.0), v2: Visit(v2, 160.0, -10.0)}
-    store = write_store(tmp_path / "wcs", list(layout.values()))
-    # DiaSources: v1's near its centre; v2's also one 0.5 deg beyond its
-    # detectors; v3 (no WCS) near (170, -10)
-    src = {v1: [(150.0, -10.0), (150.01, -10.01)], v2: [(160.0, -10.0), (160.0, -9.3)],
+    store = write_store(tmp_path / "wcs", list(layout.values()), unfitted={v2})
+    # DiaSources: v1's near its centre; v2's also one 2.5 deg out, beyond
+    # its field; v3 (no WCS) near (170, -10)
+    src = {v1: [(150.0, -10.0), (150.01, -10.01)], v2: [(160.0, -10.0), (160.0, -7.5)],
            v3: [(170.0, -10.0), (170.02, -10.0)]}
     ra = np.array([r for v in sorted(src) for r, _ in src[v]])
     dec = np.array([d for v in sorted(src) for _, d in src[v]])
@@ -821,14 +829,14 @@ def test_wcs_footprint_selects_candidates(tmp_path):
         vis["center"][j] = c / np.linalg.norm(c)
         vis["radius"][j] = V._angle(uv[2 * j:2 * j + 2], vis["center"][j]).max() + 1e-9
     before = vis.copy()
-    has, widened = P.wcs_footprints(str(store), vis, ra, dec)
-    assert list(has) == [True, True, False] and list(widened) == [False, True, False]
+    has, fitted, outside = P.wcs_footprints(str(store), vis, ra, dec)
+    assert list(has) == [True, True, False] and list(fitted) == [True, False, False]
+    assert list(outside) == [0, 1, 0]
     assert vis[2].tobytes() == before[2].tobytes()
-    from visit_table.locate import footprints
-    fp = footprints([str(store / "day_obs=20260105.parquet")]).to_pandas().set_index("visitId")
-    np.testing.assert_allclose(np.degrees(vis["radius"][0]), fp.loc[v1, "radius"] + 30.0 / 3600, rtol=1e-12)
-    np.testing.assert_allclose(V._unit_vectors(fp.loc[v1, "ra"], fp.loc[v1, "dec"]), vis["center"][0])
-    assert np.degrees(vis["radius"][1]) > fp.loc[v2, "radius"] + 0.3       # (enclosing (160, -9.3))
+    for j, (v, r) in enumerate(((v1, FIELD_RADIUS), (v2, FIELD_RADIUS_COMMANDED))):
+        np.testing.assert_allclose(np.degrees(vis["radius"][j]), r + 30.0 / 3600, rtol=1e-12)
+        np.testing.assert_allclose(vis["center"][j], V._unit_vectors(layout[v].ra0, layout[v].dec0),
+                                   atol=1e-15)
     # a stationary object on v1's detector 96, ~0.3 deg from its DiaSources
     on96 = layout[v1].pix2sky(96, np.array([3000.0]), np.array([2000.0]))
     pos = great_circle_path(np.array(on96[0][0]), np.array(on96[1][0]), 90.0, 0.0, 26356.0)

@@ -6,8 +6,9 @@ sliced:
 
 1. **Visits** (``read_workers`` forked processes, one slice each): read a
    slice (``visits.read_dia``) and derive its visits (``build_visits``),
-   each with its footprint: the WCS's plus PLACEMENT_MARGIN_ARCSEC where
-   the visit has one, else its DiaSources' (``placement.wcs_footprints``).
+   each with its footprint: its field (boresight and LSSTCam field radius)
+   plus PLACEMENT_MARGIN_ARCSEC where the visit has a WCS, else its
+   DiaSources' (``placement.wcs_footprints``).
    The parent concatenates them into one ``visits`` array over all nights,
    builds one ``VisitIndex`` and computes the observer at the coarse
    sample times.
@@ -366,7 +367,8 @@ def own_times(dia, visits):
 def _visits_slice(s0, s1):
     """Slices [s0, s1): per slice (its visits, rows read, seconds reading,
     seconds in build_visits, ``own_times`` of its visits, and per visit
-    whether it has a WCS footprint and whether its DiaSources widened it;
+    whether it has a WCS footprint, whether that is centred on the fitted
+    boresight and how many of its DiaSources lie outside it;
     ``placement.wcs_footprints``), and the peak RSS."""
     w = _W
     out = []
@@ -376,8 +378,9 @@ def _visits_slice(s0, s1):
         t1 = time.perf_counter()
         vis = _visits.build_visits(dia, threads=w["threads"])
         own = own_times(dia, vis)
-        fp, widened = _place.wcs_footprints(w.get("wcs_store"), vis, dia["ra"], dia["dec"])
-        out.append((vis, int(dia["diaSourceId"].size), t1 - t0, time.perf_counter() - t1, own, fp, widened))
+        fp, fitted, outside = _place.wcs_footprints(w.get("wcs_store"), vis, dia["ra"], dia["dec"])
+        out.append((vis, int(dia["diaSourceId"].size), t1 - t0, time.perf_counter() - t1, own, fp, fitted,
+                    outside))
         del dia
     return out, _peak_rss_gb()
 
@@ -1323,11 +1326,14 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     vis_parts = [r[0] for r in per_slice]
     visits = np.concatenate(vis_parts) if vis_parts else np.zeros(0, VISIT_DTYPE)
     own = np.concatenate([r[4] for r in per_slice]) if per_slice else np.zeros(0, bool)
-    # (the candidates' footprints: the WCS's where there is one, step 1)
+    # (the candidates' footprints: the field about the boresight where the
+    # visit has a WCS, step 1)
     footprint = dict(visits_wcs=int(sum(r[5].sum() for r in per_slice)),
-                     widened_by_dia=int(sum(r[6].sum() for r in per_slice)))
-    widened = [int(v) for r in per_slice for v in r[0]["visit"][r[6]]]
-    footprint["widened_examples"] = widened[:_N_EXAMPLES]
+                     visits_commanded=int(sum((r[5] & ~r[6]).sum() for r in per_slice)),
+                     dia_outside=int(sum(r[7].sum() for r in per_slice)),
+                     visits_dia_outside=int(sum((r[7] > 0).sum() for r in per_slice)))
+    outside = [int(v) for r in per_slice for v in r[0]["visit"][r[7] > 0]]
+    footprint["dia_outside_examples"] = outside[:_N_EXAMPLES]
     vstart = np.r_[0, np.cumsum([v.size for v in vis_parts])].astype(np.int64)
     n_dia = sum(r[1] for r in per_slice)
     rep["slices"] = [dict(nights=[sl["night_lo"], sl["night_hi"]], dia=r[1], dia_dropped=sl["n"] - r[1],
@@ -1607,8 +1613,9 @@ def _print_report(rep):
     print(f"unmatched rows: {pl['unmatched_rows']:,} of {dg['eligible_predictions']:,} eligible predictions "
           f"(dropped: {pl['dropped_beyond_margin']:,} beyond the margin, {pl['dropped_no_wcs_visit']:,} in "
           f"visits without a WCS; {dg['orphaned_predictions']:,} orphaned by a repeated diaSourceId); "
-          f"WCS footprints for {fp.get('visits_wcs', 0):,} visits, {fp.get('widened_by_dia', 0):,} widened "
-          f"by their DiaSources")
+          f"WCS footprints for {fp.get('visits_wcs', 0):,} visits ({fp.get('visits_commanded', 0):,} on the "
+          f"commanded boresight), {fp.get('dia_outside', 0):,} DiaSources outside them in "
+          f"{fp.get('visits_dia_outside', 0):,} visits")
     print("timings [s]: " + ", ".join(f"{k} {v:.1f}" for k, v in tim.items() if not isinstance(v, dict))
           + "; pass 2 worker CPU: " + ", ".join(f"{k} {v:.1f}" for k, v in tim["worker_cpu"].items())
           + "; pass 3 worker CPU: " + ", ".join(f"{k} {v:.1f}" for k, v in tim["pass3_cpu"].items()))
