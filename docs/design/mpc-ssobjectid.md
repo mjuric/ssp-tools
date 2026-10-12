@@ -1,5 +1,7 @@
 # ssObjectId in the MPC tables
 
+**Status: dropped by the owner (2026-10-12).** Nothing changes in how `ssObjectId` and `designation` are defined or filled. The design is kept for the record.
+
 ## Context
 
 The PPDB's Solar System tables carry three tables replicated from the MPC: `mpc_orbits`, `current_identifications` and `numbered_identifications` (`sso_base.yaml`, `ppdb.yaml`; lsst/sdm_schemas#549, DM-55375). They are keyed by designation only. SSObject, SSObservation and NearbySSO are keyed by the integer `ssObjectId`.
@@ -18,6 +20,7 @@ ssp-daily checked on that day's data (ClickHouse ppdb, generation 43):
 | Upstream ticket (2026-10-12) | In DM-55375, lsst/sdm_schemas#549, which is still open, so the PPDB dataset is rebuilt only once. |
 | Semantics (2026-10-12) | Every row carries the `ssObjectId` of its **primary** provisional designation. In `current_identifications` a secondary designation, and in `numbered_identifications` a permanent number, resolves to the object's id. |
 | Description (2026-10-12) | Brief. The schema doesn't describe how the id is computed: that is an implementation detail and may change. Users shouldn't rely on the ids outside the data; to keep a reference to an object, they keep its designation. |
+| Dropped (2026-10-12) | After review of the present state (below), nothing changes: no `ssObjectId` in the MPC tables, and the existing columns keep their meaning. `ssObjectId` is set only where the object has an SSObject row (in NearbySSO, 2,393,057 of 3,437,970 rows are NULL: 234,003 objects in mpc_orbits without an SSObject row). `designation` is the MPC's primary designation where there is one, whether or not mpc_orbits has an orbit (in SSObservation, 18 rows of `2025 MH352` and `P/2025 OZ695` have one but no orbit). Where both are set they always agree (2026-10-09 delivery). The stale `current_identifications` row behind `P/2025 OZ695` (a second step to P/2005 S2) is to be reported to the MPC by the owner. |
 
 ## Outputs
 
