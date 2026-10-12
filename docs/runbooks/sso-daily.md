@@ -182,7 +182,7 @@ python -m bench.tail_angles_validate consistency RUN_DIR/delivery RUN_DIR/delive
     --dia-sources INPUTS_DIR/ppdb_dia_sources.parquet
 ```
 
-`--dia-sources` is needed since the shutter-timing correction (below); without it every pair is held to the strict rule.
+The check takes NearbySSO's time per row from its sidecar, `NearbySSO_internal.parquet` next to it (`--sidecar` to name another). `--dia-sources` is needed only for a delivery from before the sidecar, whose NearbySSO predicted at the DiaSource's time; with neither, every pair is held to the strict rule. The report's "time basis" line says which was used.
 
 **2026-10-01 rerun:** deliverable, all checks PASS. The output is in `/sdf/data/rubin/user/mjuric/tail-angles/rerun/2026-10-01/run/`.
 
@@ -196,7 +196,7 @@ NearbySSO matches comets and ISOs (designations C/, P/, D/, I/) within 15″, an
 
 SSObservation's `midpointMjdTai` is the exposure midpoint corrected for the shutter's motion, with two flags, `midpointMjdTai_flag` and `midpointMjdTai_flag_degraded` (`docs/design/shutter-timing.md`). The extract reads the correction table (above).
 
-**SSObservation vs. NearbySSO.** NearbySSO predicts at each DiaSource's own `midpointMjdTai`, still the visit time until AP corrects DiaSource. So at the same DiaSource the two tables differ by about the rate × Δt, Δt = SSObservation's time − the DiaSource's (≤ 0.24 s for most visits, up to ~2 s for header-timed, degraded ones): up to a few tens of mas for fast objects, more on the degraded visits. The checks that compare the two (`bench/tail_angles_validate.py consistency`, `bench/nearbysso_validate.py same-orbits`, `bench/nongrav_validate.py nearbysso`) take Δt from SSObservation and the DiaSource input, and allow for it (`bench/time_shift.py`):
+**SSObservation vs. NearbySSO.** NearbySSO evaluates each row at its own corrected time, recorded in its sidecar (`NearbySSO_internal.parquet`, `midpointMjdTai`; `docs/design/nearbysso-unmatched.md`). Before the sidecar it predicted at each DiaSource's own `midpointMjdTai`, the visit time until AP corrects DiaSource. At the same DiaSource the two tables differ by about the rate × Δt, Δt = SSObservation's time − NearbySSO's: with the sidecar Δt is at the microsecond level on matched pairs; against the DiaSource's time it is ≤ 0.24 s for most visits, up to ~2 s for header-timed, degraded ones. The checks that compare the two (`bench/tail_angles_validate.py consistency`, `bench/nearbysso_validate.py same-orbits`, `bench/nongrav_validate.py nearbysso`) take Δt from SSObservation and NearbySSO's sidecar (falling back to the DiaSource input without one, and for SSObservation rows whose DiaSource has no NearbySSO row), report the time basis they used, and allow for Δt (`bench/time_shift.py`):
 
 - where Δt = 0, the old tolerances, unchanged;
 - positions: the motion over Δt is taken out first, and what's left must be within the old tolerance plus 0.2% of |rate| |Δt|, a bound on the track's curvature over Δt, and 0.05 mas (2% of |rate| |Δt| where SSObservation has no ranges);

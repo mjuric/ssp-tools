@@ -57,8 +57,10 @@ exit 0 on PASS, 1 on FAIL)::
       the matched rows; no S/ objects; no NearbySSO row for an orbit the
       filter drops. ``--table FILE``: the per-row table (Parquet).
       Time shift (docs/design/shutter-timing.md): SSObservation predicts at its
-      own (shutter-corrected) midpointMjdTai, NearbySSO at the DiaSource's
-      (DIA_SOURCES' midpointMjdTai). Where they differ by dt, the
+      own (shutter-corrected) midpointMjdTai, NearbySSO at its own time per
+      row (its sidecar's midpointMjdTai, NearbySSO_internal.parquet next to
+      NEARBYSSO; a NearbySSO from before the sidecar predicted at the
+      DiaSource's, DIA_SOURCES' midpointMjdTai). Where they differ by dt, the
       agreement tolerances and the offset-radius and nearer-object
       explanations add bench/time_shift.py's allowances (position and
       ephOffset: |rate| |dt| plus a margin); where dt = 0 they are
@@ -192,8 +194,11 @@ SUNGRAZER_Q_AU = 0.02
 #: observation), so a miss within 2% of a cut is explained by the cut.
 CUT_BORDER_REL = 0.02
 #: (visit, ra, dec) matching of SSObservation rows without a diaSourceId to the
-#: NearbySSO input: both copy the same measurement, so any real difference
-#: is float rounding; 1 mas is far below the source density.
+#: NearbySSO input; 1 mas is far below the source density. Such a row is a
+#: Source (measuredOn = science), a measurement of its own, not a copy of
+#: the DiaSource: on the 2026-10-11 delivery its ra/dec differ from the
+#: DiaSource's by up to 0.998 mas (230 rows of NV-S and AP-S), so the
+#: ephOffset comparison allows that separation (``allow_offset_radec``).
 POSITION_MATCH_MAS = 1.0
 #: A miss SSObservation's ellipse doesn't explain is asked of propagate.coarse
 #: at these offsets [days] from the observation: NearbySSO gates on the
@@ -786,15 +791,20 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     """The comparison (DataFrames): ``nss`` NearbySSO rows, ``sss``
     SSObservation rows (designation, diaSourceId, visit, midpointMjdTai, ra,
     dec, eph*, optionally SHIFT_COLUMNS), ``dia`` the NearbySSO input
-    (diaSourceId, visit, ra, dec, optionally midpointMjdTai: without it the
-    time shift is taken as 0, i.e. strict), ``orbits``
+    (diaSourceId, visit, ra, dec, optionally midpointMjdTai), ``orbits``
     mpc_orbits rows (designation, q, e, i, node, argperi, peri_time,
     mpc_orb_jsonb), ``cmap`` {designation: class}. ``coarse_sigma(
     designation, tai) -> sigma_major [arcsec]`` (optional) is asked about
     the otherwise unexplained misses: NearbySSO gates on its coarse track's
     nightly sigma, which can exceed 10" within the night even where
     SSObservation's ellipse at the observation is small. Returns the per-row
-    table."""
+    table.
+
+    NearbySSO's time: ``nss``'s ``midpointMjdTai`` (its sidecar's,
+    `TS.nearbysso_row_times`) where it has one and a row for the DiaSource;
+    else the DiaSource's ``dia`` midpointMjdTai (a NearbySSO from before
+    the sidecar); with neither the time shift is taken as 0 (strict).
+    NearbySSO rows without a DiaSource (NULL diaSourceId) aren't joined."""
     # no natural satellites
     nd = nss["designation"].astype(str).to_numpy()
     sat = np.char.startswith(nd.astype(str), "S/")
@@ -808,10 +818,19 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     rep.check("no NearbySSO row names an orbit the filter drops", not dropped,
               f"{len(named)} objects named" + (f"; dropped by the filter: {dropped[:10]}" if dropped else ""))
     if "ephOffset" in nss:
+        # ephOffset is measured again at the row's own time (the sidecar's)
+        # while the match used the visit-time prediction: allow the move
+        # between the two (0 without a sidecar)
+        from bench.nearbysso_validate import move_allowance_arcsec
+        move = move_allowance_arcsec(nss, dia)
         with np.errstate(invalid="ignore"):
-            far = nss["ephOffset"].to_numpy(np.float64) > match_radius(nd) + OFFSET_TOL_ARCSEC
+            off = nss["ephOffset"].to_numpy(np.float64, na_value=np.nan)
+            far = off > match_radius(nd) + OFFSET_TOL_ARCSEC + move
+            n_moved = int(((off > match_radius(nd) + OFFSET_TOL_ARCSEC) & ~far).sum())
         rep.check("no NearbySSO row beyond its object's match radius", not far.any(),
-                  f"{int(far.sum())} rows" + (": " + "; ".join(
+                  f"{int(far.sum())} rows; {n_moved} beyond it only by the move from the DiaSource's time to "
+                  f"the row's (allowed, max {1e3 * float(np.max(move, initial=0.0)):.3g} mas)"
+                  + (": " + "; ".join(
                       f"{d} {o:.3f}\"" for d, o in zip(nd[far][:5], nss["ephOffset"].to_numpy()[far][:5]))
                       if far.any() else ""))
 
@@ -824,7 +843,8 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
              f"{int((how == 'position').sum()):,})")
     s = sss[in_input].reset_index(drop=True)
     n = len(s)
-    nb = nss.drop_duplicates("diaSourceId").set_index("diaSourceId")
+    matched = nss[nss["diaSourceId"].notna()]
+    nb = matched.astype({"diaSourceId": "int64"}).drop_duplicates("diaSourceId").set_index("diaSourceId")
     j = nb.index.get_indexer(dsid[in_input])
     has = j >= 0
     jj = np.where(has, j, 0)
@@ -838,14 +858,16 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     def f(c):
         return s[c].to_numpy(np.float64) if c in s else np.full(n, np.nan)
 
-    # the time shift: SSObservation at its own time, NearbySSO at the
-    # DiaSource's
+    # the time shift: SSObservation at its own time, NearbySSO at its row's
+    # (the sidecar's) where known, else at the DiaSource's
     if "midpointMjdTai" in dia and len(dia):
         dtime = dia.drop_duplicates("diaSourceId").set_index("diaSourceId")["midpointMjdTai"]
         t_dia = dtime.reindex(dsid[in_input]).to_numpy(np.float64)
     else:
         t_dia = np.full(n, np.nan)
-    dt = TS.dt_days(f("midpointMjdTai"), t_dia)
+    t_nss = col("midpointMjdTai") if "midpointMjdTai" in nb else np.full(n, np.nan)
+    own_time = np.isfinite(t_nss)
+    dt = TS.dt_days(f("midpointMjdTai"), np.where(own_time, t_nss, t_dia))
     rate = TS.rate_deg_day(f("ephRateRa"), f("ephRateDec"), col("ephRateRa"), col("ephRateDec"))
     pos_allow = TS.position_mas(rate, dt)
 
@@ -856,15 +878,26 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
                        "sss_offset": f("ephOffset"),
                        "sss_sigma": sigma_major_arcsec(f("ephRaErr"), f("ephDecErr"), f("ephRa_ephDec_Cov")),
                        "nss_designation": nss_des, "nss_offset": col("ephOffset"),
-                       "dt_s": dt * TS.SECONDS_PER_DAY,
+                       "dt_s": dt * TS.SECONDS_PER_DAY, "nss_own_time": own_time,
                        "allow_pos_mas": pos_allow,
                        "allow_rate": TS.rate_allowance(dt, rate, f("topoRange"), f("topoRangeRate"),
                                                        f("helioRange"), f("ephDec")),
                        "allow_vmag": TS.vmag_allowance(dt, rate, f("topoRange"), f("topoRangeRate"),
                                                        f("helioRange"), f("helioRangeRate"))})
     match = has & (nss_des == des)
+    # the two ephOffsets are measured against different coordinates where
+    # the SSObservation row is a Source (measuredOn = science) mapped to
+    # the DiaSource by position: SSObservation against the Source's
+    # ra/dec, NearbySSO against the DiaSource's, up to POSITION_MATCH_MAS
+    # apart; they then differ by up to that separation (0 where the
+    # coordinates are the same, as for rows mapped by diaSourceId)
+    dpos = dia.drop_duplicates("diaSourceId").set_index("diaSourceId")
     with np.errstate(invalid="ignore"):
-        df["pos_mas"] = np.where(match, sky_sep_arcsec(f("ephRa"), f("ephDec"), col("ephRa"), col("ephDec"))
+        radec = sky_sep_arcsec(f("ra"), f("dec"), dpos["ra"].reindex(dsid[in_input]).to_numpy(np.float64),
+                               dpos["dec"].reindex(dsid[in_input]).to_numpy(np.float64))
+    df["allow_offset_radec"] = np.nan_to_num(radec, nan=0.0)
+    with np.errstate(invalid="ignore"):
+        df["pos_mas"] =np.where(match, sky_sep_arcsec(f("ephRa"), f("ephDec"), col("ephRa"), col("ephDec"))
                                  * 1000.0, np.nan)
         # where dt != 0: what's left once the motion over dt is taken out
         mean_ra = np.where(np.isfinite(col("ephRateRa")), (f("ephRateRa") + col("ephRateRa")) / 2,
@@ -910,10 +943,18 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     return df
 
 
-def check_nearbysso(nearbysso, ssobservation, mpc_orbits, dia_sources, objects=None, rep=None):
+def check_nearbysso(nearbysso, ssobservation, mpc_orbits, dia_sources, objects=None, rep=None, sidecar=None):
     rep = rep or Report(f"Non-grav NearbySSO: {nearbysso} vs {ssobservation}")
+    times, basis = TS.nearbysso_row_times(nearbysso, sidecar)
+    rep.info(f"NearbySSO time basis: {basis}")
     nss = pq.read_table(nearbysso, columns=["diaSourceId", "designation", "ephRa", "ephDec", "ephOffset",
-                                            "ephVmag", "ephRateRa", "ephRateDec"]).to_pandas()
+                                            "ephVmag", "ephRateRa", "ephRateDec"]).to_pandas(
+                                                types_mapper=_INT_MAPPER)
+    if times is not None:
+        nss["midpointMjdTai"] = times
+    n_unmatched = int(nss["diaSourceId"].isna().sum())
+    if n_unmatched:
+        rep.info(f"NearbySSO rows without a DiaSource (unmatched predictions, not joined): {n_unmatched:,}")
     present = set(SP.read_schema(ssobservation).names)
     sss = _read_sss(ssobservation, ["designation", "diaSourceId", "visit", "midpointMjdTai", "ra", "dec",
                                "ephRa", "ephDec", "ephOffset", "ephVmag", "ephRateRa", "ephRateDec",
@@ -961,11 +1002,13 @@ def _nearbysso_gates(df, rep):
         dt_s = df["dt_s"].to_numpy(np.float64)
         big = np.abs(dt_s) > TS.DT_MAX_S
         nz = np.abs(dt_s[dt_s != 0])
-        rep.check(f"time shift SSObservation - DiaSource within {TS.DT_MAX_S} s", not big.any(),
+        own = (f"; NearbySSO's own (sidecar) time on {int(df['nss_own_time'].sum()):,} rows, the "
+               f"DiaSource's on the rest" if "nss_own_time" in df else "")
+        rep.check(f"time shift SSObservation - NearbySSO within {TS.DT_MAX_S} s", not big.any(),
                   f"{int((dt_s != 0).sum()):,} of {len(df):,} rows shifted"
                   + (f", max |dt| {nz.max():.3f} s" if len(nz) else "")
                   + (f"; {int(big.sum())} beyond" if big.any() else "")
-                  + "; shifted rows get bench/time_shift.py's allowances, the others are strict")
+                  + "; shifted rows get bench/time_shift.py's allowances, the others are strict" + own)
     zero = np.zeros(len(m))
 
     def allow(c):
@@ -975,13 +1018,14 @@ def _nearbysso_gates(df, rep):
             ("ephRateRa", "rate_ra", RATE_TOL_DEG_DAY, allow("allow_rate")),
             ("ephRateDec", "rate_dec", RATE_TOL_DEG_DAY, allow("allow_rate")),
             ("ephVmag", "vmag", VMAG_TOL, allow("allow_vmag")),
-            ("ephOffset", "offset", OFFSET_TOL_ARCSEC, allow("allow_pos_mas") / 1e3)):
+            ("ephOffset", "offset", OFFSET_TOL_ARCSEC,
+             allow("allow_pos_mas") / 1e3 + allow("allow_offset_radec"))):
         v = m[col].to_numpy(dtype=np.float64)
         bad = np.isfinite(v) & (v > tol + extra)
         worst = m.iloc[int(np.nanargmax(v))] if np.isfinite(v).any() else None
         rep.check(f"matched rows agree: {name}", not bad.any(),
                   f"{len(m):,} rows, max {np.nanmax(v) if np.isfinite(v).any() else float('nan'):.3g} "
-                  f"(tol {tol:g}" + (" + the time-shift allowance" if np.any(extra) else "")
+                  f"(tol {tol:g}" + (" + the allowances" if np.any(extra) else "")
                   + (f"; {int(bad.sum())} beyond, worst {worst['designation']}" if bad.any() else "") + ")")
     night = df[df["status"].str.contains("within the night", regex=False)]
     if len(night):
@@ -1365,6 +1409,9 @@ def main(argv=None):
     p.add_argument("ssobservation", help=sss_help)
     p.add_argument("mpc_orbits")
     p.add_argument("dia_sources", help="the NearbySSO input DiaSources")
+    p.add_argument("--sidecar", default=None,
+                   help="NearbySSO's sidecar, for its time per row (default: NearbySSO_internal.parquet next "
+                        "to NEARBYSSO if there is one; without it, the DiaSource's midpointMjdTai)")
     p.add_argument("--table", default=None, help="also write the per-row table (Parquet)")
     p = add("uncertainty", "Monte Carlo of the published error ellipse")
     p.add_argument("mpc_orbits")
@@ -1382,7 +1429,8 @@ def main(argv=None):
     if a.cmd == "offsets":
         rep = check_offsets(a.new, a.ref, a.mpc_orbits, objects, a.ng_errors)
     elif a.cmd == "nearbysso":
-        rep, df = check_nearbysso(a.nearbysso, a.ssobservation, a.mpc_orbits, a.dia_sources, objects)
+        rep, df = check_nearbysso(a.nearbysso, a.ssobservation, a.mpc_orbits, a.dia_sources, objects,
+                                  sidecar=a.sidecar)
     elif a.cmd == "uncertainty":
         if not 1 <= a.workers <= 32:
             ap.error("--workers must be 1..32 (shared nodes)")
