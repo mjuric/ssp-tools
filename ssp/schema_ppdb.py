@@ -358,8 +358,8 @@ NearbySSODtype = np.dtype([
     ('visit', '<i8'),               # Id of the visit the prediction is for.
     ('detector', '<i2'),            # Id of the detector the predicted position falls on, or the nearest
                                     # detector when it falls in a gap between detectors or just outside th...
-    ('ssObjectId', '<i8'),          # Id of the SSObject found within a matching radius of this source, if
-                                    # any; NULL if the object has no SSObject row.
+    ('ssObjectId', '<i8'),          # Id of this row's object in SSObject (SSObject.ssObjectId); NULL if the
+                                    # object has no SSObject row.
     ('designation', '<U16'),        # The primary provisional designation in unpacked form (e.g. 2008 AB).
     ('ephRa', '<f8'),               # [deg] Predicted ICRS right ascension from the orbit in mpc_orbits.
     ('ephRaErr', '<f4'),            # [deg] 1-sigma uncertainty of ephRa (on the sky, i.e. including the
