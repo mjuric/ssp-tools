@@ -1,14 +1,20 @@
 """The SSObservation/NearbySSO time-shift allowance
-(docs/design/shutter-timing.md, "SSObservation vs. NearbySSO").
+(docs/design/shutter-timing.md, "SSObservation vs. NearbySSO";
+docs/design/nearbysso-unmatched.md, "Times").
 
-Until AP corrects DiaSource times, SSObservation predicts at the
-shutter-corrected ``midpointMjdTai`` and NearbySSO at the DiaSource's own
-(visit) time. At the same DiaSource the two predictions differ by about the
-object's rate times
-Δt = SSObservation.midpointMjdTai - DiaSource.midpointMjdTai: within 0.24 s for
-most visits, but up to ~2 s for header-timed (degraded) ones. Every
-allowance uses each row's own Δt; nothing assumes a bound on it below
-DT_MAX_S, a sanity limit.
+SSObservation predicts at its shutter-corrected ``midpointMjdTai``.
+NearbySSO evaluates each row at its own (corrected) time, recorded row for
+row in its sidecar (``NearbySSO_internal.parquet``, column
+``midpointMjdTai``, next to ``NearbySSO.parquet``; `nearbysso_row_times`).
+A NearbySSO from before the sidecar predicted at the DiaSource's own
+(visit) ``midpointMjdTai``; without a sidecar the checks fall back to that.
+At the same DiaSource the two predictions differ by about the object's rate
+times Δt = SSObservation.midpointMjdTai - t_NearbySSO, t_NearbySSO the
+sidecar's time (or, without a sidecar, the DiaSource's). With the sidecar
+both times are shutter-corrected, so Δt is small; against the DiaSource's
+(visit) time it is within 0.24 s for most visits, but up to ~2 s for
+header-timed (degraded) ones. Every allowance uses each row's own Δt;
+nothing assumes a bound on it below DT_MAX_S, a sanity limit.
 The checks that compare the two tables add the allowances below on top of
 their own tolerances. Where Δt == 0 every allowance is exactly 0, so those
 rows are held to today's tolerances.
@@ -48,6 +54,8 @@ blindly.
 """
 
 from __future__ import annotations
+
+import os
 
 import numpy as np
 
@@ -89,12 +97,56 @@ def _a(x):
     return np.asarray(x, dtype=np.float64)
 
 
-def dt_days(t_ssobservation, t_dia):
-    """Δt [d] = SSObservation.midpointMjdTai - DiaSource.midpointMjdTai; 0
-    where either is unknown (NaN), so those rows are held to the strict
+def dt_days(t_ssobservation, t_nearbysso):
+    """Δt [d] = SSObservation.midpointMjdTai - NearbySSO's time (the
+    sidecar's midpointMjdTai, or the DiaSource's without a sidecar); 0 where
+    either is unknown (NaN), so those rows are held to the strict
     tolerance."""
-    d = _a(t_ssobservation) - _a(t_dia)
+    d = _a(t_ssobservation) - _a(t_nearbysso)
     return np.where(np.isfinite(d), d, 0.0)
+
+
+#: The time bases `nearbysso_row_times` reports.
+BASIS_SIDECAR = "NearbySSO's own time per row (its sidecar's midpointMjdTai: {path})"
+BASIS_DIA = ("the DiaSource's midpointMjdTai (no NearbySSO sidecar at {path}: a NearbySSO from before "
+             "the corrected times)")
+
+
+def sidecar_path(nss_path, sidecar=None):
+    """The NearbySSO sidecar's path: ``sidecar`` if given, else
+    NearbySSO_internal.parquet next to ``nss_path``."""
+    from ssp.nearbysso import _contract as C
+    return sidecar or os.path.join(os.path.dirname(os.path.abspath(nss_path)), C.NEARBYSSO_SIDECAR_FILE)
+
+
+def nearbysso_row_times(nss_path, sidecar=None):
+    """(t, basis): NearbySSO's time [TAI MJD] of each row of ``nss_path``
+    (float64, in its row order) from the sidecar's ``midpointMjdTai``, and a
+    report line naming the basis. Without a sidecar (none given and none
+    next to ``nss_path``): (None, the DiaSource-time basis line): the caller
+    falls back to the DiaSource's midpointMjdTai, what NearbySSO predicted
+    at before the sidecar. A ``sidecar`` given but missing, or one that
+    doesn't match NearbySSO row for row by its key, is a ValueError."""
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    from ssp.nearbysso import _contract as C
+    path = sidecar_path(nss_path, sidecar)
+    if not os.path.exists(path):
+        if sidecar:
+            raise ValueError(f"{path}: no such NearbySSO sidecar")
+        return None, BASIS_DIA.format(path=path)
+    key = list(C.NEARBYSSO_KEY)
+    n = pq.read_table(nss_path, columns=key)
+    s = pq.read_table(path, columns=key + ["midpointMjdTai"])
+    if len(n) != len(s):
+        raise ValueError(f"{path}: the sidecar has {len(s):,} rows, NearbySSO {len(n):,}")
+    for k in key:
+        a, b = n[k], s[k]
+        if not (a.null_count == b.null_count and pc.all(pc.fill_null(pc.equal(a, b), True)).as_py()):
+            raise ValueError(f"{path}: the sidecar's {k} differs from NearbySSO's (row for row)")
+    t = pc.fill_null(s["midpointMjdTai"].cast("float64"), np.nan).to_numpy()
+    return np.asarray(t, np.float64), BASIS_SIDECAR.format(path=path)
 
 
 def rate_deg_day(rate_ra, rate_dec, *more):
@@ -133,7 +185,7 @@ def position_margin_mas(rate, dt, accel=None):
 def motion_residual_mas(ra_s, dec_s, ra_n, dec_n, rate_ra, rate_dec, dt):
     """|(NearbySSO - SSObservation) + rate Δt| [mas] on the tangent plane at
     SSObservation's position: what's left of the two predictions' difference
-    once the motion over Δt = t_SSObservation - t_DiaSource is taken out
+    once the motion over Δt = t_SSObservation - t_NearbySSO is taken out
     (NearbySSO, at the earlier time by Δt, is behind by rate x Δt).
     ``rate_ra`` includes cos(dec) [deg/d]. NaN rates leave the plain
     difference."""
@@ -216,9 +268,9 @@ def summary_line(dt):
     dt_s = np.abs(_a(dt)) * SECONDS_PER_DAY
     nz = dt_s[dt_s > 0]
     if not len(nz):
-        return "time shift SSObservation - DiaSource: 0 on every compared row (strict tolerances)"
-    return (f"time shift SSObservation - DiaSource: 0 on {int((dt_s == 0).sum()):,} rows (strict), nonzero "
-            f"on {len(nz):,} (|dt| median {np.median(nz):.3f} s, max {nz.max():.3f} s); allowances per "
+        return "time shift SSObservation - NearbySSO: 0 on every compared row (strict tolerances)"
+    return (f"time shift SSObservation - NearbySSO: 0 on {int((dt_s == 0).sum()):,} rows (strict), nonzero "
+            f"on {len(nz):,} (|dt| median {np.median(nz):.3g} s, max {nz.max():.3g} s); allowances per "
             f"bench/time_shift.py")
 
 

@@ -2,7 +2,7 @@
 
 See docs/design/ppdb-tap.md.
 
-The five ``ppdb.DiaSource`` columns NearbySSO reads, fetched in visit-range
+The six ``ppdb.DiaSource`` columns NearbySSO reads, fetched in visit-range
 chunks of about CHUNK_ROWS rows as UWS async jobs (pyvo, with
 RESPONSEFORMAT=parquet), one at a time (concurrent jobs can stay in
 EXECUTING indefinitely on data-int, DM-56627):
@@ -10,7 +10,7 @@ EXECUTING indefinitely on data-int, DM-56627):
 1. a sync ``GROUP BY visit`` count fixes the visits and their row counts;
 2. each chunk is one job; its rows must equal the counted rows of its
    visits (a difference fails the step: the PPDB changed during the
-   extract, and a rerun picks it up), with the five columns cast exactly
+   extract, and a rerun picks it up), with the six columns cast exactly
    to their types and no NULLs;
 3. a job still QUEUED or EXECUTING after JOB_TIMEOUT_S is aborted and
    retried once; an ERROR phase or an HTTP error is retried once too, a
@@ -38,8 +38,8 @@ import pyarrow.parquet as pq
 DEFAULT_TAP_URL = "https://data-int.lsst.cloud/api/ppdbtap"
 DEFAULT_TOKEN_FILE = "~/.data-int.token"
 TABLE = "ppdb.DiaSource"
-SCHEMA = pa.schema([("diaSourceId", pa.int64()), ("visit", pa.int64()), ("midpointMjdTai", pa.float64()),
-                    ("ra", pa.float64()), ("dec", pa.float64())])
+SCHEMA = pa.schema([("diaSourceId", pa.int64()), ("visit", pa.int64()), ("detector", pa.int64()),
+                    ("midpointMjdTai", pa.float64()), ("ra", pa.float64()), ("dec", pa.float64())])
 SELECT = f"SELECT {', '.join(SCHEMA.names)} FROM {TABLE}"
 #: Rows per chunk: 2M-row jobs hung on 2026-10-09; 1M-row ones went through.
 CHUNK_ROWS = 1_000_000

@@ -154,6 +154,20 @@ def test_compare_to_ssobservation_statuses():
     assert {"sss_ephRa", "nss_ephRa", "midpointMjdTai", "dia_ra"} <= set(disc.columns)
 
 
+def test_compare_rates_allow_one_float32_ulp():
+    """Float32 rates one ulp apart (1.2e-7 deg/d at 1.45 deg/d, above the
+    1e-7 tolerance) match; two ulps don't."""
+    nss, sss, dia, lookup, sigma_fn = _case()
+    sss, nss = sss[sss["diaSourceId"] == 1].copy(), nss[nss["diaSourceId"] == 1].copy()
+    sss["ephRateRa"] = np.float32(1.45)
+    for steps, status in ((1, "match"), (2, "value_mismatch")):
+        r = np.float32(1.45)
+        for _ in range(steps):
+            r = np.nextafter(r, np.float32(2))
+        rows, _ = V.compare_to_ssobservation(nss.assign(ephRateRa=r), sss, dia, lookup, sigma_fn)
+        assert rows["status"].iloc[0] == status
+
+
 def test_compare_sigma_only_for_unexplained():
     nss, sss, dia, lookup, _ = _case()
     seen = []
@@ -932,6 +946,28 @@ def test_same_orbits_asteroid_row_at_10_flagged():
     assert V.beyond_radius(nss).tolist() == [True, False]
 
 
+def test_beyond_radius_allows_the_move_to_the_row_time():
+    """ephOffset is measured again at the row's own time (the sidecar's):
+    a row matched at the DiaSource's (visit) time may end beyond the radius
+    by up to |rate| |dt|. 0.1 deg/d over 0.116 s is 0.48 mas."""
+    nss, sss, dia, lookup, sigma_fn = _radius_case([(1, ROCK, 5.0), (2, ROCK, 5.0)])
+    dt = 0.116 / 86400
+    nss = nss.assign(ephOffset=np.float32(5.0 + 1e-4 + 0.4e-3),        # beyond by 0.4 mas
+                     ephRateRa=np.float32(0.1), ephRateDec=np.float32(0.0))
+    nss.loc[1, "ephOffset"] = np.float32(5.0 + 1e-4 + 0.6e-3)          # beyond the move (0.49 mas)
+    # without the row time (no sidecar): strict, both flagged
+    assert V.beyond_radius(nss, allow_arcsec=V.move_allowance_arcsec(nss, dia)).tolist() == [True, True]
+    timed = nss.assign(midpointMjdTai=60800.0 - dt)
+    move = V.move_allowance_arcsec(timed, dia)
+    assert move[0] == pytest.approx((0.1 * dt * 3.6e6 * 1.02 + 0.05) / 1e3, rel=1e-4)   # MJD rounding
+    assert V.beyond_radius(timed, allow_arcsec=move).tolist() == [False, True]
+    _, summ = V.compare_to_ssobservation(timed, sss, dia, lookup, sigma_fn)
+    assert summ["n_nearbysso_beyond_radius"] == 1 and summ["nearbysso_beyond_radius"] == [2]
+    assert summ["n_nearbysso_beyond_radius_by_move"] == 1
+    _, summ = V.compare_to_ssobservation(nss, sss, dia, lookup, sigma_fn)
+    assert summ["n_nearbysso_beyond_radius"] == 2
+
+
 def test_same_orbits_comet_at_20_beyond_radius():
     nss, sss, dia, lookup, sigma_fn = _radius_case([(1, COMET, 20.0)])
     rows, summ = V.compare_to_ssobservation(nss[:0], sss, dia, lookup, sigma_fn)
@@ -1038,3 +1074,79 @@ def test_same_orbits_null_designation():
     sss["designation"] = pd.array([ROCK, None], dtype="str")
     rows, summ = V.compare_to_ssobservation(nss[:1], sss, dia, lookup, sigma_fn)
     assert rows["status"].tolist() == ["match", "filtered:not_in_orbits"] and summ["n_fail"] == 0
+
+
+# --------------------------------------------------------------------------
+# unmatched predictions, placement and corrected times (the new subcommands'
+# pure parts, on the small delivery of tests/nearbysso_delivery_fixture.py)
+# --------------------------------------------------------------------------
+
+def _report(**over):
+    pl = dict(matched_rows=3, unmatched_rows=4, dropped_beyond_margin=10, dropped_no_wcs_visit=0,
+              matched_without_wcs=1, uncorrected_rows={"beyond_100px": 1, "no_wcs": 1},
+              ppdb_corrected_visits=0, wcs_snapshot=7)
+    pl.update(over)
+    return {"placement": pl}
+
+
+def _failed(problems):
+    return [name for name, ok, _ in problems if not ok]
+
+
+def test_report_counts(tmp_path):
+    from nearbysso_delivery_fixture import write_nearbysso
+
+    write_nearbysso(tmp_path)
+    nss, side = tmp_path / "NearbySSO.parquet", tmp_path / "NearbySSO_internal.parquet"
+    assert _failed(V.report_problems(_report(), nss, side)) == []
+    assert _failed(V.report_problems(_report(matched_rows=4), nss, side)) == ["matched_rows == the files'"]
+    f = _failed(V.report_problems(_report(uncorrected_rows={"beyond_100px": 2, "no_wcs": 1}), nss, side))
+    assert f == ["uncorrected_rows: {cause: rows}, summing to the flagged rows"]
+    f = _failed(V.report_problems(_report(matched_without_wcs=0), nss, side))
+    assert "matched_without_wcs == the files'" in f
+    rep = _report()
+    del rep["placement"]["wcs_snapshot"]
+    f = _failed(V.report_problems(rep, nss, side))
+    assert f == ["every PLACEMENT_REPORT_FIELDS entry present", "wcs_snapshot recorded (an integer)"]
+
+
+def test_read_rows_aligned(tmp_path):
+    import pyarrow.parquet as pq
+    from nearbysso_delivery_fixture import ROWS, sidecar_table, take, write_nearbysso
+
+    write_nearbysso(tmp_path)
+    nss = tmp_path / "NearbySSO.parquet"
+    side = tmp_path / "NearbySSO_internal.parquet"
+    df = V.read_rows(nss, side, ("detector",), visits={ROWS["visit"][2]})
+    assert df["row"].tolist() == [2, 5, 6] and df["matched"].tolist() == [True, False, False]
+    assert df["diaSourceId"].tolist() == [105, -1, -1] and df["placed"].tolist() == [False, True, True]
+    pq.write_table(take(sidecar_table(), [1, 0, 2, 3, 4, 5, 6]), side)
+    with pytest.raises(ValueError, match="diaSourceId differs"):
+        V.read_rows(nss, side)
+
+
+def test_bbox_off_and_kink():
+    b = np.array([[-0.5, -0.5, 4071.5, 3999.5]] * 4)
+    x = np.array([100.0, 4171.5, 2000.0, 1000.0])
+    y = np.array([100.0, 2000.0, -30.5, 1000.4])
+    assert V.bbox_off(b, x, y).tolist() == [0.0, 100.0, 30.0, 0.0]
+    k = V.bbox_kink(b, x, y)
+    assert k[0] == 0.0 and np.isnan(k[1]) and np.isnan(k[2]) and k[3] == pytest.approx(0.4)
+
+
+def test_visit_test_counts():
+    pv = pd.DataFrame({"uncorrected": pd.array([True, False, None, True], dtype="boolean")})
+    assert V.visit_test_counts(pv) == (2, 1, 1)
+
+
+def test_back_moved_inverts_the_move():
+    c = dict(ephRa=[10.0, 359.9999], ephDec=[60.0, -10.0], ephRateRa=[1.0, -2.0], ephRateDec=[0.5, 0.25],
+             dt_s=[0.5, -1.0])
+    a = {k: np.array(v) for k, v in c.items()}
+    ra, dec = V.back_moved(pd.DataFrame(c))
+    dt = a["dt_s"] / 86400
+    assert dec == pytest.approx(a["ephDec"] - a["ephRateDec"] * dt, abs=1e-12)
+    dra = (a["ephRa"] - ra + 180) % 360 - 180
+    assert dra * np.cos(np.radians(a["ephDec"])) == pytest.approx(a["ephRateRa"] * dt, abs=1e-12)
+    assert V.move_arcsec(pd.DataFrame(c)) == pytest.approx(
+        np.hypot(a["ephRateRa"], a["ephRateDec"]) * 3600 * np.abs(a["dt_s"]) / 86400)

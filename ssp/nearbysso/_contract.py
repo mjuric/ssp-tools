@@ -276,10 +276,14 @@ class CoarseTrack(NamedTuple):
 # --------------------------------------------------------------------------
 
 #: One row per DiaSource with an eligible prediction within the radius,
-#: nearest only. The draft NearbySSO schema (sdm_schemas
-#: u/mjuric/ppdb-sso-ng) plus the error ellipse.
+#: nearest only, plus one per unmatched eligible prediction on the focal
+#: plane (see "Unmatched predictions, detector placement and corrected
+#: times" below). The NearbySSO schema (sso_base.yaml NearbySSO, sdm_schemas
+#: 6d7c9a1) plus the error ellipse.
 NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
-    ("diaSourceId", "i8"),
+    ("diaSourceId", "i8"),       # NULL on unmatched rows
+    ("visit", "i8"),
+    ("detector", "i2"),
     ("ssObjectId", "i8"),        # written null where the object has no SSObject row
     ("designation", "U16"),
     ("ephRa", "f8"),
@@ -287,8 +291,8 @@ NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
     ("ephDec", "f8"),            #   as DiaSource's ra/raErr/dec/decErr/ra_dec_Cov
     ("ephDecErr", "f4"),
     ("ephRa_ephDec_Cov", "f4"),  # [deg^2]
-    ("ephOffset", "f4"),         # [arcsec]
-    ("diaDistanceRank", "i2"),   # see below
+    ("ephOffset", "f4"),         # [arcsec]; NULL on unmatched rows
+    ("diaDistanceRank", "i2"),   # see below; NULL on unmatched rows
     ("ephVmag", "f4"),
     ("ephRateRa", "f4"),         # [deg/day]
     ("ephRateDec", "f4"),
@@ -325,3 +329,95 @@ NEARBYSSO_DTYPE = np.dtype([   # in the schema's order (sso_base.yaml NearbySSO)
 #   radii), so every row naming a non-comet object is exactly as with a
 #   single 5" radius, except where a comet's prediction is nearer to the
 #   DiaSource than the asteroid's.
+
+# --------------------------------------------------------------------------
+# Unmatched predictions, detector placement and corrected times
+# (docs/design/nearbysso-unmatched.md)
+# --------------------------------------------------------------------------
+#
+# NEARBYSSO_DTYPE above is this NearbySSO (WP U3 switched the output to it;
+# the ``*_NEXT`` names it had until then are gone).
+
+#: Predictions within this distance [arcsec] of a placed detector's outline
+#: (or on one) are kept; the rest are dropped. A prediction on a detector
+#: without a WCS (missing, rejected, never processed) is dropped by this
+#: cut, except within the margin of a neighbour, where it is placed on the
+#: neighbour like a gap prediction (owner, 2026-10-11).
+PLACEMENT_MARGIN_ARCSEC = 30.0
+
+#: Its primary key; diaSourceId is nullable in it (BigQuery does not
+#: enforce keys; owner, 2026-10-11).
+NEARBYSSO_KEY = ("diaSourceId", "designation", "visit")
+
+#: Columns of NearbySSO that are never NULL.
+NEARBYSSO_NONNULL = frozenset({"visit", "detector", "designation"})
+
+#: Columns NULL exactly on unmatched rows (no DiaSource).
+NEARBYSSO_UNMATCHED_NULL = ("diaSourceId", "ephOffset", "diaDistanceRank")
+
+# Row order: matched rows by diaSourceId (as today), then the unmatched rows
+#   by (visit, designation).
+#
+# detector: where the prediction falls at its visit's time on a placed
+#   detector; else the nearest placed detector by distance to its outline
+#   in the visit's tangent plane (gaps, the margin). Placement is not
+#   redone after the move to the row's time (below), so a prediction in a
+#   gap keeps its detector even if the move crosses the gap's midline. A
+#   matched row in a visit with no WCS, or more than
+#   PLACEMENT_MARGIN_ARCSEC from every placed detector (owner, 2026-10-11),
+#   takes its DiaSource's detector, with NULL placement.
+
+#: The sidecar: one row per NearbySSO row, same order, an exact 1:1 join by
+#: NEARBYSSO_KEY; written next to NearbySSO.parquet and never uploaded.
+NEARBYSSO_SIDECAR_FILE = "NearbySSO_internal.parquet"
+
+#: The sidecar's columns: the key, then:
+NEARBYSSO_SIDECAR_DTYPE = np.dtype([
+    ("diaSourceId", "i8"),            # NULL on unmatched rows (as NearbySSO)
+    ("designation", "U16"),
+    ("visit", "i8"),
+    ("eph_x", "f8"),                  # [px] on `detector`, at the row's time; outside the
+    ("eph_y", "f8"),                  #   pixel range for gaps/margin; NULL without a WCS
+    ("ephDetectorEdgeDist", "f4"),    # [arcsec] signed distance to `detector`'s edge,
+                                      #   positive inside; NULL without a WCS
+    ("midpointMjdTai", "f8"),         # TAI MJD the row's values are evaluated at
+    ("midpointMjdTai_flag", "?"),     # True: not shutter-corrected (see below)
+])
+
+#: Sidecar columns that are never NULL.
+NEARBYSSO_SIDECAR_NONNULL = frozenset({"designation", "visit", "midpointMjdTai", "midpointMjdTai_flag"})
+
+# Times. Per visit, its PPDB times are "uncorrected" if every DiaSource's
+#   midpointMjdTai is within ssp.ssobservation_contract.MAX_HEADER_MISMATCH_S
+#   (1 ms) of the visit's header midpoint, (MJD-BEG + MJD-END)/2 from the
+#   correction table's exposure log. Then every row's time is the corrected
+#   midpoint at its predicted (detector, eph_x, eph_y), from
+#   ssp.export.submittable.Corrections (shutter_timing.corrected_midpoints;
+#   off-detector positions within the margin by the timing model's own
+#   extrapolation, up to its 100 px limit). Otherwise (the PPDB records
+#   corrected times) matched rows take their DiaSource's midpointMjdTai and
+#   unmatched rows the corrected midpoint as above.
+#   midpointMjdTai_flag is True where a row keeps the visit's time because
+#   there is no correction for its position (in a visit whose PPDB times
+#   are corrected, "the visit's time" is its header midpoint; owner,
+#   2026-10-11). The causes, as the run
+#   report's uncorrected_rows names them (ssp.nearbysso.placement.
+#   TIME_CAUSES): no_table, outside_coverage, not_built, omitted,
+#   beyond_100px, no_wcs.
+#
+# Every published value of a row moves from the visit's time to its time
+#   with at_source_time (ephOffset re-measured); eph_x/eph_y move linearly
+#   by the detector model's Jacobian times the change in (ra, dec), and
+#   ephDetectorEdgeDist follows.
+
+#: The run report's NearbySSO counts (a dict under "placement").
+PLACEMENT_REPORT_FIELDS = (
+    "matched_rows",              # rows with a DiaSource
+    "unmatched_rows",            # rows without one
+    "dropped_beyond_margin",     # eligible predictions farther than the margin from any placed detector
+    "dropped_no_wcs_visit",      # eligible unmatched predictions in visits without any WCS
+    "matched_without_wcs",       # matched rows with NULL placement (their DiaSource's detector)
+    "uncorrected_rows",          # {cause: rows} with midpointMjdTai_flag True
+    "ppdb_corrected_visits",     # visits whose PPDB times are not uncorrected (see Times)
+    "wcs_snapshot",              # the WCS store's snapshot number the build read
+)

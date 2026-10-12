@@ -334,3 +334,211 @@ def test_position_margin_with_and_without_ranges():
     without = TS.position_margin_mas(rate, dt)[0]
     assert with_acc < 0.003 * shift + 0.1 < 5.0
     assert without == pytest.approx(TS.REL_MARGIN * shift + TS.ABS_MARGIN_MAS)
+
+
+# --------------------------------------------------------------------------
+# NearbySSO's own time per row (its sidecar), and the fallback to the
+# DiaSource's without one (docs/design/nearbysso-unmatched.md, "Times")
+# --------------------------------------------------------------------------
+
+def _nss_files(tmp_path, t_rows, ids=(1, None), des=("2020 AB", "2020 ZZ"), sidecar=True, **nss_cols):
+    """NearbySSO.parquet (one matched and one unmatched row by default) and,
+    if ``sidecar``, its NearbySSO_internal.parquet with ``t_rows``."""
+    d = tmp_path / "delivery"
+    d.mkdir(exist_ok=True)
+    key = {"diaSourceId": pa.array(list(ids), pa.int64()), "designation": list(des),
+           "visit": pa.array([7] * len(ids), pa.int64())}
+    pq.write_table(pa.table({**key, **nss_cols}), d / "NearbySSO.parquet")
+    if sidecar:
+        pq.write_table(pa.table({**key, "midpointMjdTai": pa.array(t_rows, pa.float64()),
+                                 "midpointMjdTai_flag": [False] * len(ids)}),
+                       d / "NearbySSO_internal.parquet")
+    return str(d / "NearbySSO.parquet")
+
+
+def test_nearbysso_row_times_from_the_sidecar(tmp_path):
+    p = _nss_files(tmp_path, [T0 + DT, T0 + 2 * DT])
+    t, basis = TS.nearbysso_row_times(p)
+    assert t.tolist() == [T0 + DT, T0 + 2 * DT]
+    assert "sidecar" in basis and "NearbySSO_internal.parquet" in basis
+
+
+def test_nearbysso_row_times_fallback_without_a_sidecar(tmp_path):
+    p = _nss_files(tmp_path, [], sidecar=False)
+    t, basis = TS.nearbysso_row_times(p)
+    assert t is None and basis.startswith("the DiaSource's midpointMjdTai")
+    with pytest.raises(ValueError, match="no such"):
+        TS.nearbysso_row_times(p, str(tmp_path / "missing.parquet"))
+
+
+def test_nearbysso_row_times_must_match_row_for_row(tmp_path):
+    p = _nss_files(tmp_path, [T0, T0])
+    side = os.path.join(os.path.dirname(p), "NearbySSO_internal.parquet")
+    s = pq.read_table(side)
+    pq.write_table(s.slice(0, 1), side)
+    with pytest.raises(ValueError, match="rows"):
+        TS.nearbysso_row_times(p)
+    pq.write_table(s.set_column(1, "designation", pa.array(["2020 ZZ", "2020 AB"])), side)
+    with pytest.raises(ValueError, match="designation"):
+        TS.nearbysso_row_times(p)
+
+
+def _same_time_case(nss_time):
+    """SSObservation and NearbySSO both at T0 + DT (identical positions),
+    the DiaSource at T0; ``nss_time``: NearbySSO's own time column (None:
+    none, as without a sidecar). One unmatched NearbySSO row (NULL
+    diaSourceId) too."""
+    ra, dec = 150.0, 40.0
+    dia = pd.DataFrame({"diaSourceId": [1], "midpointMjdTai": [T0], "ra": [ra + 1 / 3600], "dec": [dec]})
+    sss = pd.DataFrame({"diaSourceId": [1], "designation": ["2020 AB"], "ephRa": [ra], "ephDec": [dec],
+                        "ephRateRa": np.float32(8), "ephRateDec": np.float32(-6), "ephVmag": np.float32(20),
+                        "sss_midpointMjdTai": [T0 + DT], "topoRange": [0.05], "topoRangeRate": [10.0],
+                        "helioRange": [1.0], "helioRangeRate": [5.0]})
+    nss = pd.DataFrame({"diaSourceId": pd.array([1, None], dtype="Int64"),
+                        "designation": ["2020 AB", "2020 ZZ"], "ephRa": [ra, 10.0], "ephDec": [dec, 10.0],
+                        "ephRateRa": np.float32(8), "ephRateDec": np.float32(-6), "ephVmag": np.float32(20),
+                        "ephOffset": pd.array([1.0, None], dtype="Float32")})
+    if nss_time is not None:
+        nss["midpointMjdTai"] = [nss_time, T0 + 5 * DT]
+    return NV.compare_to_ssobservation(nss, sss, dia, {"2020 AB": "", "2020 ZZ": ""},
+                                       lambda d, t: np.ones(len(d)))
+
+
+def test_same_orbits_uses_nearbysso_own_time():
+    rows, summ = _same_time_case(T0 + DT)
+    assert rows["status"].iloc[0] == "match" and rows["dt_s"].iloc[0] == 0
+    assert summ["n_nearbysso_time"] == 1 and summ["n_time_shifted"] == 0
+    # the unmatched row is counted, not compared nor a duplicate id
+    assert summ["n_nearbysso_unmatched"] == 1 and summ["n_nearbysso_duplicate_ids"] == 0
+    assert summ["n_nearbysso"] == 1 and summ["n_fail"] == 0
+
+
+def test_same_orbits_falls_back_to_the_dia_time():
+    # without NearbySSO's own time the DiaSource's (T0) is used: dt = DT,
+    # and identical positions leave rate x dt unexplained
+    rows, summ = _same_time_case(None)
+    assert rows["dt_s"].iloc[0] == pytest.approx(0.2)
+    assert rows["status"].iloc[0] == "value_mismatch"
+    assert summ["n_nearbysso_time"] == 0
+
+
+def _same_orbits_cli(tmp_path, sidecar):
+    ra, dec = 150.0, 40.0
+    p = _nss_files(tmp_path, [T0 + DT, T0 + 3 * DT], sidecar=sidecar,
+                   ephRa=[ra, 10.0], ephDec=[dec, 10.0], ephRateRa=pa.array([8, -6], pa.float32()),
+                   ephRateDec=pa.array([-6, 1], pa.float32()), ephVmag=pa.array([20, 21], pa.float32()),
+                   ephOffset=pa.array([1.0, None], pa.float32()))
+    ps, pd_, po = (str(tmp_path / f) for f in ("sss.parquet", "dia.parquet", "orbits.parquet"))
+    pq.write_table(pa.table({"diaSourceId": pa.array([1], pa.int64()), "designation": ["2020 AB"],
+                             "ephRa": [ra], "ephDec": [dec], "ephRateRa": pa.array([8], pa.float32()),
+                             "ephRateDec": pa.array([-6], pa.float32()),
+                             "ephVmag": pa.array([20], pa.float32()),
+                             "midpointMjdTai": [T0 + DT], "topoRange": [0.05], "topoRangeRate": [10.0],
+                             "helioRange": [1.0], "helioRangeRate": [5.0]}), ps)
+    pq.write_table(pa.table({"diaSourceId": pa.array([1], pa.int64()), "visit": pa.array([7], pa.int64()),
+                             "midpointMjdTai": [T0], "ra": [ra + 1 / 3600], "dec": [dec]}), pd_)
+    arc = '{"orbit_fit_statistics": {"arc_length_total": "2014-2024"}}'
+    pq.write_table(pa.table({"unpacked_primary_provisional_designation": ["2020 AB", "2020 ZZ"],
+                             "packed_primary_provisional_designation": ["K20A00B", "K20A00Z"],
+                             "q": [2.0, 2.0], "e": [0.1, 0.1], "i": [5.0, 5.0], "node": [1.0, 1.0],
+                             "argperi": [2.0, 2.0], "peri_time": [60000.0, 60000.0],
+                             "mpc_orb_jsonb": [arc, arc]}), po)
+    out = tmp_path / "out"
+    code = NV.main(["same-orbits", "--nearbysso", p, "--ssobservation", ps, "--dia", pd_, "--orbits", po,
+                    "--out", str(out), "--no-sigma"])
+    return code, (out / "same-orbits.txt").read_text()
+
+
+def test_same_orbits_cli_reports_the_time_basis(tmp_path):
+    code, text = _same_orbits_cli(tmp_path, sidecar=True)
+    assert code == 0, text
+    assert "NearbySSO time basis: NearbySSO's own time per row" in text
+    assert "unmatched predictions, not compared): 1" in text
+
+
+def test_same_orbits_cli_without_sidecar(tmp_path):
+    code, text = _same_orbits_cli(tmp_path, sidecar=False)
+    assert code == 1, text
+    assert "NearbySSO time basis: the DiaSource's midpointMjdTai" in text
+
+
+def _ng_own_time_case(nss_time):
+    """NearbySSO's position equals SSObservation's (both at T0 + DT), the
+    DiaSource at T0; ``nss_time``: NearbySSO's own time column (None:
+    none). An unmatched NearbySSO row (NULL diaSourceId) too."""
+    ra, dec = np.array([10.0]), np.array([-5.0])
+    sss = pd.DataFrame({"designation": ["2000 CA"], "diaSourceId": pd.array([1000], dtype="Int64"),
+                        "visit": [2025070100000], "midpointMjdTai": T0 + DT, "ra": ra, "dec": dec,
+                        "ephRa": ra + 1e-5, "ephDec": dec, "ephRateRa": 8.0, "ephRateDec": -6.0,
+                        "ephVmag": 20.0, "ephRaErr": 1e-4, "ephDecErr": 1e-4, "ephRa_ephDec_Cov": 0.0,
+                        "topoRange": 0.05, "topoRangeRate": 10.0, "helioRange": 1.0, "helioRangeRate": 5.0})
+    sss["ephOffset"] = GV.sky_sep_arcsec(sss["ephRa"], sss["ephDec"], ra, dec)
+    dia = pd.DataFrame({"diaSourceId": [1000], "visit": [2025070100000], "ra": ra, "dec": dec,
+                        "midpointMjdTai": T0})
+    nss = pd.DataFrame({"diaSourceId": pd.array([1000, None], dtype="Int64"),
+                        "designation": ["2000 CA", "2000 CB"], "ephRa": [ra[0] + 1e-5, 50.0],
+                        "ephDec": [dec[0], 5.0], "ephOffset": [float(sss["ephOffset"].iloc[0]), np.nan],
+                        "ephVmag": 20.0, "ephRateRa": 8.0, "ephRateDec": -6.0})
+    if nss_time is not None:
+        nss["midpointMjdTai"] = [nss_time, T0]
+    orbits = pd.DataFrame({"designation": ["2000 CA", "2000 CB"], "q": 2.0, "e": 0.1, "i": 5.0, "node": 1.0,
+                           "argperi": 2.0, "peri_time": 60000.0,
+                           "mpc_orb_jsonb": '{"orbit_fit_statistics": {"arc_length_total": "2014-2024"}}'})
+    rep = GV.Report("t")
+    df = GV.nearbysso_compare(nss, sss, dia, orbits, {"2000 CA": "control", "2000 CB": "control"}, rep)
+    GV._nearbysso_gates(df, rep)
+    return rep, df
+
+
+def test_nongrav_nearbysso_uses_nearbysso_own_time():
+    rep, df = _ng_own_time_case(T0 + DT)
+    assert rep.ok, rep.text()
+    assert df["dt_s"].iloc[0] == 0 and bool(df["nss_own_time"].iloc[0])
+    assert "own (sidecar) time on 1 rows" in rep.text()
+
+
+def test_nongrav_nearbysso_falls_back_to_the_dia_time():
+    rep, df = _ng_own_time_case(None)
+    assert df["dt_s"].iloc[0] == pytest.approx(0.2) and not df["nss_own_time"].iloc[0]
+    assert "matched rows agree: position" in rep.failed, rep.text()
+
+
+def _with_sidecar(tmp_path, pn, t):
+    """Give the NearbySSO at ``pn`` a visit column and a sidecar with time
+    ``t`` on every row."""
+    n = pq.read_table(pn)
+    visit = pa.array(np.full(n.num_rows, 7), pa.int64())
+    pq.write_table(n.append_column("visit", visit), pn)
+    pq.write_table(pa.table({"diaSourceId": n["diaSourceId"], "designation": n["designation"], "visit": visit,
+                             "midpointMjdTai": np.full(n.num_rows, t)}),
+                   str(tmp_path / "NearbySSO_internal.parquet"))
+
+
+def test_tail_uses_the_sidecar_time(tmp_path):
+    # NearbySSO's angles at T0 (moved back by DT from SSObservation's at
+    # T0 + DT); the DiaSource file says T0 + DT, so the DiaSource fallback
+    # sees no shift and fails strictly; the sidecar's T0 explains it
+    ps, pn, pd_ = _tail_tables(tmp_path, DT, DT)
+    pq.write_table(pq.read_table(pd_).set_column(1, "midpointMjdTai", pa.array(np.full(200, T0 + DT))), pd_)
+    ok, lines = T.consistency(ps, pn, pd_)
+    assert not ok and any(ln.startswith("time basis: the DiaSource's") for ln in lines), "\n".join(lines)
+    _with_sidecar(tmp_path, pn, T0)
+    ok, lines = T.consistency(ps, pn, pd_)
+    assert ok, "\n".join(lines)
+    assert any(ln.startswith("time basis: NearbySSO's own time per row") for ln in lines)
+    assert any("nonzero on 200" in ln for ln in lines), "\n".join(lines)
+
+
+def test_tail_sidecar_at_ssobservation_time_is_strict(tmp_path):
+    ps, pn, pd_ = _tail_tables(tmp_path, 0.0, DT)
+    _with_sidecar(tmp_path, pn, T0 + DT)
+    ok, lines = T.consistency(ps, pn, pd_)
+    assert ok, "\n".join(lines)
+    assert any("0 on every compared row" in ln for ln in lines), "\n".join(lines)
+
+
+def test_tail_falls_back_to_dia_times_without_a_sidecar(tmp_path):
+    ps, pn, pd_ = _tail_tables(tmp_path, DT, DT)
+    ok, lines = T.consistency(ps, pn, pd_)
+    assert ok, "\n".join(lines)
+    assert any(ln.startswith("time basis: the DiaSource's midpointMjdTai") for ln in lines)

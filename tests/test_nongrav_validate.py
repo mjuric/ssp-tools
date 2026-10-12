@@ -251,6 +251,40 @@ def test_match_radius_from_contract():
     assert V.MATCH_RADIUS_ARCSEC == 5.0 and V.MATCH_RADIUS_COMET_ARCSEC == 15.0
 
 
+def test_nearbysso_offset_of_a_position_mapped_source():
+    """A Source row (no diaSourceId) mapped to the DiaSource by position:
+    SSObservation's ephOffset is measured against the Source's ra/dec,
+    NearbySSO's against the DiaSource's, so they may differ by up to the
+    two positions' separation (here 0.9 mas) on top of the tolerance; a
+    row mapped by id (same coordinates) gets no such allowance."""
+    sss, dia, nss, orbits, cmap = _nss_case()
+    sss.loc[9, "dec"] += 0.9 / 3.6e6
+    for k in (8, 9):
+        nss.loc[k, "ephOffset"] = sss.loc[k, "ephOffset"] + 1.5e-3      # 1.5 mas: tol 1 mas
+    rep, df = _nss_run(sss, dia, nss, orbits, cmap)
+    assert df.loc[9, "allow_offset_radec"] == pytest.approx(0.9e-3) and df.loc[8, "allow_offset_radec"] == 0
+    assert rep.failed == ["matched rows agree: ephOffset"], rep.text()
+    assert "worst 2000 CA" in rep.text()
+    nss.loc[8, "ephOffset"] = sss.loc[8, "ephOffset"]
+    rep, _ = _nss_run(sss, dia, nss, orbits, cmap)
+    assert rep.ok, rep.text()                       # row 9's 1.5 mas < 1 mas + 0.9 mas
+
+
+def test_nearbysso_beyond_radius_allows_the_move_to_the_row_time():
+    """ephOffset is measured again at the row's own time: beyond the radius
+    by the move from the DiaSource's time is allowed; without the row's
+    time (no sidecar) it isn't."""
+    sss, dia, nss, orbits, cmap = _nss_case()
+    dia["midpointMjdTai"] = sss["midpointMjdTai"]
+    nss.loc[7, ["ephOffset", "ephRateRa", "ephRateDec"]] = [5.0 + 1e-3 + 50e-3, 10.0, 0.0]   # 50 mas beyond
+    rep, _ = _nss_run(sss, dia, nss, orbits, cmap)
+    assert BEYOND_GATE in rep.failed, rep.text()
+    nss["midpointMjdTai"] = dia["midpointMjdTai"] + 0.2 / 86400        # 10 deg/d x 0.2 s = 83 mas
+    rep, _ = _nss_run(sss, dia, nss, orbits, cmap)
+    assert BEYOND_GATE not in rep.failed, rep.text()
+    assert "1 beyond it only by the move" in rep.text()
+
+
 def test_nearbysso_comet_row_at_10_accepted():
     """A comet's NearbySSO row at 10" (inside its 15" radius) is a match."""
     sss, dia, nss, orbits, cmap = _nss_case()

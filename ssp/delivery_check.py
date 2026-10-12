@@ -8,13 +8,21 @@ builders. Per table it checks
   * the columns: exactly the schema's, in its order;
   * the types: each Arrow type compatible with the Felis datatype;
   * NULLs: none in ``nullable: false`` columns;
-  * the primary key (ppdb.yaml's ``primaryKey``): unique and non-NULL;
+  * the primary key (ppdb.yaml's ``primaryKey``): unique, NULL counting
+    as a value, and non-NULL in its ``nullable: false`` columns (NearbySSO's
+    key has a nullable diaSourceId, NULL on its unmatched rows);
   * char lengths: string values no longer than the column's ``length``.
 
 SSObservation is delivered as parts plus a manifest and a sidecar
 (ssp.ssobservation_contract, "The partitioned delivery"):
 check_ssobservation_parts checks the partitioning, the manifest and the
 sidecar, and check_table runs on every part.
+
+NearbySSO is checked further by check_nearbysso: its sidecar
+(NearbySSO_internal.parquet), the NULL pattern of matched and unmatched
+rows, the row order, the margin, the times and the visits
+(ssp.nearbysso._contract, "Unmatched predictions, detector placement and
+corrected times").
 
 Columns are read one at a time (per part), to bound memory; everything is
 Arrow.
@@ -238,11 +246,15 @@ def check_table(table, parquet_path, schema_dir=SCHEMA_DIR):
     res.append(CheckResult("char lengths", not too_long, "; ".join(too_long) if too_long
                            else f"{len(sized)} sized string columns within length"))
 
-    res.append(_check_key(pf, primary_keys(schema_dir).get(table, []), got, nrows))
+    keys = primary_keys(schema_dir).get(table, [])
+    res.append(_check_key(pf, keys, got, nrows,
+                          nullable=[k for k in keys if spec.get(k, {}).get("nullable", True) is not False]))
     return res
 
 
-def _check_key(pf, keys, got, nrows):
+def _check_key(pf, keys, got, nrows, nullable=()):
+    """The key ``keys`` unique (NULL counting as a value, as BigQuery
+    compares it), and without NULLs but in its ``nullable`` columns."""
     if not keys:
         return CheckResult("primary key", False, "the schema gives no primaryKey")
     label = ", ".join(keys)
@@ -252,10 +264,14 @@ def _check_key(pf, keys, got, nrows):
     t = pf.read(columns=keys)
     t = pa.table({k: _decoded(t[k]) for k in keys})
     problems = []
-    nulls = {k: t[k].null_count for k in keys if t[k].null_count}
+    nulls = {k: t[k].null_count for k in keys if t[k].null_count and k not in nullable}
     if nulls:
         problems.append("NULLs in " + ", ".join(f"{k} ({n:,})" for k, n in nulls.items()))
-        t = t.drop_null()
+        valid = pc.is_valid(t[next(iter(nulls))])
+        for k in nulls:
+            valid = pc.and_(valid, pc.is_valid(t[k]))
+        t = t.filter(valid)
+    # (group_by takes NULL as one key value)
     counts = t.group_by(keys).aggregate([([], "count_all")])
     ndup = len(t) - len(counts)
     if ndup:
@@ -265,6 +281,10 @@ def _check_key(pf, keys, got, nrows):
         problems.append(f"{ndup:,} duplicate rows over {len(dup):,} key values, e.g. {ex}")
     if problems:
         return CheckResult("primary key", False, f"({label}): " + "; ".join(problems))
+    allowed = [k for k in keys if k in nullable and t[k].null_count]
+    if allowed:
+        return CheckResult("primary key", True, f"({label}): {nrows:,} unique; NULL only in nullable "
+                           + ", ".join(f"{k} ({t[k].null_count:,})" for k in allowed))
     return CheckResult("primary key", True, f"({label}): {nrows:,} unique, non-NULL")
 
 
@@ -807,6 +827,326 @@ def _check_sidecar(d, m, obsids, total, schema_dir):
     return res
 
 
+# --------------------------------------------------------------------------
+# NearbySSO: its sidecar, NULL pattern, row order, margin and times
+# (ssp.nearbysso._contract, "Unmatched predictions, detector placement and
+# corrected times"; docs/design/nearbysso-unmatched.md)
+# --------------------------------------------------------------------------
+
+#: NearbySSO columns read by check_nearbysso.
+NEARBYSSO_CHECK_COLUMNS = ("diaSourceId", "visit", "detector", "designation", "ephOffset",
+                           "diaDistanceRank", "ephRateRa", "ephRateDec")
+#: The sidecar's placement columns: NULL together (no WCS).
+SIDECAR_PLACEMENT = ("eph_x", "eph_y", "ephDetectorEdgeDist")
+#: Slack [arcsec] on the margin for the float32 ephDetectorEdgeDist and its
+#: computation: float32 resolves ~2e-6" at 30", the distance itself is a
+#: float64 great-circle angle; 1e-4" is ~50 float32 steps.
+MARGIN_FLOAT_TOL_ARCSEC = 1e-4
+#: The margin cut is made at the visit's time (design, "Approach" 2) and
+#: the row then moves to its corrected time, ephDetectorEdgeDist following
+#: (7). The move is at most |rate| |dt|, with |dt| bounded by
+#: MAX_CORRECTION_S (3 s: shifts beyond are hung readouts, flagged degraded
+#: by the extract) plus SHUTTER_GRADIENT_MAX_S (0.3 s, the per-pixel part):
+#: so the margin check allows |rate| * MARGIN_MOVE_DT_S on top of the
+#: float slack. (On the 2026-10-09 inputs no unmatched row is beyond 30".)
+MARGIN_MOVE_DT_S = 3.3
+#: LSSTCam's detector IDs (189 detectors; ComCam's 0..8 are within).
+DETECTOR_RANGE = (0, 188)
+#: The earliest plausible day_obs (Rubin's first on-sky data were in 2024).
+DAY_OBS_MIN = 20240101
+#: TAI - UTC [s] (since 2017-01-01; no leap second announced since), for
+#: the night (day_obs: the date at UTC-12h) of a TAI MJD.
+TAI_MINUS_UTC_S = 37.0
+_MJD0 = np.datetime64("1858-11-17", "D")
+
+
+def _np(col, fill=None):
+    """A ChunkedArray as NumPy (decoded; NULLs filled with ``fill``)."""
+    col = _decoded(col)
+    if fill is not None:
+        col = pc.fill_null(col, fill)
+    return col.to_numpy()
+
+
+def _valid(col):
+    return np.asarray(pc.is_valid(col).to_numpy(zero_copy_only=False), dtype=bool)
+
+
+def _ex(idx, *cols, n=N_EXAMPLES):
+    """Example rows ``idx`` (an index array) as 'row k (a, b, ...)'."""
+    out = []
+    for i in np.asarray(idx)[:n].tolist():
+        out.append(f"row {i:,} (" + ", ".join(repr(c[i]) for c in cols) + ")")
+    return "; ".join(out)
+
+
+def day_obs_mjd(day_obs):
+    """The MJD of each day_obs date (YYYYMMDD int), or -1 where it is not
+    a valid calendar date."""
+    day_obs = np.asarray(day_obs, dtype=np.int64)
+    out = np.full(len(day_obs), -1, np.int64)
+    for k, d in enumerate(day_obs.tolist()):
+        try:
+            s = f"{d:08d}"
+            out[k] = (np.datetime64(f"{s[:4]}-{s[4:6]}-{s[6:]}", "D") - _MJD0).astype(np.int64)
+        except ValueError:
+            pass
+    return out
+
+
+def tai_night_mjd(mjd_tai):
+    """The day_obs of TAI MJDs as the MJD of that date: the UTC date at
+    UTC-12h."""
+    return np.floor(np.asarray(mjd_tai, np.float64) - TAI_MINUS_UTC_S / 86400 - 0.5).astype(np.int64)
+
+
+def check_nearbysso(delivery_dir):
+    """NearbySSO's own rules beyond the schema (check_table): the sidecar
+    (NEARBYSSO_SIDECAR_FILE next to NearbySSO.parquet: rows, key, columns,
+    types and NULLs), the NULL pattern of matched and unmatched rows, the
+    row order, the 30" margin of the unmatched rows, the rows' times and
+    their visits. A list of CheckResult; anything unreadable is a FAIL.
+
+    Reads the key, detector, the NULL-pattern and rate columns of
+    NearbySSO and the whole sidecar (~100 B/row)."""
+    from ssp.export.submittable import SHUTTER_GRADIENT_MAX_S
+    from ssp.nearbysso._contract import (
+        NEARBYSSO_KEY,
+        NEARBYSSO_NONNULL,
+        NEARBYSSO_SIDECAR_DTYPE,
+        NEARBYSSO_SIDECAR_FILE,
+        NEARBYSSO_SIDECAR_NONNULL,
+        NEARBYSSO_UNMATCHED_NULL,
+        PLACEMENT_MARGIN_ARCSEC,
+    )
+
+    d = Path(delivery_dir)
+    res = []
+    try:
+        nf = pq.ParquetFile(d / "NearbySSO.parquet")
+        have = [c for c in NEARBYSSO_CHECK_COLUMNS if c in nf.schema_arrow.names]
+        missing = [c for c in NEARBYSSO_CHECK_COLUMNS if c not in have]
+        if missing:
+            return [CheckResult("nearbysso", False, f"NearbySSO lacks {missing}: its rules not checked")]
+        n = nf.read(columns=have)
+    except Exception as e:
+        return [CheckResult("nearbysso", False, f"cannot read NearbySSO ({type(e).__name__}: {e})")]
+    nrows = len(n)
+
+    # ---- the sidecar: there, row for row, its columns and types ----------
+    f = d / NEARBYSSO_SIDECAR_FILE
+    if not f.exists():
+        return [CheckResult("sidecar", False, f"{f}: missing")]
+    try:
+        sf = pq.ParquetFile(f)
+        s = sf.read()
+    except Exception as e:
+        return [CheckResult("sidecar", False, f"{f}: cannot read ({type(e).__name__}: {e})")]
+    if len(s) != nrows:
+        return [CheckResult("sidecar", False, f"{f.name}: {len(s):,} rows, NearbySSO {nrows:,}")]
+    res.append(CheckResult("sidecar", True, f"{f.name}: {len(s):,} rows, as NearbySSO"))
+
+    want = list(NEARBYSSO_SIDECAR_DTYPE.names)
+    names = s.column_names
+    probs = []
+    if names != want:
+        probs.append(f"columns {names}, want {want}")
+    for c in want:
+        if c in names and names.count(c) == 1:
+            t = s.schema.field(c).type
+            if not _np_dtype_ok(NEARBYSSO_SIDECAR_DTYPE[c].str, t):
+                probs.append(f"{c}: {t}, want {NEARBYSSO_SIDECAR_DTYPE[c].str}")
+    res.append(CheckResult("sidecar columns", not probs, "; ".join(probs) or
+                           f"{len(want)} columns, in the contract's order and types"))
+    if probs:       # (the checks below need the contract's columns and types)
+        return res
+    sc = {c: s[c] for c in want}
+
+    # NULLs: never in the non-null columns; the placement NULL together;
+    # values present are finite
+    probs = []
+    for c in want:
+        if c in NEARBYSSO_SIDECAR_NONNULL and sc[c].null_count:
+            probs.append(f"{c}: {sc[c].null_count:,} NULLs")
+    pv = [_valid(sc[c]) for c in SIDECAR_PLACEMENT]
+    placed = pv[0] & pv[1] & pv[2]
+    partial = (pv[0] | pv[1] | pv[2]) & ~placed
+    if partial.any():
+        probs.append(f"{SIDECAR_PLACEMENT} not NULL together in {int(partial.sum()):,} rows, e.g. "
+                     + _ex(np.flatnonzero(partial), *[_np(sc[c]) for c in SIDECAR_PLACEMENT]))
+    for c in (*SIDECAR_PLACEMENT, "midpointMjdTai"):
+        v = _np(sc[c], np.nan).astype(np.float64)
+        bad = _valid(sc[c]) & ~np.isfinite(v)
+        if bad.any():
+            probs.append(f"{c}: {int(bad.sum()):,} non-finite values")
+    res.append(CheckResult("sidecar nulls", not probs, "; ".join(probs) or
+                           f"none in {sorted(NEARBYSSO_SIDECAR_NONNULL)}; placement NULL together "
+                           f"({int((~placed).sum()):,} rows), finite"))
+
+    # the key, row for row (NULL == NULL)
+    probs = []
+    for k in NEARBYSSO_KEY:
+        a, b = _decoded(n[k]), _decoded(sc[k])
+        try:
+            same = pc.fill_null(pc.equal(a, b.cast(a.type)), False)
+        except Exception as e:
+            probs.append(f"{k}: cannot compare ({type(e).__name__}: {e})")
+            continue
+        both_null = np.asarray(pc.and_(pc.is_null(a), pc.is_null(b)).to_numpy(zero_copy_only=False), bool)
+        bad = ~(np.asarray(same.to_numpy(zero_copy_only=False), bool) | both_null)
+        if bad.any():
+            i = int(np.flatnonzero(bad)[0])
+            probs.append(f"{k}: {int(bad.sum()):,} rows differ, first at row {i:,} "
+                         f"({b[i].as_py()!r} vs NearbySSO {a[i].as_py()!r})")
+    res.append(CheckResult("sidecar key", not probs, "; ".join(probs) or
+                           f"{NEARBYSSO_KEY} equal to NearbySSO's, row for row"))
+
+    # ---- NearbySSO: the NULL pattern ---------------------------------------
+    matched = _valid(n["diaSourceId"])
+    probs = []
+    for c in NEARBYSSO_UNMATCHED_NULL[1:]:
+        bad = _valid(n[c]) != matched
+        if bad.any():
+            probs.append(f"{c} NULL where diaSourceId is not, or set where it is NULL: {int(bad.sum()):,} "
+                         f"rows, e.g. " + _ex(np.flatnonzero(bad), _np(n["diaSourceId"], -1), _np(n[c], -1)))
+    for c in sorted(NEARBYSSO_NONNULL):
+        if n[c].null_count:
+            probs.append(f"{c}: {n[c].null_count:,} NULLs")
+    rank = _np(n["diaDistanceRank"], 1)
+    bad = matched & (rank < 1)
+    if bad.any():
+        probs.append(f"diaDistanceRank < 1 in {int(bad.sum()):,} matched rows")
+    nm = int(matched.sum())
+    res.append(CheckResult("null pattern", not probs, "; ".join(probs) or
+                           f"{NEARBYSSO_UNMATCHED_NULL} NULL together: {nm:,} matched, {nrows - nm:,} "
+                           f"unmatched rows; diaDistanceRank >= 1"))
+
+    # ---- row order: matched by diaSourceId, then unmatched by (visit,
+    # designation); the key unique (with designation, (visit, designation)
+    # is unique among the unmatched rows, so strictly increasing)
+    probs = []
+    um = np.flatnonzero(~matched)
+    if len(um) and um[0] != nm:
+        probs.append(f"a matched row after an unmatched one (first unmatched row {int(um[0]):,}, "
+                     f"{nm:,} matched rows)")
+    did = _np(n["diaSourceId"], 0)[:nm]
+    bad = np.flatnonzero(did[1:] < did[:-1]) + 1
+    if len(bad) and matched[:nm].all():
+        probs.append(f"matched rows not by diaSourceId: {len(bad):,} out of order, e.g. "
+                     + _ex(bad, did))
+    if not len(probs) and len(um) > 1:
+        v = _np(n["visit"], 0)[nm:]
+        des = _decoded(n["designation"]).slice(nm)
+        des = des.combine_chunks() if isinstance(des, pa.ChunkedArray) else des
+        des_le = np.asarray(pc.fill_null(pc.less_equal(des.slice(1), des.slice(0, len(des) - 1)), True)
+                            .to_numpy(zero_copy_only=False), bool)
+        bad = (v[1:] < v[:-1]) | ((v[1:] == v[:-1]) & des_le)
+        if bad.any():
+            i = np.flatnonzero(bad) + 1
+            probs.append(f"unmatched rows not strictly by (visit, designation): {len(i):,} out of order, "
+                         f"e.g. " + _ex(i + nm, _np(n["visit"]), _np(n["designation"])))
+    res.append(CheckResult("row order", not probs, "; ".join(probs) or
+                           "matched rows by diaSourceId, then unmatched rows by (visit, designation)"))
+
+    # ---- the margin: unmatched rows placed, within 30" -------------------
+    probs = []
+    edge = _np(sc["ephDetectorEdgeDist"], np.nan).astype(np.float64)
+    unplaced = ~matched & ~placed
+    if unplaced.any():
+        probs.append(f"{int(unplaced.sum()):,} unmatched rows without a placement, e.g. "
+                     + _ex(np.flatnonzero(unplaced), _np(n["visit"]), _np(n["designation"])))
+    rate = np.hypot(_np(n["ephRateRa"], np.nan), _np(n["ephRateDec"], np.nan)) * 3600 / 86400   # "/s
+    tol = MARGIN_FLOAT_TOL_ARCSEC + np.nan_to_num(rate, nan=np.inf) * MARGIN_MOVE_DT_S
+    with np.errstate(invalid="ignore"):
+        beyond = ~matched & placed & (edge < -PLACEMENT_MARGIN_ARCSEC - tol)
+        moved = ~matched & placed & (edge < -PLACEMENT_MARGIN_ARCSEC - MARGIN_FLOAT_TOL_ARCSEC) & ~beyond
+    if beyond.any():
+        probs.append(f"{int(beyond.sum()):,} unmatched rows beyond the margin, e.g. "
+                     + _ex(np.flatnonzero(beyond), _np(n["visit"]), _np(n["designation"]), edge))
+    lo = float(np.nanmin(edge[~matched])) if (~matched & placed).any() else None
+    res.append(CheckResult("margin", not probs, "; ".join(probs) or
+                           f"unmatched rows placed, ephDetectorEdgeDist >= -{PLACEMENT_MARGIN_ARCSEC:g}\" "
+                           f"(min {lo if lo is None else round(lo, 5)}; {int(moved.sum()):,} beyond it only "
+                           f"by their move to the corrected time)"))
+
+    # ---- times ------------------------------------------------------------
+    probs = []
+    t = _np(sc["midpointMjdTai"], np.nan).astype(np.float64)
+    flag = _np(sc["midpointMjdTai_flag"], False).astype(bool)
+    visit = _np(n["visit"], 0).astype(np.int64)
+    noflag = ~placed & ~flag
+    if noflag.any():
+        probs.append(f"{int(noflag.sum()):,} rows without a placement not flagged (no WCS, so no correction)"
+                     ", e.g. " + _ex(np.flatnonzero(noflag), _np(n["diaSourceId"], -1), visit))
+    # the night of the time is the visit's day_obs
+    night = day_obs_mjd(np.unique(visit // 100000))
+    vnight = night[np.searchsorted(np.unique(visit // 100000), visit // 100000)]
+    with np.errstate(invalid="ignore"):
+        wrong = (vnight >= 0) & np.isfinite(t) & (tai_night_mjd(np.nan_to_num(t)) != vnight)
+    if wrong.any():
+        probs.append(f"{int(wrong.sum()):,} rows whose midpointMjdTai is not in their visit's night, e.g. "
+                     + _ex(np.flatnonzero(wrong), visit, t))
+    # per visit, the flagged and the corrected rows apart: each set spans
+    # at most the shutter's gradient across the focal plane, twice
+    # SHUTTER_GRADIENT_MAX_S (|corrected - the visit's midpoint in the
+    # table| <= 0.3 s). Flagged rows keep the visit's time, or (without a
+    # correction table, or matched rows of a visit whose PPDB times are
+    # corrected) their DiaSource's own, itself a header or corrected time.
+    # (Flagged and corrected rows are not compared: they differ by the
+    # visit's late-readout shift, which has no bound.)
+    spread_max = 2 * SHUTTER_GRADIENT_MAX_S
+    order = np.lexsort([t, flag, visit])
+    vs, fs, ts = visit[order], flag[order], t[order]
+    start = np.flatnonzero(np.r_[True, (vs[1:] != vs[:-1]) | (fs[1:] != fs[:-1])])
+    stop = np.r_[start[1:], len(vs)]
+    spread = (ts[stop - 1] - ts[start]) * 86400
+    gv, gf = vs[start], fs[start]
+    with np.errstate(invalid="ignore"):
+        bad = ~(spread <= spread_max)
+    for what, sel in (("flagged", bad & gf), ("corrected", bad & ~gf)):
+        if sel.any():
+            ex = zip(gv[sel][:N_EXAMPLES], spread[sel][:N_EXAMPLES])
+            probs.append(f"{int(sel.sum()):,} visits whose {what} rows' times span more than "
+                         f"{spread_max:g} s, e.g. " + "; ".join(f"visit {v} ({s:.3f} s)" for v, s in ex))
+    smax = {k: float(np.max(spread[sel])) if sel.any() else 0.0 for k, sel in (("c", ~gf), ("f", gf))}
+    res.append(CheckResult("times", not probs, "; ".join(probs) or
+                           f"in their visit's night; {int(flag.sum()):,} flagged rows "
+                           f"({int((~placed).sum()):,} without a placement); per visit, corrected times "
+                           f"span <= {smax['c']:.3f} s, flagged <= {smax['f']:.6f} s "
+                           f"(limit {spread_max:g} s)"))
+
+    # ---- visits and detectors -------------------------------------------
+    probs = []
+    uday = np.unique(visit // 100000)
+    bad_day = uday[(night < 0) | (uday < DAY_OBS_MIN)]
+    if len(bad_day):
+        probs.append(f"{len(bad_day):,} implausible day_obs (visit // 100000), "
+                     f"e.g. {bad_day[:N_EXAMPLES].tolist()}")
+    det = _np(n["detector"], -1)
+    lo_det, hi_det = DETECTOR_RANGE
+    bad = (det < lo_det) | (det > hi_det)
+    if bad.any():
+        probs.append(f"{int(bad.sum()):,} rows with a detector outside {lo_det}..{hi_det}, "
+                     "e.g. " + _ex(np.flatnonzero(bad), visit, det))
+    # a (visit, object) has matched rows or one unmatched row, never both
+    if not probs:
+        des = _decoded(n["designation"])
+        um_pairs = pa.table({"visit": n["visit"].filter(pa.array(~matched)),
+                             "designation": des.filter(pa.array(~matched))})
+        m_pairs = pa.table({"visit": n["visit"].filter(pa.array(matched)),
+                            "designation": des.filter(pa.array(matched))})
+        both = um_pairs.join(m_pairs.group_by(["visit", "designation"]).aggregate([]),
+                             ["visit", "designation"], join_type="inner")
+        if len(both):
+            probs.append(f"{len(both):,} (visit, designation) with both matched and unmatched rows, e.g. "
+                         + "; ".join(str(tuple(r.values())) for r in both.slice(0, N_EXAMPLES).to_pylist()))
+    span = f"{int(uday.min())}..{int(uday.max())}" if len(uday) else "-"
+    res.append(CheckResult("visits", not probs, "; ".join(probs) or
+                           f"{len(np.unique(visit)):,} visits on {len(uday):,} nights ({span}); detectors in "
+                           f"{lo_det}..{hi_det}; no prediction both matched and unmatched"))
+    return res
+
+
 def ssobservation_part_files(delivery_dir):
     """The SSObservation part files to run check_table on: the manifest's,
     or (without a readable manifest) the files matching PART_GLOB."""
@@ -849,6 +1189,12 @@ def check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES):
             out[table] = [CheckResult("file", False, f"{path}: missing")]
         else:
             out[table] = check_table(table, path, schema_dir)
+            if table == "NearbySSO" and out[table][0].ok:
+                try:
+                    out[table].extend(check_nearbysso(delivery_dir))
+                except Exception as e:      # a safety net: a FAIL, never a crash
+                    out[table].append(CheckResult("nearbysso", False,
+                                                  f"cannot check ({type(e).__name__}: {e})"))
     return out
 
 

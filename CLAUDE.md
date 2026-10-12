@@ -43,7 +43,8 @@ The rules here are for development in ssp-tools, by Claude sessions and their su
 
 **5. Review.**
 - The integrator reviews every WP.
-- WPs with non-trivial logic get an **independent review**, by a fresh agent that tries to break them: probes, mutation testing, comparison against brute force or a reference. Small WPs get a light review.
+- WPs with non-trivial logic get an **independent review**, by a fresh agent that tries to break them: probes, comparison against brute force or a reference, and real-data checks. Small WPs get a light review.
+- **No mutation testing** (owner, 2026-10-11): neither systematic mutation runs nor breaking the code by hand to prove a test catches it. It takes a lot of time and tokens. Reviews look for bugs directly instead.
 - Fixes go back to the WP's author, round after round, until the review is clean.
 - Findings that change a design assumption go to the owner before going further.
 
@@ -94,6 +95,6 @@ The rules here are for development in ssp-tools, by Claude sessions and their su
 
 ## Environment
 
-- **Venv:** `.venv`, created with `uv sync --extra dev --extra all` (the dev extra brings pytest and pytest-xdist: run the suite with `pytest -n 16`). After pulling new console scripts, refresh them with `VIRTUAL_ENV=$PWD/.venv uv pip install --no-deps -e .`
+- **Venv:** `.venv`, created with `uv sync --extra dev --extra all` (the dev extra brings pytest and pytest-xdist: `pytest` runs the suite on 32 workers by default, about 2 minutes; `-n 0` runs it serially). After pulling new console scripts, refresh them with `VIRTUAL_ENV=$PWD/.venv uv pip install --no-deps -e .`
 - **ASSIST data:** `data/assist/linux_p1550p2650.440` and `data/assist/sb441-n16.bsp`. Export the two `SSP_ASSIST_*` variables, and `OMP_NUM_THREADS=1`.
 - **Runbooks:** `docs/runbooks/sso-daily.md` (the daily PPDB Solar System tables).

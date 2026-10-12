@@ -17,8 +17,10 @@ lsst/dax_ppdb python/lsst/dax/ppdb/bigquery/sso_uploader.py:
 2. Upload each table to gs://<bucket>/<prefix>/<Table>.parquet, where the
    prefix is the UTC time to the millisecond, with if_generation_match=0
    so nothing is ever overwritten; SSObservation as its parts, in part
-   order, then its manifest, each under its own name. The sidecar of
-   internal columns (SSObservation_internal.parquet) is never uploaded. On
+   order, then its manifest, each under its own name. The sidecars of
+   internal columns (SSObservation_internal.parquet, and NearbySSO's
+   NearbySSO_internal.parquet) are never uploaded: only <Table>.parquet
+   and SSObservation's manifest-listed parts are picked. On
    any failure, including a failure to publish, delete every object this
    upload wrote and fail.
 3. Publish one JSON message, {"bucket", "object_prefix",
@@ -79,7 +81,11 @@ from .delivery_contract import (
     UPLOAD_MESSAGE_FIELDS,
     UPLOAD_PREFIX_FORMAT,
 )
+from .nearbysso._contract import NEARBYSSO_SIDECAR_FILE
 from .ssobservation_contract import SIDECAR_FILE, SSOBSERVATION_MANIFEST_FILE
+
+#: Files of the delivery that are never uploaded (internal columns).
+SIDECARS = (SIDECAR_FILE, NEARBYSSO_SIDECAR_FILE)
 
 #: The delivered table that is uploaded as parts plus its manifest.
 PARTITIONED = "SSObservation"
@@ -265,7 +271,7 @@ def _verify_partitioned(run_dir, table, rec):
                         f"report says {rec['bytes']}")
     paths = []
     for name, size, md5 in parts:
-        if not isinstance(name, str) or Path(name).name != name or name == SIDECAR_FILE:
+        if not isinstance(name, str) or Path(name).name != name or name in SIDECARS:
             problems.append(f"{table}: the manifest lists {name!r}, not a part")
             continue
         path = delivery / name
@@ -403,8 +409,9 @@ def upload(cfg, file_map, object_prefix=None, publish_timeout=PUBLISH_TIMEOUT_S)
 
     bucket_name, topic, project = cfg["bucket_name"], cfg["topic"], cfg["project"]
     object_prefix = object_prefix or generate_prefix()
-    if any(Path(p).name == SIDECAR_FILE for paths in file_map.values() for p in paths):
-        raise SSOUploadError(f"{SIDECAR_FILE} (internal columns) is never uploaded")
+    side = sorted({Path(p).name for paths in file_map.values() for p in paths} & set(SIDECARS))
+    if side:
+        raise SSOUploadError(f"{', '.join(side)} (internal columns) is never uploaded")
     try:
         bucket = _storage_client().bucket(bucket_name)
     except Exception as e:      # e.g. GoogleAuthError: no application-default credentials

@@ -32,6 +32,24 @@ Subcommands (each writes ``<out>/<name>.txt`` and ``<out>/<name>.parquet``)::
   mock-rank            (development) a NearbySSO file with diaDistanceRank
                        added by brute force, optionally with faults
 
+Unmatched predictions, detector placement and corrected times
+(docs/design/nearbysso-unmatched.md, "Validation"; the rows and their
+sidecar NearbySSO_internal.parquet)::
+
+  placement            sampled visits: detector, eph_x, eph_y and
+                       ephDetectorEdgeDist against a fresh VisitLocator.place
+                       at the published position (the linear pixel
+                       correction), the margin and the rows without a
+                       placement at the visit's time, and the times
+                       against corrected_midpoints at the visit-time pixel
+  dia-detector         matched rows' detector against their DiaSource's
+  times                every row's time and flag against corrected_midpoints
+                       at its stored pixel; flagged rows by cause and the
+                       per-visit uncorrected test against the run report
+  report-counts        the run report's placement counts against the files
+  ppdb-times           the per-visit uncorrected test on fabricated corrected
+                       DiaSource times: two builds through the CLI
+
 Exit status: 0 pass (or report-only), 1 a gate failed, 3 incomplete (e.g.
 sigma unknown because propagate.coarse isn't implemented yet).
 
@@ -106,12 +124,16 @@ ELEMENTS = ["q", "e", "i", "node", "argperi", "peri_time"]
 
 #: Default tolerances for "identical" eph* values (same-orbits). Identical
 #: code and inputs should agree bitwise; these allow for integrator step
-#: choices that depend on the set of requested times (numerical noise).
+#: choices that depend on the set of requested times (numerical noise). The
+#: float32 rates are allowed at least one float32 ulp (see
+#: compare_to_ssobservation).
 TOL = dict(pos_mas=0.1, rate_deg_day=1e-7, vmag=1e-4)
 #: SSObservation columns read, where present, for the time-shift allowance
 #: (bench/time_shift.py): SSObservation predicts at its (shutter-corrected)
-#: midpointMjdTai, read as ``sss_midpointMjdTai``, NearbySSO at the
-#: DiaSource's. Where the two times are equal the tolerances are TOL's.
+#: midpointMjdTai, read as ``sss_midpointMjdTai``, NearbySSO at its own
+#: time per row (its sidecar's midpointMjdTai; the DiaSource's for a
+#: NearbySSO from before the sidecar). Where the two times are equal the
+#: tolerances are TOL's.
 SHIFT_COLUMNS = ["topoRange", "topoRangeRate", "helioRange", "helioRangeRate"]
 
 #: Objects whose NearbySSO ephemerides are, by design, not from their own
@@ -757,11 +779,18 @@ def compare_to_ssobservation(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
     (`radius_of`), or one radius [arcsec] for all.
 
     Time shift (docs/design/shutter-timing.md): where ``sss`` has
-    ``sss_midpointMjdTai`` (SSObservation's own time) and it differs from the
-    DiaSource's ``midpointMjdTai`` by dt, the two predictions differ by
-    about rate x dt: the eph* tolerances, the separation-from-radius and
-    the nearer-object decisions get bench/time_shift.py's allowances on
-    top; at dt = 0 they are unchanged. |dt| > TS.DT_MAX_S is a failure.
+    ``sss_midpointMjdTai`` (SSObservation's own time) and it differs from
+    NearbySSO's time by dt, the two predictions differ by about rate x dt:
+    the eph* tolerances, the separation-from-radius and the nearer-object
+    decisions get bench/time_shift.py's allowances on top; at dt = 0 they
+    are unchanged. |dt| > TS.DT_MAX_S is a failure. NearbySSO's time is
+    ``nss``'s ``midpointMjdTai`` (its sidecar's, `TS.nearbysso_row_times`)
+    where it has one and a row for the DiaSource; else the DiaSource's
+    ``midpointMjdTai`` (a NearbySSO from before the sidecar, or an
+    SSObservation row whose DiaSource has no NearbySSO row).
+
+    NearbySSO rows without a DiaSource (NULL diaSourceId: unmatched
+    predictions) are not compared; they are counted.
 
     Returns (rows, summary): one row per SSObservation row with its status:
 
@@ -780,9 +809,15 @@ def compare_to_ssobservation(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
     - ``unexplained``: missing from NearbySSO for no known reason (a bug).
     """
     nss = pd.DataFrame(nss)
+    unmatched_nss = pd.isna(nss["diaSourceId"]).to_numpy()
+    n_unmatched_nss = int(unmatched_nss.sum())
+    if n_unmatched_nss:
+        nss = nss[~unmatched_nss].reset_index(drop=True)
+        nss["diaSourceId"] = nss["diaSourceId"].astype("int64")
     n_dup = int(nss["diaSourceId"].duplicated().sum())
     nsub = nss.drop_duplicates("diaSourceId")[
-        ["diaSourceId", "designation"] + [c for c in EPH_COMPARED + ["ephOffset"] if c in nss]]
+        ["diaSourceId", "designation"] + [c for c in EPH_COMPARED + ["ephOffset", "midpointMjdTai"]
+                                          if c in nss]]
     nsub = nsub.rename(columns={c: "nss_" + c for c in nsub.columns if c != "diaSourceId"})
     sss = pd.DataFrame(sss)
     d = sss[["diaSourceId", "designation"] + EPH_COMPARED
@@ -808,11 +843,14 @@ def compare_to_ssobservation(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
                                         d["dia_ra"].to_numpy()[m], d["dia_dec"].to_numpy()[m])
     d["sep"] = sep
 
-    # the time shift: SSObservation at its own time, NearbySSO at the
-    # DiaSource's
+    # the time shift: SSObservation at its own time, NearbySSO at its row's
+    # (the sidecar's) where known, else at the DiaSource's
     def opt(c):
         return d[c].to_numpy(dtype=float) if c in d else np.full(n, np.nan)
-    dt = TS.dt_days(opt("sss_midpointMjdTai"), d["midpointMjdTai"].to_numpy(dtype=float))
+    t_nss = opt("nss_midpointMjdTai")
+    own_time = has_nss & np.isfinite(t_nss)
+    dt = TS.dt_days(opt("sss_midpointMjdTai"),
+                    np.where(own_time, t_nss, d["midpointMjdTai"].to_numpy(dtype=float)))
     rate = TS.rate_deg_day(opt("ephRateRa"), opt("ephRateDec"), opt("nss_ephRateRa"), opt("nss_ephRateDec"))
     pos_allow = TS.position_mas(rate, dt)
     rate_allow = TS.rate_allowance(dt, rate, opt("topoRange"), opt("topoRangeRate"), opt("helioRange"),
@@ -848,8 +886,14 @@ def compare_to_ssobservation(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
         d["d_" + c] = np.where(same, d["nss_" + c].to_numpy(dtype=float) - d[c].to_numpy(dtype=float),
                                np.nan)
     bad = (np.nan_to_num(dpos) > tol["pos_mas"] + pos_margin)
-    bad |= np.abs(np.nan_to_num(d["d_ephRateRa"])) > tol["rate_deg_day"] + rate_allow
-    bad |= np.abs(np.nan_to_num(d["d_ephRateDec"])) > tol["rate_deg_day"] + rate_allow
+    # the rates are float32 in both tables: the two passes' integrator noise
+    # can round them one float32 ulp apart (1.2e-7 deg/d at 1-2 deg/d, above
+    # TOL's 1e-7), so the tolerance is at least one ulp
+    for c in ("ephRateRa", "ephRateDec"):
+        with np.errstate(invalid="ignore"):
+            big = np.fmax(np.abs(d[c].to_numpy(dtype=float)), np.abs(d["nss_" + c].to_numpy(dtype=float)))
+        ulp = np.spacing(np.nan_to_num(big).astype(np.float32)).astype(np.float64)
+        bad |= np.abs(np.nan_to_num(d["d_" + c])) > np.maximum(tol["rate_deg_day"], ulp) + rate_allow
     bad |= np.abs(np.nan_to_num(d["d_ephVmag"])) > tol["vmag"] + vmag_allow
     # a NaN on one side only is a mismatch too
     for c in EPH_COMPARED:
@@ -868,8 +912,8 @@ def compare_to_ssobservation(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
         (reason != "", None),
         (~have_dia, "no_diasource"),
         (~sss_ok, "sss_no_ephemeris"),
-        # NearbySSO's prediction (at the DiaSource's time) may be beyond
-        # the radius where SSObservation's (at its own) is just within it
+        # NearbySSO's prediction (at its own time) may be beyond the
+        # radius where SSObservation's (at its own) is just within it
         (np.nan_to_num(sep, nan=np.inf) > rad - pos_allow / 1e3, "separation"),
     ):
         m = todo & cond
@@ -904,14 +948,23 @@ def compare_to_ssobservation(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
     in_sss = np.isin(nss["diaSourceId"].to_numpy(), d["diaSourceId"].to_numpy())
     # NearbySSO rows beyond their own object's match radius (wrong,
     # whatever SSObservation says)
-    beyond = beyond_radius(nss, radius)
+    move = move_allowance_arcsec(nss, dia)
+    beyond = beyond_radius(nss, radius, move)
+    radius_plain = radius_of(nss["designation"].to_numpy(), radius) + OFFSET_EPS
+    off = nss["ephOffset"].to_numpy(np.float64) if "ephOffset" in nss else np.full(len(nss), np.nan)
+    with np.errstate(invalid="ignore"):
+        moved_beyond = (np.nan_to_num(off) > radius_plain) & ~beyond
     counts = pd.Series(status).value_counts().to_dict()
     ms = d[same]
     summary = {
         "n_ssobservation": n, "n_nearbysso": len(nss), "n_nearbysso_duplicate_ids": n_dup,
+        "n_nearbysso_unmatched": n_unmatched_nss,
+        "n_nearbysso_time": int(own_time.sum()),
         "n_nearbysso_not_in_ssobservation": int((~in_sss).sum()),
         "n_nearbysso_beyond_radius": int(beyond.sum()),
         "nearbysso_beyond_radius": nss.loc[beyond, "diaSourceId"].head(10).tolist(),
+        "n_nearbysso_beyond_radius_by_move": int(moved_beyond.sum()),
+        "max_move_allowance_mas": float(np.max(move)) * 1e3 if len(move) else 0.0,
         "status_counts": {k: int(v) for k, v in sorted(counts.items())},
         "n_identical": int(identical.sum()),
         "max_d_pos_mas": float(np.nanmax(ms["d_pos_mas"])) if len(ms) else np.nan,
@@ -930,31 +983,69 @@ def compare_to_ssobservation(nss, sss, dia, reason_of, sigma_fn=None, tol=TOL,
     return d, summary
 
 
-def beyond_radius(nss, radius=None):
+def move_allowance_arcsec(nss, dia):
+    """Per NearbySSO row, the motion [arcsec] between the DiaSource's time
+    (``dia``'s midpointMjdTai, the visit-time prediction the match used)
+    and the row's own time (``nss``'s midpointMjdTai, from the sidecar):
+    |rate| |t_row - t_DiaSource| (1 + REL_MARGIN) + ABS_MARGIN_MAS, as
+    bench/time_shift.py's rule for "beyond the match radius". 0 where
+    either time is unknown (no sidecar: strict) or they are equal.
+    ephOffset is measured again at the row's time
+    (docs/design/nearbysso-unmatched.md, "Times"), so a row matched within
+    the radius at the visit's time may end just beyond it."""
+    nss = pd.DataFrame(nss)
+    n = len(nss)
+    if not n or "midpointMjdTai" not in nss or dia is None or "midpointMjdTai" not in dia:
+        return np.zeros(n)
+    t_dia = (pd.DataFrame(dia).drop_duplicates("diaSourceId").set_index("diaSourceId")["midpointMjdTai"])
+    ids = nss["diaSourceId"]
+    t_d = np.full(n, np.nan)
+    have = ids.notna().to_numpy()
+    if have.any():
+        t_d[have] = t_dia.reindex(ids[have].astype("int64").to_numpy()).to_numpy(np.float64)
+    dt = TS.dt_days(nss["midpointMjdTai"].to_numpy(np.float64), t_d)
+
+    def f(c):
+        return nss[c].to_numpy(np.float64) if c in nss else np.full(n, np.nan)
+    return TS.position_mas(TS.rate_deg_day(f("ephRateRa"), f("ephRateDec")), dt) / 1e3
+
+
+def beyond_radius(nss, radius=None, allow_arcsec=None):
     """Mask of NearbySSO rows whose ephOffset exceeds their object's match
-    radius (`radius_of`) by more than OFFSET_EPS: rows that shouldn't
+    radius (`radius_of`) by more than OFFSET_EPS (+ ``allow_arcsec``, the
+    move to the row's time, `move_allowance_arcsec`): rows that shouldn't
     exist (all False if there's no ephOffset)."""
     nss = pd.DataFrame(nss)
     if "ephOffset" not in nss or not len(nss):
         return np.zeros(len(nss), bool)
     off = nss["ephOffset"].to_numpy(np.float64)
-    return np.nan_to_num(off, nan=0.0) > radius_of(nss["designation"].to_numpy(), radius) + OFFSET_EPS
+    allow = 0.0 if allow_arcsec is None else np.asarray(allow_arcsec, np.float64)
+    return np.nan_to_num(off, nan=0.0) > radius_of(nss["designation"].to_numpy(), radius) + OFFSET_EPS + allow
 
 
 def report_comparison(rep, summary, tol=None):
     rep(f"SSObservation rows:          {summary['n_ssobservation']:,}")
-    rep(f"NearbySSO rows:         {summary['n_nearbysso']:,} "
+    rep(f"NearbySSO rows with a DiaSource: {summary['n_nearbysso']:,} "
         f"({summary['n_nearbysso_not_in_ssobservation']:,} for DiaSources not in SSObservation; "
-        f"{summary['n_nearbysso_duplicate_ids']} duplicate diaSourceIds)")
+        f"{summary['n_nearbysso_duplicate_ids']} duplicate diaSourceIds)"
+        + (f"; without one (unmatched predictions, not compared): {summary['n_nearbysso_unmatched']:,}"
+           if summary.get("n_nearbysso_unmatched") else ""))
     rep(f"NearbySSO rows with ephOffset beyond their object's match radius: "
         f"{summary['n_nearbysso_beyond_radius']:,}"
-        + (f" (e.g. {summary['nearbysso_beyond_radius']})" if summary['n_nearbysso_beyond_radius'] else ""))
+        + (f" (e.g. {summary['nearbysso_beyond_radius']})" if summary['n_nearbysso_beyond_radius'] else "")
+        + (f"; beyond it only by the move from the DiaSource's time to the row's (allowed: |rate| |dt| "
+           f"(1 + {TS.REL_MARGIN}) + {TS.ABS_MARGIN_MAS} mas, max {summary['max_move_allowance_mas']:.3g} "
+           f"mas): {summary['n_nearbysso_beyond_radius_by_move']:,}"
+           if "n_nearbysso_beyond_radius_by_move" in summary else ""))
     rep("status of each SSObservation row:")
     for k, v in summary["status_counts"].items():
         rep(f"  {k:32s} {v:>10,}")
     rep(f"bitwise-identical eph* rows: {summary['n_identical']:,}")
+    if "n_nearbysso_time" in summary:
+        rep(f"NearbySSO's time: its own (sidecar) on {summary['n_nearbysso_time']:,} SSObservation rows, "
+            f"the DiaSource's on the other {summary['n_ssobservation'] - summary['n_nearbysso_time']:,}")
     if "n_time_shifted" in summary:
-        rep(f"rows where SSObservation's midpointMjdTai differs from the DiaSource's: "
+        rep(f"rows where SSObservation's midpointMjdTai differs from NearbySSO's time: "
             f"{summary['n_time_shifted']:,} (max |dt| {summary['max_abs_dt_s']:.3f} s; "
             f"{summary['n_dt_too_large']} beyond {TS.DT_MAX_S} s, a failure); their tolerances add "
             f"bench/time_shift.py's allowances, the others are strict")
@@ -982,9 +1073,24 @@ def discrepancies(rows):
     return out.reset_index(drop=True)
 
 
-def _read_nss(path, ids=None):
+def _read_nss(path, ids=None, times=None, exact_ids=False):
+    """NearbySSO's columns as a DataFrame. ``times``: NearbySSO's time per
+    row (`TS.nearbysso_row_times`), added as ``midpointMjdTai``.
+    ``exact_ids``: 64-bit integer columns with NULLs (diaSourceId on
+    unmatched rows) become pandas Int64, not float64, which would round the
+    ids."""
     cols = [c for c in NSS_COLUMNS if c in pq.read_schema(path).names]
-    return pd.read_parquet(path, columns=cols)
+    if not exact_ids:
+        df = pd.read_parquet(path, columns=cols)
+    else:
+        df = pq.read_table(path, columns=cols).to_pandas(
+            types_mapper=lambda t: pd.Int64Dtype() if t == pa.int64() else None)
+        for c in df.columns:
+            if isinstance(df[c].dtype, pd.Int64Dtype) and not df[c].isna().any():
+                df[c] = df[c].astype("int64")
+    if times is not None:
+        df["midpointMjdTai"] = np.asarray(times, np.float64)
+    return df
 
 
 #: The DiaSource processing NearbySSO's DiaSources are (PPDB DiaSource).
@@ -1013,7 +1119,11 @@ def _read_sss(path, extra=(), processing=SSS_PROCESSING):
     widened = "measuredOn" in present
     key = ["processing", "measuredOn", "primary"] if widened else []
     t = SP.read_table(path, columns=list(dict.fromkeys(cols + key)))
+    n_read = t.num_rows
+    kept = "all rows (an earlier-layout SSObservation)"
     if widened:
+        kept = ("the primary measuredOn = 'difference' rows"
+                + ("" if processing in (None, "all") else f" of processing {processing}"))
         keep = pc.and_(pc.equal(t["measuredOn"].cast(pa.string()), "difference"), t["primary"])
         if processing not in (None, "all"):
             keep = pc.and_(keep, pc.equal(t["processing"].cast(pa.string()), processing))
@@ -1034,19 +1144,28 @@ def _read_sss(path, extra=(), processing=SSS_PROCESSING):
         else:
             out[c] = a.to_pandas()
     # SSObservation's own time, kept apart from the DiaSource's midpointMjdTai
-    return pd.DataFrame(out, columns=t.column_names).rename(columns={"midpointMjdTai": "sss_midpointMjdTai"})
+    df = pd.DataFrame(out, columns=t.column_names).rename(columns={"midpointMjdTai": "sss_midpointMjdTai"})
+    df.attrs.update(n_read=n_read, kept=kept)
+    return df
 
 
 def cmd_same_orbits(args):
     rep = Report("same-orbits", args.out)
     rep("# NearbySSO vs SSObservation built from the same mpc_orbits")
     rep(f"nearbysso={args.nearbysso}\nssobservation={args.ssobservation}\ndia={args.dia}\norbits={args.orbits}")
-    nss, sss = _read_nss(args.nearbysso), _read_sss(args.ssobservation, processing=args.sss_processing)
-    dia = read_dia_subset(args.dia, ids=np.union1d(sss["diaSourceId"], nss["diaSourceId"]))
+    times, basis = TS.nearbysso_row_times(args.nearbysso, args.sidecar)
+    rep(f"NearbySSO time basis: {basis}")
+    nss = _read_nss(args.nearbysso, times=times, exact_ids=True)
+    sss = _read_sss(args.ssobservation, processing=args.sss_processing)
+    if "n_read" in sss.attrs:
+        rep(f"SSObservation: {sss.attrs['n_read']:,} rows read, {len(sss):,} kept ({sss.attrs['kept']})")
+    nss_ids = nss["diaSourceId"].dropna().to_numpy(np.int64)
+    dia = read_dia_subset(args.dia, ids=np.union1d(sss["diaSourceId"], nss_ids))
     orbits = read_orbits(args.orbits, designations=set(sss["designation"].dropna()))
     sigma_fn = None if args.no_sigma else SigmaOracle(args.orbits)
     tol = dict(pos_mas=args.pos_tol_mas, rate_deg_day=args.rate_tol, vmag=args.vmag_tol)
     rows, summary = compare_to_ssobservation(nss, sss, dia, reason_lookup(orbits), sigma_fn, tol)
+    summary["time_basis"] = basis
     report_comparison(rep, summary, tol)
     if sigma_fn is not None and sigma_fn.note:
         rep(sigma_fn.note)
@@ -2229,6 +2348,847 @@ def cmd_mock(args):
 
 
 # ---------------------------------------------------------------------------
+# Unmatched predictions, detector placement and corrected times
+# (docs/design/nearbysso-unmatched.md, "Validation")
+#
+# Black box: the rows and their sidecar against visit-table's
+# VisitLocator.place, shutter-timing's corrected_midpoints (the table's
+# first night and exposure logs through ssp.export.submittable.Corrections),
+# the DiaSources and the run report. The build is run only through its CLI
+# (ppdb-times).
+# ---------------------------------------------------------------------------
+
+#: The production WCS store and correction table (the design's "Inputs").
+DEFAULT_WCS_STORE = "/sdf/home/m/mjuric/ssp_daily_data/visit-table/wcs"
+DEFAULT_CORRECTION_TABLE = "/sdf/home/m/mjuric/ssp_daily_data/shutter-timing"
+#: corrected_midpoints statuses (shutter_timing.CorrectionStatus) whose
+#: time is applied; the others keep the visit's time, flagged.
+ST_OK, ST_DEGRADED, ST_OMITTED, ST_NOT_BUILT = 0, 1, 2, 3
+APPLIED_STATUS = (ST_OK, ST_DEGRADED)
+#: Nominal LSSTCam pixel scale [arcsec/px], to express moves in pixels for
+#: the tolerances below (an estimate: only scales allowances).
+PIXEL_SCALE = 0.2
+#: Placement tolerances, fresh placement at the published position against
+#: the stored (moved) pixels: an absolute part plus a part relative to the
+#: row's move (the linear pixel correction's second-order error), and the
+#: step of VisitLocator.place at its EDGE_BAND boundary (~0.025", ~0.1 px)
+#: for rows whose move may cross it.
+PLACE_TOL = dict(px=1e-3, rel=1e-3, arcsec=1e-3, band_arcsec=0.03, band_px=0.1)
+#: VisitLocator.place's edgeDistance jump on a detector's bisector, as a
+#: fraction of the distance (see placement_check; ~5e-4 measured).
+KINK_REL = 1e-3
+#: Time tolerance [s] at the visit-time pixel (MJD float64 resolves 0.6 us).
+TIME_TOL_S = 1e-5
+#: Bound on the corrected time's change per pixel [s/px]: ~0.49 s across the
+#: ~64,000 px focal plane is ~8e-6; with a margin. Times at the stored
+#: (moved) pixels differ by at most this times the move.
+GRADIENT_S_PER_PX = 2e-5
+
+
+def _eg(df, mask, *cols, n=3):
+    """' (e.g. rows [...], col [...], ...)' for the first ``n`` rows of
+    ``mask``, or ''."""
+    mask = np.asarray(mask, bool)
+    if not mask.any():
+        return ""
+    parts = [f"rows {df['row'].to_numpy()[mask][:n].tolist()}"]
+    parts += [f"{c} {np.asarray(df[c])[mask][:n].tolist()}" for c in cols]
+    return " (e.g. " + ", ".join(parts) + ")"
+
+
+def sidecar_of(nss_path, sidecar=None):
+    return TS.sidecar_path(nss_path, sidecar)
+
+
+def read_rows(nss_path, sidecar_path, columns=(), visits=None):
+    """NearbySSO's key and ``columns`` with the sidecar's columns, one row
+    per row (a DataFrame; ``row`` the row number, ``matched`` whether it
+    has a DiaSource, diaSourceId -1 and NaN where NULL, ``placed`` whether
+    the placement is set). ``visits``: keep only those. The sidecar must
+    match NearbySSO row for row (the delivery check's rule; a ValueError
+    otherwise)."""
+    cols = list(dict.fromkeys(["diaSourceId", "designation", "visit", *columns]))
+    n = pq.read_table(nss_path, columns=cols)
+    s = pq.read_table(sidecar_path)
+    if len(n) != len(s):
+        raise ValueError(f"the sidecar has {len(s):,} rows, NearbySSO {len(n):,}")
+    keep = None
+    if visits is not None:
+        keep = pc.is_in(n["visit"], pa.array(np.asarray(sorted(visits), np.int64)))
+        n, s = n.filter(keep), s.filter(keep)
+    for k in C.NEARBYSSO_KEY:
+        a, b = n[k], s[k]
+        if not (a.null_count == b.null_count and pc.all(pc.fill_null(pc.equal(a, b), True)).as_py()):
+            raise ValueError(f"the sidecar's {k} differs from NearbySSO's")
+    df = pd.DataFrame({"row": np.flatnonzero(keep.to_numpy(zero_copy_only=False)) if keep is not None
+                       else np.arange(len(n))})
+    df["matched"] = pc.is_valid(n["diaSourceId"]).to_numpy(zero_copy_only=False)
+    for c in cols:
+        col = n[c]
+        if pa.types.is_integer(col.type):
+            df[c] = pc.fill_null(col, -1).to_numpy()
+        elif pa.types.is_floating(col.type):
+            df[c] = pc.fill_null(col, np.nan).to_numpy()
+        else:
+            df[c] = col.to_numpy(zero_copy_only=False)
+    for c in s.column_names:
+        if c in C.NEARBYSSO_KEY:
+            continue
+        col = s[c]
+        df[c] = (pc.fill_null(col, np.nan).to_numpy() if pa.types.is_floating(col.type)
+                 else col.to_numpy(zero_copy_only=False))
+    df["placed"] = pc.is_valid(s["eph_x"]).to_numpy(zero_copy_only=False)
+    return df
+
+
+def wcs_paths(wcs_dir, nights):
+    """The WCS store's files for ``nights`` (day_obs) that exist."""
+    out = [os.path.join(wcs_dir, f"day_obs={int(n)}.parquet") for n in sorted(set(int(x) for x in nights))]
+    return [p for p in out if os.path.exists(p)]
+
+
+def read_dia_visits(dia_path, visits=None, columns=("diaSourceId", "visit", "detector", "midpointMjdTai")):
+    """DiaSources (``columns``) of ``visits`` (all if None), as a DataFrame."""
+    filt = None if visits is None else pc.field("visit").isin(np.asarray(sorted(visits), np.int64))
+    t = pq.read_table(dia_path, columns=list(columns), filters=filt)
+    return pd.DataFrame({c: t[c].to_numpy() for c in columns})
+
+
+def visit_times(dia):
+    """Per visit: its DiaSources' time (``t_visit``, the minimum) and their
+    spread [s] (non-zero: the PPDB records per-source times)."""
+    g = dia.groupby("visit")["midpointMjdTai"]
+    out = pd.DataFrame({"t_visit": g.min(), "spread_s": (g.max() - g.min()) * 86400})
+    return out
+
+
+def move_arcsec(df):
+    """The on-sky move [arcsec] of each row from its visit's time to its own
+    (``dt_s``: t - t_visit, s)."""
+    rate = np.hypot(df["ephRateRa"].to_numpy(np.float64), df["ephRateDec"].to_numpy(np.float64))   # deg/day
+    return rate * 3600 * np.abs(df["dt_s"].to_numpy()) / 86400
+
+
+def back_moved(df):
+    """(ra, dec) of each row moved back from its time to its visit's, along
+    its rates (first order: the published rates are at the row's time;
+    sub-mas for |dt| <= ~1 s)."""
+    dt = df["dt_s"].to_numpy() / 86400
+    dec = df["ephDec"].to_numpy()
+    ra = df["ephRa"].to_numpy() - df["ephRateRa"].to_numpy(np.float64) * dt / np.cos(np.radians(dec))
+    return ra % 360, dec - df["ephRateDec"].to_numpy(np.float64) * dt
+
+
+def bbox_off(b, x, y):
+    """How far [px] (x, y) lies outside the pixel bbox ``b`` ((N, 4): minX,
+    minY, maxX, maxY, the pixel edges as visit-table stores them), the
+    larger of the two axes as shutter-timing measures it; 0 inside."""
+    return np.maximum.reduce([b[:, 0] - x, x - b[:, 2], b[:, 1] - y, y - b[:, 3], np.zeros(len(x))])
+
+
+def bbox_kink(b, x, y):
+    """Inside the bbox: the difference [px] between the distances to its
+    two nearest edges (0 on a bisector, where the edge distance, a minimum
+    over the edges, has a kink); NaN outside."""
+    d = np.sort(np.stack([x - b[:, 0], b[:, 2] - x, y - b[:, 1], b[:, 3] - y], axis=1), axis=1)
+    return np.where(d[:, 0] >= 0, d[:, 1] - d[:, 0], np.nan)
+
+
+def placement_check(df, wcs_dir, dia, rep, gate):
+    """Fresh placements of the rows of ``df`` (whole visits): at the
+    published position (``f_*``) and at the visit's time (``v_*``). Adds
+    the columns and runs the placement gates."""
+    from visit_table.locate import WcsStore
+
+    vt = visit_times(dia)
+    df = df.join(vt, on="visit")
+    df["dt_s"] = (df["midpointMjdTai"] - df["t_visit"]) * 86400
+    df["move_arcsec"] = move_arcsec(df)
+    visits = np.unique(df["visit"])
+    store = WcsStore(wcs_paths(wcs_dir, visits // 100000), visits=visits.tolist())
+    n = len(df)
+    out = {k: np.full(n, np.nan) for k in ("f_x", "f_y", "f_edge", "v_x", "v_y", "v_edge", "bbox_off_px",
+                                           "edge_kink_px")}
+    out.update(f_det=np.full(n, -1), v_det=np.full(n, -1), has_wcs=np.zeros(n, bool))
+    vra, vdec = back_moved(df)
+    ra, dec = df["ephRa"].to_numpy(), df["ephDec"].to_numpy()
+    det = df["detector"].to_numpy()
+    sx, sy = df["eph_x"].to_numpy(), df["eph_y"].to_numpy()
+    by_visit = df.groupby("visit").indices
+    for v, idx in by_visit.items():
+        try:
+            loc = store.locator(int(v))
+        except KeyError:
+            continue
+        out["has_wcs"][idx] = True
+        p = loc.place(ra[idx], dec[idx])
+        q = loc.place(vra[idx], vdec[idx])
+        out["f_det"][idx], out["f_x"][idx], out["f_y"][idx], out["f_edge"][idx] = \
+            p.detector, p.x, p.y, p.edgeDistance
+        out["v_det"][idx], out["v_x"][idx], out["v_y"][idx], out["v_edge"][idx] = \
+            q.detector, q.x, q.y, q.edgeDistance
+        # pixels outside the stored detector's bbox (for the 100 px rule),
+        # and inside it the gap between the two nearest bbox edges (the
+        # edge distance has a kink where they are equal)
+        k = np.minimum(np.searchsorted(loc.detector, det[idx]), len(loc.detector) - 1)
+        ok = loc.detector[k] == det[idx]
+        out["bbox_off_px"][idx] = np.where(ok, bbox_off(loc.bbox[k], sx[idx], sy[idx]), np.nan)
+        out["edge_kink_px"][idx] = np.where(ok, bbox_kink(loc.bbox[k], sx[idx], sy[idx]), np.nan)
+    for k, a in out.items():
+        df[k] = a
+
+    placed, matched = df["placed"].to_numpy(), df["matched"].to_numpy()
+    mv = df["move_arcsec"].to_numpy()
+    band = np.minimum(np.abs(df["f_edge"].to_numpy()), np.abs(df["v_edge"].to_numpy())) <= 0.1 + mv + 1e-3
+    df["edge_zone"] = band
+    rep(f"rows: {len(df):,} in {len(visits):,} visits ({int(matched.sum()):,} matched, "
+        f"{int((~matched).sum()):,} unmatched); with a placement {int(placed.sum()):,}; "
+        f"visits with a WCS {int(df.groupby('visit')['has_wcs'].first().sum()):,}")
+    rep(f"move to the corrected time: {_stats(mv, 'arcsec')}; |dt| {_stats(df['dt_s'].abs(), 's')}")
+    own = vt["spread_s"] > C_MAX_HEADER_MS * 1e-3
+    if own.any():
+        rep(f"visits whose DiaSources have different times (their t_visit is the earliest): "
+            f"{int(own.sum()):,}")
+
+    # rows without a placement: matched, far from every detector with a WCS
+    np_ = ~placed
+    far = ~df["has_wcs"].to_numpy() | (df["v_edge"].to_numpy() < -C.PLACEMENT_MARGIN_ARCSEC)
+    gate("rows without a placement are matched and > 30\" from every detector with a WCS (at the "
+         "visit's time)", (matched[np_] & far[np_]).all(),
+         f"{int(np_.sum()):,} rows; {int((np_ & ~matched).sum()):,} unmatched, {int((np_ & ~far).sum()):,} "
+         f"within the margin" + _eg(df, np_ & ~far, "v_edge"))
+    # rows with a placement: in a visit with a WCS, within the margin at the
+    # visit's time
+    with np.errstate(invalid="ignore"):
+        beyond = placed & ~(df["v_edge"].to_numpy() >= -C.PLACEMENT_MARGIN_ARCSEC - 1e-6)
+    gate("rows with a placement: a WCS, and within 30\" at the visit's time",
+         (placed <= df["has_wcs"].to_numpy()).all() and not beyond.any(),
+         f"{int(placed.sum()):,} rows; {int((placed & ~df['has_wcs'].to_numpy()).sum()):,} without a WCS, "
+         f"{int(beyond.sum()):,} beyond" + _eg(df, beyond, "v_edge", "ephDetectorEdgeDist", "matched"))
+
+    # placed rows: detector, pixels and edge distance as a fresh placement at
+    # the published position (the linear pixel correction against
+    # placement at the moved position)
+    # The detector is chosen at the visit's time (the design: placement is
+    # not redone after the move), so a move may cross the boundary between
+    # two detectors' domains: an edge, or the midline of a gap (where the
+    # two detectors' outlines are equally far: the stored detector's
+    # distance within the move of the fresh one's).
+    p = placed & df["has_wcs"].to_numpy()
+    same = p & (df["f_det"].to_numpy() == det)
+    edge_s = df["ephDetectorEdgeDist"].to_numpy(np.float64)
+    midline = (edge_s < 0) & (np.abs(edge_s - df["f_edge"].to_numpy()) <= mv + 1e-3)
+    crossing = p & ~same & (band | midline)
+    wrong = p & ~same & ~(band | midline)
+    gate("detector == a fresh placement's at the published position (except moves across an edge or a "
+         "gap's midline)", not wrong.any(),
+         f"{int(p.sum()):,} rows; {int((p & ~same & band).sum()):,} differ within their move of an edge, "
+         f"{int((p & ~same & midline & ~band).sum()):,} of a gap's midline, {int(wrong.sum()):,} elsewhere"
+         + _eg(df, wrong, "detector", "f_det", "ephDetectorEdgeDist", "f_edge", "move_arcsec"))
+    df["crossing"] = crossing
+    mv_px = mv / PIXEL_SCALE
+    dx = np.abs(sx - df["f_x"].to_numpy())
+    dy = np.abs(sy - df["f_y"].to_numpy())
+    de = np.abs(edge_s - df["f_edge"].to_numpy())
+    # ephDetectorEdgeDist "follows" the move linearly, but it is a minimum
+    # over the edges, with a kink on a bisector (two edges equally near).
+    # Both it and its linear update are 1-Lipschitz, so they differ by at
+    # most twice the move: that is the edge distance's tolerance (the
+    # pixels keep the tight one).
+    # Also, VisitLocator.place's own edgeDistance jumps on a bisector: it
+    # picks the nearest edge in the visit's tangent plane but reports the
+    # true angle, which differs by the projection's scale error (found on
+    # the 2026-10-09 inputs: up to ~5e-4 of the distance, 0.14"). Near a
+    # bisector (the two nearest bbox edges within 2e-3 of the distance, the
+    # pixel scale's anisotropy, plus twice the move), KINK_REL of the
+    # distance more is allowed.
+    near_px = np.abs(edge_s) / PIXEL_SCALE
+    kink = df["edge_kink_px"].to_numpy() <= 2 * mv_px + 2e-3 * near_px + 0.01
+    df["edge_kink"] = kink
+    tol_px = PLACE_TOL["px"] + PLACE_TOL["rel"] * mv_px + np.where(band, PLACE_TOL["band_px"], 0)
+    tol_as = PLACE_TOL["arcsec"] + 2 * mv + np.where(band, PLACE_TOL["band_arcsec"], 0) \
+        + np.where(kink, KINK_REL * np.abs(edge_s), 0)
+    bad = same & ((dx > tol_px) | (dy > tol_px) | (de > tol_as))
+    beyond_plain = same & ~band & (de > PLACE_TOL["arcsec"] + PLACE_TOL["rel"] * mv)
+    jump = same & ~band & (de > PLACE_TOL["arcsec"] + 2 * mv)
+    rep(f"edge distances beyond {PLACE_TOL['arcsec']:g}\" + {PLACE_TOL['rel']:g} x the move: "
+        f"{int(beyond_plain.sum()):,} ({int((beyond_plain & kink).sum()):,} near a bisector); beyond twice "
+        f"the move: {int(jump.sum()):,} ({int((jump & kink).sum()):,} near a bisector, |d edge| / distance "
+        f"<= {np.nanmax(np.r_[(de / np.abs(edge_s))[jump & kink], 0]):.2e}: place()'s jump)")
+    df["d_x"], df["d_y"], df["d_edge"] = np.where(same, dx, np.nan), np.where(same, dy, np.nan), \
+        np.where(same, de, np.nan)
+    rep(f"|stored - fresh| (same detector): x {_stats(dx[same], 'px')}; y {_stats(dy[same], 'px')}; "
+        f"edge {_stats(de[same], 'arcsec')}")
+    plain = same & ~band
+    rep(f"  away from edges: max |dx|,|dy| {np.nanmax(np.r_[dx[plain], dy[plain], 0]):.2e} px")
+    gate(f"eph_x, eph_y == the fresh placement's (within {PLACE_TOL['px']:g} px + {PLACE_TOL['rel']:g} x "
+         f"the move), ephDetectorEdgeDist (within {PLACE_TOL['arcsec']:g}\" + twice the move); + the edge "
+         "band's step near edges",
+         not bad.any(), f"{int(same.sum()):,} rows; {int(bad.sum()):,} beyond"
+         + _eg(df, bad, "d_x", "d_y", "d_edge", "move_arcsec"))
+    # the correction was applied: the stored pixels moved from the visit-time
+    # placement by about the move
+    vs = same & (df["v_det"].to_numpy() == det) & (mv_px > 0.01) & ~band
+    shift = np.hypot(sx - df["v_x"].to_numpy(), sy - df["v_y"].to_numpy())
+    if vs.any():
+        ratio = shift[vs] / mv_px[vs]
+        rep(f"pixel correction applied: |stored - visit-time placement| / (move / {PIXEL_SCALE}\"/px) over "
+            f"{int(vs.sum()):,} rows moving > 0.01 px: median {np.median(ratio):.3f}, "
+            f"5-95% {np.percentile(ratio, 5):.3f}..{np.percentile(ratio, 95):.3f}")
+        gate("the pixels moved with the row (not left at the visit-time placement)",
+             np.median(ratio) > 0.5, f"median ratio {np.median(ratio):.3f}")
+    return df
+
+
+C_MAX_HEADER_MS = 1.0     # ssp.ssobservation_contract.MAX_HEADER_MISMATCH_S, in ms
+
+
+def expected_times(df, table_dir, at="visit"):
+    """The corrected time and flag each row should have, from
+    corrected_midpoints at the visit-time placement (``at='visit'``:
+    v_det, v_x, v_y) or at the stored pixels (``'stored'``); rows without
+    a placement keep the visit's time, flagged. Adds ``{at}_status``,
+    ``{at}_t``, ``{at}_flag``."""
+    from shutter_timing.corrections import corrected_midpoints
+
+    from ssp.export.submittable import Corrections
+
+    corr = Corrections(table_dir)
+    if at == "visit":
+        det, x, y = df["v_det"].to_numpy(), df["v_x"].to_numpy(), df["v_y"].to_numpy()
+        ok = df["placed"].to_numpy() & (det >= 0)
+    else:
+        det, x, y = df["detector"].to_numpy(), df["eph_x"].to_numpy(), df["eph_y"].to_numpy()
+        ok = df["placed"].to_numpy()
+    visit = df["visit"].to_numpy()
+    status = np.full(len(df), 255, np.uint8)       # 255: not looked up (no placement)
+    t = np.full(len(df), np.nan)
+    inside = ok & ((visit // 100000) >= (corr.first_night or 0))
+    status[ok & ~inside] = 254                      # 254: outside the table's coverage
+    if inside.any():
+        r = corrected_midpoints(visit[inside], det[inside], x[inside], y[inside], table_dir=table_dir)
+        status[inside], t[inside] = r.status, r.t_mid_mjd_tai
+    applied = np.isin(status, APPLIED_STATUS)
+    df[f"{at}_status"] = status
+    df[f"{at}_flag"] = ~applied
+    df[f"{at}_t"] = np.where(applied, t, df["t_visit"].to_numpy())
+    return df
+
+
+def time_gates(df, gate, rep, at="visit"):
+    """The rows' times and flags against expected_times(df, at)."""
+    flag = df["midpointMjdTai_flag"].to_numpy().astype(bool)
+    t = df["midpointMjdTai"].to_numpy()
+    eflag, et = df[f"{at}_flag"].to_numpy(), df[f"{at}_t"].to_numpy()
+    mv_px = df["move_arcsec"].to_numpy() / PIXEL_SCALE
+    # a row whose move crosses the 100 px boundary (or the bbox edge) may
+    # have either status
+    off = df["bbox_off_px"].to_numpy() if "bbox_off_px" in df else np.full(len(df), np.nan)
+    boundary = (np.abs(off - 100) <= mv_px + 1e-3) | ((off <= mv_px + 1e-3) & (off > 0))
+    fdiff = (flag != eflag) & ~boundary
+    gate(f"midpointMjdTai_flag == no correction at the {'visit-time' if at == 'visit' else 'stored'} pixel",
+         not fdiff.any(), f"{len(df):,} rows, {int(flag.sum()):,} flagged; {int(fdiff.sum()):,} differ"
+         + (f", {int(((flag != eflag) & boundary).sum()):,} more within their move of a status boundary"
+            if ((flag != eflag) & boundary).any() else "")
+         + (f" (e.g. rows {df['row'][fdiff].head(3).tolist()}, status "
+            f"{df[f'{at}_status'][fdiff].head(3).tolist()})" if fdiff.any() else ""))
+    both = ~flag & ~eflag
+    dt = np.abs(t - et) * 86400
+    tol = TIME_TOL_S + (GRADIENT_S_PER_PX * mv_px if at == "stored" else 0)
+    bad = both & ~(dt <= tol)
+    rep(f"|t - corrected_midpoints| ({at} pixels), corrected rows: {_stats(dt[both], 's')}; "
+        f"bit-identical {int((dt[both] == 0).sum()):,} of {int(both.sum()):,}")
+    gate(f"corrected rows: midpointMjdTai == corrected_midpoints at the {at} pixel (within "
+         f"{TIME_TOL_S:g} s" + (f" + {GRADIENT_S_PER_PX:g} s/px x the move)" if at == "stored" else ")"),
+         not bad.any(), f"{int(both.sum()):,} rows; {int(bad.sum()):,} beyond"
+         + (f" (e.g. rows {df['row'][bad].head(3).tolist()}: {dt[bad][:3].tolist()} s)" if bad.any() else ""))
+    fl = flag & eflag
+    own = df["spread_s"].to_numpy() > C_MAX_HEADER_MS * 1e-3
+    fbad = fl & ~own & (t != df["t_visit"].to_numpy())
+    gate("flagged rows keep the visit's time (bitwise)", not fbad.any(),
+         f"{int(fl.sum()):,} rows ({int((fl & own).sum()):,} in visits with per-source times, not checked); "
+         f"{int(fbad.sum()):,} differ")
+    return df
+
+
+def flag_causes(df, at="stored"):
+    """Flagged rows by cause, from the status at the stored pixels:
+    {no_wcs, outside_coverage, not_built, omitted, beyond_100px, other}."""
+    from shutter_timing.corrections import OFF_DETECTOR_OMIT_PIX
+
+    f = df["midpointMjdTai_flag"].to_numpy().astype(bool)
+    st = df[f"{at}_status"].to_numpy()
+    off = df["bbox_off_px"].to_numpy()
+    out = {"no_wcs": int((f & ~df["placed"].to_numpy()).sum()),
+           "outside_coverage": int((f & (st == 254)).sum()),
+           "not_built": int((f & (st == ST_NOT_BUILT)).sum()),
+           "beyond_100px": int((f & (st == ST_OMITTED) & (off > OFF_DETECTOR_OMIT_PIX)).sum()),
+           "omitted": int((f & (st == ST_OMITTED) & ~(off > OFF_DETECTOR_OMIT_PIX)).sum())}
+    out["other"] = int(f.sum()) - sum(out.values())
+    return out
+
+
+def _gates(rep):
+    gates = rep.gates = []
+
+    def gate(name, ok, detail=""):
+        gates.append((name, bool(ok)))
+        rep(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f": {detail}" if detail else ""))
+    return gate
+
+
+def _verdict(rep, what):
+    ok = all(g for _, g in rep.gates)
+    nbad = sum(not g for _, g in rep.gates)
+    rep(f"GATE ({what}): {'PASS' if ok else 'FAIL'} ({nbad} of {len(rep.gates)} failed)")
+    return 0 if ok else 1
+
+
+UNMATCHED_NSS_COLUMNS = ("detector", "ephRa", "ephDec", "ephRateRa", "ephRateDec", "ephOffset")
+
+
+def cmd_placement(args):
+    """Placement spot check on sampled visits (and every visit with a row
+    without a placement): detector, eph_x, eph_y, ephDetectorEdgeDist
+    against fresh VisitLocator.place placements, and the times against
+    corrected_midpoints at the visit-time pixel (bit-identical expected)."""
+    rep = Report("placement", args.out)
+    gate = _gates(rep)
+    t0 = time.time()
+    side = sidecar_of(args.nearbysso, args.sidecar)
+    rep("# NearbySSO placement and times, sampled visits, against VisitLocator.place and corrected_midpoints")
+    rep(f"nearbysso={args.nearbysso}\nsidecar={side}\ndia={args.dia}\nwcs_store={args.wcs_store}\n"
+        f"correction_table={args.correction_table}")
+    vis = pq.read_table(args.nearbysso, columns=["visit"])["visit"].to_numpy()
+    nul = pq.read_table(side, columns=["visit", "eph_x"])
+    no_place = np.unique(nul["visit"].to_numpy()[~pc.is_valid(nul["eph_x"]).to_numpy(zero_copy_only=False)])
+    uv = np.unique(vis)
+    rng = np.random.default_rng(args.seed)
+    pick = set(uv.tolist()) if not args.n_visits else \
+        set(rng.choice(uv, min(args.n_visits, len(uv)), replace=False).tolist())
+    pick |= set(no_place.tolist())
+    rep(f"visits: {len(uv):,} in NearbySSO; sampled {args.n_visits} (seed {args.seed}) + {len(no_place)} "
+        f"with rows without a placement = {len(pick):,}")
+    df = read_rows(args.nearbysso, side, UNMATCHED_NSS_COLUMNS, visits=pick)
+    dia = read_dia_visits(args.dia, pick)
+    df = placement_check(df, args.wcs_store, dia, rep, gate)
+    # rows without a placement take their DiaSource's detector
+    nd = df[~df["placed"]].merge(dia.drop_duplicates("diaSourceId")[["diaSourceId", "detector"]]
+                                 .rename(columns={"detector": "dia_detector"}), on="diaSourceId", how="left")
+    gate("rows without a placement: detector == their DiaSource's",
+         (nd["detector"] == nd["dia_detector"]).all(),
+         f"{len(nd):,} rows; {int((nd['detector'] != nd['dia_detector']).sum()):,} differ")
+    rep(f"placement: {time.time() - t0:.1f} s")
+    t1 = time.time()
+    df = expected_times(df, args.correction_table, at="visit")
+    df = time_gates(df, gate, rep, at="visit")
+    df = expected_times(df, args.correction_table, at="stored")
+    df = time_gates(df, gate, rep, at="stored")
+    rep(f"flagged rows by cause (sample): {flag_causes(df)}")
+    rep(f"times: {time.time() - t1:.1f} s; total {time.time() - t0:.1f} s")
+    code = _verdict(rep, "placement and times, sampled visits")
+    rep.write(df)
+    return code
+
+
+def cmd_dia_detector(args):
+    """Matched rows' detector against their DiaSource's: they agree except
+    near an edge (counted and listed)."""
+    rep = Report("dia-detector", args.out)
+    gate = _gates(rep)
+    t0 = time.time()
+    side = sidecar_of(args.nearbysso, args.sidecar)
+    rep("# NearbySSO matched rows' detector against their DiaSource's")
+    rep(f"nearbysso={args.nearbysso}\nsidecar={side}\ndia={args.dia}")
+    df = read_rows(args.nearbysso, side, ("detector", "ephOffset"))
+    df = df[df["matched"]]
+    dia = read_dia_visits(args.dia, columns=("diaSourceId", "visit", "detector"))
+    dia = dia.drop_duplicates()
+    rep_ids = dia["diaSourceId"].duplicated(keep=False)
+    if rep_ids.any():
+        rep(f"DiaSource ids on several rows with different visit or detector: {int(rep_ids.sum()):,} rows "
+            "(joined on (diaSourceId, visit))")
+    m = df.merge(dia.rename(columns={"detector": "dia_detector"}), on=["diaSourceId", "visit"], how="left")
+    missing = m["dia_detector"].isna()
+    gate("every matched row's DiaSource is in the DiaSource file", not missing.any(),
+         f"{int(missing.sum()):,} missing")
+    m = m[~missing].copy()
+    m["dia_detector"] = m["dia_detector"].astype(np.int64)
+    dup = m.duplicated(["row"], keep=False)
+    if dup.any():
+        rep(f"rows joined to several DiaSource rows: {int(dup.sum()):,}; one kept per row")
+        m = m.drop_duplicates("row")
+    diff = m["detector"].to_numpy() != m["dia_detector"].to_numpy()
+    edge = m["ephDetectorEdgeDist"].to_numpy()
+    placed = m["placed"].to_numpy()
+    # near an edge: the prediction is within its offset from the DiaSource
+    # (plus 0.5") of its detector's edge, so the DiaSource may be across it
+    near = placed & (np.abs(edge) <= m["ephOffset"].to_numpy(np.float64) + 0.5)
+    rep(f"matched rows: {len(m):,}; detector differs from the DiaSource's: {int(diff.sum()):,} "
+        f"({int((diff & near).sum()):,} near an edge, {int((diff & ~near & placed).sum()):,} not, "
+        f"{int((diff & ~placed).sum()):,} without a placement)")
+    if diff.any():
+        e = edge[diff & placed]
+        rep(f"  their ephDetectorEdgeDist: {_stats(e, 'arcsec')}; inside (>0) {int((e > 0).sum()):,}, "
+            f"outside {int((e <= 0).sum()):,}")
+        rep(f"  their ephOffset: {_stats(m['ephOffset'][diff], 'arcsec')}")
+    gate("matched rows without a placement: detector == their DiaSource's", not (diff & ~placed).any(),
+         f"{int((~placed).sum()):,} rows; {int((diff & ~placed).sum()):,} differ")
+    far = diff & ~near & placed
+    gate("detector == the DiaSource's, except near an edge (|ephDetectorEdgeDist| <= ephOffset + 0.5\")",
+         not far.any(), f"{int(far.sum()):,} far from an edge"
+         + _eg(m, far, "diaSourceId", "visit", "detector", "dia_detector", "ephDetectorEdgeDist"))
+    rep(f"total {time.time() - t0:.1f} s")
+    code = _verdict(rep, "detector against the DiaSources")
+    rep.write(m[diff].reset_index(drop=True))
+    return code
+
+
+def per_visit_uncorrected(dia, table_dir):
+    """The design's per-visit test: a visit's PPDB times are "uncorrected"
+    if every DiaSource's midpointMjdTai is within MAX_HEADER_MISMATCH_S of
+    the header midpoint (exposure log). A DataFrame per visit: t_min,
+    t_max, header, max_dev_s, uncorrected (NaN header: None)."""
+    from ssp.export.submittable import Corrections
+
+    corr = Corrections(table_dir)
+    g = dia.groupby("visit")["midpointMjdTai"]
+    v = pd.DataFrame({"t_min": g.min(), "t_max": g.max()})
+    visits = v.index.to_numpy()
+    inside = (visits // 100000) >= (corr.first_night or 0)
+    hdr = np.full(len(v), np.nan)
+    if inside.any():
+        hdr[inside] = corr.exposure_log(visits[inside])["header_mid_mjd_tai"]
+    v["header"] = hdr
+    v["max_dev_s"] = np.maximum(np.abs(v["t_min"] - hdr), np.abs(v["t_max"] - hdr)) * 86400
+    v["uncorrected"] = pd.array(np.where(np.isfinite(hdr), v["max_dev_s"] <= C_MAX_HEADER_MS * 1e-3, False),
+                                dtype="boolean")
+    v.loc[~np.isfinite(hdr), "uncorrected"] = pd.NA
+    return v
+
+
+def visit_test_counts(pv):
+    """(uncorrected, corrected, unknown) visits of per_visit_uncorrected."""
+    u = pv["uncorrected"]
+    k = u.notna().to_numpy()
+    b = u[k].astype(bool).to_numpy()
+    return int(b.sum()), int((~b).sum()), int((~k).sum())
+
+
+def cmd_times(args):
+    """Every row's time and flag against corrected_midpoints at its stored
+    pixel (the moved one: within the gradient times the move), flagged rows
+    at their visit's time, the flagged rows by cause against the report,
+    and the per-visit uncorrected test against the report's count."""
+    from visit_table.locate import WcsStore
+
+    rep = Report("times", args.out)
+    gate = _gates(rep)
+    t0 = time.time()
+    side = sidecar_of(args.nearbysso, args.sidecar)
+    rep("# NearbySSO times, every row, against corrected_midpoints at the stored pixels")
+    rep(f"nearbysso={args.nearbysso}\nsidecar={side}\ndia={args.dia}\n"
+        f"correction_table={args.correction_table}")
+    df = read_rows(args.nearbysso, side, ("detector", "ephRateRa", "ephRateDec"))
+    dia = read_dia_visits(args.dia, columns=("visit", "midpointMjdTai"))
+    vt = visit_times(dia)
+    df = df.join(vt, on="visit")
+    gate("every row's visit has DiaSources", df["t_visit"].notna().all(),
+         f"{int(df['t_visit'].isna().sum()):,} rows without")
+    df["dt_s"] = (df["midpointMjdTai"] - df["t_visit"]) * 86400
+    df["move_arcsec"] = move_arcsec(df)
+    rep(f"rows {len(df):,}; |t - t_visit| {_stats(df['dt_s'].abs(), 's')}; "
+        f"move {_stats(df['move_arcsec'], 'arcsec')}")
+    t1 = time.time()
+    df = expected_times(df, args.correction_table, at="stored")
+    rep(f"corrected_midpoints on {int(df['placed'].sum()):,} rows: {time.time() - t1:.1f} s")
+    # the stored detector's bbox, for the 100 px cause and the status
+    # boundaries (of the rows flagged, or uncorrected at the stored pixel)
+    fl = (df["midpointMjdTai_flag"].to_numpy().astype(bool) | df["stored_flag"].to_numpy()) \
+        & df["placed"].to_numpy()
+    off = np.full(len(df), np.nan)
+    if fl.any():
+        fv = np.unique(df["visit"][fl])
+        store = WcsStore(wcs_paths(args.wcs_store, fv // 100000), visits=fv.tolist())
+        key = store.visit * 1000 + store.detector
+        o = np.argsort(key)
+        rows = np.flatnonzero(fl)
+        want = df["visit"].to_numpy()[rows] * 1000 + df["detector"].to_numpy()[rows]
+        k = np.minimum(np.searchsorted(key[o], want), len(key) - 1)
+        hit = key[o][k] == want
+        d = bbox_off(store.bbox[o][k], df["eph_x"].to_numpy()[rows], df["eph_y"].to_numpy()[rows])
+        off[rows] = np.where(hit, d, np.nan)
+    df["bbox_off_px"] = off
+    df = time_gates(df, gate, rep, at="stored")
+    causes = flag_causes(df)
+    rep(f"flagged rows by cause (status at the stored pixel): {causes}")
+    if args.report:
+        pl = json.load(open(args.report)).get("placement", {})
+        rc = pl.get("uncorrected_rows") or {}
+        mismatch = {k: (rc.get(k), v) for k, v in causes.items() if k != "other" and rc.get(k, 0) != v}
+        gate("report uncorrected_rows by cause == the flagged rows by cause (no_wcs, outside_coverage, "
+             "not_built, omitted, beyond_100px)", not mismatch and causes["other"] == 0,
+             f"report {rc}; " + (f"differ (report, files): {mismatch}" if mismatch else "equal")
+             + (f"; {causes['other']:,} flagged rows of no known cause" if causes["other"] else ""))
+        other = {k: v for k, v in rc.items() if k not in causes and v}
+        if other:
+            rep(f"report causes this check does not derive (non-zero): {other}")
+        pv = per_visit_uncorrected(dia, args.correction_table)
+        n_unc, n_corr, n_unk = visit_test_counts(pv)
+        rep(f"per-visit test: {len(pv):,} visits; uncorrected {n_unc:,}, corrected {n_corr:,}, no header "
+            f"midpoint {n_unk:,}; max |t - header| over uncorrected visits "
+            f"{pv.loc[pv['uncorrected'].fillna(False).astype(bool), 'max_dev_s'].max():.2e} s")
+        gate("report ppdb_corrected_visits == the visits failing the per-visit test",
+             pl.get("ppdb_corrected_visits") == n_corr,
+             f"report {pl.get('ppdb_corrected_visits')!r}, recomputed {n_corr:,} ({n_unk:,} visits without a "
+             "header midpoint not counted)")
+    rep(f"total {time.time() - t0:.1f} s")
+    code = _verdict(rep, "times, every row")
+    bad = df["midpointMjdTai_flag"].to_numpy().astype(bool) != df["stored_flag"].to_numpy()
+    rep.write(df[bad].reset_index(drop=True))
+    return code
+
+
+def report_problems(rep_json, nss_path, sidecar_path):
+    """The run report's placement counts against the files: a list of
+    (name, ok, detail)."""
+    pl = rep_json.get("placement")
+    out = []
+    if not isinstance(pl, dict):
+        return [("report has a 'placement' dict", False, f"{type(pl).__name__}")]
+    missing = [f for f in C.PLACEMENT_REPORT_FIELDS if f not in pl]
+    out.append(("every PLACEMENT_REPORT_FIELDS entry present", not missing, f"missing {missing}" if missing
+                else f"{len(C.PLACEMENT_REPORT_FIELDS)} fields"))
+    n = pq.read_table(nss_path, columns=["diaSourceId"])["diaSourceId"]
+    s = pq.read_table(sidecar_path, columns=["eph_x", "midpointMjdTai_flag"])
+    matched = pc.is_valid(n).to_numpy(zero_copy_only=False)
+    placed = pc.is_valid(s["eph_x"]).to_numpy(zero_copy_only=False)
+    flag = s["midpointMjdTai_flag"].to_numpy(zero_copy_only=False).astype(bool)
+    want = {"matched_rows": int(matched.sum()), "unmatched_rows": int((~matched).sum()),
+            "matched_without_wcs": int((matched & ~placed).sum())}
+    for k, v in want.items():
+        out.append((f"{k} == the files'", pl.get(k) == v, f"report {pl.get(k)!r}, files {v:,}"))
+    out.append(("no unmatched row without a placement", not (~matched & ~placed).any(),
+                f"{int((~matched & ~placed).sum()):,}"))
+    uc = pl.get("uncorrected_rows")
+    ok = isinstance(uc, dict) and all(isinstance(v, int) and v >= 0 for v in uc.values())
+    tot = sum(uc.values()) if ok else None
+    out.append(("uncorrected_rows: {cause: rows}, summing to the flagged rows", ok and tot == int(flag.sum()),
+                f"report {uc!r} (sum {tot}), flagged rows {int(flag.sum()):,}"))
+    if ok and "no_wcs" in uc:
+        out.append(("uncorrected_rows['no_wcs'] == rows without a placement == matched_without_wcs",
+                    uc["no_wcs"] == int((~placed).sum()) == pl.get("matched_without_wcs"),
+                    f"{uc['no_wcs']:,}, {int((~placed).sum()):,}, {pl.get('matched_without_wcs')!r}"))
+    for k in ("dropped_beyond_margin", "dropped_no_wcs_visit", "ppdb_corrected_visits"):
+        v = pl.get(k)
+        out.append((f"{k} a non-negative integer", isinstance(v, int) and v >= 0, repr(v)))
+    ws = pl.get("wcs_snapshot")
+    out.append(("wcs_snapshot recorded (an integer)", isinstance(ws, int) and not isinstance(ws, bool),
+                repr(ws)))
+    return out
+
+
+def cmd_report_counts(args):
+    """The run report's placement counts against the files."""
+    rep = Report("report-counts", args.out)
+    gate = _gates(rep)
+    side = sidecar_of(args.nearbysso, args.sidecar)
+    rep("# NearbySSO run report: placement counts against the files")
+    rep(f"report={args.report}\nnearbysso={args.nearbysso}\nsidecar={side}")
+    r = json.load(open(args.report))
+    rep(f"placement: {json.dumps(r.get('placement'))}")
+    for name, ok, detail in report_problems(r, args.nearbysso, side):
+        gate(name, ok, detail)
+    if args.wcs_store and args.dia:
+        from visit_table.locate import footprints
+
+        dv = np.unique(pq.read_table(args.dia, columns=["visit"])["visit"].to_numpy())
+        fp = footprints(wcs_paths(args.wcs_store, dv // 100000), visits=dv.tolist())
+        with_wcs = set(fp["visitId"].to_numpy().tolist())
+        nv = pq.read_table(args.nearbysso, columns=["diaSourceId", "visit"])
+        um = ~pc.is_valid(nv["diaSourceId"]).to_numpy(zero_copy_only=False)
+        um_v = np.unique(nv["visit"].to_numpy()[um])
+        bad = [v for v in um_v.tolist() if v not in with_wcs]
+        rep(f"DiaSource visits {len(dv):,}, with a WCS {len(with_wcs & set(dv.tolist())):,}; visits with "
+            f"rows {len(np.unique(nv['visit'].to_numpy())):,}")
+        gate("unmatched rows only in visits with a WCS", not bad, f"{len(bad):,} visits without" +
+             (f" (e.g. {bad[:3]})" if bad else ""))
+        n_nowcs = len(set(dv.tolist()) - with_wcs)
+        d0 = (r.get("placement") or {}).get("dropped_no_wcs_visit")
+        gate("no visit without a WCS => dropped_no_wcs_visit == 0", n_nowcs > 0 or d0 == 0,
+             f"{n_nowcs:,} DiaSource visits without a WCS; dropped_no_wcs_visit {d0!r}")
+    code = _verdict(rep, "report counts")
+    rep.write()
+    return code
+
+
+# ---- ppdb-times: the per-visit test on fabricated corrected times -----------
+
+def fabricate_corrected(dia, wcs_dir, table_dir, rng, frac=0.5, n_one=3):
+    """A copy of DiaSources ``dia`` (a DataFrame) whose visits are split in
+    three: 'corrected' (a fraction ``frac``: every DiaSource's time replaced
+    by the correction table's at its own pixel, placed with VisitLocator.
+    place on the visit's WCS; positions without a correction keep their
+    time), 'one' (``n_one`` visits: one DiaSource's time moved by +2 ms),
+    and 'unchanged'. Returns (the copy, {visit: group})."""
+    from shutter_timing.corrections import corrected_midpoints
+    from visit_table.locate import WcsStore
+
+    visits = np.unique(dia["visit"])
+    order = rng.permutation(visits)
+    k = int(round(frac * len(visits)))
+    group = {int(v): "corrected" for v in order[:k]}
+    group.update({int(v): "one" for v in order[k:k + n_one]})
+    group.update({int(v): "unchanged" for v in order[k + n_one:]})
+    out = dia.copy()
+    store = WcsStore(wcs_paths(wcs_dir, visits // 100000), visits=visits.tolist())
+    t = out["midpointMjdTai"].to_numpy().copy()
+    for v, idx in out.groupby("visit").indices.items():
+        g = group[int(v)]
+        if g == "one":
+            t[idx[0]] += 2e-3 / 86400
+        elif g == "corrected":
+            try:
+                loc = store.locator(int(v))
+            except KeyError:
+                continue
+            p = loc.place(out["ra"].to_numpy()[idx], out["dec"].to_numpy()[idx])
+            r = corrected_midpoints(np.full(len(idx), v), p.detector, p.x, p.y, table_dir=table_dir)
+            ok = np.isin(r.status, APPLIED_STATUS)
+            t[idx[ok]] = r.t_mid_mjd_tai[ok]
+    out["midpointMjdTai"] = t
+    return out, group
+
+
+def run_build(dia_path, orbits, ssobject, out_path, wcs_store, table_dir, workers, log):
+    """ssp-build-nearbysso, through its CLI."""
+    import subprocess
+
+    exe = os.path.join(os.path.dirname(sys.executable), "ssp-build-nearbysso")
+    cmd = [exe, "--dia", dia_path, "--orbits", orbits, "--output", out_path, "--workers", str(workers),
+           "--wcs-store", wcs_store, "--correction-table", table_dir]
+    if ssobject:
+        cmd += ["--ssobject", ssobject]
+    t0 = time.time()
+    with open(log, "w") as fh:
+        r = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT)
+    if r.returncode:
+        raise RuntimeError(f"{' '.join(cmd)} failed ({r.returncode}); see {log}")
+    return time.time() - t0
+
+
+def cmd_ppdb_times(args):
+    """The per-visit uncorrected/corrected test on fabricated corrected
+    times: the build on a subset of the DiaSources (A), and on a copy whose
+    times are the correction table's in some visits (B)."""
+    rep = Report("ppdb-times", args.out)
+    gate = _gates(rep)
+    t0 = time.time()
+    rng = np.random.default_rng(args.seed)
+    rep("# NearbySSO per-visit test on fabricated corrected PPDB times (two builds through the CLI)")
+    dia_all = pq.read_table(args.dia)
+    nights = np.unique(dia_all["visit"].to_numpy() // 100000)
+    pick = [int(x) for x in args.nights.split(",")] if args.nights else \
+        sorted(rng.choice(nights, args.n_nights, replace=False).tolist())
+    keep = np.isin(dia_all["visit"].to_numpy() // 100000, pick)
+    sub = dia_all.filter(pa.array(keep))
+    rep(f"dia={args.dia}: nights {pick}: {len(sub):,} DiaSources in "
+        f"{len(np.unique(sub['visit'].to_numpy())):,} visits")
+    os.makedirs(args.out, exist_ok=True)
+    pa_path, pb_path = os.path.join(args.out, "dia_A.parquet"), os.path.join(args.out, "dia_B.parquet")
+    pq.write_table(sub, pa_path)
+    a = sub.to_pandas()
+    b, group = fabricate_corrected(a, args.wcs_store, args.correction_table, rng)
+    pq.write_table(pa.Table.from_pandas(b, schema=sub.schema, preserve_index=False), pb_path)
+    test = per_visit_uncorrected(b, args.correction_table)
+    exp_corr = set(test.index[(~test["uncorrected"].fillna(True).astype(bool)).to_numpy()].tolist())
+    by = {g: sum(group[v] == g for v in exp_corr) for g in ("corrected", "one", "unchanged")}
+    rep(f"visits by group: {pd.Series(group).value_counts().to_dict()}; failing the per-visit test in B: "
+        f"{len(exp_corr):,} {by}; no header midpoint {int(test['uncorrected'].isna().sum()):,}")
+    ta = per_visit_uncorrected(a, args.correction_table)
+    a_unc, a_corr, a_unk = visit_test_counts(ta)
+    rep(f"A: per-visit test: uncorrected {a_unc:,}, corrected {a_corr:,}, no header {a_unk:,}")
+    builds = {}
+    for name, p in (("A", pa_path), ("B", pb_path)):
+        out = os.path.join(args.out, f"build_{name}", "nearbysso.parquet")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        if not (args.reuse and os.path.exists(out)):
+            w = run_build(p, args.orbits, args.ssobject, out, args.wcs_store, args.correction_table,
+                          args.workers, os.path.join(args.out, f"build_{name}.log"))
+            rep(f"build {name}: {w:.0f} s")
+        builds[name] = out
+    ra = json.load(open(builds["A"].replace(".parquet", ".report.json")))["placement"]
+    rb = json.load(open(builds["B"].replace(".parquet", ".report.json")))["placement"]
+    gate("A: ppdb_corrected_visits == the per-visit test's count", ra["ppdb_corrected_visits"] == a_corr,
+         f"report {ra['ppdb_corrected_visits']}, expected {a_corr:,}")
+    gate("B: ppdb_corrected_visits == the per-visit test's count",
+         rb["ppdb_corrected_visits"] == len(exp_corr),
+         f"report {rb['ppdb_corrected_visits']}, expected {len(exp_corr):,}")
+    cols = ("detector", "ephRa", "ephDec", "ephOffset", "diaDistanceRank", "ephVmag", "ephRateRa",
+            "ephRateDec")
+    A = read_rows(builds["A"], sidecar_of(builds["A"]), cols)
+    B = read_rows(builds["B"], sidecar_of(builds["B"]), cols)
+    key = list(C.NEARBYSSO_KEY)
+    m = A.merge(B, on=key, how="outer", suffixes=("_a", "_b"), indicator=True)
+    m["group"] = m["visit"].map(group)
+    m["test"] = np.where(m["visit"].isin(exp_corr), "corrected", "uncorrected")
+    only = m["_merge"] != "both"
+    rep(f"rows: A {len(A):,}, B {len(B):,}; in one only {int(only.sum()):,} "
+        f"({m.loc[only, ['_merge', 'test']].value_counts().to_dict()})")
+    unc_only = only & (m["test"] == "uncorrected")
+    gate("visits passing the test (uncorrected): the same rows in A and B", not unc_only.any(),
+         f"{int(unc_only.sum()):,} rows in one build only")
+    both = m[~only].copy()
+    unc = (both["test"] == "uncorrected").to_numpy()
+    vals = ("detector", "ephRa", "ephDec", "ephOffset", "diaDistanceRank", "ephVmag", "ephRateRa",
+            "ephRateDec", "eph_x", "eph_y", "ephDetectorEdgeDist", "midpointMjdTai", "midpointMjdTai_flag")
+    diff = np.zeros(len(both), bool)
+    for c in vals:
+        x, y = both[f"{c}_a"].to_numpy(), both[f"{c}_b"].to_numpy()
+        diff |= ~((x == y) | (pd.isna(x) & pd.isna(y)))
+    gate("visits passing the test: rows identical in A and B (every value)", not (diff & unc).any(),
+         f"{int(unc.sum()):,} rows; {int((diff & unc).sum()):,} differ")
+    # visits failing it: matched rows at their DiaSource's own (B) time,
+    # unmatched rows at the table's time (as in A)
+    bt = b.drop_duplicates("diaSourceId").set_index("diaSourceId")["midpointMjdTai"]
+    mb = both["matched_b"].astype(bool).to_numpy()
+    cm = both[~unc & mb].copy()
+    cm["dia_t_b"] = cm["diaSourceId"].map(bt).to_numpy()
+    cm["dt_own_s"] = (cm["midpointMjdTai_b"] - cm["dia_t_b"]) * 86400
+    eq = (cm["midpointMjdTai_b"] == cm["dia_t_b"]).to_numpy()
+    cm["row"] = cm["row_b"]
+    rep(f"failing visits: matched rows {len(cm):,}, flagged {int(cm['midpointMjdTai_flag_b'].sum()):,}; "
+        f"|t_B - t_A| {_stats((cm['midpointMjdTai_b'] - cm['midpointMjdTai_a']) * 86400, 's')}")
+    gate("visits failing the test: matched rows at their DiaSource's own time (bitwise)", eq.all(),
+         f"{len(cm):,} rows; {int((~eq).sum()):,} differ" + _eg(cm, ~eq, "diaSourceId", "dt_own_s"))
+    cu = both[~unc & ~mb]
+    du = np.abs(cu["midpointMjdTai_b"].to_numpy() - cu["midpointMjdTai_a"].to_numpy()) * 86400
+    fl = cu["midpointMjdTai_flag_a"].to_numpy() == cu["midpointMjdTai_flag_b"].to_numpy()
+    fb = cu["midpointMjdTai_flag_b"].astype(bool).to_numpy()
+    rep(f"failing visits: unmatched rows {len(cu):,} ({int(fb.sum()):,} flagged); corrected ones' "
+        f"|t_B - t_A| {_stats(du[~fb], 's')}")
+    gate("visits failing the test: unmatched corrected rows at the table's time, as in A (within 1 ms); "
+         "flags as in A", (du[~fb] <= 1e-3).all() and fl.all(),
+         f"{int((~fb).sum()):,} rows; {int((du[~fb] > 1e-3).sum()):,} beyond 1 ms, {int((~fl).sum()):,} "
+         "flags differ")
+    # Flagged rows keep "the visit's time", which the design does not define
+    # for a visit whose PPDB times are corrected: reported, not gated
+    if fb.any():
+        med = b.groupby("visit")["midpointMjdTai"].median()
+        hdr = per_visit_uncorrected(b, args.correction_table)["header"]
+        f = cu[fb]
+        d_med = (f["midpointMjdTai_b"] - f["visit"].map(med)).abs().to_numpy() * 86400
+        d_hdr = (f["midpointMjdTai_b"] - f["visit"].map(hdr)).abs().to_numpy() * 86400
+        rep(f"failing visits, flagged unmatched rows ({len(f):,}): |t - median DiaSource time| "
+            f"{_stats(d_med, 's')}; |t - header midpoint| {_stats(d_hdr, 's')} (report only: the design "
+            "does not say which is 'the visit's time' here)")
+    rep(f"total {time.time() - t0:.1f} s")
+    code = _verdict(rep, "per-visit test on fabricated corrected times")
+    rep.write(m[only | (m["test"] == "corrected")].drop(columns=["_merge"]).reset_index(drop=True))
+    return code
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2258,6 +3218,9 @@ def main(argv=None):
     common(p)
     p.add_argument("--ssobservation", required=True,
                    help="SSObservation: the delivery directory, its manifest, or a single Parquet file")
+    p.add_argument("--sidecar", default=None,
+                   help=f"NearbySSO's sidecar, for its time per row (default: {C.NEARBYSSO_SIDECAR_FILE} "
+                        "next to --nearbysso if there is one; without it, the DiaSource's midpointMjdTai)")
     p.add_argument("--no-sigma", action="store_true", help="don't compute sigma (classify as unknown)")
     p.add_argument("--pos-tol-mas", type=float, default=TOL["pos_mas"])
     p.add_argument("--rate-tol", type=float, default=TOL["rate_deg_day"], help="deg/day")
@@ -2338,6 +3301,58 @@ def main(argv=None):
     p.add_argument("--sss-processing", default=SSS_PROCESSING,
                    help="SSObservation: the processing to compare (default: %(default)s; 'all')")
     p.set_defaults(func=cmd_mock)
+
+    # unmatched predictions, placement and corrected times
+    # (docs/design/nearbysso-unmatched.md, "Validation")
+    def unmatched(p, dia=True, wcs=True, table=True):
+        p.add_argument("--nearbysso", required=True)
+        p.add_argument("--sidecar", default=None,
+                       help=f"the sidecar (default: {C.NEARBYSSO_SIDECAR_FILE} next to --nearbysso)")
+        if dia:
+            p.add_argument("--dia", required=True, help="ppdb_dia_sources Parquet (with detector)")
+        if wcs:
+            p.add_argument("--wcs-store", default=DEFAULT_WCS_STORE,
+                           help="visit-table's wcs/ (default: %(default)s)")
+        if table:
+            p.add_argument("--correction-table", default=DEFAULT_CORRECTION_TABLE,
+                           help="shutter-timing correction table (default: %(default)s)")
+        p.add_argument("--out", required=True, help="report directory")
+        p.add_argument("--seed", type=int, default=42)
+
+    p = sub.add_parser("placement", help="sampled visits: placement and times, fresh")
+    unmatched(p)
+    p.add_argument("--n-visits", type=int, default=50, help="visits sampled (0: all)")
+    p.set_defaults(func=cmd_placement)
+
+    p = sub.add_parser("dia-detector", help="matched rows' detector against their DiaSource's")
+    unmatched(p, wcs=False, table=False)
+    p.set_defaults(func=cmd_dia_detector)
+
+    p = sub.add_parser("times", help="every row's time and flag; causes vs the report")
+    unmatched(p)
+    p.add_argument("--report", default=None, help="the run report (nearbysso.report.json): causes and "
+                   "ppdb_corrected_visits checked against it")
+    p.set_defaults(func=cmd_times)
+
+    p = sub.add_parser("report-counts", help="the run report's placement counts against the files")
+    unmatched(p, dia=False, table=False)
+    p.add_argument("--report", required=True, help="nearbysso.report.json")
+    p.add_argument("--dia", default=None, help="DiaSources (with --wcs-store: visits without a WCS)")
+    p.set_defaults(func=cmd_report_counts)
+
+    p = sub.add_parser("ppdb-times", help="the per-visit test on fabricated corrected times (two builds)")
+    p.add_argument("--dia", required=True, help="ppdb_dia_sources Parquet (with detector)")
+    p.add_argument("--orbits", required=True, help="mpc_orbits Parquet")
+    p.add_argument("--ssobject", default=None, help="SSObject Parquet")
+    p.add_argument("--wcs-store", default=DEFAULT_WCS_STORE)
+    p.add_argument("--correction-table", default=DEFAULT_CORRECTION_TABLE)
+    p.add_argument("--nights", default=None, help="comma-separated day_obs (default: --n-nights random)")
+    p.add_argument("--n-nights", type=int, default=2)
+    p.add_argument("--workers", type=int, default=16)
+    p.add_argument("--reuse", action="store_true", help="reuse existing builds in --out")
+    p.add_argument("--out", required=True)
+    p.add_argument("--seed", type=int, default=42)
+    p.set_defaults(func=cmd_ppdb_times)
 
     args = ap.parse_args(argv)
     # (future epochs: astropy falls back to mean polar motion, sub-mas here)

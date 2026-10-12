@@ -1,10 +1,14 @@
-"""WP4: build ``nearbysso.parquet`` (docs/design/nearbysso.md).
+"""WP4: build ``nearbysso.parquet`` (docs/design/nearbysso.md,
+docs/design/nearbysso-unmatched.md).
 
 Three passes; each orbit is integrated once, and only the DiaSources are
 sliced:
 
 1. **Visits** (``read_workers`` forked processes, one slice each): read a
-   slice (``visits.read_dia``) and derive its visits (``build_visits``).
+   slice (``visits.read_dia``) and derive its visits (``build_visits``),
+   each with its footprint: its field (boresight and LSSTCam field radius)
+   plus PLACEMENT_MARGIN_ARCSEC where the visit has a WCS, else its
+   DiaSources' (``placement.wcs_footprints``).
    The parent concatenates them into one ``visits`` array over all nights,
    builds one ``VisitIndex`` and computes the observer at the coarse
    sample times.
@@ -12,12 +16,11 @@ sliced:
    costliest first; see ``orbit_schedule``), per orbit over all nights:
    ``propagate.coarse``, ``VisitIndex.candidates``, the precise
    ``compute_ephemerides_one`` at the candidate visits (as SSObservation), the
-   error ellipse there (``propagate.ellipse_at``) and the sigma gate; at
-   visits whose sources carry their own times, also the published values'
-   rates of change (``DOT_DTYPE``; see "Times" below). The eligible
-   predictions (``PRED_DTYPE``, 56 bytes each, and 32 more for the rates
-   of change if any visit's sources carry their own times) come back to
-   the parent, which sorts them by (visit, orbit).
+   error ellipse there (``propagate.ellipse_at``) and the sigma gate, and
+   the published values' rates of change (``DOT_DTYPE``; see "Times"
+   below). The eligible predictions (``PRED_DTYPE``, 56 bytes each, and 44
+   more for the rates of change) come back to the parent, which sorts them
+   by (visit, orbit).
 3. **Matching** (``read_workers`` processes, one slice each; the
    predictions shared through fork): read the slice again, index it
    (``DiaIndex``), match the slice's predictions (a contiguous range of the
@@ -25,11 +28,21 @@ sliced:
    comets and ISOs, 5" otherwise), rank each prediction's matches by separation
    (``diaDistanceRank``, ties by diaSourceId) and keep the nearest per
    DiaSource (ties by designation). A slice owns its DiaSources, and so
-   every DiaSource of a visit, so both are exact. Each kept row's published
-   values are then moved to its own DiaSource's time (``at_source_time``).
+   every DiaSource of a visit, so both are exact. Every eligible
+   prediction of the slice is then placed on a detector at its visit's
+   time; those that are the nearest of no DiaSource become unmatched rows
+   if on a detector or within PLACEMENT_MARGIN_ARCSEC of one (else they
+   are dropped, and counted); and each row, matched or not, is given its
+   time and its published values are moved there (``place_and_time``; see
+   "Times").
 
-The parent then attaches ``ssObjectId`` from an SSObject table, writes the
-Parquet file (sorted by diaSourceId) and a JSON run report next to it.
+The parent then reduces the matched rows across slices (a repeated
+diaSourceId; a prediction this leaves the nearest of nothing becomes an
+unmatched row, ``orphan_rows``), attaches ``ssObjectId`` from an SSObject
+table, and writes the Parquet file (the matched rows by diaSourceId, then
+the unmatched rows, with NULL diaSourceId, ephOffset and diaDistanceRank,
+by (visit, designation)), its sidecar (``NEARBYSSO_SIDECAR_FILE``: the
+placement and times, row for row) and a JSON run report next to it.
 
 Slices never split a night (``night = visit // 100000``, i.e. day_obs):
 they are blocks of ``slice_days`` consecutive day_obs dates, read with time
@@ -43,33 +56,41 @@ so that every visit time is bracketed (``ellipse_at`` clamps outside the
 sampled span) by samples of its own night, and the rate and distance
 changes ``candidates`` estimates for a night come from that night alone.
 
-**Times** (docs/design/shutter-timing.md). Candidate selection, matching,
-``diaDistanceRank`` and the nearest-object reduction use the prediction at
-the visit's time (``build_visits``'s ``t_tai_mjd``: the time its sources
-share, else their median). Every published value of a row is evaluated at
-its own DiaSource's ``midpointMjdTai``, as read (``at_source_time``):
+**Times** (docs/design/shutter-timing.md, docs/design/nearbysso-unmatched.md).
+Candidate selection, matching, ``diaDistanceRank`` and the nearest-object
+reduction use the prediction at the visit's time (``build_visits``'s
+``t_tai_mjd``: the time its sources share, else their median). Every
+published value of a row is evaluated at the row's time
+(``at_source_time``), which ``placement.row_times`` gives by the contract's
+rule: per visit, if every DiaSource's ``midpointMjdTai`` is the header
+midpoint (to 1 ms), the shutter-corrected midpoint at the prediction's
+pixel (``wcs_store``, ``correction_table``); else (the PPDB records
+corrected times) the DiaSource's own; the visit's time, flagged, where
+there is no correction (and, without a header midpoint to test against, the
+DiaSource's own time, flagged):
 
-- a row at its visit's time (every row, today) is published exactly as
-  predicted, bitwise;
-- a row at another time (shutter-corrected DiaSources: |dt| <= ~0.25 s,
-  up to ~2 s for header-timed visits) is moved there: its position by dt
+- a row at its visit's time is published exactly as predicted, bitwise;
+- a row at another time (shutter-corrected: |dt| <= ~0.25 s, up to ~2 s
+  for header-timed visits) is moved there: its position by dt
   along the great circle of its rates at dt/2 (with the rotation of the
   local east/north frame along the path, so to second order also near the
   poles), its ``ephOffset`` measured from there, and its ellipse, rates,
-  ``ephVmag`` and tail angles by their rates of change times dt. The orbit
-  pass computes those rates of change only at visits whose sources' times
-  differ (none, today), from a second, separate precise evaluation
-  ``DOT_STEP_DAYS`` later; the first one is untouched. The ellipse's are
-  taken on both sides (``ellipse_at`` a step later and a step earlier),
-  the forward ones for dt > 0 and the backward ones for dt < 0, because
+  ``ephVmag`` and tail angles by their rates of change times dt; its
+  pixels (``eph_x``, ``eph_y``) by the WCS model's Jacobian times the move
+  (``placement.move_pixels``). The orbit pass computes those rates of
+  change at every candidate visit, from a second, separate precise
+  evaluation ``DOT_STEP_DAYS`` later; the first one is untouched. The
+  ellipse's are taken on both sides (``ellipse_at`` a step later and a
+  step earlier), the forward ones for dt > 0 and the backward ones for
+  dt < 0, because
   ``ellipse_at`` has a kink at each coarse sample and is constant beyond a
   night's first and last, where visits often lie. If the second evaluation
   fails (an exception, or non-finite values), the rates of change fall
   back to 0, so the rows keep their visit's values; the run report counts
   those predictions (``source_times.rates_of_change_fallback``).
 
-This costs a second ``compute_ephemerides_one`` per orbit with such visits
-(~3.4% of the orbit pass's CPU on 2026-10-04), where an exact evaluation
+This costs a second ``compute_ephemerides_one`` per orbit (6.0% of the
+orbit pass's CPU on 2026-10-09, WP U0), where an exact evaluation
 at each row's own time would cost a third pass re-integrating every matched
 orbit (and its coarse track, for the ellipse). Against that exact
 evaluation (``compute_ephemerides_one`` and ``ellipse_at`` at the row's
@@ -123,10 +144,14 @@ from .. import nongrav as _nongrav
 from ..ephem_assist import (MJD_J2000, compute_ephemerides_one, open_ephem, tail_position_angles,
                             tail_position_angles_f32)
 from ..photfit import hg_V_mag
+from ..sso_daily import DEFAULT_CORRECTION_TABLE
 from . import orbits as _orbits
+from . import placement as _place
 from . import propagate, visits as _visits
-from ._contract import (MATCH_RADIUS_ARCSEC, MATCH_RADIUS_COMET_ARCSEC, NEARBYSSO_DTYPE, OBSCODE, ORBIT_DTYPE,
-                        SIGMA_MAX_ARCSEC, VISIT_DTYPE, match_radius)
+from ._contract import (MATCH_RADIUS_ARCSEC, MATCH_RADIUS_COMET_ARCSEC, NEARBYSSO_DTYPE, NEARBYSSO_NONNULL,
+                        NEARBYSSO_SIDECAR_DTYPE, NEARBYSSO_SIDECAR_FILE, NEARBYSSO_SIDECAR_NONNULL,
+                        NEARBYSSO_UNMATCHED_NULL, OBSCODE, ORBIT_DTYPE, SIGMA_MAX_ARCSEC, VISIT_DTYPE,
+                        match_radius)
 
 #: The smallest spacing [day] of a night's three coarse samples (for a night
 #: with a single visit, or visits close in time; see the module docstring).
@@ -157,9 +182,8 @@ _ELLIPSE = ("ra_err", "dec_err", "ra_dec_cov")
 
 #: The rates of change [per day] of a prediction's ``_MOVED`` values (44
 #: bytes), aligned with the predictions; ``<name>_dot`` forward in time,
-#: and for the ellipse also ``<name>_dot_back``, backward. Only computed
-#: (``process_orbit``) when some visit's sources carry their own times;
-#: nonzero only at those visits, and where finite.
+#: and for the ellipse also ``<name>_dot_back``, backward. Computed
+#: (``process_orbit``) at every candidate visit; 0 where not finite.
 DOT_DTYPE = np.dtype([(f"{c}_dot", "f4") for c in _MOVED] + [(f"{c}_dot_back", "f4") for c in _ELLIPSE])
 
 #: A row's published values at its DiaSource's own time (``at_source_time``).
@@ -268,10 +292,11 @@ def plan_slices(nights, tmin, tmax, slice_days, n=None):
     return out
 
 
-def _read_slice(path, sl):
+def _read_slice(path, sl, extra=()):
     """The slice's DiaSources: read by its time bounds, then cut to its own
-    nights (a no-op unless nights overlap in time)."""
-    dia = _visits.read_dia(path, sl["t_lo"], sl["t_hi"])
+    nights (a no-op unless nights overlap in time). ``extra``: more integer
+    columns (``read_dia``)."""
+    dia = _visits.read_dia(path, sl["t_lo"], sl["t_hi"], extra=extra)
     night = dia["visit"] // 100000
     keep = (night >= sl["night_lo"]) & (night <= sl["night_hi"])
     if not keep.all():
@@ -341,8 +366,10 @@ def own_times(dia, visits):
 
 def _visits_slice(s0, s1):
     """Slices [s0, s1): per slice (its visits, rows read, seconds reading,
-    seconds in build_visits, ``own_times`` of its visits), and the peak
-    RSS."""
+    seconds in build_visits, ``own_times`` of its visits, and per visit
+    whether it has a WCS footprint, whether that is centred on the fitted
+    boresight and how many of its DiaSources lie outside it;
+    ``placement.wcs_footprints``), and the peak RSS."""
     w = _W
     out = []
     for s in range(s0, s1):
@@ -350,8 +377,10 @@ def _visits_slice(s0, s1):
         dia = _read_slice(w["dia_path"], w["slices"][s])
         t1 = time.perf_counter()
         vis = _visits.build_visits(dia, threads=w["threads"])
-        out.append((vis, int(dia["diaSourceId"].size), t1 - t0, time.perf_counter() - t1,
-                    own_times(dia, vis)))
+        own = own_times(dia, vis)
+        fp, fitted, outside = _place.wcs_footprints(w.get("wcs_store"), vis, dia["ra"], dia["dec"])
+        out.append((vis, int(dia["diaSourceId"].size), t1 - t0, time.perf_counter() - t1, own, fp, fitted,
+                    outside))
         del dia
     return out, _peak_rss_gb()
 
@@ -384,8 +413,7 @@ def candidate_margin(designation):
 def process_orbit(i, w, ephem, stage_t):
     """Orbit ``i`` of ``w["orbits"]`` over every night: its eligible
     predictions (``PRED_DTYPE``, or None), its counters, and the
-    predictions' rates of change (``DOT_DTYPE``; None unless some visit's
-    sources carry their own times)."""
+    predictions' rates of change (``DOT_DTYPE``, or None)."""
     orbit = w["orbits"][i]
     c = dict.fromkeys(_COUNTS, 0)
     t0 = time.perf_counter()
@@ -446,25 +474,21 @@ def process_orbit(i, w, ephem, stage_t):
     p["anti_motion_pa"] = tail_position_angles_f32(anti_motion)
     t4 = time.perf_counter()
     stage_t["ellipse"] += t4 - t3
-    if not w.get("any_own"):
-        return p, c, None
 
-    # the rates of change of the published values, at the visits whose
-    # sources carry their own times (at_source_time): from a second,
+    # the rates of change of the published values, at every candidate visit
+    # (at_source_time moves each row to its own time): from a second,
     # separate evaluation DOT_STEP_DAYS later, so that the first stays as it
     # is; the ellipse's also a step earlier. A failure leaves them 0 (the
     # rows keep their visit's values), counted, never losing the orbit's rows.
     dots = np.zeros(k.size, dtype=DOT_DTYPE)
-    own = w["dot_h"][cand[k]] != 0.0
-    if own.any():
-        try:
-            dots[own], n_bad = _rates_of_change_at(orbit, track, e, k[own], cand[k[own]],
-                                                   (ra_err, dec_err, ra_dec_cov), w, ephem)
-            c["rates_of_change_nonfinite"] = n_bad
-        except Exception:
-            dots[own] = 0.0
-            c["rates_of_change_exception"] = int(own.sum())
-        stage_t["dots"] += time.perf_counter() - t4
+    try:
+        dots, n_bad = _rates_of_change_at(orbit, track, e, k, cand[k], (ra_err, dec_err, ra_dec_cov), w,
+                                          ephem)
+        c["rates_of_change_nonfinite"] = n_bad
+    except Exception:
+        dots[:] = 0
+        c["rates_of_change_exception"] = int(k.size)
+    stage_t["dots"] += time.perf_counter() - t4
     return p, c, dots
 
 
@@ -509,7 +533,7 @@ def _orbit_chunk(o0, o1):
     """Orbits ``w["order"][o0:o1]``: (predictions, counters, exceptions by
     type, examples, stage times, {"coarse_all", "coarse_partial",
     "exception"}: the orbits whose coarse pass failed entirely or in part,
-    or that raised, peak RSS, the predictions' rates of change or None).
+    or that raised, peak RSS, the predictions' rates of change).
     One bad orbit doesn't stop the rest."""
     global _EPHEM
     w = _W
@@ -546,9 +570,7 @@ def _orbit_chunk(o0, o1):
             out.append(p)
             out_dots.append(dots)
     preds = np.concatenate(out) if out else np.zeros(0, dtype=PRED_DTYPE)
-    dots = None
-    if w.get("any_own"):
-        dots = np.concatenate(out_dots) if out_dots else np.zeros(0, dtype=DOT_DTYPE)
+    dots = np.concatenate(out_dots) if out_dots else np.zeros(0, dtype=DOT_DTYPE)
     counts["orbits"] = o1 - o0
     counts["step_cap_stops"] = int(propagate.STEP_CAP_STOPS)
     bad = {k: np.array(v, dtype=np.int64) for k, v in bad.items()}
@@ -702,20 +724,28 @@ def _match_slice(s0, s1):
     """Slices [s0, s1): per slice, the nearest match of each of its
     DiaSources, as (diaSourceId, prediction index, separation,
     diaDistanceRank), plus the numbers of matches, and of comets' (and
-    ISOs') matches, before that reduction, and the published values of
-    each kept row at its DiaSource's own time (``at_source_time``); then
-    (seconds reading, indexing, matching) and the peak RSS."""
+    ISOs') matches, before that reduction, the published values of each
+    kept row at its time (``at_source_time``), its placement and time
+    (``ROW_PLACE_DTYPE``; ``place_and_time``) and the slice's visit
+    statistics; then the slice's unmatched rows (the eligible predictions
+    that are the nearest of none of its DiaSources and lie on a detector or
+    within PLACEMENT_MARGIN_ARCSEC of one: their prediction indices, in
+    order, their published values and their placement), and its visits'
+    time states and header causes (``visit_states``; for the parent's
+    ``orphan_rows``) and whether each has a WCS; then (seconds reading,
+    indexing, matching, placing and timing) and the peak RSS."""
     w = _W
     preds, vstart, poff, orbit_radius = w["preds"], w["vstart"], w["poff"], w["orbit_radius"]
-    out, tim = [], np.zeros(3)
+    out, tim = [], np.zeros(4)
     for s in range(s0, s1):
         t0 = time.perf_counter()
-        dia = _read_slice(w["dia_path"], w["slices"][s])
+        dia = _read_slice(w["dia_path"], w["slices"][s], extra=w.get("dia_extra", ()))
         v0, v1 = vstart[s], vstart[s + 1]
         vis = w["visits"][v0:v1]
         t1 = time.perf_counter()
         dindex = _visits.DiaIndex(dia, vis, threads=w["threads"])
         ids, t_src = dia["diaSourceId"], dia["midpointMjdTai"]
+        det_src = dia["detector"] if "detector" in dia else np.full(ids.size, -1, np.int64)
         del dia
         t2 = time.perf_counter()
         p0, p1 = int(poff[v0]), int(poff[v1])
@@ -744,13 +774,189 @@ def _match_slice(s0, s1):
         # so the lower row wins, deterministically.)
         sel = nearest(row, sep, k)
         n_comet = int((orbit_radius[preds["orbit"][k]] > MATCH_RADIUS_ARCSEC).sum())
-        r, ps = row[sel], preds[k[sel]]
-        pub = at_source_time(ps, None if w.get("dots") is None else w["dots"][k[sel]],
-                             w["visits"]["t_tai_mjd"][ps["visit"]], t_src[r], dindex.ra[r], dindex.dec[r],
-                             sep[sel])
-        out.append((ids[r], k[sel], sep[sel], rank[sel], n_match, n_comet, pub))
-        tim += (t1 - t0, t2 - t1, time.perf_counter() - t2)
+        r = row[sel]
+        t3 = time.perf_counter()
+        pub, place, vstats, unmatched, states = place_and_time(
+            w, vis, v0, p0, p1, k[sel], t_src, det_src, r, dindex.ra[r], dindex.dec[r], sep[sel])
+        out.append((ids[r], k[sel], sep[sel], rank[sel], n_match, n_comet, pub, place, vstats, unmatched,
+                    states))
+        tim += (t1 - t0, t2 - t1, t3 - t2, time.perf_counter() - t3)
     return out, tim, _peak_rss_gb()
+
+
+def visit_states(corr, vis, t_src):
+    """Per visit of ``vis`` (a slice's, whose DiaSources' times are
+    ``t_src``): (its time state, the cause of a missing header midpoint,
+    the largest deviation [s]); ``placement.header_midpoints`` and
+    ``visit_time_states``."""
+    header, hcause = _place.header_midpoints(corr, vis["visit"])
+    state, dev = _place.visit_time_states(t_src, vis["dia_start"], vis["dia_end"], header)
+    return state, hcause, dev
+
+
+def time_rows(vis, vi, state, hcause, ps, dots, pl, t_src, dia_det, ra_src, dec_src, sep, corr):
+    """Rows of predictions ``ps`` (at their visit's time, with rates of
+    change ``dots``) at visits ``vis[vi]`` (whose time states are ``state``
+    and ``hcause``, aligned with ``vis``; ``visit_states``), placed at the
+    visit's time as ``pl`` (``placement.place_rows``), matched to
+    DiaSources with times ``t_src`` (NaN: unmatched) and detectors
+    ``dia_det`` (-1: none), at ``ra_src``, ``dec_src``, ``sep`` [arcsec]
+    from the prediction (NaN: unmatched): their times
+    (``placement.row_times``), their published values moved there
+    (``at_source_time``) and their pixels moved with them
+    (``placement.move_pixels``). A row without a WCS takes its DiaSource's
+    detector; one with neither raises ValueError (``detector`` is never
+    NULL, and never inferred). Returns (``PUB_DTYPE``,
+    ``ROW_PLACE_DTYPE``)."""
+    has = pl["has_wcs"]
+    nodet = ~has & (dia_det < 0)
+    if nodet.any():
+        i = int(np.flatnonzero(nodet)[0])
+        raise ValueError(f"{int(nodet.sum())} NearbySSO row(s) without a detector: no WCS places them and "
+                         f"their DiaSource has no detector (e.g. visit {int(vis['visit'][vi[i]])}); the "
+                         "input DiaSources need a non-null detector column")
+    visit_ids = vis["visit"]
+    detector = np.where(has, pl["detector"], dia_det)
+    t_visit = vis["t_tai_mjd"][vi]
+    # the time a flagged row keeps: the visit's; in a visit whose PPDB times
+    # are corrected (no single visit time), its header midpoint from the
+    # exposure log (owner, 2026-10-11)
+    t_keep = t_visit.copy()
+    c = np.flatnonzero(state[vi] == _place.VISIT_CORRECTED)
+    if c.size:
+        h, _ = _place.header_midpoints(corr, visit_ids[vi][c])
+        ok = np.isfinite(h)
+        t_keep[c[ok]] = h[ok]
+    t_row, cause = _place.row_times(state[vi], hcause[vi], t_keep, t_src, has, visit_ids[vi], detector,
+                                    pl["x"], pl["y"], pl["bbox"], corr)
+    pub = at_source_time(ps, dots, t_visit, t_row, ra_src, dec_src, sep)
+    x, y, edge = _place.move_pixels(pl["x"], pl["y"], pl["edge"], pl["jacobian"], pl["bbox"], ps["ra"],
+                                    ps["dec"], pub["ra"], pub["dec"])
+    place = np.empty(len(ps), dtype=_place.ROW_PLACE_DTYPE)
+    place["visit"] = visit_ids[vi]
+    place["detector"] = detector
+    place["dia_detector"] = dia_det
+    place["eph_x"], place["eph_y"], place["ephDetectorEdgeDist"] = x, y, edge
+    place["midpointMjdTai"] = t_row
+    place["time_cause"] = cause
+    place["midpointMjdTai_flag"] = cause >= _place.FIRST_FLAGGED
+    place["has_wcs"] = has
+    place["move_px"] = np.hypot(x - pl["x"], y - pl["y"])
+    return pub, place
+
+
+def _take(pl, i):
+    """``placement.place_rows``'s output at rows ``i``."""
+    return {c: v[i] for c, v in pl.items()}
+
+
+def place_and_time(w, vis, v0, p0, p1, km, t_src, det_src, r, ra_src, dec_src, sep):
+    """The rows of a slice (its visits ``vis``, the ``v0``-th onwards of
+    all; its eligible predictions ``w["preds"][p0:p1]``, of which ``km``
+    are the matched rows'; its DiaSources' times ``t_src`` and detectors
+    ``det_src``, the matched rows' DiaSources ``r``, at ``ra_src``,
+    ``dec_src``, ``sep`` [arcsec] from the prediction), placed on
+    detectors, timed and moved (docs/design/nearbysso-unmatched.md, steps
+    2-7):
+
+    1. per visit of the slice, whether its PPDB times are uncorrected
+       (``visit_states``, against the correction table's header midpoints,
+       ``w["corrections"]``);
+    2. every eligible prediction of the slice placed at its visit's time on
+       the slice's WCSs (``w["wcs_store"]``; ``placement.place_rows``).
+       A matched row keeps its row whatever its placement: without a WCS,
+       or more than PLACEMENT_MARGIN_ARCSEC from every detector with one,
+       it takes its DiaSource's detector, and NaN pixels. Every other
+       prediction (the nearest of none of the slice's DiaSources) is an
+       unmatched row if placed (on a detector, or within the margin of
+       one), else dropped: beyond the margin, or in a visit without a WCS;
+    3. each row's time, and its published values and pixels moved there
+       (``time_rows``).
+
+    Returns (the matched rows' ``PUB_DTYPE`` and ``ROW_PLACE_DTYPE``, the
+    slice's visit statistics (a dict), the unmatched rows (their prediction
+    indices, in order, ``PUB_DTYPE``, ``ROW_PLACE_DTYPE``), and the slice's
+    visits' (time state, header cause, whether it has a WCS))."""
+    preds, dots_all = w["preds"], w.get("dots")
+    visit_ids = vis["visit"]
+    corr = w.get("corrections")
+    state, hcause, dev = visit_states(corr, vis, t_src)
+    t_open = time.perf_counter()
+    store = _place.open_store(w.get("wcs_store"), vis["night"], visit_ids)
+    t_read = time.perf_counter() - t_open
+    q = preds[p0:p1]
+    pl_all = _place.place_rows(store, visit_ids[q["visit"].astype(np.int64) - v0], q["ra"], q["dec"])
+    # the matched rows, then the unmatched ones, in prediction order, i.e.
+    # by (visit, designation)
+    km = np.asarray(km, np.int64)
+    matched = np.zeros(p1 - p0, bool)
+    matched[km - p0] = True
+    um = np.flatnonzero(~matched & pl_all["has_wcs"])
+    nm, nu = km.size, um.size
+    li = np.concatenate([km - p0, um])
+    ps = q[li]
+    nan = np.full(nu, np.nan)
+    pub, place = time_rows(
+        vis, ps["visit"].astype(np.int64) - v0, state, hcause, ps,
+        None if dots_all is None else dots_all[p0 + li], _take(pl_all, li),
+        np.concatenate([t_src[r], nan]), np.concatenate([det_src[r], np.full(nu, -1, np.int64)]),
+        np.concatenate([ra_src, nan]), np.concatenate([dec_src, nan]), np.concatenate([sep, nan]), corr)
+    corrected = np.flatnonzero(state == _place.VISIT_CORRECTED)
+    # (as place_rows sees them: a visit with only rejected detectors has
+    # no locator, so no WCS)
+    with_wcs = np.zeros(vis.size, bool)
+    if store is not None:
+        with_wcs = np.isin(visit_ids, store.visit[~store.rejected])
+    dropped = ~matched & ~pl_all["has_wcs"]
+    vstats = dict(visits=int(vis.size), uncorrected=int((state == _place.VISIT_UNCORRECTED).sum()),
+                  corrected=int(corrected.size),
+                  unverified={_place.TIME_CAUSES[c]: int(n) for c, n in
+                              zip(*np.unique(hcause[state == _place.VISIT_UNVERIFIED], return_counts=True))},
+                  corrected_first=(int(visit_ids[corrected[0]]), float(dev[corrected[0]])) if corrected.size
+                  else None,
+                  without_wcs=int((~with_wcs).sum()),
+                  # the slice's matched rows beyond the margin (rows without a
+                  # WCS), before the reduction across slices
+                  beyond_margin=int(pl_all["beyond_margin"][km - p0].sum()),
+                  predictions=int(p1 - p0), unmatched=int(nu),
+                  dropped_beyond_margin=int((dropped & pl_all["beyond_margin"]).sum()),
+                  dropped_no_wcs_visit=int((dropped & ~pl_all["beyond_margin"]).sum()),
+                  wcs_files=len(_place.wcs_paths(w["wcs_store"], vis["night"])) if w.get("wcs_store") else 0,
+                  wcs_read_s=t_read,
+                  # (the lookups run in this process: the parent's Corrections
+                  # never sees what they read)
+                  corrections=None if corr is None else dict(
+                      formats=sorted(corr.formats), calibrations=sorted(corr.calibrations),
+                      versions=sorted(corr.versions)))
+    return pub[:nm], place[:nm], vstats, (p0 + um, pub[nm:], place[nm:]), (state, hcause, with_wcs)
+
+
+def orphan_rows(w, visits, state, hcause, idx):
+    """The rows of predictions ``idx`` (into ``w["preds"]``, sorted) that a
+    slice kept as the nearest of a DiaSource but the parent's reduction
+    across slices dropped (a repeated diaSourceId, nearer in another
+    slice), leaving them the nearest of none: unmatched rows if placed, as
+    ``place_and_time`` makes them, from the time states ``state`` and
+    header causes ``hcause`` of ``visits`` (all of them, aligned). Returns
+    (the indices of those placed, their ``PUB_DTYPE`` and
+    ``ROW_PLACE_DTYPE``, the number dropped beyond the margin, and in
+    visits without a WCS)."""
+    idx = np.asarray(idx, np.int64)
+    ps = w["preds"][idx]
+    vi = ps["visit"].astype(np.int64)
+    used = np.unique(vi)
+    store = _place.open_store(w.get("wcs_store"), visits["night"][used], visits["visit"][used])
+    pl = _place.place_rows(store, visits["visit"][vi], ps["ra"], ps["dec"])
+    keep = np.flatnonzero(pl["has_wcs"])
+    n = keep.size
+    nan = np.full(n, np.nan)
+    dots = w.get("dots")
+    pub, place = time_rows(visits, vi[keep], state, hcause, ps[keep],
+                           None if dots is None else dots[idx[keep]], _take(pl, keep), nan,
+                           np.full(n, -1, np.int64), nan, nan, nan, w.get("corrections"))
+    drop = ~pl["has_wcs"]
+    return (idx[keep], pub, place, int((drop & pl["beyond_margin"]).sum()),
+            int((drop & ~pl["beyond_margin"]).sum()))
 
 
 # --------------------------------------------------------------------------
@@ -821,6 +1027,101 @@ def _source_time_stats(pub, p, orbit_radius):
     return st
 
 
+def merged_provenance(corr, vstats):
+    """``corr.provenance()`` with what the slices' lookups read (their
+    ``vstats["corrections"]``) merged in: they run in pass-3 workers, so
+    this process's ``corr`` never saw them."""
+    for v in vstats:
+        c = v.get("corrections")
+        if c is not None:
+            corr.formats.update(c["formats"])
+            corr.calibrations.update(c["calibrations"])
+            corr.versions.update(c["versions"])
+    return corr.provenance()
+
+
+def _quantiles(x):
+    """p50, p90, p99 and the max of the finite ``x`` (None if none)."""
+    x = np.asarray(x, np.float64)
+    x = x[np.isfinite(x)]
+    if not x.size:
+        return None
+    q = np.quantile(x, [0.5, 0.9, 0.99])
+    return dict(n=int(x.size), p50=float(q[0]), p90=float(q[1]), p99=float(q[2]), max=float(x.max()))
+
+
+#: Matched rows on another detector than their DiaSource's, listed at most.
+_N_DETECTOR_EXAMPLES = 20
+
+
+def placement_report(place, pub, p, n_matched, vstats, snapshot, orphans=(0, 0, 0), footprint=None,
+                     visit_has_wcs=None):
+    """The run report's ``placement`` (the contract's
+    PLACEMENT_REPORT_FIELDS) and ``placement_diagnostics`` (visit counts,
+    footprints, times, moves, and the matched rows placed on another
+    detector than their DiaSource's), for the rows' ``place``
+    (ROW_PLACE_DTYPE), their published values ``pub`` and predictions
+    ``p``, the first ``n_matched`` of them matched, the slices' visit
+    statistics ``vstats``, the WCS store's ``snapshot``, the parent's
+    orphaned predictions (``orphan_rows``: rows, dropped beyond the
+    margin, dropped in visits without a WCS), the visits' ``footprint``
+    statistics (pass 1) and whether each visit (by ``p["visit"]``) has a
+    WCS, ``visit_has_wcs``: a matched row without a WCS in a visit with one
+    is beyond the margin (counted from the final rows, so not a row the
+    reduction across slices dropped)."""
+    cause = place["time_cause"]
+    m = slice(0, n_matched)
+    if visit_has_wcs is None:
+        visit_has_wcs = np.zeros(int(p["visit"].max()) + 1 if len(p) else 0, bool)
+    flagged = {_place.TIME_CAUSES[c]: int((cause == c).sum())
+               for c in range(_place.FIRST_FLAGGED, len(_place.TIME_CAUSES))}
+    rep = dict(matched_rows=int(n_matched), unmatched_rows=int(place.size - n_matched),
+               dropped_beyond_margin=int(sum(v["dropped_beyond_margin"] for v in vstats) + orphans[1]),
+               dropped_no_wcs_visit=int(sum(v["dropped_no_wcs_visit"] for v in vstats) + orphans[2]),
+               matched_without_wcs=int((~place["has_wcs"][m]).sum()),
+               uncorrected_rows=flagged, ppdb_corrected_visits=int(sum(v["corrected"] for v in vstats)),
+               wcs_snapshot=snapshot)
+    firsts = [v["corrected_first"] for v in vstats if v["corrected_first"] is not None]
+    unverified = Counter()
+    for v in vstats:
+        unverified.update(v["unverified"])
+    dt_s = np.abs(pub["dt"]) * 86400.0
+    move = util.sky_separation_arcsec(p["ra"], p["dec"], pub["ra"], pub["dec"])
+    corrected = cause == _place.CAUSE_CORRECTED
+    pm = place[m]
+    other = (pm["has_wcs"] & (pm["dia_detector"] >= 0) & (pm["detector"] != pm["dia_detector"]))
+    ex = np.flatnonzero(other)[:_N_DETECTOR_EXAMPLES]
+
+    def causes(c):
+        return {name: int((c == i).sum()) for i, name in enumerate(_place.TIME_CAUSES)}
+    diag = dict(
+        visits=int(sum(v["visits"] for v in vstats)),
+        visits_uncorrected=int(sum(v["uncorrected"] for v in vstats)),
+        visits_corrected=rep["ppdb_corrected_visits"],
+        visits_unverified=dict(unverified),
+        ppdb_corrected_first=min(firsts) if firsts else None,
+        visits_without_wcs=int(sum(v["without_wcs"] for v in vstats)),
+        footprint=footprint,
+        eligible_predictions=int(sum(v["predictions"] for v in vstats)),
+        orphaned_predictions=int(sum(orphans)),
+        matched_beyond_margin=int((~place["has_wcs"][m] & visit_has_wcs[p["visit"][m]]).sum()),
+        wcs_files=int(sum(v["wcs_files"] for v in vstats)),
+        time_causes=causes(cause), time_causes_matched=causes(cause[m]),
+        time_causes_unmatched=causes(cause[n_matched:]),
+        abs_dt_s=_quantiles(dt_s), abs_dt_s_corrected=_quantiles(dt_s[corrected]),
+        move_arcsec=_quantiles(move), move_px=_quantiles(place["move_px"]),
+        rows_moved=int((pub["dt"] != 0.0).sum()),
+        dia_detector_missing=int((pm["dia_detector"] < 0).sum()),
+        other_detector=int(other.sum()),
+        other_detector_examples=[dict(visit=int(pm["visit"][i]),
+                                      dia_detector=int(pm["dia_detector"][i]),
+                                      detector=int(pm["detector"][i]),
+                                      edge_arcsec=float(pm["ephDetectorEdgeDist"][i]))
+                                 for i in ex],
+    )
+    return rep, diag
+
+
 def ssobject_ids(path, designations):
     """``ssObjectId`` of each designation from an SSObject Parquet table
     (its ``designation`` and ``ssObjectId`` columns), and whether it has a
@@ -850,30 +1151,61 @@ def ssobject_ids(path, designations):
     return ids, found
 
 
-#: NEARBYSSO_DTYPE float columns written nullable, NaN as NULL.
+#: NEARBYSSO_DTYPE float columns written NULL where NaN.
 _NULLABLE_FLOAT = ("ephAntiSunPA", "ephAntiMotionPA")
 
 
-def write_parquet(rows, has_ssobject, path):
-    """Write ``rows`` (NEARBYSSO_DTYPE, sorted by diaSourceId) with
-    ``ssObjectId`` null where ``has_ssobject`` is False."""
+def write_parquet(rows, has_ssobject, path, unmatched=None):
+    """Write ``rows`` (NEARBYSSO_DTYPE, in the contract's row order) with
+    ``ssObjectId`` null where ``has_ssobject`` is False, and
+    NEARBYSSO_UNMATCHED_NULL null where ``unmatched`` is True (None: no
+    row is). Columns not in NEARBYSSO_NONNULL are nullable, as in the
+    schema."""
+    if unmatched is None:
+        unmatched = np.zeros(len(rows), bool)
     arrays, fields = [], []
     for name in NEARBYSSO_DTYPE.names:
         col = rows[name]
+        mask = None
         if name == "ssObjectId":
-            a = pa.array(col, type=pa.int64(), mask=~has_ssobject)
+            mask = ~has_ssobject
+        elif name in NEARBYSSO_UNMATCHED_NULL:
+            mask = unmatched
         elif name in _NULLABLE_FLOAT:
-            # (NaN is NULL)
-            nan = np.isnan(col)
-            a = pa.array(col, type=pa.float32(), mask=nan if nan.any() else None)
-        elif col.dtype.kind == "U":
+            mask = np.isnan(col)          # (NaN is NULL)
+        if col.dtype.kind == "U":
             a = pa.array(col.tolist(), type=pa.string())
         else:
-            a = pa.array(col)
+            a = pa.array(col, mask=mask if mask is not None and mask.any() else None)
         arrays.append(a)
-        fields.append(pa.field(name, a.type, nullable=(name == "ssObjectId" or name in _NULLABLE_FLOAT)))
+        fields.append(pa.field(name, a.type, nullable=name not in NEARBYSSO_NONNULL))
     table = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
     pq.write_table(table, path, row_group_size=1 << 20)
+
+
+def write_sidecar(rows, place, unmatched, path):
+    """Write the sidecar (NEARBYSSO_SIDECAR_DTYPE) of ``rows``
+    (NEARBYSSO_DTYPE) with their ``place`` (ROW_PLACE_DTYPE, aligned):
+    one row per row, in the same order; ``diaSourceId`` null where
+    ``unmatched``, the placement null where there is no WCS (NaN)."""
+    arrays, fields = [], []
+    for name in NEARBYSSO_SIDECAR_DTYPE.names:
+        col = rows[name] if name in NEARBYSSO_DTYPE.names else place[name]
+        mask = None
+        if name == "diaSourceId":
+            mask = unmatched
+        elif col.dtype.kind == "f":
+            mask = np.isnan(col)
+        if col.dtype.kind == "U":
+            a = pa.array(col.tolist(), type=pa.string())
+        else:
+            a = pa.array(col.astype(NEARBYSSO_SIDECAR_DTYPE[name], copy=False),
+                         mask=mask if mask is not None and mask.any() else None)
+        if name in NEARBYSSO_SIDECAR_NONNULL and a.null_count:
+            raise ValueError(f"the NearbySSO sidecar: {a.null_count} NULL(s) in {name}")
+        arrays.append(a)
+        fields.append(pa.field(name, a.type, nullable=name not in NEARBYSSO_SIDECAR_NONNULL))
+    pq.write_table(pa.Table.from_arrays(arrays, schema=pa.schema(fields)), path, row_group_size=1 << 20)
 
 
 # --------------------------------------------------------------------------
@@ -881,7 +1213,8 @@ def write_parquet(rows, has_ssobject, path):
 # --------------------------------------------------------------------------
 
 def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_workers=8,
-          slice_days=7, chunk_factor=64, report_path=None, verbose=True):
+          slice_days=7, chunk_factor=64, report_path=None, verbose=True, wcs_store=None,
+          correction_table=None, return_rows=False):
     """Build ``out_path`` (``nearbysso.parquet``) from the DiaSources at
     ``dia_path`` and the ``mpc_orbits`` Parquet at ``orbits_path`` (or an
     ``ORBIT_DTYPE`` array, e.g. for tests). ``ssObjectId`` comes from the
@@ -894,21 +1227,40 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     Writes the run report as JSON to ``report_path`` (default: next to the
     output, ``<stem>.report.json``) and returns it.
 
-    An existing output and report are removed first, and both are written
-    to temporary files renamed into place, so a failed run leaves neither
-    (and never a stale one).
+    ``wcs_store``: the visit-table WCS store (``wcs/``) to place the rows
+    on detectors with, and ``correction_table``: the shutter-timing
+    correction table for their times (``ssp.export.submittable.
+    Corrections``); None for neither (the CLI defaults to the production
+    ones). Without a WCS store no row is placed; without a correction table
+    every row keeps its DiaSource's own time, flagged (``placement``). The
+    two fail differently: a WCS store that is missing (a warning), or lacks
+    a night, visit or detector, means rows without a WCS, flagged and
+    counted; a correction table that is given but missing or unusable
+    (``CorrectionError``) aborts the build, as it does the extract: the
+    times never silently degrade.
+
+    Next to the output, in its directory, it writes the sidecar
+    (NEARBYSSO_SIDECAR_FILE: the rows' placement and times, one row per
+    row, in the same order). An existing output, sidecar and report are
+    removed first, and all three are written to temporary files renamed
+    into place, so a failed run leaves none (and never a stale one). With
+    ``return_rows``, returns (the report, the rows (NEARBYSSO_DTYPE), their
+    placement and times (aligned with them; ``placement.ROW_PLACE_DTYPE``)).
     """
     T0 = time.perf_counter()
     out_path = str(out_path)
     if report_path is None:
         stem = out_path[:-len(".parquet")] if out_path.endswith(".parquet") else out_path
         report_path = stem + ".report.json"
-    for path in (out_path, report_path):
+    sidecar_path = os.path.join(os.path.dirname(os.path.abspath(out_path)), NEARBYSSO_SIDECAR_FILE)
+    for path in (out_path, report_path, sidecar_path):
         if os.path.lexists(path):
             os.remove(path)
     rep = dict(inputs=dict(dia=str(dia_path), ssobject=None if ssobject_path is None else str(ssobject_path),
                            orbits="<array>" if isinstance(orbits_path, np.ndarray) else str(orbits_path)),
                workers=workers, read_workers=read_workers, slice_days=slice_days, timings={})
+    rep["inputs"].update(wcs_store=None if wcs_store is None else str(wcs_store),
+                         correction_table=None if correction_table is None else str(correction_table))
     tim = rep["timings"]
     peak = rep["peak_rss_gb"] = {}
 
@@ -932,6 +1284,21 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     rep["orbits"] = stats
     tim["load_orbits"] = time.perf_counter() - t
 
+    # The correction table and the WCS store (nothing is checked about how
+    # current either is) ------------------------------------------------------
+    corr = None
+    if correction_table is not None:
+        from ..export.submittable import Corrections
+        corr = Corrections(correction_table, guard=None)
+    snapshot = _place.wcs_snapshot(wcs_store) if wcs_store is not None else None
+    if wcs_store is not None and not os.path.isdir(wcs_store):
+        warnings.warn(f"the WCS store {wcs_store} does not exist: no row is placed on a detector",
+                      stacklevel=2)
+    dia_extra = ("detector",) if "detector" in ds.dataset(dia_path, format="parquet").schema.names else ()
+    if not dia_extra:
+        warnings.warn(f"{dia_path}: no detector column; a matched row without a WCS will fail the build",
+                      stacklevel=2)
+
     # Slices ---------------------------------------------------------------
     t = time.perf_counter()
     read_stats = {}
@@ -943,7 +1310,8 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
         f"({tim['plan_slices']:.1f} s)")
     rw = max(1, min(read_workers, ns))
     threads = max(1, _visits.DEFAULT_THREADS // rw)
-    _W.update(dia_path=dia_path, slices=slices, threads=threads)
+    _W.update(dia_path=dia_path, slices=slices, threads=threads,
+              wcs_store=None if wcs_store is None else str(wcs_store))
     one = [(s, s + 1) for s in range(ns)]
 
     # Pass 1: visits -------------------------------------------------------
@@ -958,6 +1326,14 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     vis_parts = [r[0] for r in per_slice]
     visits = np.concatenate(vis_parts) if vis_parts else np.zeros(0, VISIT_DTYPE)
     own = np.concatenate([r[4] for r in per_slice]) if per_slice else np.zeros(0, bool)
+    # (the candidates' footprints: the field about the boresight where the
+    # visit has a WCS, step 1)
+    footprint = dict(visits_wcs=int(sum(r[5].sum() for r in per_slice)),
+                     visits_commanded=int(sum((r[5] & ~r[6]).sum() for r in per_slice)),
+                     dia_outside=int(sum(r[7].sum() for r in per_slice)),
+                     visits_dia_outside=int(sum((r[7] > 0).sum() for r in per_slice)))
+    outside = [int(v) for r in per_slice for v in r[0]["visit"][r[7] > 0]]
+    footprint["dia_outside_examples"] = outside[:_N_EXAMPLES]
     vstart = np.r_[0, np.cumsum([v.size for v in vis_parts])].astype(np.int64)
     n_dia = sum(r[1] for r in per_slice)
     rep["slices"] = [dict(nights=[sl["night_lo"], sl["night_hi"]], dia=r[1], dia_dropped=sl["n"] - r[1],
@@ -968,19 +1344,18 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     ts = sample_times(vindex)
     obs_ts = observer_at(ts)
     times = Time(visits["t_tai_mjd"], format="mjd", scale="tai").tdb
-    # (the second evaluation, at the visits whose sources carry their own
-    # times: see process_orbit)
-    dot_h = np.where(own, DOT_STEP_DAYS, 0.0)
+    # (the second evaluation, at every visit: see process_orbit)
+    dot_h = np.full(visits.size, DOT_STEP_DAYS)
     times_h = times + TimeDelta(dot_h, format="jd")
     t_h = times_h.tdb.mjd - MJD_J2000
     obs_pos_h = np.full((visits.size, 3), np.nan)
     obs_vel_h = np.full((visits.size, 3), np.nan)
-    if own.any():
-        r_h, v_h = util.observatory_barycentric_posvel(OBSCODE, times_h[own])
-        obs_pos_h[own] = np.asarray(r_h.to_value(u.au)).reshape(3, -1).T
-        obs_vel_h[own] = np.asarray(v_h.to_value(u.km / u.s)).reshape(3, -1).T
+    if visits.size:
+        r_h, v_h = util.observatory_barycentric_posvel(OBSCODE, times_h)
+        obs_pos_h[:] = np.asarray(r_h.to_value(u.au)).reshape(3, -1).T
+        obs_vel_h[:] = np.asarray(v_h.to_value(u.km / u.s)).reshape(3, -1).T
+    # (visits whose sources' times differ: for the report)
     rep["visits_own_times"] = int(own.sum())
-    any_own = bool(own.any())
     tim["pass1_visits"] = time.perf_counter() - t
     log(f"pass 1: {visits.size:,} visits in {nights.size} nights, {ts.size} coarse samples "
         f"({tim['pass1_visits']:.1f} s)")
@@ -994,7 +1369,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     use_pool = _pooled(workers, len(chunks))
     # (workers open their own ephemeris; in this process, reuse ours)
     _W.update(orbits=orbits, ts=ts, obs_ts=obs_ts, visits=visits, times=times, vindex=vindex,
-              order=order, ephem=None if use_pool else ephem, any_own=any_own, dot_h=dot_h, times_h=times_h,
+              order=order, ephem=None if use_pool else ephem, dot_h=dot_h, times_h=times_h,
               t_h=t_h, obs_pos_h=obs_pos_h, obs_vel_h=obs_vel_h)
     log(f"pass 2: {orbits.size:,} orbits in {len(chunks)} chunks on {workers if use_pool else 1} worker(s)")
     try:
@@ -1021,7 +1396,7 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
             lst.extend(v[:_N_EXAMPLES - len(lst)])
     peak["pass2_worker"] = max((r[6] for r in res), default=0.0)
     pchunks = [r[0] for r in res]
-    dchunks = [r[7] for r in res] if any_own else None
+    dchunks = [r[7] for r in res]
     del res
     tim["pass2_orbits"] = time.perf_counter() - t
     t = time.perf_counter()
@@ -1036,34 +1411,63 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     t = time.perf_counter()
     orbit_radius = match_radius(orbits["designation"])
     _W.update(dia_path=dia_path, slices=slices, threads=threads, visits=visits, vstart=vstart, preds=preds,
-              poff=poff, orbit_radius=orbit_radius, dots=dots)
+              poff=poff, orbit_radius=orbit_radius, dots=dots, dia_extra=dia_extra, corrections=corr,
+              wcs_store=None if wcs_store is None else str(wcs_store))
     try:
         res = _map(_match_slice, one, rw, "pass 3: matching", weights=[sl["n"] for sl in slices],
                    unit="slices")
     finally:
         _W.clear()
     per_slice = [r for chunk, _, _ in res for r in chunk]
-    t3 = sum((r[1] for r in res), np.zeros(3))
+    t3 = sum((r[1] for r in res), np.zeros(4))
     peak["pass3_worker"] = max((r[2] for r in res), default=0.0)
     del res
     for st, r in zip(rep["slices"], per_slice):
-        st.update(matches=r[4], nearest=int(r[0].size))
+        st.update(matches=r[4], nearest=int(r[0].size), unmatched=int(r[9][0].size))
     ids = np.concatenate([r[0] for r in per_slice]) if per_slice else np.zeros(0, np.int64)
     k = np.concatenate([r[1] for r in per_slice]) if per_slice else np.zeros(0, np.int64)
     sep = np.concatenate([r[2] for r in per_slice]) if per_slice else np.zeros(0)
     rank = np.concatenate([r[3] for r in per_slice]) if per_slice else np.zeros(0, np.int16)
     pub = np.concatenate([r[6] for r in per_slice]) if per_slice else np.zeros(0, PUB_DTYPE)
+    place = np.concatenate([r[7] for r in per_slice]) if per_slice else np.zeros(0, _place.ROW_PLACE_DTYPE)
+    vstats = [r[8] for r in per_slice]
+    u_idx = np.concatenate([r[9][0] for r in per_slice]) if per_slice else np.zeros(0, np.int64)
+    u_pub = np.concatenate([r[9][1] for r in per_slice]) if per_slice else np.zeros(0, PUB_DTYPE)
+    u_place = (np.concatenate([r[9][2] for r in per_slice]) if per_slice
+               else np.zeros(0, _place.ROW_PLACE_DTYPE))
+    v_state = np.concatenate([r[10][0] for r in per_slice]) if per_slice else np.zeros(0, np.uint8)
+    v_hcause = np.concatenate([r[10][1] for r in per_slice]) if per_slice else np.zeros(0, np.uint8)
+    v_has_wcs = np.concatenate([r[10][2] for r in per_slice]) if per_slice else np.zeros(0, bool)
     n_matches = int(sum(r[4] for r in per_slice))
     n_comet_matches = int(sum(r[5] for r in per_slice))
     del per_slice
     tim["pass3_matching"] = time.perf_counter() - t
-    tim["pass3_cpu"] = dict(read=float(t3[0]), dia_index=float(t3[1]), match=float(t3[2]))
+    tim["pass3_cpu"] = dict(read=float(t3[0]), dia_index=float(t3[1]), match=float(t3[2]),
+                            place_time=float(t3[3]), wcs_read=float(sum(v["wcs_read_s"] for v in vstats)))
 
     # Reduce (a diaSourceId is in one slice, unless the input repeats it) --
     t = time.perf_counter()
     sel = nearest(ids, sep, k)
-    ids, k, sep, rank, pub = ids[sel], k[sel], sep[sel], rank[sel], pub[sel]
+    # (a prediction a slice kept as the nearest of a repeated diaSourceId
+    # whose copy in another slice won, and the nearest of nothing else, is
+    # an unmatched prediction after all: orphan_rows)
+    orphans = np.setdiff1d(k, k[sel])
+    ids, k, sep, rank, pub, place = ids[sel], k[sel], sep[sel], rank[sel], pub[sel], place[sel]
+    orphan_stats = (0, 0, 0)
+    if orphans.size:
+        o_idx, o_pub, o_place, o_far, o_nowcs = orphan_rows(
+            dict(preds=preds, dots=dots, corrections=corr,
+                 wcs_store=None if wcs_store is None else str(wcs_store)), visits, v_state, v_hcause, orphans)
+        orphan_stats = (int(o_idx.size), o_far, o_nowcs)
+        u_idx = np.concatenate([u_idx, o_idx])
+        u_pub = np.concatenate([u_pub, o_pub])
+        u_place = np.concatenate([u_place, o_place])
+    # the unmatched rows by (visit, designation), i.e. by prediction
+    o = np.argsort(u_idx, kind="stable")
+    u_idx, u_pub, u_place = u_idx[o], u_pub[o], u_place[o]
     p = preds[k]
+    pu = preds[u_idx]
+    nm, nu = k.size, u_idx.size
     # (a comet row beyond MATCH_RADIUS_ARCSEC is one the comet radius
     # added: no non-comet matched its DiaSource, since any would be within
     # MATCH_RADIUS_ARCSEC, nearer than the comet)
@@ -1071,14 +1475,24 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     comets = dict(matches_before_nearest=n_comet_matches, rows=int(comet.sum()),
                   rows_beyond_match_radius=int((comet & (sep > MATCH_RADIUS_ARCSEC)).sum()),
                   objects=int(np.unique(p["orbit"][comet]).size))
-    rows = np.zeros(k.size, dtype=NEARBYSSO_DTYPE)
-    rows["diaSourceId"] = ids
-    rows["designation"] = orbits["designation"][p["orbit"]]
+    source_times = _source_time_stats(pub, p, orbit_radius)
+    # the matched rows (by diaSourceId), then the unmatched ones
+    unmatched = np.r_[np.zeros(nm, bool), np.ones(nu, bool)]
+    pub = np.concatenate([pub, u_pub])
+    place = np.concatenate([place, u_place])
+    p_all = np.concatenate([p, pu])
+    del u_pub, u_place
+    rows = np.zeros(nm + nu, dtype=NEARBYSSO_DTYPE)
+    rows["diaSourceId"][:nm] = ids
+    rows["visit"] = place["visit"]
+    rows["detector"] = place["detector"]
+    rows["designation"] = orbits["designation"][p_all["orbit"]]
     # (at the row's own time: see the module docstring)
     rows["ephRa"] = pub["ra"]
     rows["ephDec"] = pub["dec"]
     rows["ephOffset"] = pub["sep"]
-    rows["diaDistanceRank"] = rank
+    rows["ephOffset"][nm:] = np.nan
+    rows["diaDistanceRank"][:nm] = rank
     rows["ephVmag"] = pub["vmag"]
     rows["ephRateRa"] = pub["rate_ra"]
     rows["ephRateDec"] = pub["rate_dec"]
@@ -1087,7 +1501,8 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
     rows["ephRa_ephDec_Cov"] = pub["ra_dec_cov"]
     rows["ephAntiSunPA"] = pub["anti_sun_pa"]
     rows["ephAntiMotionPA"] = pub["anti_motion_pa"]
-    source_times = _source_time_stats(pub, p, orbit_radius)
+    if (rows["detector"] < 0).any():           # (time_rows refuses them; never written)
+        raise ValueError("NearbySSO rows without a detector")
     # (predictions whose rates of change fell back to 0, so whose rows
     # keep their visit's values: the second evaluation raised, or some rate
     # came out non-finite)
@@ -1097,18 +1512,33 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
         warnings.warn(f"{counts['rates_of_change_exception']} predictions' rates of change failed (an "
                       "exception in the second evaluation); their rows keep their visit's values",
                       stacklevel=2)
+    rep["placement"], rep["placement_diagnostics"] = placement_report(
+        place, pub, p_all, nm, vstats, snapshot, orphans=orphan_stats, footprint=footprint,
+        visit_has_wcs=v_has_wcs)
+    del p_all
+    if rep["placement"]["ppdb_corrected_visits"]:
+        first = rep["placement_diagnostics"]["ppdb_corrected_first"]
+        log(f"warning: {rep['placement']['ppdb_corrected_visits']} visit(s) whose PPDB DiaSource times are "
+            f"not the header midpoint (corrected): matched rows take their DiaSource's own time; the first, "
+            f"visit {first[0]}, by up to {first[1] * 1e3:.3f} ms")
+    if corr is not None:
+        rep["correction_table"] = merged_provenance(corr, vstats)
     sso_id, has_sso = ssobject_ids(ssobject_path, rows["designation"])
     rows["ssObjectId"] = sso_id
     tim["reduce"] = time.perf_counter() - t
 
     t = time.perf_counter()
     tmp = f"{out_path}.tmp-{os.getpid()}"
+    tmp_side = f"{sidecar_path}.tmp-{os.getpid()}"
     try:
-        write_parquet(rows, has_sso, tmp)
+        write_parquet(rows, has_sso, tmp, unmatched=unmatched)
+        write_sidecar(rows, place, unmatched, tmp_side)
     except BaseException:
-        if os.path.lexists(tmp):
-            os.remove(tmp)
+        for path in (tmp, tmp_side):
+            if os.path.lexists(path):
+                os.remove(path)
         raise
+    rep["sidecar"] = dict(file=NEARBYSSO_SIDECAR_FILE, rows=int(rows.size))
     tim["write"] = time.perf_counter() - t
 
     tim["worker_cpu"] = stage_cpu
@@ -1121,7 +1551,8 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
         counts=counts, failed_orbits=failed,
         exceptions=dict(errors), exception_examples=examples,
         predictions=int(preds.size), predictions_gb=preds.nbytes / 2**30,
-        matches_before_nearest=n_matches, output_rows=int(rows.size), with_ssobject=int(has_sso.sum()),
+        matches_before_nearest=n_matches, output_rows=int(rows.size), matched_rows=int(nm),
+        unmatched_rows=int(nu), with_ssobject=int(has_sso.sum()),
         comets=comets, source_times=source_times,
     )
     tmp_rep = f"{report_path}.tmp-{os.getpid()}"
@@ -1129,13 +1560,16 @@ def build(dia_path, orbits_path, out_path, ssobject_path=None, workers=1, read_w
         with open(tmp_rep, "w") as fh:
             json.dump(rep, fh, indent=1)
         os.replace(tmp, out_path)
+        os.replace(tmp_side, sidecar_path)
         os.replace(tmp_rep, report_path)
     finally:
-        for path in (tmp, tmp_rep):
+        for path in (tmp, tmp_side, tmp_rep):
             if os.path.lexists(path):
                 os.remove(path)
     if verbose:
         _print_report(rep)
+    if return_rows:
+        return rep, rows, place
     return rep
 
 
@@ -1168,6 +1602,20 @@ def _print_report(rep):
           f"{st['max_abs_dt_s']:.3f} s ({st['rows_beyond_max_dt']:,} beyond {MAX_SOURCE_DT_S:g} s), moved up "
           f"to {st['max_move_arcsec']:.4f}\"; {st['offset_beyond_radius']:,} with ephOffset beyond the "
           "match radius")
+    pl, dg = rep["placement"], rep["placement_diagnostics"]
+    print(f"placement (WCS snapshot {pl['wcs_snapshot']}): {pl['matched_rows']:,} matched rows, "
+          f"{pl['matched_without_wcs']:,} without a WCS, {dg['other_detector']:,} on another detector than "
+          f"their DiaSource's; visits: {dg['visits_uncorrected']:,} uncorrected, "
+          f"{pl['ppdb_corrected_visits']:,} corrected in the PPDB, "
+          f"unverified {dg['visits_unverified'] or 'none'}, "
+          f"{dg['visits_without_wcs']:,} without a WCS; rows by time: {dg['time_causes']}")
+    fp = dg["footprint"] or {}
+    print(f"unmatched rows: {pl['unmatched_rows']:,} of {dg['eligible_predictions']:,} eligible predictions "
+          f"(dropped: {pl['dropped_beyond_margin']:,} beyond the margin, {pl['dropped_no_wcs_visit']:,} in "
+          f"visits without a WCS; {dg['orphaned_predictions']:,} orphaned by a repeated diaSourceId); "
+          f"WCS footprints for {fp.get('visits_wcs', 0):,} visits ({fp.get('visits_commanded', 0):,} on the "
+          f"commanded boresight), {fp.get('dia_outside', 0):,} DiaSources outside them in "
+          f"{fp.get('visits_dia_outside', 0):,} visits")
     print("timings [s]: " + ", ".join(f"{k} {v:.1f}" for k, v in tim.items() if not isinstance(v, dict))
           + "; pass 2 worker CPU: " + ", ".join(f"{k} {v:.1f}" for k, v in tim["worker_cpu"].items())
           + "; pass 3 worker CPU: " + ", ".join(f"{k} {v:.1f}" for k, v in tim["pass3_cpu"].items()))
@@ -1210,6 +1658,14 @@ def main():
         help="With --workers > 1, split the orbits into about this many chunks per worker, the "
              "costliest (NEOs) first, to balance the load (default: %(default)s).",
     )
+    parser.add_argument("--wcs-store", default=_place.DEFAULT_WCS_STORE, metavar="DIR",
+                        help="The visit-table WCS store (its wcs/ directory) to place the rows on detectors "
+                             "with; 'none' for no placement. Missing nights, visits or detectors are rows "
+                             "without a WCS, flagged and counted (default: %(default)s)")
+    parser.add_argument("--correction-table", default=DEFAULT_CORRECTION_TABLE, metavar="DIR",
+                        help="The shutter-timing correction table for the rows' corrected times; 'none' for "
+                             "none (every row keeps its DiaSource's time, flagged). A missing or unusable "
+                             "table aborts the build (default: %(default)s)")
     parser.add_argument("--reraise", action="store_true",
                         help="Re-raise exceptions instead of exiting gracefully (for debugging)")
     args = parser.parse_args()
@@ -1217,9 +1673,13 @@ def main():
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be at least 1")
 
+    def path_or_none(v):
+        return None if v.strip().lower() in ("", "none") else v
+
     try:
         build(args.dia, args.orbits, args.output, ssobject_path=args.ssobject, workers=args.workers,
-              read_workers=args.read_workers, slice_days=args.slice_days, chunk_factor=args.chunk_factor)
+              read_workers=args.read_workers, slice_days=args.slice_days, chunk_factor=args.chunk_factor,
+              wcs_store=path_or_none(args.wcs_store), correction_table=path_or_none(args.correction_table))
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         if args.reraise:

@@ -344,6 +344,8 @@ if out.endswith(".json"):
     json.dump({k: {"status": v, "report": "checks/fake.txt"} for k, v in checks.items()}, open(out, "w"))
     sys.exit(int(sys.argv[5]))
 pq.write_table(pa.table({"x": list(range(n))}), out)
+if len(sys.argv) > 4:                   # (a sidecar)
+    pq.write_table(pa.table({"y": list(range(n))}), sys.argv[4])
 """
 
 #: The stand-in ssobservation builder: the partitioned layout of the
@@ -384,6 +386,7 @@ def delivered_names(n_parts=1):
     """The file names of a complete delivery, with SSObservation in
     ``n_parts`` parts."""
     return sorted([f"{t}.parquet" for t in DELIVERY_TABLES if t != "SSObservation"]
+                  + list(B.TABLE_SIDECARS.values())
                   + [PART_FILE_FORMAT.format(k) for k in range(n_parts)]
                   + [SSOBSERVATION_MANIFEST_FILE, SIDECAR_FILE])
 
@@ -421,8 +424,11 @@ def fake_steps(monkeypatch):
                     json.dumps(state["checks"]), str(state["check_exit"])], {}
         table = B.STEP_TABLES[step][0]
         out = work / f"{table}.parquet"
-        return ([sys.executable, "-c", FAKE, str(out), fail, str(state["rows"])],
-                {out: Path(run_dir).resolve() / "delivery" / f"{table}.parquet"})
+        delivery = Path(run_dir).resolve() / "delivery"
+        side = B.TABLE_SIDECARS.get(table)
+        return ([sys.executable, "-c", FAKE, str(out), fail, str(state["rows"])]
+                + ([str(work / side)] if side else []),
+                {out: delivery / f"{table}.parquet", **({work / side: delivery / side} if side else {})})
 
     monkeypatch.setattr(B, "step_command", step_command)
     return state
@@ -1034,7 +1040,7 @@ def subset_tables():
     pf = pq.ParquetFile(FIXTURE / "mpc_orbits.parquet")
     orb = pa.Table.from_batches([cut(b) for b in pf.iter_batches(batch_size=200_000)], schema=pf.schema_arrow)
     ppdb = dia.filter(pc.equal(dia["measuredOn"], "difference")).select(
-        ["diaSourceId", "visit", "midpointMjdTai", "ra", "dec"])
+        ["diaSourceId", "visit", "detector", "midpointMjdTai", "ra", "dec"])
     return dict(obs_sbn=obs, dia_sources=dia, mpc_orbits=orb, current_identifications=cut(cur),
                 numbered_identifications=cut(num), ppdb_dia_sources=ppdb)
 
@@ -1070,6 +1076,13 @@ def test_e2e_subset(e2e):
     assert rep["tables"]["SSObservation"]["rows"] == tables["dia_sources"].num_rows
     assert rep["tables"]["mpc_orbits"]["rows"] == tables["mpc_orbits"].num_rows
     assert rep["tables"]["NearbySSO"]["rows"] > 0
+    # NearbySSO's sidecar: delivered next to it, row for row, in the report
+    from ssp.nearbysso._contract import NEARBYSSO_SIDECAR_FILE
+    e = rep["tables"]["NearbySSO"]
+    side = d / "run" / e["sidecar"]
+    assert side.name == NEARBYSSO_SIDECAR_FILE and side.parent == d / "run" / "delivery"
+    assert pq.ParquetFile(side).metadata.num_rows == e["rows"]
+    assert e["sidecar_md5"] == B._md5(side) and e["sidecar_bytes"] == side.stat().st_size
     for t in DELIVERY_TABLES:
         s = (SP.parquet_schema(d / "run" / "delivery") if t == "SSObservation"
              else pq.read_schema(d / "run" / "delivery" / f"{t}.parquet"))
@@ -1151,14 +1164,54 @@ def test_e2e_non_clickhouse_source(e2e, tmp_path):
     for s in BUILD_STEPS[:-1]:
         assert rep2["steps"][s]["status"] == "ok", (s, rep2["steps"][s])
     _expect_checks(rep2)
-    for t in [*DELIVERY_TABLES, SIDECAR_FILE]:
+    from ssp.nearbysso._contract import NEARBYSSO_SIDECAR_FILE
+    for t in [*DELIVERY_TABLES, SIDECAR_FILE, NEARBYSSO_SIDECAR_FILE]:
         if t == "SSObservation":
             a, b = (SP.read_ssobservation(r / "delivery") for r in (d / "run", tmp_path / "run"))
         else:
-            name = t if t == SIDECAR_FILE else f"{t}.parquet"
+            name = t if t in (SIDECAR_FILE, NEARBYSSO_SIDECAR_FILE) else f"{t}.parquet"
             a = pq.read_table(d / "run" / "delivery" / name)
             b = pq.read_table(tmp_path / "run" / "delivery" / name)
         assert a.schema == b.schema, t
-        if t == "NearbySSO":           # (its row order follows the DiaSources')
-            a, b = (x.sort_by("diaSourceId") for x in (a, b))
+        if t in ("NearbySSO", NEARBYSSO_SIDECAR_FILE):   # (the contract's order: the same)
+            assert a["diaSourceId"].equals(b["diaSourceId"]) and a["visit"].equals(b["visit"]), t
         assert a.to_pandas().equals(b.to_pandas()), t     # (NaN == NaN)
+
+
+def test_nearbysso_gets_the_correction_table_and_wcs_store(tmp_path):
+    """NearbySSO's correction table is the one the extract used (the
+    manifest's shutter_timing entry), 'none' without one; the WCS store is
+    the production one."""
+    from ssp.nearbysso.placement import DEFAULT_WCS_STORE
+
+    m = write_inputs(tmp_path / "in")
+    argv, _ = B.step_command("nearbysso", tmp_path / "in", tmp_path / "run", m, 1)
+    assert argv[argv.index("--correction-table") + 1] == "none"
+    assert argv[argv.index("--wcs-store") + 1] == DEFAULT_WCS_STORE
+    m = dict(m, shutter_timing=dict(table_dir="/some/table", table_format=2))
+    argv, moves = B.step_command("nearbysso", tmp_path / "in", tmp_path / "run", m, 1)
+    assert argv[argv.index("--correction-table") + 1] == "/some/table"
+    # NearbySSO and its sidecar, written next to it, are both delivered
+    from ssp.nearbysso._contract import NEARBYSSO_SIDECAR_FILE
+    out = Path(argv[argv.index("--output") + 1])
+    delivery = (tmp_path / "run").resolve() / "delivery"
+    assert moves == {out: delivery / "NearbySSO.parquet",
+                     out.parent / NEARBYSSO_SIDECAR_FILE: delivery / NEARBYSSO_SIDECAR_FILE}
+
+
+def test_nearbysso_sidecar_kept_and_recorded(tmp_path):
+    """The NearbySSO sidecar is a delivered file (not a stray), and in
+    NearbySSO's tables entry."""
+    from ssp.nearbysso._contract import NEARBYSSO_SIDECAR_FILE
+    d = tmp_path / "run" / "delivery"
+    d.mkdir(parents=True)
+    pq.write_table(pa.table({"x": [1, 2]}), d / "NearbySSO.parquet")
+    pq.write_table(pa.table({"y": [1, 2]}), d / NEARBYSSO_SIDECAR_FILE)
+    (d / "stray.parquet").write_text("x")
+    B._remove_strays(tmp_path / "run", _quiet)
+    assert sorted(p.name for p in d.iterdir()) == sorted(["NearbySSO.parquet", NEARBYSSO_SIDECAR_FILE])
+    e = B.table_entry(tmp_path / "run", "NearbySSO")
+    assert e["file"] == "delivery/NearbySSO.parquet" and e["sidecar"] == f"delivery/{NEARBYSSO_SIDECAR_FILE}"
+    assert e["sidecar_md5"] == B._md5(d / NEARBYSSO_SIDECAR_FILE) and e["rows"] == 2
+    assert [p.name for p in B.delivered_paths(tmp_path / "run", "NearbySSO")] == [
+        "NearbySSO.parquet", NEARBYSSO_SIDECAR_FILE]

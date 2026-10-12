@@ -25,7 +25,7 @@ extract"). The steps:
     step run, or a reused one) therefore also runs ``dia_sources``, unless
     ``dia_sources`` is itself reused.
 ``ppdb_dia_sources``
-    The five ``ppdb.DiaSource`` columns NearbySSO reads: from the PPDB's TAP
+    The six ``ppdb.DiaSource`` columns NearbySSO reads: from the PPDB's TAP
     service (``--tap-url``, data-int by default; ssp.export.ppdb_tap), or
     with ``--tap-url none`` one read-only ClickHouse query.
 
@@ -99,7 +99,7 @@ MPC_SQL = {
 }
 assert tuple(MPC_SQL) == MPC_SNAPSHOT
 
-PPDB_SQL = ("SELECT diaSourceId, visit, midpointMjdTai, ra, dec FROM ppdb.DiaSource "
+PPDB_SQL = ("SELECT diaSourceId, visit, toInt64(detector) AS detector, midpointMjdTai, ra, dec FROM ppdb.DiaSource "
             "ORDER BY visit, diaSourceId")
 PPDB_SETTINGS = {"readonly": 1, "output_format_parquet_compression_method": "zstd"}
 
@@ -231,7 +231,7 @@ def ppdb_source(args):
 
 
 def export_ppdb(out_path, args):
-    """The five ``ppdb.DiaSource`` columns, written to ``out_path``.
+    """The six ``ppdb.DiaSource`` columns, written to ``out_path``.
     Returns the manifest's ``ppdb_tap`` details (None from ClickHouse)."""
     if tap_url(args):
         try:

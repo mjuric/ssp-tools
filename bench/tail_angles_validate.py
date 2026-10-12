@@ -21,20 +21,23 @@ Subcommands::
               angles computed from the EphResult in the ICRS, the mean
               equator of date and the true equator of date, against PsAng /
               PsAMV. Settles which pole Horizons uses and checks ours.
-  consistency SSOBSERVATION NEARBYSSO [--dia-sources DIA]
+  consistency SSOBSERVATION NEARBYSSO [--sidecar SIDECAR] [--dia-sources DIA]
               (pass/fail, no network) the two tables' angles equal at the
               same (designation, diaSourceId): bitwise, or within
               max(1 float32 ulp, 1e-4 deg), since the two passes'
               integrations may differ at ~1e-11 deg (both counts
               reported); non-null exactly where there is an orbit; in
               [0, 360); and SSObservation's angles recomputed from its own
-              float32 helio_* / topo_* columns. With DIA (the NearbySSO
-              input, ppdb_dia_sources.parquet), a pair whose SSObservation
-              midpointMjdTai differs from its DiaSource's (the shutter
+              float32 helio_* / topo_* columns. A pair whose SSObservation
+              midpointMjdTai differs from NearbySSO's time (the shutter
               correction, docs/design/shutter-timing.md) also gets the
               time-shift allowance of bench/time_shift.py on top; pairs at
-              the same time keep the strict rule. Without DIA every pair is
-              held to the strict rule.
+              the same time keep the strict rule. NearbySSO's time per row
+              is its sidecar's midpointMjdTai (NearbySSO_internal.parquet
+              next to NEARBYSSO, or SIDECAR); a NearbySSO from before the
+              sidecar predicted at the DiaSource's, taken from DIA (the
+              NearbySSO input, ppdb_dia_sources.parquet). With neither,
+              every pair is held to the strict rule.
 
 Outputs of ``jpl`` (``--out``, default WORK): tail_angles_jpl_report.txt and
 tail_angles_jpl_rows.csv.
@@ -599,10 +602,13 @@ def _dia_times(dia_sources, ids):
     return dict(zip(t.column("diaSourceId").to_numpy(), t.column("midpointMjdTai").to_numpy()))
 
 
-def consistency(ssobservation, nearbysso, dia_sources=None):
+def consistency(ssobservation, nearbysso, dia_sources=None, sidecar=None):
     """(passed, report lines) of the SSObservation/NearbySSO angle checks.
-    ``dia_sources``: the NearbySSO input, for the time-shift allowance
-    (bench/time_shift.py); None holds every pair to the strict rule.
+    The time-shift allowance (bench/time_shift.py) takes NearbySSO's time
+    per row from its sidecar (``sidecar``, default NearbySSO_internal.parquet
+    next to ``nearbysso``) where there is one; else (a NearbySSO from before
+    the sidecar) the DiaSource's, from ``dia_sources`` (the NearbySSO
+    input); with neither, every pair is held to the strict rule.
     ``ssobservation``: the partitioned SSObservation's directory or
     manifest, or a single Parquet file."""
     import pyarrow as pa
@@ -621,11 +627,14 @@ def consistency(ssobservation, nearbysso, dia_sources=None):
     s = SP.read_table(ssobservation, columns=cols)
     s = s.append_column("_row", pa.array(np.arange(s.num_rows, dtype=np.int64)))
     n = pq.read_table(nearbysso, columns=["designation", "diaSourceId", "ephRa", *PA_COLS])
+    n_times, basis = TS.nearbysso_row_times(nearbysso, sidecar)
     for name, t in (("ssobservation", s), ("nearbysso", n)):
         for c in PA_COLS:
             ty = t.schema.field(c).type
             checks.append((str(ty) == "float", f"{name}.{c}: type {ty} (float32 expected)"))
     L.append(f"SSObservation {s.num_rows:,} rows; NearbySSO {n.num_rows:,} rows")
+    if n_times is not None:
+        n = n.append_column("_nrow", pa.array(np.arange(n.num_rows, dtype=np.int64)))
 
     # 1. NULL rules and range
     s_orbit = s.column("ephRa").is_valid().to_numpy(zero_copy_only=False)
@@ -639,7 +648,8 @@ def consistency(ssobservation, nearbysso, dia_sources=None):
     #    within max(1 float32 ulp, PAIR_TOL_DEG)
     def keyed(t, prefix):
         t = t.filter(pc.is_valid(t.column("diaSourceId")))
-        keep = ["designation", "diaSourceId", *PA_COLS] + (["_row"] if "_row" in t.column_names else [])
+        keep = ["designation", "diaSourceId", *PA_COLS]
+        keep += [c for c in ("_row", "_nrow") if c in t.column_names]
         df = t.select(keep).to_pandas()
         for c in PA_COLS:  # float32 bit patterns; NULL -> a sentinel
             v = t.column(c)
@@ -671,11 +681,18 @@ def consistency(ssobservation, nearbysso, dia_sources=None):
     checks.append((len(m) > 0, f"matched rows: {len(m):,} (> 0 expected)"))
 
     # the time shift of each pair (docs/design/shutter-timing.md):
-    # SSObservation at its midpointMjdTai, NearbySSO at its DiaSource's;
-    # 0 -> strict
+    # SSObservation at its midpointMjdTai, NearbySSO at its own time (the
+    # sidecar's), or at its DiaSource's without a sidecar; 0 -> strict
     row = m["_row"].to_numpy()
     dt = np.zeros(len(m))
-    if dia_sources is not None and "midpointMjdTai" in present:
+    if n_times is not None and "midpointMjdTai" in present:
+        L.append(f"time basis: {basis}")
+        dt = TS.dt_days(_f(s, "midpointMjdTai")[row], n_times[m["_nrow"].to_numpy()])
+        L.append(TS.summary_line(dt))
+        big = TS.too_large(dt)
+        checks.append((not big.any(), f"time shift: {int(big.sum())} pairs with |dt| > {TS.DT_MAX_S} s"))
+    elif dia_sources is not None and "midpointMjdTai" in present:
+        L.append(f"time basis: {basis}")
         tmap = _dia_times(dia_sources, m["diaSourceId"].to_numpy())
         t_dia = np.array([tmap.get(i, np.nan) for i in m["diaSourceId"].to_numpy()], np.float64)
         dt = TS.dt_days(_f(s, "midpointMjdTai")[row], t_dia)
@@ -685,8 +702,8 @@ def consistency(ssobservation, nearbysso, dia_sources=None):
         big = TS.too_large(dt)
         checks.append((not big.any(), f"time shift: {int(big.sum())} pairs with |dt| > {TS.DT_MAX_S} s"))
     else:
-        L.append("time shift: not computed (no --dia-sources, or no SSObservation midpointMjdTai); every "
-                 "pair held to the strict rule")
+        L.append("time shift: not computed (no NearbySSO sidecar and no --dia-sources, or no SSObservation "
+                 "midpointMjdTai); every pair held to the strict rule")
     if "ephRate" in present:
         rate = _f(s, "ephRate")
     elif "ephRateRa" in present:
@@ -788,7 +805,7 @@ def consistency(ssobservation, nearbysso, dia_sources=None):
 
 
 def cmd_consistency(args):
-    passed, lines = consistency(args.ssobservation_file, args.nearbysso_file, args.dia_sources)
+    passed, lines = consistency(args.ssobservation_file, args.nearbysso_file, args.dia_sources, args.sidecar)
     text = "\n".join(lines) + "\n"
     print(text)
     if args.report:
@@ -840,7 +857,10 @@ def main(argv=None):
     c.add_argument("nearbysso_file")
     c.add_argument("--report", help="also write the report to this file")
     c.add_argument("--dia-sources", help="the NearbySSO input (ppdb_dia_sources.parquet): the DiaSource "
-                                         "times, for the shutter-correction time-shift allowance")
+                                         "times, for the shutter-correction time-shift allowance of a "
+                                         "NearbySSO without a sidecar")
+    c.add_argument("--sidecar", help="NearbySSO's sidecar, for its time per row (default: "
+                                     "NearbySSO_internal.parquet next to NEARBYSSO if there is one)")
     args = ap.parse_args(argv)
     return {"fetch": cmd_fetch, "status": cmd_status, "jpl": cmd_jpl, "consistency": cmd_consistency}[
         args.cmd

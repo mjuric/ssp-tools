@@ -18,6 +18,7 @@ from ssp.ssobservation_contract import (
     SSOBSERVATION_MANIFEST_FIELDS,
     SSOBSERVATION_MANIFEST_FILE,
 )
+from nearbysso_delivery_fixture import write_nearbysso
 from ssobs_parts_fixture import read_manifest, refresh, rename_part, write_manifest, write_parts
 
 N = 6
@@ -82,13 +83,15 @@ def test_pass_dictionary_and_large_string(tmp_path, table):
 
 
 def write_delivery(d, skip=()):
-    """Every delivery table: SSObservation partitioned, the rest single
-    files."""
+    """Every delivery table: SSObservation partitioned, NearbySSO with its
+    sidecar (tests/nearbysso_delivery_fixture.py), the rest single files."""
     for table in DELIVERY_TABLES:
         if table in skip:
             continue
         if table == "SSObservation":
             write_ss(d)
+        elif table == "NearbySSO":
+            write_nearbysso(d)
         else:
             write(d, table, make_table(table))
 
@@ -220,6 +223,26 @@ def test_null_key(tmp_path):
     rs = results("mpc_orbits", write(tmp_path, "mpc_orbits", t))
     assert failed(rs) == ["nulls", "primary key"]
     assert "NULLs in id (1)" in rs["primary key"].detail
+
+
+def test_nearbysso_key_with_null_dia_source_id(tmp_path):
+    """NearbySSO's key (diaSourceId, designation, visit) has a nullable
+    diaSourceId (its unmatched rows): NULL there passes, NULL counting as a
+    value for uniqueness; NULL in visit (nullable: false) does not."""
+    t = make_table("NearbySSO")
+    t = replace(t, "diaSourceId", pa.array([1, 2, None, None, None, 3], pa.int64()))
+    t = replace(t, "visit", pa.array([7, 7, 7, 8, 7, 7], pa.int64()))
+    rs = results("NearbySSO", write(tmp_path, "NearbySSO", t))
+    assert failed(rs) == []
+    assert "NULL only in nullable diaSourceId (3)" in rs["primary key"].detail
+    t = replace(t, "designation", pa.array(["a", "b", "c", "c", "c", "d"]))       # (NULL, c, 7) twice
+    rs = results("NearbySSO", write(tmp_path, "NearbySSO", t))
+    assert failed(rs) == ["primary key"]
+    assert "1 duplicate rows over 1 key values" in rs["primary key"].detail
+    t = replace(t, "visit", pa.array([7, 7, 7, 8, None, 7], pa.int64()))
+    rs = results("NearbySSO", write(tmp_path, "NearbySSO", t))
+    assert failed(rs) == ["nulls", "primary key"]
+    assert "NULLs in visit (1)" in rs["primary key"].detail
 
 
 def test_composite_primary_key(tmp_path):

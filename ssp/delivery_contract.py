@@ -39,7 +39,7 @@ INPUT_FILES = {
                     "extract-submitted-sources output (ssp.SubmittableSources), with "
                     "shutter-corrected times (ssp.ssobservation_contract, 'Shutter-motion')"),
     "ppdb_dia_sources": ("ppdb_dia_sources.parquet",
-                         "PPDB DiaSource: diaSourceId, visit, midpointMjdTai, ra, dec"),
+                         "PPDB DiaSource: diaSourceId, visit, detector, midpointMjdTai, ra, dec"),
 }
 
 #: The four MPC files must come from one consistent snapshot (one database
@@ -56,7 +56,7 @@ REQUIRED_INPUT_COLUMNS = {
     "numbered_identifications": ["packed_primary_provisional_designation"],
     "dia_sources": ["obsid", "diaSourceId", "processing", "measuredOn", "midpointMjdTai",
                     "ra", "dec"],
-    "ppdb_dia_sources": ["diaSourceId", "visit", "midpointMjdTai", "ra", "dec"],
+    "ppdb_dia_sources": ["diaSourceId", "visit", "detector", "midpointMjdTai", "ra", "dec"],
 }
 
 #: INPUTS_DIR/manifest.json, written last by stage 1 (or by whatever else
@@ -129,7 +129,9 @@ REPORT_FIELDS = {
     "inputs": "the input manifest, as read",
     "ssp_tools_commit": "git commit of the code that built the delivery",
     "steps": "{step: {status: 'ok'|'failed'|'skipped', started_utc, wall_s, max_rss_gb, log}}",
-    "tables": "{Table: {file, rows, md5, bytes}} for every delivered table; for SSObservation "
+    "tables": "{Table: {file, rows, md5, bytes}} for every delivered table; NearbySSO's also "
+              "{sidecar, sidecar_md5, sidecar_bytes} (ssp.nearbysso._contract.NEARBYSSO_SIDECAR_FILE, "
+              "next to it, never uploaded); for SSObservation "
               "{manifest, manifest_md5, parts: [file, ...], sidecar, rows, bytes} (rows and bytes "
               "are totals over the parts, not counting the manifest or the sidecar; each part's md5 "
               "is in the manifest, and the manifest's own md5 is manifest_md5)",
@@ -218,6 +220,17 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 #   SSOBSERVATION_INTERNAL_DTYPE's types, non-null, the same obsid sequence
 #   as the parts concatenated, and its rows/bytes/md5; the sidecar's
 #   columns are not in the delivered schema.
+# check_nearbysso(delivery_dir) -> list[CheckResult]
+#   (run by check_delivery after NearbySSO's schema checks;
+#   docs/design/nearbysso-unmatched.md, ssp.nearbysso._contract) The
+#   sidecar NEARBYSSO_SIDECAR_FILE exists with NearbySSO's row count,
+#   NEARBYSSO_SIDECAR_DTYPE's columns and types, NULLs only where allowed
+#   (eph_x/eph_y/ephDetectorEdgeDist together), and NEARBYSSO_KEY equal to
+#   NearbySSO's row by row; NEARBYSSO_UNMATCHED_NULL NULL together; the row
+#   order; unmatched rows placed and within PLACEMENT_MARGIN_ARCSEC; rows
+#   without a placement flagged; times in their visit's night with a
+#   bounded spread per visit; day_obs and detector ranges; no (visit,
+#   designation) both matched and unmatched.
 # CheckResult: a NamedTuple (name: str, ok: bool, detail: str).
 # CLI: python -m ssp.delivery_check DELIVERY_DIR [--tables ...]
 #   (exit 0 if every result is ok).
