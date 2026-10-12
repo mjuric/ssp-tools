@@ -185,3 +185,24 @@ Dependencies outside this repository:
   - Brute-force completeness on 320 object-nights: 0 missing or extra rows.
   - Fixed: a diagnostic double count of orphans beyond the margin.
 
+
+**U4, checks (PR #101, 2026-10-11):** `check_nearbysso` in the delivery check (the sidecar, the NULL pattern, the order, the 30″ margin, the times, the visits), and `bench/nearbysso_validate.py`'s `placement`, `dia-detector`, `times`, `report-counts` and `ppdb-times`, written black-box from this design and the contract.
+
+**The boresight footprint (4655914, 2026-10-12):** visit-table v0.3.0's `footprints()` (fitted boresight, 2.06°) plus 30″; the DiaSource widening guard replaced by a count (`footprint.dia_outside` in the run report).
+
+**End to end (2026-10-12):**
+- `ssp-build-sso` on the 2026-10-09 inputs (U1's, with `detector`), 32 workers, sdfiana031: deliverable, all 8 checks PASS. Output in `/sdf/data/rubin/user/mjuric/nearbysso-unmatched/final/`.
+  - The inputs are a hard-linked copy whose manifest names the production format-2 correction table (`ssp_daily_data/shutter-timing`). The original manifest named the format-1 table, which shutter-timing 0.5.0 refuses.
+- Timings and memory: 14:43 wall and 15.8 GB peak in total; nearbysso 444 s and 12.2 GB (orbit pass 394 s, matching pass 19 s); ssobservation 236 s and 15.1 GB.
+- NearbySSO: 3,437,970 rows, as U3: 1,713,936 matched, 1,724,034 unmatched.
+  - 4,889,367 eligible predictions (U3: 4,121,214); 1,452,429 dropped beyond 30″ (U3: 684,276). The larger field adds only predictions beyond 30″ of every detector: the corner footprint already held every detector.
+  - All 5,919 visits have a WCS footprint on the fitted boresight; 0 DiaSources outside one.
+  - Flagged: 35,798 beyond 100 px, 14 `no_wcs`; 3,402,158 rows corrected.
+  - Against U3: keys, detectors, times and flags identical; 54,003 rows (3,211 objects) differ by ≤ 0.016 mas in position and ≤ 7e-5 px in pixels, from the different visits each orbit is integrated through.
+- U4's bench on the output: all 40 gates PASS (`report-counts` 13, `dia-detector` 3, `placement` 12, `times` 6, `ppdb-times` 6).
+- Finding: the older cross-table checks (`nearbysso_validate same-orbits`, `tail_angles_validate consistency`, `nongrav_validate nearbysso`) still took NearbySSO's time to be its DiaSource's. Since U2 it is the corrected time, as SSObservation's: positions agree to 0.001 mas, but subtracting rate × (SSObservation − DiaSource time) gave 3,139 false mismatches (up to 7.9 mas). Fixed (bench only, PR below): the three take NearbySSO's time per row from its sidecar (the DiaSource's without one). Also fixed there:
+  - `same-orbits` and `nongrav` read NearbySSO's ids as float64 (the NULLs of unmatched rows), which loosened the DiaSource join; unmatched rows are now left out of the comparison and counted;
+  - the "beyond the match radius" gates allow the move from the visit's time (matching) to the row's time (`ephOffset`): one row, 2024 YT60 in visit 2026052200508, is 0.1 mas beyond 5″ after a 0.116 s move;
+  - `nongrav`'s `ephOffset` comparison allows, on SSObservation Source rows mapped to a DiaSource by position, the Source-to-DiaSource separation (SSObservation measures against the Source, NearbySSO against the DiaSource);
+  - float32 rates are compared to max(1e-7 deg/d, one float32 ulp).
+- Cross-table checks on the output, after the fix: `same-orbits` PASS (216,462 pairs, 0 mismatches, position residual ≤ 4e-6 mas, |Δt| ≤ 8.4e-5 s); `nongrav nearbysso` PASS (216,694 pairs); `tail_angles consistency` PASS (216,464 pairs, angles ≤ 3.05e-5°). `same-orbits` keeps 275,201 SSObservation rows of 8,078,546: the primary AP-DS DiaSource rows NearbySSO is built from.
