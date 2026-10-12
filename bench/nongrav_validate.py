@@ -57,8 +57,10 @@ exit 0 on PASS, 1 on FAIL)::
       the matched rows; no S/ objects; no NearbySSO row for an orbit the
       filter drops. ``--table FILE``: the per-row table (Parquet).
       Time shift (docs/design/shutter-timing.md): SSObservation predicts at its
-      own (shutter-corrected) midpointMjdTai, NearbySSO at the DiaSource's
-      (DIA_SOURCES' midpointMjdTai). Where they differ by dt, the
+      own (shutter-corrected) midpointMjdTai, NearbySSO at its own time per
+      row (its sidecar's midpointMjdTai, NearbySSO_internal.parquet next to
+      NEARBYSSO; a NearbySSO from before the sidecar predicted at the
+      DiaSource's, DIA_SOURCES' midpointMjdTai). Where they differ by dt, the
       agreement tolerances and the offset-radius and nearer-object
       explanations add bench/time_shift.py's allowances (position and
       ephOffset: |rate| |dt| plus a margin); where dt = 0 they are
@@ -786,15 +788,20 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     """The comparison (DataFrames): ``nss`` NearbySSO rows, ``sss``
     SSObservation rows (designation, diaSourceId, visit, midpointMjdTai, ra,
     dec, eph*, optionally SHIFT_COLUMNS), ``dia`` the NearbySSO input
-    (diaSourceId, visit, ra, dec, optionally midpointMjdTai: without it the
-    time shift is taken as 0, i.e. strict), ``orbits``
+    (diaSourceId, visit, ra, dec, optionally midpointMjdTai), ``orbits``
     mpc_orbits rows (designation, q, e, i, node, argperi, peri_time,
     mpc_orb_jsonb), ``cmap`` {designation: class}. ``coarse_sigma(
     designation, tai) -> sigma_major [arcsec]`` (optional) is asked about
     the otherwise unexplained misses: NearbySSO gates on its coarse track's
     nightly sigma, which can exceed 10" within the night even where
     SSObservation's ellipse at the observation is small. Returns the per-row
-    table."""
+    table.
+
+    NearbySSO's time: ``nss``'s ``midpointMjdTai`` (its sidecar's,
+    `TS.nearbysso_row_times`) where it has one and a row for the DiaSource;
+    else the DiaSource's ``dia`` midpointMjdTai (a NearbySSO from before
+    the sidecar); with neither the time shift is taken as 0 (strict).
+    NearbySSO rows without a DiaSource (NULL diaSourceId) aren't joined."""
     # no natural satellites
     nd = nss["designation"].astype(str).to_numpy()
     sat = np.char.startswith(nd.astype(str), "S/")
@@ -824,7 +831,8 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
              f"{int((how == 'position').sum()):,})")
     s = sss[in_input].reset_index(drop=True)
     n = len(s)
-    nb = nss.drop_duplicates("diaSourceId").set_index("diaSourceId")
+    matched = nss[nss["diaSourceId"].notna()]
+    nb = matched.astype({"diaSourceId": "int64"}).drop_duplicates("diaSourceId").set_index("diaSourceId")
     j = nb.index.get_indexer(dsid[in_input])
     has = j >= 0
     jj = np.where(has, j, 0)
@@ -838,14 +846,16 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     def f(c):
         return s[c].to_numpy(np.float64) if c in s else np.full(n, np.nan)
 
-    # the time shift: SSObservation at its own time, NearbySSO at the
-    # DiaSource's
+    # the time shift: SSObservation at its own time, NearbySSO at its row's
+    # (the sidecar's) where known, else at the DiaSource's
     if "midpointMjdTai" in dia and len(dia):
         dtime = dia.drop_duplicates("diaSourceId").set_index("diaSourceId")["midpointMjdTai"]
         t_dia = dtime.reindex(dsid[in_input]).to_numpy(np.float64)
     else:
         t_dia = np.full(n, np.nan)
-    dt = TS.dt_days(f("midpointMjdTai"), t_dia)
+    t_nss = col("midpointMjdTai") if "midpointMjdTai" in nb else np.full(n, np.nan)
+    own_time = np.isfinite(t_nss)
+    dt = TS.dt_days(f("midpointMjdTai"), np.where(own_time, t_nss, t_dia))
     rate = TS.rate_deg_day(f("ephRateRa"), f("ephRateDec"), col("ephRateRa"), col("ephRateDec"))
     pos_allow = TS.position_mas(rate, dt)
 
@@ -856,7 +866,7 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
                        "sss_offset": f("ephOffset"),
                        "sss_sigma": sigma_major_arcsec(f("ephRaErr"), f("ephDecErr"), f("ephRa_ephDec_Cov")),
                        "nss_designation": nss_des, "nss_offset": col("ephOffset"),
-                       "dt_s": dt * TS.SECONDS_PER_DAY,
+                       "dt_s": dt * TS.SECONDS_PER_DAY, "nss_own_time": own_time,
                        "allow_pos_mas": pos_allow,
                        "allow_rate": TS.rate_allowance(dt, rate, f("topoRange"), f("topoRangeRate"),
                                                        f("helioRange"), f("ephDec")),
@@ -910,10 +920,18 @@ def nearbysso_compare(nss, sss, dia, orbits, cmap, rep, coarse_sigma=None):
     return df
 
 
-def check_nearbysso(nearbysso, ssobservation, mpc_orbits, dia_sources, objects=None, rep=None):
+def check_nearbysso(nearbysso, ssobservation, mpc_orbits, dia_sources, objects=None, rep=None, sidecar=None):
     rep = rep or Report(f"Non-grav NearbySSO: {nearbysso} vs {ssobservation}")
+    times, basis = TS.nearbysso_row_times(nearbysso, sidecar)
+    rep.info(f"NearbySSO time basis: {basis}")
     nss = pq.read_table(nearbysso, columns=["diaSourceId", "designation", "ephRa", "ephDec", "ephOffset",
-                                            "ephVmag", "ephRateRa", "ephRateDec"]).to_pandas()
+                                            "ephVmag", "ephRateRa", "ephRateDec"]).to_pandas(
+                                                types_mapper=_INT_MAPPER)
+    if times is not None:
+        nss["midpointMjdTai"] = times
+    n_unmatched = int(nss["diaSourceId"].isna().sum())
+    if n_unmatched:
+        rep.info(f"NearbySSO rows without a DiaSource (unmatched predictions, not joined): {n_unmatched:,}")
     present = set(SP.read_schema(ssobservation).names)
     sss = _read_sss(ssobservation, ["designation", "diaSourceId", "visit", "midpointMjdTai", "ra", "dec",
                                "ephRa", "ephDec", "ephOffset", "ephVmag", "ephRateRa", "ephRateDec",
@@ -961,11 +979,13 @@ def _nearbysso_gates(df, rep):
         dt_s = df["dt_s"].to_numpy(np.float64)
         big = np.abs(dt_s) > TS.DT_MAX_S
         nz = np.abs(dt_s[dt_s != 0])
-        rep.check(f"time shift SSObservation - DiaSource within {TS.DT_MAX_S} s", not big.any(),
+        own = (f"; NearbySSO's own (sidecar) time on {int(df['nss_own_time'].sum()):,} rows, the "
+               f"DiaSource's on the rest" if "nss_own_time" in df else "")
+        rep.check(f"time shift SSObservation - NearbySSO within {TS.DT_MAX_S} s", not big.any(),
                   f"{int((dt_s != 0).sum()):,} of {len(df):,} rows shifted"
                   + (f", max |dt| {nz.max():.3f} s" if len(nz) else "")
                   + (f"; {int(big.sum())} beyond" if big.any() else "")
-                  + "; shifted rows get bench/time_shift.py's allowances, the others are strict")
+                  + "; shifted rows get bench/time_shift.py's allowances, the others are strict" + own)
     zero = np.zeros(len(m))
 
     def allow(c):
@@ -1365,6 +1385,9 @@ def main(argv=None):
     p.add_argument("ssobservation", help=sss_help)
     p.add_argument("mpc_orbits")
     p.add_argument("dia_sources", help="the NearbySSO input DiaSources")
+    p.add_argument("--sidecar", default=None,
+                   help="NearbySSO's sidecar, for its time per row (default: NearbySSO_internal.parquet next "
+                        "to NEARBYSSO if there is one; without it, the DiaSource's midpointMjdTai)")
     p.add_argument("--table", default=None, help="also write the per-row table (Parquet)")
     p = add("uncertainty", "Monte Carlo of the published error ellipse")
     p.add_argument("mpc_orbits")
@@ -1382,7 +1405,8 @@ def main(argv=None):
     if a.cmd == "offsets":
         rep = check_offsets(a.new, a.ref, a.mpc_orbits, objects, a.ng_errors)
     elif a.cmd == "nearbysso":
-        rep, df = check_nearbysso(a.nearbysso, a.ssobservation, a.mpc_orbits, a.dia_sources, objects)
+        rep, df = check_nearbysso(a.nearbysso, a.ssobservation, a.mpc_orbits, a.dia_sources, objects,
+                                  sidecar=a.sidecar)
     elif a.cmd == "uncertainty":
         if not 1 <= a.workers <= 32:
             ap.error("--workers must be 1..32 (shared nodes)")

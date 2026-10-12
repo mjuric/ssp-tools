@@ -154,6 +154,20 @@ def test_compare_to_ssobservation_statuses():
     assert {"sss_ephRa", "nss_ephRa", "midpointMjdTai", "dia_ra"} <= set(disc.columns)
 
 
+def test_compare_rates_allow_one_float32_ulp():
+    """Float32 rates one ulp apart (1.2e-7 deg/d at 1.45 deg/d, above the
+    1e-7 tolerance) match; two ulps don't."""
+    nss, sss, dia, lookup, sigma_fn = _case()
+    sss, nss = sss[sss["diaSourceId"] == 1].copy(), nss[nss["diaSourceId"] == 1].copy()
+    sss["ephRateRa"] = np.float32(1.45)
+    for steps, status in ((1, "match"), (2, "value_mismatch")):
+        r = np.float32(1.45)
+        for _ in range(steps):
+            r = np.nextafter(r, np.float32(2))
+        rows, _ = V.compare_to_ssobservation(nss.assign(ephRateRa=r), sss, dia, lookup, sigma_fn)
+        assert rows["status"].iloc[0] == status
+
+
 def test_compare_sigma_only_for_unexplained():
     nss, sss, dia, lookup, _ = _case()
     seen = []
