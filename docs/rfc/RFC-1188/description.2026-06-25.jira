@@ -1,0 +1,45 @@
+h2. Summary
+
+This RFC proposes changing the PPDB Solar System table baseline from the current model, where {{SSSource}} is tightly linked 1:1 to {{DiaSource}}, to a decoupled model in which Solar System tables are constructed from a persistent record of the measurements submitted to the MPC. The new baseline makes {{SSSource}} and {{SSObject}} independent of the current contents and identifier namespace of the PPDB {{DiaSource}} table, while preserving a lightweight association table for users who need to relate PPDB {{DiaSource}} detections to nearby predicted Solar System objects.
+
+h2. Motivation
+
+The current baseline assumes that Solar System detections accepted by the MPC can be mapped back to PPDB {{DiaSource}} rows and used to regenerate {{SSSource}} and {{SSObject}} daily. This assumption fails once Rubin data releases begin replacing previously submitted prompt-processing measurements with DRP-derived measurements. At that point, the MPC’s list of accepted source identifiers may contain a mix of PP-generated and DRP-generated IDs, while the PPDB {{DiaSource}} table contains only PP-generated rows.
+
+This also creates problems for commissioning, early survey validation, source-based moving-object measurements before templates are available, and special processing campaigns. These measurements may be legitimate Rubin-submitted Solar System observations, but may not exist as PPDB {{DiaSource}} rows. As a result, the current baseline risks making the PPDB Solar System products incomplete, hard to regenerate, and difficult to explain to users.
+
+h2. Proposed Change
+
+Adopt a new PPDB Solar System table baseline with the following design:
+
+# For every submission to the MPC, persist the full measurement record that was submitted, including the Source or DiaSource-like astrometric and photometric fields needed to reconstruct Solar System data products.
+# When Rubin receives the MPC’s accepted association information, construct {{SSSource}} and {{SSObject}} from this persistent submitted-measurement store rather than from PPDB {{DiaSource}}.
+# Extend {{SSSource}} to include the DiaSource-like astrometric and photometric columns that users currently obtain by joining {{SSSource}} to {{DiaSource}}.
+# Break the hard schema dependency between {{DiaSource}} and {{SSSource}}.
+# Remove {{ssObjectId}} from {{DiaSource}}.
+# Treat all {{DiaSource}} rows as normal {{DiaObject}}-associated difference-image detections, rather than mutating them daily based on Solar System associations.
+# Add a small daily-regenerated association table, tentatively named {{NearbyAsteroids}}, containing tuples such as:
+{{diaSourceId, ssSourceId, distance}}
+This table provides a user-facing way to discover which PPDB {{DiaSource}} rows were near predicted Solar System object positions without requiring {{DiaSource}} itself to carry Solar System state.
+
+h2. Consequences
+
+This change makes the PPDB Solar System products independent of whether a measurement originated in prompt processing, DRP, commissioning processing, source-based early processing, or a special run. It also removes the need for daily bulk updates to {{DiaSource}}, avoids rewriting or invalidating previously published alert identifiers, and allows the Solar System side of PPDB to be managed as a smaller, more self-contained data product.
+
+The primary user-facing model becomes:
+
+For the most up-to-date, best-quality, evergreen Rubin understanding of the Solar System, use the PPDB Solar System tables.
+
+For a homogeneous, versioned, pipeline-consistent catalog with well-characterized systematics, use the most recent DRP Solar System data products.
+
+This change may also allow the DRP side to retire the proposed “gold reprocessing” Solar System product and instead retain only the LSST-only Solar System catalog, reducing DRP complexity by removing the MPC from that processing flow.
+
+h2. Implementation Notes
+
+The submitted-measurement store should be append-oriented and immutable, keyed by the identifiers used in MPC submission and acceptance workflows. It must retain sufficient astrometric, photometric, provenance, and processing-context metadata to reconstruct {{SSSource}} and {{SSObject}} without consulting {{DiaSource}}.
+
+{{SSSource}} should become measurement-complete for Solar System use cases. Its schema should include the fields needed for Solar System science queries without requiring a join to {{DiaSource}}.
+
+{{NearbyAsteroids}} should be regenerated and bulk-loaded daily. It should remain intentionally narrow and should not be treated as the authoritative Solar System association state; that role belongs to {{SSSource}}/{{SSObject}}.
+
+!image-20260625-215128.png|width=671,alt="image-20260625-215128.png"!
