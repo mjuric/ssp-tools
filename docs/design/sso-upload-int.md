@@ -29,6 +29,7 @@
 | The combined file | Kept, as `RUN_DIR/upload/SSObservation.parquet`. |
 | The message's `files` field | Dropped. The message is exactly dax_ppdb's: `{"bucket", "object_prefix", "uploaded_tables"}`. |
 | Validation against the stack | A full upload to the int bucket without the Pub/Sub message is allowed. It must be shown identical to an upload by dax_ppdb's `SSOUploader` (the latest daily stack, with dax_ppdb from `tickets/DM-55375`). |
+| The design (2026-11-12) | Approved, including the validation against the stack. Built as one WP by a subagent, reviewed by the integrator. |
 
 ## Outputs
 

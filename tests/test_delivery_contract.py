@@ -21,4 +21,5 @@ def test_inputs_and_steps():
     assert set(C.REQUIRED_INPUT_COLUMNS) == set(C.INPUT_FILES)
     assert set(C.MPC_SNAPSHOT) <= set(C.INPUT_FILES)
     assert C.BUILD_STEPS[-1] == "check"
-    assert C.UPLOAD_MESSAGE_FIELDS == ("bucket", "object_prefix", "uploaded_tables", "files")
+    assert C.UPLOAD_MESSAGE_FIELDS == ("bucket", "object_prefix", "uploaded_tables")
+    assert sorted(C.UPLOAD_TABLE_ORDER) == sorted(C.DELIVERY_TABLES)
