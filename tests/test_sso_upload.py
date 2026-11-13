@@ -38,11 +38,39 @@ class FakeBlob:
         with open(filename, "rb") as f:
             self.store.objects[self.name] = f.read()
 
-    def delete(self):
+    def delete(self, if_generation_match=None):
+        from google.api_core.exceptions import PreconditionFailed
         self.store.calls.append(("delete", self.name))
+        self.store.delete_generations.append(if_generation_match)
         if self.name in self.store.fail_delete:
             raise RuntimeError("injected delete failure")
+        if if_generation_match is not None and self.store.generation(self.name) != if_generation_match:
+            raise PreconditionFailed("generation changed")
         del self.store.objects[self.name]
+
+    # what the chunked (parallel) path uses
+    def exists(self):
+        self.store.calls.append(("exists", self.name))
+        if self.store.exists_exc:
+            raise self.store.exists_exc
+        return self.name in self.store.objects
+
+    def reload(self):
+        self.store.calls.append(("reload", self.name))
+        if self.store.reload_exc:
+            raise self.store.reload_exc
+        data = self.store.objects[self.name]
+        self.size, self.crc32c = len(data), _crc32c(data)
+        self.generation = self.store.generation(self.name)
+        if self.store.after_reload:
+            self.store.after_reload(self)
+
+
+def _crc32c(data):
+    import base64
+
+    import google_crc32c
+    return base64.b64encode(google_crc32c.Checksum(data).digest()).decode()
 
 
 class FakeBucket:
@@ -55,12 +83,29 @@ class FakeBucket:
 
 class FakeStorage:
     def __init__(self):
-        self.objects, self.calls, self.buckets = {}, [], []
+        self.objects, self.calls, self.buckets = _Objects(), [], []
         self.fail_on, self.fail_delete = {}, set()
+        self.exists_exc = self.reload_exc = self.after_reload = None
+        self.delete_generations = []
+
+    def generation(self, name):
+        return self.objects.generations.get(name) if name in self.objects else None
 
     def bucket(self, name):
         self.buckets.append(name)
         return FakeBucket(self)
+
+
+class _Objects(dict):
+    """The fake bucket's {name: bytes}; every write gets a new generation."""
+
+    def __init__(self):
+        super().__init__()
+        self.generations, self._next = {}, 1
+
+    def __setitem__(self, name, data):
+        super().__setitem__(name, data)
+        self.generations[name], self._next = self._next, self._next + 1
 
 
 class FakeFuture:
@@ -565,7 +610,9 @@ def test_upload_success_and_message(fakes, tmp_path):
     r = report(run)
     assert r["upload"] == rec and r["uploads"] == [rec]
     assert list(rec) == ["config", "bucket", "object_prefix", "tables", "message_id", "dry_run",
-                         "published", "utc", "ssobservation"]
+                         "published", "utc", "ssobservation", "parallel"]
+    # parallel by default, but nothing here is big enough to go in chunks
+    assert rec["parallel"] == {"chunk_bytes": 64 << 20, "workers": 16, "min_bytes": 1 << 30, "tables": []}
     assert rec["message_id"] == "msg-123" and rec["dry_run"] is False and rec["published"] is True
     assert rec["ssobservation"] == combined_record(run)
 
@@ -1048,3 +1095,519 @@ def test_run_dir_read_only_delivery(no_remote, tmp_path):
     U.run("dev", run, dry_run=True)
     after = {p.name: (p.stat().st_ino, p.stat().st_mtime_ns, U.md5_file(p)) for p in d.iterdir()}
     assert after == before
+
+
+# --------------------------------------------------------------------------
+# --parallel: chunked uploads of the big files
+# (docs/design/sso-upload-parallel.md)
+# --------------------------------------------------------------------------
+
+#: The stand-in "big" files: the threshold, and mpc_orbits made bigger than
+#: it (the combined SSObservation is bigger already).
+BIG = 600
+
+
+def make_big_run(tmp_path):
+    """make_run, with SSObservation (combined) and mpc_orbits at least BIG
+    bytes and every other table smaller."""
+    run = make_run(tmp_path)
+    p = run / C.DELIVERY_DIR / "mpc_orbits.parquet"
+    p.write_bytes(b"PAR1" + bytes(range(256)) * 4 + b"PAR1")
+    r = report(run)
+    r["tables"]["mpc_orbits"].update(md5=U.md5_file(p), bytes=p.stat().st_size)
+    (run / C.REPORT_FILE).write_text(json.dumps(r))
+    return run
+
+
+class FakeMPU:
+    """Stands in for upload_chunks_concurrently and the XML multipart
+    listing and abort, on a FakeStorage. ``fail`` maps an object name to
+    what happens: an exception to raise with the multipart upload left
+    incomplete, or "corrupt" / "short" to write wrong bytes."""
+
+    def __init__(self, store):
+        self.store, self.uploads, self.calls, self.fail = store, {}, [], {}
+        self.aborted, self.list_exc, self.abort_exc, self._n = [], None, None, 0
+
+    def chunks(self, path, blob, chunk_bytes, workers):
+        self.calls.append((blob.name, str(path), chunk_bytes, workers))
+        self._n += 1
+        uid = f"u{self._n}"
+        self.uploads[uid] = blob.name
+        with open(path, "rb") as f:
+            data = f.read()
+        how = self.fail.get(blob.name)
+        if isinstance(how, BaseException):
+            raise how
+        if how == "corrupt":
+            data = data[:-1] + bytes([data[-1] ^ 1])
+        elif how == "short":
+            data = data[:-1]
+        # no precondition: a multipart upload overwrites
+        self.store.objects[blob.name] = data
+        del self.uploads[uid]
+
+    def list(self, bucket, prefix):
+        if self.list_exc:
+            raise self.list_exc
+        return [(n, u) for u, n in self.uploads.items() if n.startswith(prefix)]
+
+    def abort(self, bucket, name, upload_id):
+        if self.abort_exc:
+            raise self.abort_exc
+        assert self.uploads.pop(upload_id) == name
+        self.aborted.append((name, upload_id))
+
+
+@pytest.fixture
+def mpu(fakes, monkeypatch):
+    pytest.importorskip("google_crc32c")
+    st, pub = fakes
+    m = FakeMPU(st)
+    monkeypatch.setattr(U, "PARALLEL_MIN_BYTES", BIG)
+    monkeypatch.setattr(U, "_chunks_concurrently", m.chunks)
+    monkeypatch.setattr(U, "_list_multipart_uploads", m.list)
+    monkeypatch.setattr(U, "_abort_multipart_upload", m.abort)
+    return st, pub, m
+
+
+CHUNKED = ("SSObservation", "mpc_orbits")
+DEV_CFG = "bucket_name: ppdb-dev-sso-ingest\ntopic: load-sso-topic\nproject: ppdb-dev-5c07\n"
+
+
+def test_parallel_defaults():
+    """The owner's choice (2026-11-13): parallel by default, 64 MiB x 16."""
+    assert (U.PARALLEL_CHUNK_MIB, U.PARALLEL_WORKERS, U.PARALLEL_MIN_BYTES) == (64, 16, 1 << 30)
+    assert U.parallel_options() == {"chunk_bytes": 64 << 20, "workers": 16}
+
+
+def test_parallel_by_default(mpu, tmp_path, fixed_prefix):
+    """No flag, no config key: the big files go in chunks of 64 MiB, 16
+    threads."""
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    rec = U.run("dev", run)
+    assert [c[0] for c in m.calls] == objects_of(CHUNKED, PREFIX)
+    assert {c[2:] for c in m.calls} == {(64 << 20, 16)}
+    assert rec["parallel"] == {"chunk_bytes": 64 << 20, "workers": 16, "min_bytes": BIG,
+                               "tables": list(CHUNKED)}
+    assert pub.published == [(TOPIC_PATH, message(PREFIX, SIX).encode())]
+    assert sorted(st.objects) == sorted(objects_of(SIX, PREFIX))
+
+
+def test_parallel_chunks_only_the_big_files(mpu, tmp_path, fixed_prefix):
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    rec = U.run("dev", run, parallel=True, chunk_mib=64, workers=8)
+    # the big two in chunks, the rest as before (if_generation_match=0)
+    assert m.calls == [(f"{PREFIX}/SSObservation.parquet", str(combined(run)), 64 << 20, 8),
+                       (f"{PREFIX}/mpc_orbits.parquet", str(run / C.DELIVERY_DIR / "mpc_orbits.parquet"),
+                        64 << 20, 8)]
+    plain = [t for t in SIX if t not in CHUNKED]
+    assert [c[1:] for c in st.calls if c[0] == "upload"] == [(o, 0) for o in objects_of(plain, PREFIX)]
+    # each chunked object checked not to exist first, then read back
+    for t in CHUNKED:
+        name = f"{PREFIX}/{t}.parquet"
+        assert [c[0] for c in st.calls if c[1] == name] == ["exists", "reload"]
+    # the same objects and the same message as without --parallel
+    assert sorted(st.objects) == sorted(objects_of(SIX, PREFIX))
+    assert st.objects[f"{PREFIX}/SSObservation.parquet"] == combined(run).read_bytes()
+    for t in SIX[1:]:
+        assert st.objects[f"{PREFIX}/{t}.parquet"] == (run / C.DELIVERY_DIR / f"{t}.parquet").read_bytes()
+    assert pub.published == [(TOPIC_PATH, message(PREFIX, SIX).encode())]
+    assert rec["parallel"] == {"chunk_bytes": 64 << 20, "workers": 8, "min_bytes": BIG,
+                               "tables": list(CHUNKED)}
+    assert report(run)["upload"] == rec
+    assert m.uploads == {} and m.aborted == []
+
+
+@pytest.mark.parametrize("how", ["cli-off", "config-off", "cli-off-over-config-on"])
+def test_no_parallel_gives_the_single_stream_path(mpu, tmp_path, fixed_prefix, how):
+    """--no-parallel (also over the config's parallel: true), or the
+    config's parallel: false: even the big files go in one
+    if_generation_match=0 upload, and the record's parallel is null."""
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    cfg = "dev"
+    if how != "cli-off":
+        cfg = tmp_path / "c.yaml"
+        cfg.write_text(DEV_CFG + f"parallel: {'false' if how == 'config-off' else 'true'}\n")
+    rec = U.run(str(cfg), run, parallel=None if how == "config-off" else False)
+    assert m.calls == []
+    assert [c[1:] for c in st.calls] == [(o, 0) for o in objects_of(SIX, PREFIX)]
+    assert all(c[0] == "upload" for c in st.calls)
+    assert "parallel" in rec and rec["parallel"] is None
+    assert report(run)["upload"]["parallel"] is None
+    assert pub.published == [(TOPIC_PATH, message(PREFIX, SIX).encode())]
+
+
+def test_cli_parallel_over_config_off(mpu, tmp_path, fixed_prefix):
+    """--parallel wins over the config's parallel: false."""
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(DEV_CFG + "parallel: false\n")
+    rec = U.run(str(cfg), run, parallel=True)
+    assert [c[0] for c in m.calls] == objects_of(CHUNKED, PREFIX)
+    assert rec["parallel"]["tables"] == list(CHUNKED)
+
+
+def test_parallel_from_the_config(mpu, tmp_path, fixed_prefix):
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(DEV_CFG + "parallel: true\n")
+    rec = U.run(str(cfg), run)
+    assert [c[0] for c in m.calls] == objects_of(CHUNKED, PREFIX)
+    assert rec["parallel"]["chunk_bytes"] == U.PARALLEL_CHUNK_MIB << 20
+    assert rec["parallel"]["workers"] == U.PARALLEL_WORKERS
+    cfg.write_text("bucket_name: b\ntopic: t\nproject: p\nparallel: yes please\n")
+    with pytest.raises(U.SSOUploadError, match="parallel must be true or false"):
+        U.load_config(str(cfg))
+
+
+def test_parallel_refuses_an_existing_object(mpu, tmp_path, fixed_prefix):
+    """No precondition on a multipart upload: an object already at the name
+    is found by the check, left untouched, and the upload fails cleanly."""
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    theirs = f"{PREFIX}/mpc_orbits.parquet"
+    st.objects[theirs] = b"someone else's"
+    with pytest.raises(U.SSOUploadError, match="already exists"):
+        U.run("dev", run, parallel=True)
+    assert st.objects == {theirs: b"someone else's"}
+    assert [c[0] for c in m.calls] == [f"{PREFIX}/SSObservation.parquet"]     # never started on it
+    assert [c[1] for c in st.calls if c[0] == "delete"] == objects_of(SIX[:3], PREFIX)
+    assert pub.published == [] and "upload" not in report(run)
+
+
+@pytest.mark.parametrize("table", CHUNKED)
+def test_parallel_failure_aborts_and_cleans_up(mpu, tmp_path, fixed_prefix, table):
+    from google.api_core.exceptions import ServiceUnavailable
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    name = f"{PREFIX}/{table}.parquet"
+    m.fail[name] = ServiceUnavailable("a part failed")
+    with pytest.raises(U.SSOUploadError, match="in chunks") as ei:
+        U.run("dev", run, parallel=True)
+    assert isinstance(ei.value.__cause__, ServiceUnavailable)
+    # the incomplete multipart upload aborted, every object of this run gone
+    assert m.uploads == {} and [a[0] for a in m.aborted] == [name]
+    assert st.objects == {} and pub.published == []
+    k = SIX.index(table)
+    assert [c[1] for c in st.calls if c[0] == "delete"] == objects_of(SIX[:k], PREFIX)
+    assert "upload" not in report(run)
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+def test_parallel_interrupt_aborts_and_cleans_up(mpu, tmp_path, fixed_prefix, exc):
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    m.fail[f"{PREFIX}/mpc_orbits.parquet"] = exc()
+    with pytest.raises(exc):
+        U.run("dev", run, parallel=True)
+    assert m.uploads == {} and len(m.aborted) == 1
+    assert st.objects == {} and pub.published == []
+
+
+@pytest.mark.parametrize("how", ["corrupt", "short"])
+def test_parallel_crc32c_or_size_mismatch_deletes_it(mpu, tmp_path, fixed_prefix, how):
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    name = f"{PREFIX}/SSObservation.parquet"
+    m.fail[name] = how
+    with pytest.raises(U.SSOUploadError, match="CRC32C .* the upload is corrupt"):
+        U.run("dev", run, parallel=True)
+    assert [c[1] for c in st.calls if c[0] == "delete"] == [name]
+    assert st.objects == {} and pub.published == []
+
+
+def test_parallel_cleanup_failures_keep_the_original_error(mpu, tmp_path, fixed_prefix, caplog):
+    from google.api_core.exceptions import ServiceUnavailable
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    m.fail[f"{PREFIX}/mpc_orbits.parquet"] = ServiceUnavailable("a part failed")
+    m.list_exc = RuntimeError("can't list")
+    with pytest.raises(U.SSOUploadError, match="in chunks"):
+        U.run("dev", run, parallel=True)
+    assert "failed to list the multipart uploads" in caplog.text
+    assert st.objects == {}          # the earlier objects are still deleted
+    # an abort that fails is logged, too
+    caplog.clear()
+    m.list_exc, m.abort_exc = None, RuntimeError("can't abort")
+    m.uploads.clear()
+    with pytest.raises(U.SSOUploadError, match="in chunks"):
+        U.run("dev", run, parallel=True)
+    assert "abort it by hand" in caplog.text
+
+
+def test_parallel_needs_the_crc32c_c_extension(mpu, tmp_path, fixed_prefix, monkeypatch):
+    import google_crc32c
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    monkeypatch.setattr(google_crc32c, "implementation", "python")
+    with pytest.raises(U.SSOUploadError, match="C extension"):
+        U.run("dev", run, parallel=True)
+    assert st.calls == [] and m.calls == []
+    # not needed when nothing is big enough to go in chunks
+    monkeypatch.setattr(U, "PARALLEL_MIN_BYTES", 1 << 40)
+    U.run("dev", run, parallel=True)
+    assert m.calls == []
+
+
+@pytest.mark.parametrize("chunk_mib, workers, match", [
+    (4, 8, "--chunk-mib"), (5 * 1024 + 1, 8, "--chunk-mib"), ("x", 8, "--chunk-mib"),
+    (float("nan"), 8, "--chunk-mib"), (float("inf"), 8, "--chunk-mib"), (float("-inf"), 8, "--chunk-mib"),
+    (True, 8, "--chunk-mib"),
+    (64, 0, "--parallel-workers"), (64, U.PARALLEL_MAX_WORKERS + 1, "--parallel-workers"),
+    (64, True, "--parallel-workers"), (64, 8.0, "--parallel-workers")])
+def test_parallel_options_refused(no_remote, tmp_path, chunk_mib, workers, match):
+    with pytest.raises(U.SSOUploadError, match=match):
+        U.parallel_options(chunk_mib, workers)
+    run = make_run(tmp_path)
+    with pytest.raises(U.SSOUploadError, match=match):
+        U.run("dev", run, dry_run=True, chunk_mib=chunk_mib, workers=workers)       # the default
+    with pytest.raises(U.SSOUploadError, match=match):
+        U.run("dev", run, dry_run=True, parallel=True, chunk_mib=chunk_mib, workers=workers)
+    # not checked with --no-parallel
+    U.run("dev", run, dry_run=True, parallel=False, chunk_mib=chunk_mib, workers=workers)
+
+
+def test_parallel_too_many_parts(mpu, tmp_path, fixed_prefix, monkeypatch):
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    monkeypatch.setattr(U, "MPU_MAX_PARTS", 0)
+    with pytest.raises(U.SSOUploadError, match="at most 0"):
+        U.run("dev", run, parallel=True)
+    assert m.calls == [] and st.objects == {}
+
+
+def test_parallel_dry_run(no_remote, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(U, "PARALLEL_MIN_BYTES", BIG)
+    run = make_big_run(tmp_path)
+    rec = U.run("dev", run, dry_run=True, chunk_mib=32, workers=4)     # parallel by default
+    out = capsys.readouterr().out
+    prefix = rec["object_prefix"]
+    assert f"parallel: files of at least {BIG} bytes in chunks of 32 MiB, 4 threads: {list(CHUNKED)}" in out
+    for t in SIX:
+        line, = [x for x in out.splitlines() if f"/{prefix}/{t}.parquet " in x]
+        if t in CHUNKED:
+            assert "in chunks of 32 MiB, 4 threads" in line
+        else:
+            assert line.endswith("(if_generation_match=0)")
+    assert rec["parallel"]["tables"] == list(CHUNKED)
+    rec = U.run("dev", run, dry_run=True, parallel=False)
+    out = capsys.readouterr().out
+    assert "parallel: off" in out and "in chunks" not in out
+    assert out.count("(if_generation_match=0)") == len(SIX)
+    assert rec["parallel"] is None
+
+
+def test_main_non_finite_chunk(no_remote, tmp_path):
+    """--chunk-mib nan / inf from the command line: a clean error, not a
+    ValueError or OverflowError."""
+    run = make_run(tmp_path)
+    for v in ("nan", "inf"):
+        assert U.main(["dev", str(run), "--dry-run", "--chunk-mib", v]) == 1
+
+
+def test_parallel_existence_check_403(mpu, tmp_path, fixed_prefix):
+    from google.api_core.exceptions import Forbidden
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    st.exists_exc = Forbidden("no storage.objects.get")
+    with pytest.raises(U.SSOUploadError, match=r"lacks storage\.objects\.get.*--no-parallel avoids it"):
+        U.run("dev", run)
+    assert m.calls == [] and st.objects == {}
+
+
+def test_parallel_mismatch_deletes_only_our_generation(mpu, tmp_path, fixed_prefix):
+    """On a CRC32C mismatch the object is deleted with if_generation_match
+    on the generation read back."""
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    name = f"{PREFIX}/SSObservation.parquet"
+    m.fail[name] = "corrupt"
+    gens = []
+    st.after_reload = lambda blob: gens.append(blob.generation)
+    with pytest.raises(U.SSOUploadError, match="the upload is corrupt"):
+        U.run("dev", run)
+    assert gens and st.delete_generations == [gens[0]]
+    assert st.objects == {}
+
+
+def test_parallel_mismatch_never_deletes_a_newer_object(mpu, tmp_path, fixed_prefix, caplog):
+    """If the object changed after the read-back (someone else's write),
+    the generation-matched delete fails and it is kept."""
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    name = f"{PREFIX}/SSObservation.parquet"
+    m.fail[name] = "corrupt"
+
+    def overwrite(blob):
+        st.objects[name] = b"someone else's"
+    st.after_reload = overwrite
+    with pytest.raises(U.SSOUploadError, match="the upload is corrupt"):
+        U.run("dev", run)
+    assert st.objects == {name: b"someone else's"}
+    assert "remove it by hand" in caplog.text
+
+
+def test_parallel_failure_before_complete_never_deletes(mpu, tmp_path, fixed_prefix, monkeypatch):
+    """A failure before our multipart upload completed: an object that
+    appeared at the name meanwhile isn't ours, and is left alone."""
+    from google.api_core.exceptions import ServiceUnavailable
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    name = f"{PREFIX}/SSObservation.parquet"
+
+    def theirs_then_fail(path, blob, chunk_bytes, workers):
+        st.objects[name] = b"someone else's"
+        m.fail[name] = ServiceUnavailable("a part failed")
+        m.chunks(path, blob, chunk_bytes, workers)
+    monkeypatch.setattr(U, "_chunks_concurrently", theirs_then_fail)
+    with pytest.raises(U.SSOUploadError, match="in chunks"):
+        U.run("dev", run)
+    assert st.objects == {name: b"someone else's"}
+    assert not [c for c in st.calls if c[0] == "delete"]
+    assert m.uploads == {} and len(m.aborted) == 1
+
+
+def test_parallel_unread_generation_is_not_deleted(mpu, tmp_path, fixed_prefix, caplog):
+    """Completed, but the read-back failed: without the generation, the
+    object is not deleted (logged for removal by hand)."""
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    name = f"{PREFIX}/SSObservation.parquet"
+    st.reload_exc = RuntimeError("read-back failed")
+    with pytest.raises(U.SSOUploadError, match="can't read back"):
+        U.run("dev", run)
+    assert name in st.objects
+    assert not [c for c in st.calls if c[0] == "delete"]
+    assert "remove it by hand" in caplog.text
+
+
+def test_main_parallel_flags(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(U, "run", lambda *a, **kw: seen.update(kw))
+    assert U.main(["dev", str(tmp_path)]) == 0
+    assert seen["parallel"] is None
+    assert seen["chunk_mib"] == U.PARALLEL_CHUNK_MIB and seen["workers"] == U.PARALLEL_WORKERS
+    assert U.main(["dev", str(tmp_path), "--parallel", "--chunk-mib", "64", "--parallel-workers", "8"]) == 0
+    assert (seen["parallel"], seen["chunk_mib"], seen["workers"]) == (True, 64, 8)
+    assert U.main(["dev", str(tmp_path), "--no-parallel"]) == 0
+    assert seen["parallel"] is False
+
+
+def test_size_pool():
+    """The https pool is grown to the thread count; retries are kept; a
+    bigger pool or a non-plain adapter is left alone."""
+    requests = pytest.importorskip("requests")
+    s = requests.Session()
+    s.mount("https://", requests.adapters.HTTPAdapter(max_retries=3))
+    U._size_pool(s, 16)
+    a = s.adapters["https://"]
+    assert type(a) is requests.adapters.HTTPAdapter
+    assert a._pool_maxsize == 16 and a.max_retries.total == 3
+    U._size_pool(s, 8)
+    assert s.adapters["https://"] is a
+
+    class Custom(requests.adapters.HTTPAdapter):
+        pass
+    s.mount("https://", c := Custom())
+    U._size_pool(s, 16)
+    assert s.adapters["https://"] is c
+
+
+def test_crc32c_file(tmp_path):
+    pytest.importorskip("google_crc32c")
+    p = tmp_path / "f"
+    p.write_bytes(b"123456789")
+    assert U.crc32c_file(p) == "4waSgw=="          # the CRC32C check value, 0xE3069283
+    data = os.urandom(3 * 1000 + 17)
+    p.write_bytes(data)
+    assert U.crc32c_file(p, bufsize=1000) == _crc32c(data)
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status_code, self.content, self.text = status, body.encode(), body
+
+
+def _uploads_xml(items, next_key=None, next_uid=None):
+    ups = "".join(f"<Upload><Key>{k}</Key><UploadId>{u}</UploadId></Upload>" for k, u in items)
+    more = (f"<NextKeyMarker>{next_key}</NextKeyMarker><NextUploadIdMarker>{next_uid}</NextUploadIdMarker>"
+            if next_key else "")
+    return ('<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult '
+            'xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>b</Bucket>'
+            f"<IsTruncated>{'true' if next_key else 'false'}</IsTruncated>{more}{ups}"
+            "</ListMultipartUploadsResult>")
+
+
+def test_list_and_abort_multipart_uploads(monkeypatch):
+    """The XML API calls themselves, on a fake session."""
+    class Http:
+        def __init__(self):
+            self.gets, self.deletes = [], []
+
+        def get(self, url, params):
+            self.gets.append((url, dict(params)))
+            if "key-marker" not in params:
+                return _Resp(200, _uploads_xml([("p/A.parquet", "u1")], "p/A.parquet", "u1"))
+            return _Resp(200, _uploads_xml([("p/B.parquet", "u2")]))
+
+        def delete(self, url, params):
+            self.deletes.append((url, params))
+            return _Resp(204, "")
+
+    http = Http()
+    monkeypatch.setattr(U, "_xml_api", lambda bucket: ("https://storage.example/b", http))
+    assert U._list_multipart_uploads(None, "p/") == [("p/A.parquet", "u1"), ("p/B.parquet", "u2")]
+    assert http.gets == [("https://storage.example/b", {"uploads": "", "prefix": "p/"}),
+                         ("https://storage.example/b", {"uploads": "", "prefix": "p/",
+                                                        "key-marker": "p/A.parquet",
+                                                        "upload-id-marker": "u1"})]
+    U._abort_multipart_upload(None, "p/A b.parquet", "u1")
+    assert http.deletes == [("https://storage.example/b/p/A%20b.parquet", {"uploadId": "u1"})]
+    http.get = lambda url, params: _Resp(403, "denied")
+    with pytest.raises(U.SSOUploadError, match="HTTP 403"):
+        U._list_multipart_uploads(None, "p/")
+    http.delete = lambda url, params: _Resp(500, "oops")
+    with pytest.raises(U.SSOUploadError, match="HTTP 500"):
+        U._abort_multipart_upload(None, "p/A.parquet", "u1")
+
+
+def test_list_multipart_uploads_any_namespace(monkeypatch):
+    """Elements are matched in any namespace, or none."""
+    body = ("<ListMultipartUploadsResult><IsTruncated>false</IsTruncated>"
+            "<Upload><Key>p/A.parquet</Key><UploadId>u1</UploadId></Upload></ListMultipartUploadsResult>")
+    monkeypatch.setattr(U, "_xml_api", lambda bucket: ("https://h/b", type("H", (), {
+        "get": staticmethod(lambda url, params: _Resp(200, body))})))
+    assert U._list_multipart_uploads(None, "p/") == [("p/A.parquet", "u1")]
+    other = body.replace("<ListMultipartUploadsResult>", '<ListMultipartUploadsResult xmlns="urn:x">')
+    monkeypatch.setattr(U, "_xml_api", lambda bucket: ("https://h/b", type("H", (), {
+        "get": staticmethod(lambda url, params: _Resp(200, other))})))
+    assert U._list_multipart_uploads(None, "p/") == [("p/A.parquet", "u1")]
+
+
+@pytest.mark.parametrize("pages", [
+    # truncated, but no markers
+    [_uploads_xml([("p/A.parquet", "u1")]).replace("<IsTruncated>false", "<IsTruncated>true")],
+    # truncated, one marker missing
+    [_uploads_xml([("p/A.parquet", "u1")], "p/A.parquet", "u1").replace(
+        "<NextUploadIdMarker>u1</NextUploadIdMarker>", "")],
+    # truncated, the same markers again
+    [_uploads_xml([("p/A.parquet", "u1")], "p/A.parquet", "u1")] * 3,
+])
+def test_list_multipart_uploads_stops_on_bad_markers(monkeypatch, pages):
+    calls = []
+
+    class Http:
+        @staticmethod
+        def get(url, params):
+            calls.append(dict(params))
+            assert len(calls) <= 3, "looping"
+            return _Resp(200, pages[min(len(calls), len(pages)) - 1])
+    monkeypatch.setattr(U, "_xml_api", lambda bucket: ("https://h/b", Http))
+    with pytest.raises(U.SSOUploadError, match="missing or unchanged"):
+        U._list_multipart_uploads(None, "p/")
