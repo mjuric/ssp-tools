@@ -14,6 +14,7 @@ Querying `mpc_orbits` through the data-int PPDB TAP fails with `'ascii' codec ca
 | Fix (2026-11-12, via ssp-daily's brief) | Escape the non-ASCII characters as JSON `\uXXXX` escapes. No schema change to `unicode`: no sdm_schemas change and no PPDB table rebuild. |
 | Check (2026-11-12, via the brief) | A delivery check: the text columns of mpc_orbits, and, if cheap, every string column of all delivered tables, are ASCII; the delivery fails otherwise. |
 | Build (2026-11-12) | The owner asked for it to be built by a subagent, as usual. |
+| Text checks optional (2026-11-13) | Every JSON and non-ASCII check is optional and off by default: the `mpc` step's JSON validation of the `*_json`/`*_jsonb` columns (`json.loads` of every value) and the delivery check `ascii`. One option, `--text-checks`, turns both on (`ssp-build-sso`, `ssp-sso-daily`, `python -m ssp.delivery_check`). The escape itself always runs. |
 
 ## Approach
 
