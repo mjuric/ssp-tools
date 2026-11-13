@@ -1,9 +1,12 @@
 """ssp-upload-sso (stage 3) with fake GCS and Pub/Sub clients; no network."""
 import concurrent.futures
 import json
+import os
 import re
 from datetime import datetime, timedelta, timezone
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from ssp import delivery_contract as C
@@ -11,7 +14,10 @@ from ssp import sso_upload as U
 from ssp.ssobservation_contract import PART_FILE_FORMAT, SIDECAR_FILE, SSOBSERVATION_MANIFEST_FILE
 
 TOPIC_PATH = "projects/ppdb-dev-5c07/topics/load-sso-topic"
-FIVE = ("SSObservation", "SSObject", "mpc_orbits", "current_identifications", "numbered_identifications")
+#: All six tables, in the upload order (dax_ppdb SSO_TABLES).
+SIX = ("SSObservation", "NearbySSO", "SSObject", "mpc_orbits", "current_identifications",
+       "numbered_identifications")
+SSOBS = C.UPLOAD_SSOBSERVATION_FILE
 
 
 # --------------------------------------------------------------------------
@@ -69,14 +75,17 @@ class FakeFuture:
 
 
 class FakePublisher:
-    def __init__(self, exc=None):
+    def __init__(self, exc=None, publish_exc=None):
         self.published, self.exc, self.futures = [], exc, []
+        self.publish_exc = publish_exc
 
     @staticmethod
     def topic_path(project, topic):
         return f"projects/{project}/topics/{topic}"
 
     def publish(self, topic, data):
+        if self.publish_exc:
+            raise self.publish_exc
         self.published.append((topic, data))
         self.futures.append(FakeFuture(self.exc))
         return self.futures[-1]
@@ -100,22 +109,56 @@ def no_remote(monkeypatch):
     monkeypatch.setattr(U, "_publisher_client", boom)
 
 
-#: SSObservation's parts in make_run.
-N_PARTS = 2
+# --------------------------------------------------------------------------
+# A stand-in delivery
+# --------------------------------------------------------------------------
+
+#: SSObservation's parts in make_run: rows of each, and the row group size
+#: they are written with (so each has more than one row group).
+PART_ROWS = (7, 5)
+PART_RG = 3
+
+#: The stand-in SSObservation schema: a string key, a nullable int64, a
+#: dictionary column (as the real parts have), not-null.
+SSOBS_SCHEMA = pa.schema([
+    pa.field("obsid", pa.string(), nullable=False),
+    pa.field("ssObjectId", pa.int64()),
+    pa.field("band", pa.dictionary(pa.int32(), pa.string()), nullable=False),
+    pa.field("midpointMjdTai", pa.float64(), nullable=False),
+])
 
 
-def make_partitioned(run, n_parts=N_PARTS):
-    """A stand-in partitioned SSObservation (parts, sidecar, manifest) in
-    RUN_DIR/delivery; returns its report entry."""
+def part_table(k, n, schema=SSOBS_SCHEMA, start=0):
+    base = 100 * k + start
+    cols = {"obsid": [f"o{base + i:05d}" for i in range(n)],
+            "ssObjectId": [None if i == 2 else base + i // 2 for i in range(n)],
+            "band": pa.array(["gri"[(base + i) % 3] for i in range(n)]).dictionary_encode(),
+            "midpointMjdTai": [60000.0 + base + i / 10 for i in range(n)]}
+    if "extra" in schema.names:
+        cols["extra"] = list(range(n))
+    return pa.table(cols, schema=schema)
+
+
+def write_part(path, k, n, schema=SSOBS_SCHEMA, start=0):
+    pq.write_table(part_table(k, n, schema, start), path, compression="zstd", row_group_size=PART_RG)
+
+
+def _part_entry(p, rows):
+    return dict(file=p.name, rows=rows, ssObjectId_min=0, ssObjectId_max=0, null_ssObjectId=False,
+                bytes=p.stat().st_size, md5=U.md5_file(p))
+
+
+def make_partitioned(run, part_rows=PART_ROWS):
+    """A stand-in partitioned SSObservation (Parquet parts, sidecar,
+    manifest) in RUN_DIR/delivery; returns its report entry."""
     d = run / C.DELIVERY_DIR
     parts = []
-    for k in range(n_parts):
+    for k, n in enumerate(part_rows):
         p = d / PART_FILE_FORMAT.format(k)
-        p.write_bytes(f"PAR1 SSObservation part {k} PAR1".encode())
-        parts.append(dict(file=p.name, rows=10 + k, ssObjectId_min=k, ssObjectId_max=k, null_ssObjectId=False,
-                          bytes=p.stat().st_size, md5=U.md5_file(p)))
+        write_part(p, k, n)
+        parts.append(_part_entry(p, n))
     side = d / SIDECAR_FILE
-    side.write_bytes(b"PAR1 sidecar PAR1")
+    pq.write_table(pa.table({"obsid": ["o"], "matchMethod": ["x"]}), side)
     m = dict(table="SSObservation", format_version=1, rows=sum(p["rows"] for p in parts), parts=parts,
              sidecar=dict(file=SIDECAR_FILE, key="obsid", columns=["matchMethod"], rows=1,
                           bytes=side.stat().st_size, md5=U.md5_file(side)))
@@ -125,24 +168,6 @@ def make_partitioned(run, n_parts=N_PARTS):
             "parts": [f"{C.DELIVERY_DIR}/{p['file']}" for p in parts],
             "sidecar": f"{C.DELIVERY_DIR}/{SIDECAR_FILE}", "rows": m["rows"],
             "bytes": sum(p["bytes"] for p in parts)}
-
-
-def files_of(table, n_parts=N_PARTS):
-    """The object names (relative to the prefix) of ``table``, in upload
-    order."""
-    if table == "SSObservation":
-        return [PART_FILE_FORMAT.format(k) for k in range(n_parts)] + [SSOBSERVATION_MANIFEST_FILE]
-    return [f"{table}.parquet"]
-
-
-def objects_of(tables, prefix=None):
-    names = [n for t in tables for n in files_of(t)]
-    return [f"{prefix}/{n}" for n in names] if prefix else names
-
-
-def message(prefix, tables):
-    return json.dumps({"bucket": "ppdb-dev-sso-ingest", "object_prefix": prefix,
-                       "uploaded_tables": list(tables), "files": {t: files_of(t) for t in tables}})
 
 
 def make_run(tmp_path, deliverable=True, tables=C.DELIVERY_TABLES):
@@ -163,12 +188,50 @@ def make_run(tmp_path, deliverable=True, tables=C.DELIVERY_TABLES):
     return run
 
 
+def rewrite_ssobservation(run, write):
+    """Rewrite the delivery's SSObservation parts with ``write(k, path)``,
+    and its manifest and report entry to match (a rebuilt delivery)."""
+    d = run / C.DELIVERY_DIR
+    mpath = d / SSOBSERVATION_MANIFEST_FILE
+    m = json.loads(mpath.read_text())
+    for k, e in enumerate(m["parts"]):
+        p = d / e["file"]
+        write(k, p)
+        e.update(_part_entry(p, pq.ParquetFile(p).metadata.num_rows))
+    m["rows"] = sum(e["rows"] for e in m["parts"])
+    mpath.write_text(json.dumps(m))
+    r = report(run)
+    r["tables"]["SSObservation"].update(manifest_md5=U.md5_file(mpath), rows=m["rows"],
+                                        bytes=sum(e["bytes"] for e in m["parts"]))
+    (run / C.REPORT_FILE).write_text(json.dumps(r))
+
+
 def report(run):
     return json.loads((run / C.REPORT_FILE).read_text())
 
 
 def ordered(tables):
-    return [t for t in C.DELIVERY_TABLES if t in tables]
+    return [t for t in C.UPLOAD_TABLE_ORDER if t in tables]
+
+
+def objects_of(tables, prefix):
+    return [f"{prefix}/{t}.parquet" for t in tables]
+
+
+def message(prefix, tables, bucket="ppdb-dev-sso-ingest"):
+    return json.dumps({"bucket": bucket, "object_prefix": prefix, "uploaded_tables": list(tables)})
+
+
+def combined(run):
+    return run / C.UPLOAD_DIR / SSOBS
+
+
+def combined_record(run):
+    return json.loads((run / C.UPLOAD_DIR / C.UPLOAD_SSOBSERVATION_RECORD).read_text())
+
+
+def parts_of(run):
+    return sorted((run / C.DELIVERY_DIR).glob("SSObservation.part*.parquet"))
 
 
 PREFIX = "20260914T200401001"
@@ -207,20 +270,26 @@ def test_prefix_pinned_to_utc(monkeypatch):
 
 
 def test_accepted_tables():
-    assert U.ACCEPTED_TABLES == tuple(ordered(FIVE))
-    assert "NearbySSO" in C.DELIVERY_TABLES and "NearbySSO" not in U.ACCEPTED_TABLES
+    """All six, NearbySSO included, in dax_ppdb's SSO_TABLES order."""
+    assert U.UNSUPPORTED_TABLES == ()
+    assert U.ACCEPTED_TABLES == SIX == C.UPLOAD_TABLE_ORDER
+    assert set(SIX) == set(C.DELIVERY_TABLES)
 
 
-def test_dev_config_and_templates():
-    _, cfg = U.load_config("dev")
-    assert cfg == {"bucket_name": "ppdb-dev-sso-ingest", "topic": "load-sso-topic",
-                   "project": "ppdb-dev-5c07",
-                   "tables": ["SSObservation", "SSObject", "numbered_identifications",
-                              "current_identifications", "mpc_orbits"]}
-    assert set(cfg["tables"]) == set(FIVE)
-    for env in ("int", "prod"):
-        with pytest.raises(U.SSOUploadError, match="template"):
-            U.load_config(env)
+@pytest.mark.parametrize("env, bucket, project", [("dev", "ppdb-dev-sso-ingest", "ppdb-dev-5c07"),
+                                                  ("int", "ppdb-int-sso-ingest", "ppdb-int-6c62")])
+def test_configs(env, bucket, project):
+    _, cfg = U.load_config(env)
+    assert cfg == {"bucket_name": bucket, "topic": "load-sso-topic", "project": project,
+                   "tables": list(SIX)}
+
+
+def test_prod_template_and_unknown_names():
+    with pytest.raises(U.SSOUploadError, match="template"):
+        U.load_config("prod")
+    text = (U.CONFIG_DIR / "prod.yaml").read_text()
+    assert all(f"#   - {t}\n" in text for t in SIX)
+    assert "not uploaded until" not in text
     with pytest.raises(U.SSOUploadError, match="no config named"):
         U.load_config("nosuchenv")
 
@@ -251,35 +320,32 @@ def test_config_validation(tmp_path):
     assert U.load_config(str(p))[1]["tables"] == ["SSObservation"]
 
 
-def test_nearbysso_refused_without_include_unsupported(no_remote, tmp_path):
+def test_nearbysso_in_the_default_set(no_remote, tmp_path, capsys):
     run = make_run(tmp_path)
-    with pytest.raises(U.SSOUploadError, match="fails the entire load.*--include-unsupported"):
-        U.run("dev", run, dry_run=True, tables=list(FIVE) + ["NearbySSO"])
-    # a config listing it is refused too
+    rec = U.run("dev", run, dry_run=True)
+    assert rec["tables"] == list(SIX)
+    out = capsys.readouterr().out
+    assert f"gs://ppdb-dev-sso-ingest/{rec['object_prefix']}/NearbySSO.parquet" in out
+    # and with a config without tables
     cfg = tmp_path / "c.yaml"
-    cfg.write_text("bucket_name: b\ntopic: t\nproject: p\ntables: [SSObservation, NearbySSO]\n")
+    cfg.write_text("bucket_name: b\ntopic: t\nproject: p\n")
+    assert U.run(str(cfg), run, dry_run=True)["tables"] == list(SIX)
+
+
+def test_unsupported_hook_still_works(no_remote, tmp_path, monkeypatch, caplog):
+    """--include-unsupported is a no-op today; with a table listed as
+    unsupported, its refusal and warning still work."""
+    run = make_run(tmp_path)
+    assert U.run("dev", run, dry_run=True, include_unsupported=True)["tables"] == list(SIX)
+    assert U.main(["dev", str(run), "--dry-run", "--include-unsupported"]) == 0
+    monkeypatch.setattr(U, "UNSUPPORTED_TABLES", ("NearbySSO",))
     with pytest.raises(U.SSOUploadError, match="--include-unsupported"):
-        U.run(str(cfg), run, dry_run=True)
-    assert "upload" not in report(run)
-
-
-def test_nearbysso_with_include_unsupported_warns_once(no_remote, tmp_path, caplog):
-    run = make_run(tmp_path)
+        U.run("dev", run, dry_run=True)
     with caplog.at_level("WARNING"):
-        rec = U.run("dev", run, dry_run=True, tables=list(FIVE) + ["NearbySSO"],
-                    include_unsupported=True)
-    assert rec["tables"] == list(C.DELIVERY_TABLES)
-    warned = [r for r in caplog.records if "NearbySSO" in r.getMessage()]
-    assert len(warned) == 1 and "fails the entire load" in warned[0].getMessage()
-
-
-def test_default_holds_nearbysso_back(no_remote, tmp_path, caplog):
-    run = make_run(tmp_path)
-    with caplog.at_level("INFO"):
-        rec = U.run("dev", run, dry_run=True)
-    assert rec["tables"] == ordered(FIVE)
-    assert any("NearbySSO" in r.getMessage() and "not uploaded until" in r.getMessage()
-               for r in caplog.records)
+        rec = U.run("dev", run, dry_run=True, include_unsupported=True)
+    assert rec["tables"] == list(SIX)
+    assert [r for r in caplog.records if "NearbySSO" in r.getMessage() and "fails the entire load"
+            in r.getMessage()]
 
 
 def test_partial_upload_refused_without_allow_partial(no_remote, tmp_path):
@@ -287,12 +353,186 @@ def test_partial_upload_refused_without_allow_partial(no_remote, tmp_path):
     with pytest.raises(U.SSOUploadError, match="WRITE_TRUNCATE.*--allow-partial"):
         U.run("dev", run, dry_run=True, tables=["SSObject", "SSObservation"])
     rec = U.run("dev", run, dry_run=True, tables=["SSObject", "SSObservation"], allow_partial=True)
-    assert rec["tables"] == ["SSObservation", "SSObject"]       # the contract's order
-    # the config's five in any order count as complete
-    rec = U.run("dev", run, dry_run=True, tables=list(reversed(FIVE)))
-    assert rec["tables"] == ordered(FIVE)
+    assert rec["tables"] == ["SSObservation", "SSObject"]       # the upload order
+    # the config's six in any order count as complete
+    rec = U.run("dev", run, dry_run=True, tables=list(reversed(SIX)))
+    assert rec["tables"] == list(SIX)
     with pytest.raises(U.SSOUploadError, match="not delivery tables"):
         U.run("dev", run, tables=["DiaSource"])
+
+
+# --------------------------------------------------------------------------
+# The combined SSObservation
+# --------------------------------------------------------------------------
+
+def test_combined_file(no_remote, tmp_path):
+    run = make_run(tmp_path)
+    rec = U.run("dev", run, dry_run=True)
+    path = combined(run)
+    assert path.is_file() and not path.with_name(path.name + ".tmp").exists()
+    parts = parts_of(run)
+    assert len(parts) == len(PART_ROWS)
+    pf = pq.ParquetFile(path)
+    # the parts' rows, in order, with their schema; no sidecar columns
+    assert pf.read().equals(pa.concat_tables(pq.read_table(p) for p in parts))
+    assert pf.schema_arrow.equals(pq.ParquetFile(parts[0]).schema_arrow, check_metadata=True)
+    assert pf.schema_arrow.equals(SSOBS_SCHEMA)
+    assert "matchMethod" not in pf.schema_arrow.names
+    # one row group per part row group, none bigger
+    md = pf.metadata
+    want = [pq.ParquetFile(p).metadata.row_group(i).num_rows
+            for p in parts for i in range(pq.ParquetFile(p).metadata.num_row_groups)]
+    assert [md.row_group(i).num_rows for i in range(md.num_row_groups)] == want
+    assert len(want) > len(parts) and max(want) <= PART_RG
+    assert md.row_group(0).column(0).compression == "ZSTD"
+    # the record, next to it and in the report
+    r = combined_record(run)
+    assert r == {"file": f"{C.UPLOAD_DIR}/{SSOBS}", "rows": sum(PART_ROWS), "bytes": path.stat().st_size,
+                 "md5": U.md5_file(path),
+                 "manifest_md5": report(run)["tables"]["SSObservation"]["manifest_md5"]}
+    assert rec["ssobservation"] == r
+    assert report(run)["upload"]["ssobservation"] == r
+
+
+def test_combined_row_groups_are_not_split(no_remote, tmp_path, monkeypatch):
+    """Each part row group is written with a row_group_size that holds it
+    whole (the writer's default would cap it at 1 Mi rows)."""
+    run = make_run(tmp_path)
+    calls = []
+    orig = pq.ParquetWriter.write_table
+
+    def spy(self, table, row_group_size=None):
+        calls.append((table.num_rows, row_group_size))
+        return orig(self, table, row_group_size=row_group_size)
+    monkeypatch.setattr(pq.ParquetWriter, "write_table", spy)
+    U.run("dev", run, dry_run=True)
+    assert [n for n, _ in calls] == [3, 3, 1, 3, 2] and all(rgs is not None and rgs >= n for n, rgs in calls)
+
+
+def test_combined_file_reused(no_remote, tmp_path, caplog, capsys):
+    run = make_run(tmp_path)
+    U.run("dev", run, dry_run=True)
+    st = combined(run).stat()
+    capsys.readouterr()
+    with caplog.at_level("INFO"):
+        rec = U.run("dev", run, dry_run=True)
+    assert "SSObservation: reused" in capsys.readouterr().out
+    assert any("reusing" in r.getMessage() for r in caplog.records)
+    st2 = combined(run).stat()
+    assert (st2.st_ino, st2.st_mtime_ns) == (st.st_ino, st.st_mtime_ns)
+    assert rec["ssobservation"] == combined_record(run)
+
+
+def test_combined_rebuilt_for_a_new_delivery(no_remote, tmp_path, caplog):
+    """The delivery rebuilt (other parts, another manifest_md5): the file is
+    rebuilt from the new parts."""
+    run = make_run(tmp_path)
+    U.run("dev", run, dry_run=True)
+    old = combined_record(run)
+    rewrite_ssobservation(run, lambda k, p: write_part(p, k, PART_ROWS[k] + 1, start=50))
+    with caplog.at_level("INFO"):
+        rec = U.run("dev", run, dry_run=True)
+    assert any("building" in r.getMessage() and old["manifest_md5"] in r.getMessage()
+               for r in caplog.records)
+    new = combined_record(run)
+    assert new["manifest_md5"] == report(run)["tables"]["SSObservation"]["manifest_md5"]
+    assert new["manifest_md5"] != old["manifest_md5"]
+    assert new["rows"] == sum(PART_ROWS) + len(PART_ROWS) and rec["ssobservation"] == new
+    assert pq.read_table(combined(run)).equals(pa.concat_tables(pq.read_table(p) for p in parts_of(run)))
+
+
+def _flip_byte(run):
+    p = combined(run)
+    b = bytearray(p.read_bytes())
+    b[len(b) // 2] ^= 0xFF          # same size, other content
+    p.write_bytes(bytes(b))
+
+
+def _set_record(run, **kw):
+    p = run / C.UPLOAD_DIR / C.UPLOAD_SSOBSERVATION_RECORD
+    r = json.loads(p.read_text())
+    r.update(kw)
+    p.write_text(json.dumps(r))
+
+
+@pytest.mark.parametrize("damage, why", [
+    (_flip_byte, "has md5"),
+    (lambda run: combined(run).write_bytes(combined(run).read_bytes()[:-10]), "bytes, its record says"),
+    (lambda run: combined(run).unlink(), "is missing"),
+    (lambda run: (run / C.UPLOAD_DIR / C.UPLOAD_SSOBSERVATION_RECORD).unlink(), "no "),
+    (lambda run: (run / C.UPLOAD_DIR / C.UPLOAD_SSOBSERVATION_RECORD).write_text("{"), "cannot read"),
+    (lambda run: _set_record(run, manifest_md5="0" * 32), "built from manifest md5 " + "0" * 32),
+    (lambda run: _set_record(run, rows=1), "says 1 rows"),
+])
+def test_combined_rebuilt_when_damaged(no_remote, tmp_path, caplog, damage, why):
+    run = make_run(tmp_path)
+    U.run("dev", run, dry_run=True)
+    good = combined_record(run)
+    damage(run)
+    with caplog.at_level("INFO"):
+        U.run("dev", run, dry_run=True)
+    assert any("building" in r.getMessage() and why in r.getMessage() for r in caplog.records)
+    assert combined_record(run) == good          # the same file again (deterministic)
+    assert U.md5_file(combined(run)) == good["md5"]
+
+
+@pytest.mark.parametrize("change", ["extra column", "type", "nullability"])
+def test_parts_schema_mismatch_refused(no_remote, tmp_path, change):
+    run = make_run(tmp_path)
+    if change == "extra column":
+        other = SSOBS_SCHEMA.append(pa.field("extra", pa.int64()))
+    elif change == "type":
+        other = SSOBS_SCHEMA.set(3, pa.field("midpointMjdTai", pa.float32(), nullable=False))
+    else:
+        other = SSOBS_SCHEMA.set(3, pa.field("midpointMjdTai", pa.float64()))
+    rewrite_ssobservation(run, lambda k, p: write_part(p, k, PART_ROWS[k], other if k == 1 else SSOBS_SCHEMA))
+    with pytest.raises(U.SSOUploadError, match=r"part0001\.parquet has another schema"):
+        U.run("dev", run, dry_run=True)
+    assert not (run / C.UPLOAD_DIR / SSOBS).exists()
+    assert not list((run / C.UPLOAD_DIR).glob("*.tmp"))
+    assert "upload" not in report(run)
+
+
+def test_combined_check_failure_leaves_nothing(no_remote, tmp_path, monkeypatch):
+    """A combined file that fails its check is not put in place."""
+    run = make_run(tmp_path)
+    monkeypatch.setattr(U, "_read_manifest", lambda mpath, raw=None: (
+        [(p["file"], p["bytes"], p["md5"]) for p in json.loads(raw or open(mpath).read())["parts"]], 999))
+    r = report(run)
+    r["tables"]["SSObservation"]["rows"] = 999
+    (run / C.REPORT_FILE).write_text(json.dumps(r))
+    with pytest.raises(U.SSOUploadError, match="combined .* has .* rows, the manifest says 999"):
+        U.run("dev", run, dry_run=True)
+    assert not combined(run).exists() and not list((run / C.UPLOAD_DIR).glob("*"))   # its .tmp too
+
+
+def test_combined_tmp_name_is_per_process(no_remote, tmp_path, monkeypatch):
+    """The combined file is written to a temporary name unique to the
+    process and call, then renamed into place."""
+    seen = []
+    orig = U._write_combined
+
+    def spy(parts, out):
+        seen.append(out)
+        return orig(parts, out)
+    monkeypatch.setattr(U, "_write_combined", spy)
+    run = make_run(tmp_path)
+    stale = run / C.UPLOAD_DIR / f"{SSOBS}.1.deadbeef.tmp"     # another run's
+    stale.parent.mkdir()
+    stale.write_bytes(b"someone else's")
+    U.run("dev", run, dry_run=True)
+    (out,) = seen
+    assert out.parent == run / C.UPLOAD_DIR
+    assert re.fullmatch(rf"{re.escape(SSOBS)}\.{os.getpid()}\.[0-9a-f]{{8}}\.tmp", out.name)
+    assert not out.exists() and combined(run).is_file()
+    assert stale.read_bytes() == b"someone else's"          # never touched
+    assert U._tmp_name(combined(run)) != U._tmp_name(combined(run))
+
+
+def test_combined_refuses_a_changed_manifest(tmp_path):
+    run = make_run(tmp_path)
+    with pytest.raises(U.SSOUploadError, match="changed"):
+        U.combine_ssobservation(run, "0" * 32)
 
 
 # --------------------------------------------------------------------------
@@ -306,74 +546,73 @@ def test_upload_success_and_message(fakes, tmp_path):
     prefix = rec["object_prefix"]
     assert re.fullmatch(r"\d{8}T\d{9}", prefix)
     assert st.buckets == ["ppdb-dev-sso-ingest"]
-    # SSObservation as its parts in order, then its manifest; no sidecar
-    assert [c[1] for c in st.calls if c[0] == "upload"] == objects_of(ordered(FIVE), prefix)
-    assert not any(SIDECAR_FILE in name for name in st.objects)
+    # one object per table, in SSO_TABLES order; no part, manifest or sidecar
+    assert [c[1] for c in st.calls if c[0] == "upload"] == objects_of(SIX, prefix)
+    assert sorted(st.objects) == sorted(objects_of(SIX, prefix))
     assert all(c[2] == 0 for c in st.calls if c[0] == "upload")    # if_generation_match=0
-    for k in range(N_PARTS):
-        name = PART_FILE_FORMAT.format(k)
-        assert st.objects[f"{prefix}/{name}"] == (run / C.DELIVERY_DIR / name).read_bytes()
+    assert st.objects[f"{prefix}/SSObservation.parquet"] == combined(run).read_bytes()
+    for t in SIX[1:]:
+        assert st.objects[f"{prefix}/{t}.parquet"] == (run / C.DELIVERY_DIR / f"{t}.parquet").read_bytes()
     assert len(pub.published) == 1
     topic, data = pub.published[0]
     assert topic == TOPIC_PATH
-    assert data == message(prefix, ordered(FIVE)).encode("utf-8")
-    assert list(json.loads(data)) == list(C.UPLOAD_MESSAGE_FIELDS)
+    assert data == message(prefix, SIX).encode("utf-8")
+    assert data == (b'{"bucket": "ppdb-dev-sso-ingest", "object_prefix": "' + prefix.encode()
+                    + b'", "uploaded_tables": ["SSObservation", "NearbySSO", "SSObject", "mpc_orbits", '
+                    b'"current_identifications", "numbered_identifications"]}')
+    assert tuple(json.loads(data)) == C.UPLOAD_MESSAGE_FIELDS
     assert pub.futures[0].timeouts == [U.PUBLISH_TIMEOUT_S]
     r = report(run)
     assert r["upload"] == rec and r["uploads"] == [rec]
-    assert set(rec) == {"config", "bucket", "object_prefix", "tables", "message_id", "dry_run", "utc"}
-    assert rec["message_id"] == "msg-123" and rec["dry_run"] is False
+    assert list(rec) == ["config", "bucket", "object_prefix", "tables", "message_id", "dry_run",
+                         "published", "utc", "ssobservation"]
+    assert rec["message_id"] == "msg-123" and rec["dry_run"] is False and rec["published"] is True
+    assert rec["ssobservation"] == combined_record(run)
+
+
+def test_upload_order_whatever_the_config_order(fakes, tmp_path, fixed_prefix):
+    st, pub = fakes
+    run = make_run(tmp_path)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("bucket_name: b\ntopic: t\nproject: p\ntables: [" + ", ".join(reversed(SIX)) + "]\n")
+    rec = U.run(str(cfg), run)
+    assert rec["tables"] == list(SIX)
+    assert [c[1] for c in st.calls if c[0] == "upload"] == objects_of(SIX, PREFIX)
+    assert pub.published[0][1] == message(PREFIX, SIX, bucket="b").encode()
+    # upload() itself orders a file map, too
+    assert U.upload({"bucket_name": "b", "topic": "t", "project": "p"},
+                    {"SSObject": run / C.DELIVERY_DIR / "SSObject.parquet", "SSObservation": combined(run)},
+                    object_prefix="X", publish=False) == ("X", None)
+    assert [c[1] for c in st.calls if c[0] == "upload"][-2:] == ["X/SSObservation.parquet",
+                                                                 "X/SSObject.parquet"]
+    assert len(pub.published) == 1
 
 
 def test_precondition_failure_aborts_and_cleans_up(fakes, tmp_path, fixed_prefix):
     st, pub = fakes
     run = make_run(tmp_path)
-    tabs = ordered(FIVE)
     # an object already at the third table's name, as from a colliding upload
-    st.objects[f"{PREFIX}/{tabs[2]}.parquet"] = b"someone else's"
+    st.objects[f"{PREFIX}/{SIX[2]}.parquet"] = b"someone else's"
     with pytest.raises(U.SSOUploadError, match="already exists"):
         U.run("dev", run)
     # the pre-existing object is untouched, ours are deleted, nothing published
-    assert st.objects == {f"{PREFIX}/{tabs[2]}.parquet": b"someone else's"}
-    assert [c[1] for c in st.calls if c[0] == "delete"] == objects_of(tabs[:2], PREFIX)
+    assert st.objects == {f"{PREFIX}/{SIX[2]}.parquet": b"someone else's"}
+    assert [c[1] for c in st.calls if c[0] == "delete"] == objects_of(SIX[:2], PREFIX)
     assert pub.published == []
     assert "upload" not in report(run)
 
 
-def test_mid_upload_failure_cleans_up(fakes, tmp_path, fixed_prefix):
+@pytest.mark.parametrize("k", range(len(SIX)))
+def test_failure_on_any_table_cleans_up_the_earlier(fakes, tmp_path, fixed_prefix, k):
     from google.api_core.exceptions import ServiceUnavailable
     st, pub = fakes
     run = make_run(tmp_path)
-    st.fail_on[f"{PREFIX}/{ordered(FIVE)[3]}.parquet"] = ServiceUnavailable("injected")
+    st.fail_on[f"{PREFIX}/{SIX[k]}.parquet"] = ServiceUnavailable("injected")
     with pytest.raises(U.SSOUploadError, match="failed to upload"):
         U.run("dev", run)
-    assert st.objects == {}
-    assert len([c for c in st.calls if c[0] == "delete"]) == len(objects_of(ordered(FIVE)[:3]))
-    assert pub.published == []
+    assert st.objects == {} and pub.published == []
+    assert [c[1] for c in st.calls if c[0] == "delete"] == objects_of(SIX[:k], PREFIX)
     assert "upload" not in report(run)
-
-
-def test_failure_on_a_later_part_cleans_up_the_earlier(fakes, tmp_path, fixed_prefix):
-    from google.api_core.exceptions import ServiceUnavailable
-    st, pub = fakes
-    run = make_run(tmp_path)
-    st.fail_on[f"{PREFIX}/{PART_FILE_FORMAT.format(1)}"] = ServiceUnavailable("injected")
-    with pytest.raises(U.SSOUploadError, match="failed to upload"):
-        U.run("dev", run)
-    assert st.objects == {} and pub.published == []
-    assert [c[1] for c in st.calls if c[0] == "delete"] == [f"{PREFIX}/{PART_FILE_FORMAT.format(0)}"]
-
-
-def test_failure_on_the_manifest_cleans_up_the_parts(fakes, tmp_path, fixed_prefix):
-    from google.api_core.exceptions import ServiceUnavailable
-    st, pub = fakes
-    run = make_run(tmp_path)
-    st.fail_on[f"{PREFIX}/{SSOBSERVATION_MANIFEST_FILE}"] = ServiceUnavailable("injected")
-    with pytest.raises(U.SSOUploadError, match="failed to upload"):
-        U.run("dev", run)
-    assert st.objects == {} and pub.published == []
-    assert [c[1] for c in st.calls if c[0] == "delete"] == [
-        f"{PREFIX}/{PART_FILE_FORMAT.format(k)}" for k in range(N_PARTS)]
 
 
 @pytest.mark.parametrize("exc", ["auth", "other"])
@@ -381,7 +620,7 @@ def test_any_upload_error_is_wrapped(fakes, tmp_path, fixed_prefix, exc):
     from google.auth.exceptions import RefreshError
     st, _ = fakes
     run = make_run(tmp_path)
-    st.fail_on[f"{PREFIX}/{ordered(FIVE)[1]}.parquet"] = (
+    st.fail_on[f"{PREFIX}/{SIX[1]}.parquet"] = (
         RefreshError("token expired") if exc == "auth" else ValueError("odd"))
     with pytest.raises(U.SSOUploadError, match="failed to upload"):
         U.run("dev", run)
@@ -405,28 +644,95 @@ def test_cleanup_keeps_going_and_reraises_the_original(fakes, tmp_path, fixed_pr
     from google.api_core.exceptions import ServiceUnavailable
     st, _ = fakes
     run = make_run(tmp_path)
-    tabs = ordered(FIVE)
-    st.fail_on[f"{PREFIX}/{tabs[3]}.parquet"] = ServiceUnavailable("injected")
-    stuck = f"{PREFIX}/{PART_FILE_FORMAT.format(0)}"
+    st.fail_on[f"{PREFIX}/{SIX[3]}.parquet"] = ServiceUnavailable("injected")
+    stuck = f"{PREFIX}/{SIX[0]}.parquet"
     st.fail_delete.add(stuck)
     with pytest.raises(U.SSOUploadError, match="failed to upload") as ei:
         U.run("dev", run)
     assert isinstance(ei.value.__cause__, ServiceUnavailable)
-    assert [c[1] for c in st.calls if c[0] == "delete"] == objects_of(tabs[:3], PREFIX)
+    assert [c[1] for c in st.calls if c[0] == "delete"] == objects_of(SIX[:3], PREFIX)
     assert set(st.objects) == {stuck}     # the one that wouldn't delete
 
 
 def test_publish_failure_cleans_up(fakes, tmp_path, monkeypatch):
+    """publish() itself fails: the message never left, so the objects are
+    deleted."""
+    from google.api_core.exceptions import ServiceUnavailable
+    st, _ = fakes
+    pub = FakePublisher(publish_exc=ServiceUnavailable("injected"))
+    monkeypatch.setattr(U, "_publisher_client", lambda: pub)
+    run = make_run(tmp_path)
+    with pytest.raises(U.SSOUploadError, match="failed to publish"):
+        U.run("dev", run)
+    assert pub.published == []
+    assert st.objects == {}
+    assert len([c for c in st.calls if c[0] == "delete"]) == len(SIX)
+    assert "upload" not in report(run)
+
+
+def test_publisher_creation_failure_cleans_up(fakes, tmp_path, monkeypatch):
+    st, _ = fakes
+
+    def boom():
+        raise RuntimeError("no publisher")
+    monkeypatch.setattr(U, "_publisher_client", boom)
+    run = make_run(tmp_path)
+    with pytest.raises(U.SSOUploadError, match="failed to publish"):
+        U.run("dev", run)
+    assert st.objects == {} and "upload" not in report(run)
+
+
+def test_publish_error_after_handover_keeps_objects(fakes, tmp_path, monkeypatch, fixed_prefix):
+    """The message was handed to Pub/Sub, then the wait failed: it may have
+    gone through, so the objects are kept and the upload recorded."""
     from google.api_core.exceptions import ServiceUnavailable
     st, _ = fakes
     pub = FakePublisher(exc=ServiceUnavailable("injected"))
     monkeypatch.setattr(U, "_publisher_client", lambda: pub)
     run = make_run(tmp_path)
-    with pytest.raises(U.SSOUploadError, match="failed to publish"):
+    with pytest.raises(U.PublishUnconfirmedError, match="interrupted or failed.*KEPT") as ei:
         U.run("dev", run)
-    assert len(pub.published) == 1
-    assert st.objects == {}
-    assert len([c for c in st.calls if c[0] == "delete"]) == len(objects_of(FIVE))
+    assert isinstance(ei.value.__cause__, ServiceUnavailable)
+    assert sorted(st.objects) == sorted(objects_of(SIX, PREFIX))
+    assert not [c for c in st.calls if c[0] == "delete"]
+    up = report(run)["upload"]
+    assert up["published"] is None and up["object_prefix"] == PREFIX and "ServiceUnavailable" in up["error"]
+    with pytest.raises(U.SSOUploadError, match="--force"):
+        U.run("dev", run)
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+def test_publish_interrupted_keeps_objects(fakes, tmp_path, monkeypatch, fixed_prefix, exc):
+    """Ctrl-C (or SystemExit) while waiting for the confirmation: the
+    objects are kept, the upload recorded with published null, and the
+    interrupt propagates."""
+    st, _ = fakes
+    pub = FakePublisher(exc=exc())
+    monkeypatch.setattr(U, "_publisher_client", lambda: pub)
+    run = make_run(tmp_path)
+    with pytest.raises(exc):
+        U.run("dev", run)
+    assert sorted(st.objects) == sorted(objects_of(SIX, PREFIX))
+    assert not [c for c in st.calls if c[0] == "delete"]
+    r = report(run)
+    assert r["upload"]["published"] is None and r["upload"]["object_prefix"] == PREFIX
+    err = r["upload"]["error"]
+    assert "interrupted" in err and "may or may not have gone through" in err
+    assert r["uploads"] == [r["upload"]]
+    with pytest.raises(U.SSOUploadError, match="--force"):
+        U.run("dev", run)
+
+
+def test_interrupt_during_upload_still_cleans_up(fakes, tmp_path, fixed_prefix):
+    """Before the message is handed over, even a KeyboardInterrupt cleans
+    up."""
+    st, pub = fakes
+    run = make_run(tmp_path)
+    st.fail_on[f"{PREFIX}/{SIX[2]}.parquet"] = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        U.run("dev", run)
+    assert st.objects == {} and pub.published == []
+    assert "upload" not in report(run)
 
 
 def test_publish_timeout_keeps_objects(fakes, tmp_path, monkeypatch, fixed_prefix):
@@ -436,10 +742,11 @@ def test_publish_timeout_keeps_objects(fakes, tmp_path, monkeypatch, fixed_prefi
     run = make_run(tmp_path)
     with pytest.raises(U.PublishUnconfirmedError, match="KEPT"):
         U.run("dev", run)
-    assert sorted(st.objects) == sorted(objects_of(FIVE, PREFIX))
+    assert sorted(st.objects) == sorted(objects_of(SIX, PREFIX))
     assert not [c for c in st.calls if c[0] == "delete"]
     r = report(run)
     assert r["upload"]["object_prefix"] == PREFIX and r["upload"]["message_id"] is None
+    assert r["upload"]["published"] is None
     assert "wasn't confirmed" in r["upload"]["error"]
     # and a plain re-upload is refused: the message may have gone through
     with pytest.raises(U.SSOUploadError, match="--force"):
@@ -447,22 +754,90 @@ def test_publish_timeout_keeps_objects(fakes, tmp_path, monkeypatch, fixed_prefi
 
 
 # --------------------------------------------------------------------------
+# --no-publish
+# --------------------------------------------------------------------------
+
+def test_no_publish(tmp_path, monkeypatch, fixed_prefix, capsys):
+    pytest.importorskip("google.api_core.exceptions")
+    st = FakeStorage()
+    monkeypatch.setattr(U, "_storage_client", lambda: st)
+
+    def boom():
+        raise AssertionError("a publisher was created")
+    monkeypatch.setattr(U, "_publisher_client", boom)
+    run = make_run(tmp_path)
+    rec = U.run("dev", run, no_publish=True)
+    # uploaded, kept, nothing published
+    assert [c[1] for c in st.calls if c[0] == "upload"] == objects_of(SIX, PREFIX)
+    assert sorted(st.objects) == sorted(objects_of(SIX, PREFIX))
+    assert not [c for c in st.calls if c[0] == "delete"]
+    out = capsys.readouterr().out
+    assert f"gs://ppdb-dev-sso-ingest/{PREFIX}/" in out and "KEPT" in out
+    assert message(PREFIX, SIX) in out
+    assert rec["published"] is False and rec["dry_run"] is False and rec["message_id"] is None
+    assert rec["object_prefix"] == PREFIX and rec["ssobservation"] == combined_record(run)
+    assert report(run)["upload"] == rec
+
+
+def test_no_publish_does_not_block_a_real_upload(fakes, tmp_path):
+    st, pub = fakes
+    run = make_run(tmp_path)
+    nopub = U.run("dev", run, no_publish=True)
+    assert pub.published == []
+    real = U.run("dev", run)                 # no --force needed
+    assert real["published"] is True and len(pub.published) == 1
+    # a later --no-publish run doesn't replace the real upload's record, nor
+    # need --force
+    nopub2 = U.run("dev", run, no_publish=True)
+    r = report(run)
+    assert r["upload"] == real and r["uploads"] == [nopub, real, nopub2]
+    with pytest.raises(U.SSOUploadError, match="--force"):
+        U.run("dev", run)
+
+
+def test_no_publish_with_dry_run_is_an_error(no_remote, tmp_path):
+    run = make_run(tmp_path)
+    with pytest.raises(U.SSOUploadError, match="--no-publish"):
+        U.run("dev", run, dry_run=True, no_publish=True)
+    assert U.main(["dev", str(run), "--dry-run", "--no-publish"]) == 1
+    assert "upload" not in report(run)
+
+
+def test_no_publish_failure_cleans_up(fakes, tmp_path, fixed_prefix):
+    from google.api_core.exceptions import ServiceUnavailable
+    st, pub = fakes
+    run = make_run(tmp_path)
+    st.fail_on[f"{PREFIX}/{SIX[4]}.parquet"] = ServiceUnavailable("injected")
+    with pytest.raises(U.SSOUploadError, match="failed to upload"):
+        U.run("dev", run, no_publish=True)
+    assert st.objects == {} and pub.published == []
+
+
+# --------------------------------------------------------------------------
 # Dry run, history, refusals
 # --------------------------------------------------------------------------
 
-def test_dry_run_touches_nothing(no_remote, tmp_path, capsys):
+def test_dry_run_touches_nothing_remote(no_remote, tmp_path, capsys):
     run = make_run(tmp_path)
     rec = U.run("dev", run, dry_run=True)
     out = capsys.readouterr().out
     prefix = rec["object_prefix"]
-    for name in objects_of(FIVE):
-        assert f"{run / C.DELIVERY_DIR / name} -> gs://ppdb-dev-sso-ingest/{prefix}/{name}" in out
-    assert "NearbySSO" not in out and SIDECAR_FILE not in out
+    assert f"{combined(run)} -> gs://ppdb-dev-sso-ingest/{prefix}/SSObservation.parquet" in out
+    for t in SIX[1:]:
+        assert f"{run / C.DELIVERY_DIR / t}.parquet -> gs://ppdb-dev-sso-ingest/{prefix}/{t}.parquet" in out
+    assert SIDECAR_FILE not in out and "part0000" not in out and SSOBSERVATION_MANIFEST_FILE not in out
     assert TOPIC_PATH in out
-    assert message(prefix, ordered(FIVE)) in out
+    assert message(prefix, SIX) in out
     up = report(run)["upload"]
-    assert up["dry_run"] is True and up["message_id"] is None
+    assert up["dry_run"] is True and up["message_id"] is None and up["published"] is False
+    assert up["ssobservation"] == combined_record(run)
     assert U.main(["dev", str(run), "--dry-run"]) == 0
+
+
+def test_no_ssobservation_entry_without_ssobservation(no_remote, tmp_path):
+    run = make_run(tmp_path)
+    rec = U.run("dev", run, dry_run=True, tables=["SSObject"], allow_partial=True)
+    assert "ssobservation" not in rec and not (run / C.UPLOAD_DIR).exists()
 
 
 def test_upload_history(fakes, tmp_path):
@@ -477,6 +852,17 @@ def test_upload_history(fakes, tmp_path):
     r = report(run)
     assert r["upload"] == again
     assert r["uploads"] == [dry, real, dry2, again]       # --force doesn't erase history
+
+
+def test_old_records_count(no_remote, tmp_path):
+    """A real upload recorded before ``published`` existed still counts."""
+    run = make_run(tmp_path)
+    r = report(run)
+    r["upload"] = {"bucket": "b", "object_prefix": "p", "message_id": "1", "dry_run": False}
+    (run / C.REPORT_FILE).write_text(json.dumps(r))
+    with pytest.raises(U.SSOUploadError, match="--force"):
+        U.run("dev", run)
+    assert U.counts_as_upload({"dry_run": True}) is False
 
 
 def test_refuses_not_deliverable(no_remote, tmp_path):
@@ -537,7 +923,9 @@ def _edit_manifest(run, fn, report_too=True):
 
 def _corrupt_part(run, k=1):
     p = run / C.DELIVERY_DIR / PART_FILE_FORMAT.format(k)
-    p.write_bytes(p.read_bytes().replace(b"PAR1", b"PARX"))      # same size, other content
+    b = bytearray(p.read_bytes())
+    b[len(b) // 2] ^= 0xFF          # same size, other content
+    p.write_bytes(bytes(b))
     return p
 
 
@@ -559,12 +947,13 @@ def _unreadable_manifest(run):
 ])
 def test_refuses_bad_parts(no_remote, tmp_path, damage, match):
     """Each part is checked against the manifest, and the manifest against
-    the report."""
+    the report, before anything is combined."""
     run = make_run(tmp_path)
     damage(run)
     with pytest.raises(U.SSOUploadError, match=match):
         U.run("dev", run, dry_run=True)
     assert "upload" not in report(run)
+    assert not (run / C.UPLOAD_DIR).exists()
 
 
 MANIFEST_MD5_MISMATCH = (r"SSObservation: .*SSObservation\.manifest\.json has md5 [0-9a-f]{32}, the report "
@@ -601,16 +990,17 @@ def test_sidecar_never_uploaded(fakes, tmp_path):
     run = make_run(tmp_path)
     side = run / C.DELIVERY_DIR / SIDECAR_FILE
     with pytest.raises(U.SSOUploadError, match="never uploaded"):
-        U.upload(U.load_config("dev")[1], {"SSObservation": [side]})
+        U.upload(U.load_config("dev")[1], {"SSObservation": side})
     assert st.calls == [] and pub.published == []
     file_map = U.verify_delivery(run, report(run), ["SSObservation"])
-    assert file_map == {"SSObservation": [run / C.DELIVERY_DIR / n for n in files_of("SSObservation")]}
+    assert file_map == {"SSObservation": parts_of(run)}
+    U.run("dev", run)
+    assert not any(SIDECAR_FILE in name or "part0" in name or "manifest" in name for name in st.objects)
 
 
 def test_nearbysso_sidecar_never_uploaded(fakes, tmp_path):
-    """NearbySSO's sidecar, next to it in the delivery, is never picked,
-    even with NearbySSO uploaded (--include-unsupported), and upload()
-    refuses it."""
+    """NearbySSO's sidecar, next to it in the delivery, is never picked, and
+    upload() refuses it."""
     from ssp.nearbysso._contract import NEARBYSSO_SIDECAR_FILE
     st, pub = fakes
     run = make_run(tmp_path)
@@ -618,19 +1008,21 @@ def test_nearbysso_sidecar_never_uploaded(fakes, tmp_path):
     side.write_bytes(b"PAR1 sidecar PAR1")
     file_map = U.verify_delivery(run, report(run), list(C.DELIVERY_TABLES))
     assert file_map["NearbySSO"] == [run / C.DELIVERY_DIR / "NearbySSO.parquet"]
-    assert side not in [p for paths in file_map.values() for p in paths]
     with pytest.raises(U.SSOUploadError, match="never uploaded"):
-        U.upload(U.load_config("dev")[1], {"NearbySSO": [side]})
+        U.upload(U.load_config("dev")[1], {"NearbySSO": side})
     assert st.calls == [] and pub.published == []
-    rec = U.run("dev", run, tables=list(C.DELIVERY_TABLES), include_unsupported=True)
+    rec = U.run("dev", run)
     assert "NearbySSO" in rec["tables"]
     assert not any(NEARBYSSO_SIDECAR_FILE in name for name in st.objects)
-    assert any(name.endswith("/NearbySSO.parquet") for name in st.objects)
+    assert st.objects[f"{rec['object_prefix']}/NearbySSO.parquet"] == (
+        run / C.DELIVERY_DIR / "NearbySSO.parquet").read_bytes()
 
 
-def test_nearbysso_not_needed_by_default(no_remote, tmp_path):
-    run = make_run(tmp_path, tables=FIVE)       # no NearbySSO in the delivery
-    assert U.run("dev", run, dry_run=True)["tables"] == ordered(FIVE)
+def test_upload_refuses_unknown_tables(fakes, tmp_path):
+    st, _ = fakes
+    with pytest.raises(U.SSOUploadError, match="not upload tables"):
+        U.upload(U.load_config("dev")[1], {"DiaSource": tmp_path / "x.parquet"})
+    assert st.calls == []
 
 
 def test_refuses_no_report(no_remote, tmp_path):
@@ -642,3 +1034,17 @@ def test_accepts_the_delivery_dir(no_remote, tmp_path):
     run = make_run(tmp_path)
     U.run("dev", run / C.DELIVERY_DIR, dry_run=True)
     assert report(run)["upload"]["dry_run"] is True
+    assert combined(run).is_file()
+
+
+def test_run_dir_read_only_delivery(no_remote, tmp_path):
+    """The delivery is only read: nothing in it changes (it may be hard
+    links to another run's files)."""
+    run = make_run(tmp_path)
+    d = run / C.DELIVERY_DIR
+    before = {p.name: (p.stat().st_ino, p.stat().st_mtime_ns, U.md5_file(p)) for p in d.iterdir()}
+    for p in d.iterdir():
+        os.chmod(p, 0o444)
+    U.run("dev", run, dry_run=True)
+    after = {p.name: (p.stat().st_ino, p.stat().st_mtime_ns, U.md5_file(p)) for p in d.iterdir()}
+    assert after == before

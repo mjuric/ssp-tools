@@ -137,36 +137,57 @@ REPORT_FIELDS = {
               "is in the manifest, and the manifest's own md5 is manifest_md5)",
     "checks": "{check: {status: 'PASS'|'FAIL', report}}",
     "deliverable": "true only if every step and check passed; stage 3 refuses otherwise",
-    "upload": "set by stage 3: {config, bucket, object_prefix, tables, message_id, dry_run, utc}",
+    "upload": "set by stage 3: {config, bucket, object_prefix, tables, message_id, dry_run, published, "
+              "utc, ssobservation}; ssobservation is the combined file uploaded as SSObservation.parquet: "
+              "{file, rows, bytes, md5, manifest_md5} (UPLOAD_SSOBSERVATION_*); error, when the "
+              "publish wasn't confirmed (published null: the objects are kept)",
 }
 
 # --------------------------------------------------------------------------
 # Stage 3: the upload (DM-55678 contract; mirrors lsst/dax_ppdb
-# bigquery/sso_uploader.py)
+# bigquery/sso_uploader.py, tickets/DM-55375; docs/design/sso-upload-int.md)
 # --------------------------------------------------------------------------
 #
 # Config (YAML; config/sso-upload/<env>.yaml):
-#   bucket_name: ppdb-dev-sso-ingest
+#   bucket_name: ppdb-int-sso-ingest
 #   topic: load-sso-topic
-#   project: ppdb-dev-5c07          # the Pub/Sub topic's project
-#   tables: [...]                   # optional, default DELIVERY_TABLES
-# Credentials: Google application-default credentials (a service account
-# with upload-only access to the bucket and publish access to the topic).
+#   project: ppdb-int-6c62          # the Pub/Sub topic's project
+#   tables: [...]                   # optional; default UPLOAD_TABLE_ORDER
+# Credentials: Google application-default credentials (the sso-uploader
+# service account: object-user access to the bucket, publish access to the
+# topic), e.g. GOOGLE_APPLICATION_CREDENTIALS pointing at its key.
+#
+# One object per table: the loader (lsst-dm/ppdb-cloud-functions load_sso)
+# reads exactly gs://<bucket>/<prefix>/<Table>.parquet. SSObservation's
+# manifest-listed parts are combined, after their md5 checks, into
+# RUN_DIR/UPLOAD_DIR/UPLOAD_SSOBSERVATION_FILE (the parts' schema, zstd, one
+# row group per part row group), with UPLOAD_SSOBSERVATION_RECORD next to it
+# ({file, rows, bytes, md5, manifest_md5}); it is kept, and reused only while
+# the record's manifest_md5 is the report's and the file's size and md5
+# match. It is uploaded as SSObservation.parquet. No manifest, part or
+# sidecar is ever uploaded.
 #
 # Upload: a fresh prefix per upload, UPLOAD_PREFIX_FORMAT of the UTC time
 # with milliseconds (datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")[:-3]);
-# each table to gs://<bucket>/<prefix>/<Table>.parquet (SSObservation: each
-# part, then the manifest, under their own names; never the sidecar) with
-# if_generation_match=0 (never overwrite); on any failure, delete what this
-# upload wrote and fail. Then publish one Pub/Sub message, JSON:
+# the tables in UPLOAD_TABLE_ORDER, each with if_generation_match=0 (never
+# overwrite); on any failure, delete what this upload wrote and fail. Then
+# publish one Pub/Sub message, JSON, exactly dax_ppdb SSOUploader's:
 #   {"bucket": <bucket>, "object_prefix": <prefix>,
-#    "uploaded_tables": [<Table>, ...],
-#    "files": {<Table>: [<object name relative to the prefix>, ...]}}
-# (files is new with the partitioned SSObservation, for the PPDB loader
-# owners' review; a single-file table lists its one file. SSObservation
-# lists its parts in part order, then SSOBSERVATION_MANIFEST_FILE.)
+#    "uploaded_tables": [<Table>, ...]}   (in UPLOAD_TABLE_ORDER)
+# --no-publish uploads and stops before the message (no load starts; the
+# objects are kept; the record has published: false).
 UPLOAD_PREFIX_FORMAT = "%Y%m%dT%H%M%S%f"   # then [:-3]: milliseconds
-UPLOAD_MESSAGE_FIELDS = ("bucket", "object_prefix", "uploaded_tables", "files")
+UPLOAD_MESSAGE_FIELDS = ("bucket", "object_prefix", "uploaded_tables")
+
+#: dax_ppdb's SSO_TABLES order (tickets/DM-55375), which
+#: SSOUploader.from_directory uploads and lists in: the upload order.
+UPLOAD_TABLE_ORDER = ("SSObservation", "NearbySSO", "SSObject",
+                      "mpc_orbits", "current_identifications", "numbered_identifications")
+
+#: Where stage 3 keeps the combined SSObservation (RUN_DIR/UPLOAD_DIR).
+UPLOAD_DIR = "upload"
+UPLOAD_SSOBSERVATION_FILE = "SSObservation.parquet"
+UPLOAD_SSOBSERVATION_RECORD = "SSObservation.json"
 
 
 def delivery_schema(schema_dir=SCHEMA_DIR):

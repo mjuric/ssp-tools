@@ -739,9 +739,9 @@ def test_inputs_changed_during_build(tmp_path, fake_steps, monkeypatch):
     assert rep["checks"] == {} and rep["deliverable"] is False
 
 
-def _uploaded(run, dry_run=False):
+def _uploaded(run, dry_run=False, **extra):
     r = json.loads((run / "report.json").read_text())
-    r["upload"] = {"dry_run": dry_run, "object_prefix": "20261001T000000000", "message_id": "1"}
+    r["upload"] = {"dry_run": dry_run, "object_prefix": "20261001T000000000", "message_id": "1", **extra}
     r["uploads"] = [dict(r["upload"])]
     (run / "report.json").write_text(json.dumps(r))
     return r
@@ -769,6 +769,29 @@ def test_dry_run_upload_not_refused(tmp_path, fake_steps):
     before = _uploaded(run, dry_run=True)
     rep = B.build(tmp_path / "in", run, log=_quiet)
     assert rep["deliverable"] is True and rep["uploads"] == before["uploads"]
+
+
+def test_no_publish_upload_not_refused(tmp_path, fake_steps):
+    """A --no-publish upload (published false) loaded nothing: a rebuild is
+    allowed without --force-rebuild."""
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    B.build(tmp_path / "in", run, log=_quiet)
+    before = _uploaded(run, published=False, message_id=None)
+    rep = B.build(tmp_path / "in", run, log=_quiet)
+    assert rep["deliverable"] is True and rep["uploads"] == before["uploads"]
+
+
+@pytest.mark.parametrize("published", [None, True])
+def test_unconfirmed_or_published_upload_refused(tmp_path, fake_steps, published):
+    """An unconfirmed publish (published null) may have gone through, and a
+    published one did: both still refuse a rebuild."""
+    write_inputs(tmp_path / "in")
+    run = tmp_path / "run"
+    B.build(tmp_path / "in", run, log=_quiet)
+    _uploaded(run, published=published)
+    with pytest.raises(ValueError, match="was uploaded"):
+        B.build(tmp_path / "in", run, log=_quiet)
 
 
 def test_stray_delivery_files_removed(tmp_path, fake_steps):
