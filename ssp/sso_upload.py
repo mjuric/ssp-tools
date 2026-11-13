@@ -3,7 +3,7 @@ ingestion (DM-55678).
 
     ssp-upload-sso CONFIG RUN_DIR [--dry-run | --no-publish] [--tables T ...]
                    [--force] [--allow-partial] [--include-unsupported]
-                   [--parallel [--chunk-mib N] [--parallel-workers N]]
+                   [--no-parallel | --chunk-mib N --parallel-workers N]
 
 It follows the contract in ssp/delivery_contract.py, which mirrors
 lsst/dax_ppdb python/lsst/dax/ppdb/bigquery/sso_uploader.py (tickets/
@@ -30,8 +30,10 @@ reads exactly gs://<bucket>/<prefix>/<Table>.parquet, one object per table
 3. Upload each table as one object, gs://<bucket>/<prefix>/<Table>.parquet
    (SSObservation from the combined file, the others from delivery/), in
    dax_ppdb's SSO_TABLES order (UPLOAD_TABLE_ORDER), where the prefix is
-   the UTC time to the millisecond, with if_generation_match=0 so nothing
-   is ever overwritten. No manifest, part or sidecar
+   the UTC time to the millisecond, so that nothing is ever overwritten:
+   files under PARALLEL_MIN_BYTES in one stream with if_generation_match=0,
+   bigger ones in parallel chunks ("Parallel chunked uploads", below).
+   No manifest, part or sidecar
    (SSObservation_internal.parquet, NearbySSO_internal.parquet) is ever
    uploaded. On any failure, including a failure to hand the message to
    Pub/Sub, delete every object this upload wrote and fail.
@@ -49,14 +51,18 @@ reads exactly gs://<bucket>/<prefix>/<Table>.parquet, one object per table
    ``published`` is true for a published upload, false for a dry run or a
    --no-publish run, and null when the publish wasn't confirmed.
 
-Parallel chunked uploads (--parallel; an experiment)
-----------------------------------------------------
-With --parallel (or ``parallel: true`` in the config; default off), each
-file of at least PARALLEL_MIN_BYTES (today SSObservation and mpc_orbits) is
-uploaded in chunks over parallel streams, with google-cloud-storage's
+Parallel chunked uploads (the default)
+-------------------------------------
+By default (owner, 2026-11-13), each file of at least PARALLEL_MIN_BYTES
+(today SSObservation and mpc_orbits) is uploaded in chunks over parallel
+streams, with google-cloud-storage's
 transfer_manager.upload_chunks_concurrently (GCS's XML multipart upload,
-threads; --chunk-mib, --parallel-workers). Smaller files go as above
-(docs/design/sso-upload-parallel.md). Such an object differs in three ways:
+threads; --chunk-mib, default PARALLEL_CHUNK_MIB, and --parallel-workers,
+default PARALLEL_WORKERS). Smaller files go as in step 3. Opt out with
+--no-parallel or ``parallel: false`` in the config; the command line wins
+over the config (docs/design/sso-upload-parallel.md); every file then goes
+in one stream with if_generation_match=0. A chunked object differs in
+three ways:
 
 - It has a CRC32C but no MD5. After the upload, its CRC32C (and size) must
   equal the local file's (google-crc32c), or the object is deleted and the
@@ -68,9 +74,12 @@ threads; --chunk-mib, --parallel-workers). Smaller files go as above
 - On any failure (or interrupt), the incomplete multipart uploads of the
   object are aborted (listed with the XML API, ?uploads) and the object is
   deleted if it was written; an upload killed outright (SIGKILL, power
-  loss) can leave an incomplete multipart upload, which only a bucket
-  lifecycle rule (AbortIncompleteMultipartUpload) or a manual abort
-  removes.
+  loss) can leave an incomplete multipart upload, which is left to the
+  bucket's lifecycle rule (AbortIncompleteMultipartUpload, on the PPDB
+  side) or a manual abort.
+
+The upload record's ``parallel`` is {chunk_bytes, workers, min_bytes,
+tables} (the tables that went in chunks), or null with --no-parallel.
 
 The message is unchanged.
 
@@ -166,7 +175,8 @@ ACCEPTED_TABLES = tuple(t for t in UPLOAD_TABLE_ORDER if t not in UNSUPPORTED_TA
 #: How long to wait for Pub/Sub to confirm the message.
 PUBLISH_TIMEOUT_S = 120
 
-#: With --parallel, files at least this big are uploaded in parallel chunks.
+#: Files at least this big are uploaded in parallel chunks (unless
+#: --no-parallel).
 PARALLEL_MIN_BYTES = 1 << 30
 #: The default chunk size (MiB) and number of upload threads for --parallel:
 #: the fastest setting measured, at about 1.2 GB peak memory
@@ -791,12 +801,28 @@ def _require_crc32c_c():
                              f"{google_crc32c.implementation!r} one")
 
 
+def _size_pool(session, workers):
+    """Give the client's requests session an https connection pool of at
+    least ``workers`` connections, so the upload threads don't reconnect
+    (urllib3: "Connection pool is full, discarding connection"; the default
+    is 10). Only a plain HTTPAdapter is replaced, keeping its retries; any
+    other (e.g. google-auth's mutual-TLS adapters) is left alone."""
+    import requests.adapters
+    old = getattr(session, "adapters", {}).get("https://")
+    if type(old) is not requests.adapters.HTTPAdapter or old._pool_maxsize >= workers:
+        return
+    session.mount("https://", requests.adapters.HTTPAdapter(
+        pool_connections=old._pool_connections, pool_maxsize=workers, max_retries=old.max_retries,
+        pool_block=old._pool_block))
+
+
 def _chunks_concurrently(path, blob, chunk_bytes, workers):
     """One XML multipart upload of ``path`` to ``blob``, in parts of
     ``chunk_bytes`` sent by ``workers`` threads, each part checked with
     CRC32C (patched in tests). The library cancels the multipart upload if a
     part fails."""
     from google.cloud.storage import transfer_manager
+    _size_pool(blob.client._http, workers)
     transfer_manager.upload_chunks_concurrently(
         str(path), blob, chunk_size=chunk_bytes, worker_type=transfer_manager.THREAD,
         max_workers=workers, checksum="crc32c")
@@ -942,13 +968,13 @@ def run(config, run_dir, tables=None, dry_run=False, force=False, allow_partial=
         include_unsupported=False, no_publish=False, out=None, parallel=None,
         chunk_mib=PARALLEL_CHUNK_MIB, workers=PARALLEL_WORKERS):
     """The whole of stage 3. Returns the upload record. ``parallel``: True or
-    False, or None for the config's ``parallel`` (default False)."""
+    False, or None for the config's ``parallel`` (default True)."""
     out = out or sys.stdout
     if dry_run and no_publish:
         raise SSOUploadError("--no-publish uploads and --dry-run doesn't: give one or the other")
     cfg_path, cfg = load_config(config)
     if parallel is None:
-        parallel = cfg.get("parallel", False)
+        parallel = cfg.get("parallel", True)
     par = parallel_options(chunk_mib, workers) if parallel else None
     tables = select_tables(cfg, cfg_path, tables, allow_partial, include_unsupported)
 
@@ -987,13 +1013,19 @@ def run(config, run_dir, tables=None, dry_run=False, force=False, allow_partial=
     if ssobs is not None:
         record["ssobservation"] = ssobs
     chunked = [t for t in upload_map if is_chunked(upload_map[t], par)]
-    if par is not None:
-        # which objects go in chunks (they get a CRC32C but no MD5)
-        record["parallel"] = {**par, "min_bytes": PARALLEL_MIN_BYTES, "tables": chunked}
+    # which objects go in chunks (they get a CRC32C but no MD5); null with
+    # --no-parallel
+    record["parallel"] = (None if par is None else
+                          {**par, "min_bytes": PARALLEL_MIN_BYTES, "tables": chunked})
     topic_path = f"projects/{cfg['project']}/topics/{cfg['topic']}"
     if dry_run:
         record["object_prefix"] = generate_prefix()
         print(f"dry run: config {cfg_path}; nothing is uploaded or published", file=out)
+        if par is None:
+            print("  parallel: off (--no-parallel or parallel: false); every file in one stream", file=out)
+        else:
+            print(f"  parallel: files of at least {PARALLEL_MIN_BYTES} bytes in chunks of "
+                  f"{par['chunk_bytes'] >> 20} MiB, {par['workers']} threads: {chunked or 'none'}", file=out)
         for t, uri in planned_objects(cfg["bucket_name"], record["object_prefix"], upload_map).items():
             how = (f"in chunks of {par['chunk_bytes'] >> 20} MiB, {par['workers']} threads; checked not "
                    "to exist, CRC32C verified" if t in chunked else "if_generation_match=0")
@@ -1063,13 +1095,14 @@ def main(argv=None):
                         help="upload even though report.json records an earlier upload")
     parser.add_argument("--parallel", action=argparse.BooleanOptionalAction, default=None,
                         help=f"upload files of at least {PARALLEL_MIN_BYTES >> 30} GiB in parallel chunks "
-                             "(GCS multipart; the objects get a CRC32C, verified, but no MD5); default: the "
-                             "config's 'parallel', else off. An experiment: "
+                             "(GCS multipart; the objects get a CRC32C, verified, but no MD5). On by "
+                             "default; --no-parallel sends every file in one stream (if_generation_match=0, "
+                             "with an MD5). Overrides the config's 'parallel' (default true). "
                              "docs/design/sso-upload-parallel.md")
     parser.add_argument("--chunk-mib", type=float, default=PARALLEL_CHUNK_MIB, metavar="MIB",
-                        help=f"--parallel chunk size in MiB (default {PARALLEL_CHUNK_MIB})")
+                        help=f"parallel chunk size in MiB (default {PARALLEL_CHUNK_MIB})")
     parser.add_argument("--parallel-workers", type=int, default=PARALLEL_WORKERS, metavar="N",
-                        help=f"--parallel upload threads, at most {PARALLEL_MAX_WORKERS} "
+                        help=f"parallel upload threads, at most {PARALLEL_MAX_WORKERS} "
                              f"(default {PARALLEL_WORKERS})")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

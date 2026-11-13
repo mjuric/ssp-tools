@@ -582,7 +582,9 @@ def test_upload_success_and_message(fakes, tmp_path):
     r = report(run)
     assert r["upload"] == rec and r["uploads"] == [rec]
     assert list(rec) == ["config", "bucket", "object_prefix", "tables", "message_id", "dry_run",
-                         "published", "utc", "ssobservation"]
+                         "published", "utc", "ssobservation", "parallel"]
+    # parallel by default, but nothing here is big enough to go in chunks
+    assert rec["parallel"] == {"chunk_bytes": 64 << 20, "workers": 16, "min_bytes": 1 << 30, "tables": []}
     assert rec["message_id"] == "msg-123" and rec["dry_run"] is False and rec["published"] is True
     assert rec["ssobservation"] == combined_record(run)
 
@@ -1145,6 +1147,26 @@ CHUNKED = ("SSObservation", "mpc_orbits")
 DEV_CFG = "bucket_name: ppdb-dev-sso-ingest\ntopic: load-sso-topic\nproject: ppdb-dev-5c07\n"
 
 
+def test_parallel_defaults():
+    """The owner's choice (2026-11-13): parallel by default, 64 MiB x 16."""
+    assert (U.PARALLEL_CHUNK_MIB, U.PARALLEL_WORKERS, U.PARALLEL_MIN_BYTES) == (64, 16, 1 << 30)
+    assert U.parallel_options() == {"chunk_bytes": 64 << 20, "workers": 16}
+
+
+def test_parallel_by_default(mpu, tmp_path, fixed_prefix):
+    """No flag, no config key: the big files go in chunks of 64 MiB, 16
+    threads."""
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    rec = U.run("dev", run)
+    assert [c[0] for c in m.calls] == objects_of(CHUNKED, PREFIX)
+    assert {c[2:] for c in m.calls} == {(64 << 20, 16)}
+    assert rec["parallel"] == {"chunk_bytes": 64 << 20, "workers": 16, "min_bytes": BIG,
+                               "tables": list(CHUNKED)}
+    assert pub.published == [(TOPIC_PATH, message(PREFIX, SIX).encode())]
+    assert sorted(st.objects) == sorted(objects_of(SIX, PREFIX))
+
+
 def test_parallel_chunks_only_the_big_files(mpu, tmp_path, fixed_prefix):
     st, pub, m = mpu
     run = make_big_run(tmp_path)
@@ -1171,23 +1193,35 @@ def test_parallel_chunks_only_the_big_files(mpu, tmp_path, fixed_prefix):
     assert m.uploads == {} and m.aborted == []
 
 
-@pytest.mark.parametrize("how", ["default", "config-off", "cli-off"])
-def test_default_path_unchanged(mpu, tmp_path, fixed_prefix, how):
-    """Without --parallel (or with --no-parallel over the config's
-    parallel: true), even the big files go in one if_generation_match=0
-    upload, and the record is as before."""
+@pytest.mark.parametrize("how", ["cli-off", "config-off", "cli-off-over-config-on"])
+def test_no_parallel_gives_the_single_stream_path(mpu, tmp_path, fixed_prefix, how):
+    """--no-parallel (also over the config's parallel: true), or the
+    config's parallel: false: even the big files go in one
+    if_generation_match=0 upload, and the record's parallel is null."""
     st, pub, m = mpu
     run = make_big_run(tmp_path)
     cfg = "dev"
-    if how != "default":
+    if how != "cli-off":
         cfg = tmp_path / "c.yaml"
-        cfg.write_text(DEV_CFG + f"parallel: {'true' if how == 'cli-off' else 'false'}\n")
-    rec = U.run(str(cfg), run, parallel=False if how == "cli-off" else None)
+        cfg.write_text(DEV_CFG + f"parallel: {'false' if how == 'config-off' else 'true'}\n")
+    rec = U.run(str(cfg), run, parallel=None if how == "config-off" else False)
     assert m.calls == []
     assert [c[1:] for c in st.calls] == [(o, 0) for o in objects_of(SIX, PREFIX)]
     assert all(c[0] == "upload" for c in st.calls)
-    assert "parallel" not in rec
+    assert "parallel" in rec and rec["parallel"] is None
+    assert report(run)["upload"]["parallel"] is None
     assert pub.published == [(TOPIC_PATH, message(PREFIX, SIX).encode())]
+
+
+def test_cli_parallel_over_config_off(mpu, tmp_path, fixed_prefix):
+    """--parallel wins over the config's parallel: false."""
+    st, pub, m = mpu
+    run = make_big_run(tmp_path)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(DEV_CFG + "parallel: false\n")
+    rec = U.run(str(cfg), run, parallel=True)
+    assert [c[0] for c in m.calls] == objects_of(CHUNKED, PREFIX)
+    assert rec["parallel"]["tables"] == list(CHUNKED)
 
 
 def test_parallel_from_the_config(mpu, tmp_path, fixed_prefix):
@@ -1301,9 +1335,11 @@ def test_parallel_options_refused(no_remote, tmp_path, chunk_mib, workers, match
         U.parallel_options(chunk_mib, workers)
     run = make_run(tmp_path)
     with pytest.raises(U.SSOUploadError, match=match):
+        U.run("dev", run, dry_run=True, chunk_mib=chunk_mib, workers=workers)       # the default
+    with pytest.raises(U.SSOUploadError, match=match):
         U.run("dev", run, dry_run=True, parallel=True, chunk_mib=chunk_mib, workers=workers)
-    # not checked without --parallel
-    U.run("dev", run, dry_run=True, chunk_mib=chunk_mib, workers=workers)
+    # not checked with --no-parallel
+    U.run("dev", run, dry_run=True, parallel=False, chunk_mib=chunk_mib, workers=workers)
 
 
 def test_parallel_too_many_parts(mpu, tmp_path, fixed_prefix, monkeypatch):
@@ -1318,9 +1354,10 @@ def test_parallel_too_many_parts(mpu, tmp_path, fixed_prefix, monkeypatch):
 def test_parallel_dry_run(no_remote, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(U, "PARALLEL_MIN_BYTES", BIG)
     run = make_big_run(tmp_path)
-    rec = U.run("dev", run, dry_run=True, parallel=True, chunk_mib=32, workers=4)
+    rec = U.run("dev", run, dry_run=True, chunk_mib=32, workers=4)     # parallel by default
     out = capsys.readouterr().out
     prefix = rec["object_prefix"]
+    assert f"parallel: files of at least {BIG} bytes in chunks of 32 MiB, 4 threads: {list(CHUNKED)}" in out
     for t in SIX:
         line, = [x for x in out.splitlines() if f"/{prefix}/{t}.parquet " in x]
         if t in CHUNKED:
@@ -1328,6 +1365,11 @@ def test_parallel_dry_run(no_remote, tmp_path, monkeypatch, capsys):
         else:
             assert line.endswith("(if_generation_match=0)")
     assert rec["parallel"]["tables"] == list(CHUNKED)
+    rec = U.run("dev", run, dry_run=True, parallel=False)
+    out = capsys.readouterr().out
+    assert "parallel: off" in out and "in chunks" not in out
+    assert out.count("(if_generation_match=0)") == len(SIX)
+    assert rec["parallel"] is None
 
 
 def test_main_parallel_flags(monkeypatch, tmp_path):
@@ -1340,6 +1382,26 @@ def test_main_parallel_flags(monkeypatch, tmp_path):
     assert (seen["parallel"], seen["chunk_mib"], seen["workers"]) == (True, 64, 8)
     assert U.main(["dev", str(tmp_path), "--no-parallel"]) == 0
     assert seen["parallel"] is False
+
+
+def test_size_pool():
+    """The https pool is grown to the thread count; retries are kept; a
+    bigger pool or a non-plain adapter is left alone."""
+    requests = pytest.importorskip("requests")
+    s = requests.Session()
+    s.mount("https://", requests.adapters.HTTPAdapter(max_retries=3))
+    U._size_pool(s, 16)
+    a = s.adapters["https://"]
+    assert type(a) is requests.adapters.HTTPAdapter
+    assert a._pool_maxsize == 16 and a.max_retries.total == 3
+    U._size_pool(s, 8)
+    assert s.adapters["https://"] is a
+
+    class Custom(requests.adapters.HTTPAdapter):
+        pass
+    s.mount("https://", c := Custom())
+    U._size_pool(s, 16)
+    assert s.adapters["https://"] is c
 
 
 def test_crc32c_file(tmp_path):

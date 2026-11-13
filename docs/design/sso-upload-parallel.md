@@ -47,14 +47,17 @@ The owner then decides whether to merge.
 
 ## Results (2026-11-12)
 
-The WP is on branch `wp-parallel` (d2bfe00 and the commit after it), not merged.
+The WP is on branch `wp-parallel`, not merged.
 
 ### What was built
 
-- **`--parallel`** (`--no-parallel`; config key `parallel`, a boolean; default off), `--chunk-mib` (default 64, 5 to 5120) and `--parallel-workers` (default 16, 1 to 16).
+- **Parallel by default** (after the owner's 2026-11-13 decision; the experiment itself ran it as opt-in `--parallel`).
+  - Opt out with `--no-parallel`, or with `parallel: false` in the config (a boolean, default true). The command line wins over the config, `--parallel` included.
+  - `--chunk-mib` (default 64, 5 to 5120) and `--parallel-workers` (default 16, 1 to 16).
   - Files of at least `PARALLEL_MIN_BYTES` (1 GiB) go through `transfer_manager.upload_chunks_concurrently`: threads, each part checked by CRC32C.
-  - Other files, and every file without `--parallel`, go exactly as before.
-  - The message is unchanged. The upload record gets `parallel`: `{chunk_bytes, workers, min_bytes, tables}`.
+  - Other files, and every file with `--no-parallel`, go exactly as before.
+  - The message is unchanged. The upload record gets `parallel`: `{chunk_bytes, workers, min_bytes, tables}`, or null with `--no-parallel`. The dry run says which files would go in chunks.
+- **The connection pool is sized to the threads.** The client's https adapter is a plain `requests` `HTTPAdapter` with a pool of 10, so with 16 threads urllib3 warned "Connection pool is full" and reconnected. It is replaced with one of `pool_maxsize` = workers, keeping its retries. Any other adapter, such as google-auth's mutual-TLS ones, is left alone.
 - **Overwrite protection: the fallback.** GCS refuses preconditions on XML multipart uploads. Checked on the int bucket, under a probe prefix that was then deleted:
   - `x-goog-if-generation-match: 0` on the initiate request gets HTTP 400 `NotImplemented`, "Object preconditions are not supported for multipart uploads";
   - the same header on the complete request alone is ignored: the upload replaced an existing object.
@@ -118,7 +121,7 @@ The upload times are from the run's per-file log lines; wall time, CPU and RSS a
 - **Peak memory is about chunk size × threads.**
 - **The CPU cost is negligible:** 31–37 s in every run, about 20 s of it the md5 checks before the upload.
 - **256 MiB chunks are worse,** not better: SSObservation is only 13 parts and `mpc_orbits` 9, so the threads aren't all busy at the end, and one slow part holds up the whole file.
-- **urllib3 warns** "Connection pool is full, discarding connection" (pool size 10, 16 threads), 3–12 times a run. It only costs a TLS reconnect for some parts; harmless.
+- **urllib3 warned** "Connection pool is full, discarding connection" (pool size 10, 16 threads), 3–12 times a run. It only cost a TLS reconnect for some parts. The pool is now sized to the threads, and the run with the defaults (below) had no warnings.
 
 **The object metadata:** SSObservation and `mpc_orbits` from every run, before the delete.
 
@@ -138,15 +141,23 @@ The local CRC32Cs were computed separately (`google-crc32c`), and the md5s match
 - The three small probe prefixes (`wp-parallel-probe-*`) were deleted and checked empty too.
 - The 14 runs appended `--no-publish` records to the test copy's `report.json`. Nothing was published.
 
+**The defaults, live (2026-11-13 04:01 UTC).**
+- The command, with no parallel flag: `ssp-upload-sso int RUN --no-publish --tables SSObservation mpc_orbits --allow-partial`, on sdfiana031 at load 27.
+- Both files went in chunks of 64 MiB over 16 threads: SSObservation in 50 parts, 14.3 s (231 MB/s); `mpc_orbits` in 34 parts, 11.0 s (206 MB/s). That is 25.3 s for both.
+- Wall time 40 s; 34 s CPU; peak RSS 1.15 GB. No pool warnings.
+- Each object's CRC32C and size equal the local file's, and neither has an MD5.
+- The record's `parallel` names both tables.
+- The prefix (`20261113T040128608`) was deleted and checked empty: no objects, and no incomplete multipart uploads in it or in the bucket.
+
 ### Recommendation
+
+**Adopted as the default on 2026-11-13** (owner), at 64 MiB × 16, with `--no-parallel` / `parallel: false` to opt out.
 
 **Worth it.** At 64 MiB × 16 (now the default), the two big files go 10–40 times faster than one stream: 18–23 s against 219–856 s. That brings the whole upload from about 4–15 minutes to under a minute of transfer, at about 1.2 GB of memory and no extra CPU worth counting.
 
-**The costs, for the owner to weigh:**
-1. **No MD5 on the two big objects.** The CRC32C is verified end to end instead. Whether anything downstream (the loader, the PPDB team's checks) expects an MD5 needs confirming with the DM-55678 owners.
+**The costs:**
+1. **No MD5 on the two big objects.** The CRC32C is verified end to end instead. Whether anything downstream (the loader, the PPDB team's checks) expects an MD5 is worth confirming with the DM-55678 owners.
 2. **Weaker overwrite protection:** a check plus the fresh prefix, instead of a server-side precondition. Within one millisecond prefix, a collision is very unlikely.
-3. **Incomplete multipart uploads** are possible after a hard kill. They are invisible to `gsutil ls` and are billed. Ask the PPDB team for an `AbortIncompleteMultipartUpload` lifecycle rule on the bucket.
+3. **Incomplete multipart uploads** are possible after a hard kill. They are invisible to `gsutil ls` and are billed. The owner left them to a bucket lifecycle rule, `AbortIncompleteMultipartUpload`, on the PPDB side (2026-11-13).
 
-**If merged:**
-- `ssp/delivery_contract.py` needs the integrator's update. It says each object is uploaded with `if_generation_match=0`, and it lists neither the `parallel` config key nor the `parallel` field of the upload record.
-- Keep `--parallel` opt-in until point 1 is settled, then consider `parallel: true` in the configs.
+The contract (`ssp/delivery_contract.py`) describes parallel as the default, the record's `parallel` field and the config key (9f8d611).
