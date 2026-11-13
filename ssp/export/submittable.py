@@ -418,8 +418,14 @@ def stream_parquet(client, sql, path, **kw):
     then left for inspection, and must not be used)."""
     import shutil
 
-    with open(path, "wb") as f, client.raw_stream(sql, fmt="Parquet", **kw) as stream:
-        shutil.copyfileobj(stream, f, 1 << 24)
+    from urllib3.exceptions import HTTPError
+
+    try:
+        with open(path, "wb") as f, client.raw_stream(sql, fmt="Parquet", **kw) as stream:
+            shutil.copyfileobj(stream, f, 1 << 24)
+    except HTTPError as e:
+        # ClickHouse (26.x) ends a chunked response early on an error midway
+        raise ClickHouseResultError(f"the ClickHouse stream ({path}) broke off: {e}") from None
     size = os.path.getsize(path)
     with open(path, "rb") as f:
         head = f.read(4)

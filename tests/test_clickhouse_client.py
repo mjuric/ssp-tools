@@ -189,6 +189,8 @@ ERRORS = {
     "truncated": ([HALF], []),
     "empty": ([], []),
     "error_after_parquet": ([parquet_bytes(), OLD_ERROR], []),
+    # ClickHouse 26.8: a chunked body that stops before its last chunk
+    "broken_chunked": ([b"%x\r\n%s\r\n" % (len(HALF), HALF)], ["Transfer-Encoding: chunked"]),
 }
 
 
@@ -199,7 +201,13 @@ def test_error_after_headers_raises(stub, tmp_path, case, how):
     stub.cases[case] = (0.5, parts, extra)
     c = client(stub)
     match = "TIMEOUT_EXCEEDED" if OLD_ERROR in parts or NEW_ERROR in parts else "not a complete Parquet"
-    with pytest.raises(S.ClickHouseResultError, match=match):
+    if case == "broken_chunked":
+        # clickhouse_connect raises for raw_query itself (a urllib3 error)
+        error, match = ((Exception, "IncompleteRead") if how == "query"
+                        else (S.ClickHouseResultError, "broke off"))
+    else:
+        error = S.ClickHouseResultError
+    with pytest.raises(error, match=match):
         if how == "query":
             S.query_parquet(c, f"SELECT '{case}'")
         else:
