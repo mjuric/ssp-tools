@@ -17,6 +17,7 @@ Splitting a file into pieces sent in parallel streams should be faster. Two ways
 | Scope (2026-11-12) | Chunked parallel uploads for the two big files only (SSObservation, mpc_orbits), accepting CRC32C instead of MD5 for them. |
 | Process (2026-11-12) | Built by a subagent. Measure the upload speed and report to the owner whether it is worth it, before anything is merged. |
 | Live tests (2026-11-12) | `--no-publish` uploads to the int bucket, deleted afterwards. Nothing is published. |
+| After the measurement (2026-11-13) | Worth it: the default, at the measured optimum (64 MiB chunks × 16 streams), with an opt-out (`--no-parallel`, config `parallel: false`). Incomplete multipart uploads after a hard kill are left to a bucket lifecycle rule (the PPDB side). |
 
 ## Approach
 
