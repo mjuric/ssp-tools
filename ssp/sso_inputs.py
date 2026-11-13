@@ -238,20 +238,13 @@ def export_ppdb(out_path, args):
             return ppdb_tap.export(out_path, tap_url(args), args.tap_token)
         except ppdb_tap.PPDBTapError as e:
             raise ExtractError(f"ppdb_dia_sources: {e}") from None
-    import clickhouse_connect
+    from ssp.export.submittable import ClickHouseResultError, clickhouse_client, stream_parquet
 
-    from ssp.export.submittable import bypass_proxy, credentials
-
-    user, password = credentials(args.ch_host, args.ch_port, CH_DATABASE, args.ch_user)
-    bypass_proxy(args.ch_host)
-    client = clickhouse_connect.get_client(
-        host=args.ch_host, port=args.ch_port, username=user, password=password,
-        settings={"max_execution_time": 3600, "cancel_http_readonly_queries_on_client_close": 1},
-    )
+    client = clickhouse_client(args.ch_host, args.ch_port, CH_DATABASE, args.ch_user)
     try:
-        with open(out_path, "wb") as f, \
-                client.raw_stream(PPDB_SQL, settings=PPDB_SETTINGS, fmt="Parquet") as stream:
-            shutil.copyfileobj(stream, f, 1 << 24)
+        stream_parquet(client, PPDB_SQL, out_path, settings=PPDB_SETTINGS)
+    except ClickHouseResultError as e:
+        raise ExtractError(f"ppdb_dia_sources: {e}") from None
     finally:
         client.close()
 
