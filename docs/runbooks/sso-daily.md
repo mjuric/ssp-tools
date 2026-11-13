@@ -11,6 +11,8 @@ This builds and delivers the six PPDB Solar System tables (RFC-1188), in three s
 
 The tables: SSObservation, SSObject, NearbySSO, `mpc_orbits`, `current_identifications` and `numbered_identifications`, per `sdm_schemas` `ppdb.yaml`/`sso_base.yaml` (tickets/DM-55375, lsst/sdm_schemas#549; copies in `tests/data/sdm_schemas/`).
 
+Every delivered string is ASCII, as Felis `char`/`text` (VOTable `char`) requires (`docs/design/mpc-orbits-ascii.md`). The build's `mpc` step escapes the non-ASCII characters of `mpc_orbits.mpc_orb_jsonb` (the MPC's naming citations) as JSON `\uXXXX` escapes, editing the text, not re-serialising it, and logs how many values it escaped (`logs/mpc.log`; about 3,200 a day). The delivery check (`ascii`) fails any table, or SSObservation part, with a non-ASCII value in any string column, naming the column, the count and examples.
+
 Design: `docs/design/sso-delivery.md` (the stages), `docs/design/sssource-widened.md` (SSObservation, SSObject), `docs/design/nearbysso.md` (NearbySSO) and `docs/design/nongrav.md` (non-gravitational forces, and comets in NearbySSO). The contract between the stages is `ssp/delivery_contract.py`.
 
 ## Setup (once)

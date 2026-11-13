@@ -92,6 +92,11 @@ MPC_TABLES = ("mpc_orbits", "current_identifications", "numbered_identifications
 #: (table, column) -> the input column it is a copy of.
 MPC_DERIVED = {("mpc_orbits", "designation"): "unpacked_primary_provisional_designation"}
 
+#: Delivered JSON columns whose non-ASCII characters the ``mpc`` step
+#: escapes as JSON \uXXXX (escape_json_non_ascii): Felis text is VOTable
+#: char, ASCII only (docs/design/mpc-orbits-ascii.md).
+MPC_ASCII_ESCAPED = (("mpc_orbits", "mpc_orb_jsonb"),)
+
 #: The delivered tables each step writes (``check`` writes RUN_DIR/checks).
 STEP_TABLES = {
     "mpc": MPC_TABLES,
@@ -557,6 +562,49 @@ def _check_json(values, offset):
     return None
 
 
+_NON_ASCII = re.compile(r"[^\x00-\x7f]")
+
+
+def _json_escape(m):
+    """The JSON escape of matched character ``m``, as Python's json writes
+    it with ensure_ascii: \\uXXXX in lower-case hex, a surrogate pair above
+    U+FFFF."""
+    c = ord(m.group())
+    if c < 0x10000:
+        return f"\\u{c:04x}"
+    c -= 0x10000
+    return f"\\u{0xd800 | (c >> 10):04x}\\u{0xdc00 | (c & 0x3ff):04x}"
+
+
+def escape_json_non_ascii(arr):
+    """``(array, n)``: string array ``arr`` of JSON texts with each non-ASCII
+    character replaced by its JSON escape (_json_escape), and the number
+    ``n`` of values changed. The text is edited, not re-serialised: in valid
+    JSON non-ASCII characters occur only in strings, where the escape means
+    the same character, so json.loads of a value is unchanged, while its
+    number literals and every ASCII value stay byte for byte as they were.
+    NULLs stay NULL; the type is kept. ``array`` is ``arr`` itself if no
+    value changed, else a ChunkedArray (zero-copy slices of ``arr`` and the
+    escaped values)."""
+    mask = pc.fill_null(pc.invert(pc.string_is_ascii(arr)), False)
+    idx = pc.indices_nonzero(mask)
+    if not len(idx):
+        return arr, 0
+    escaped = pa.array([_NON_ASCII.sub(_json_escape, s) for s in arr.take(idx).to_pylist()], arr.type)
+    # A ChunkedArray of zero-copy slices of ``arr`` and the escaped values:
+    # copying a batch of mpc_orb_jsonb (~1 GB) takes seconds, and
+    # pc.replace_with_mask over ten.
+    pieces, start = [], 0
+    for j, i in enumerate(idx.to_pylist()):
+        if i > start:
+            pieces.append(arr.slice(start, i - start))
+        pieces.append(escaped.slice(j, 1))
+        start = i + 1
+    if start < len(arr):
+        pieces.append(arr.slice(start))
+    return pa.chunked_array(pieces, arr.type), len(idx)
+
+
 def mpc_columns(table, schema=None):
     """The input columns the ``mpc`` step reads for delivered ``table``."""
     cols = (schema or delivery_schema())[table]
@@ -584,9 +632,11 @@ def shape_mpc_table(table, src, dst, schema=None, workers=1, batch_rows=MPC_BATC
     """Shape MPC input ``src`` to delivered ``table`` at ``dst``
     (zstd Parquet): exactly delivery_schema()'s columns, in order, cast to
     their types (cast_column), with the MPC_DERIVED columns added and the
-    input's other columns dropped; JSON columns must hold JSON objects.
-    The rows keep the input's order. Written to a temporary file first, so
-    a failure leaves no ``dst``. Returns the row count."""
+    input's other columns dropped; JSON columns must hold JSON objects;
+    the MPC_ASCII_ESCAPED columns have their non-ASCII characters escaped
+    (escape_json_non_ascii). The rows keep the input's order. Written to a
+    temporary file first, so a failure leaves no ``dst``. Returns the row
+    count."""
     schema = schema or delivery_schema()
     columns = schema[table]
     pf = pq.ParquetFile(src)
@@ -599,6 +649,8 @@ def shape_mpc_table(table, src, dst, schema=None, workers=1, batch_rows=MPC_BATC
     log(f"{table}: {pf.metadata.num_rows:,} rows; {len(columns)} delivered columns; "
         f"dropped input columns {dropped}")
     json_cols = [i for i, c in enumerate(columns) if is_json_column(c)]
+    escaped_cols = [i for i, c in enumerate(columns) if (table, c["name"]) in MPC_ASCII_ESCAPED]
+    n_escaped = dict.fromkeys(escaped_cols, 0)
 
     tmp = f"{dst}.tmp"
     n = 0
@@ -616,7 +668,12 @@ def shape_mpc_table(table, src, dst, schema=None, workers=1, batch_rows=MPC_BATC
     try:
         with pq.ParquetWriter(tmp, arrow_schema(columns), compression="zstd") as w:
             for batch in pf.iter_batches(batch_size=batch_rows, columns=need):
-                out = shape_batch(table, batch, columns)
+                out = pa.Table.from_batches([shape_batch(table, batch, columns)])
+                for i in escaped_cols:
+                    arr, k = escape_json_non_ascii(out.column(i).chunk(0))
+                    if k:
+                        out = out.set_column(i, out.schema.field(i), arr)
+                        n_escaped[i] += k
                 futs = []
                 for i in json_cols:
                     values = out.column(i).to_pylist()
@@ -628,7 +685,7 @@ def shape_mpc_table(table, src, dst, schema=None, workers=1, batch_rows=MPC_BATC
                                  for k in range(0, len(values), step)]
                 _settle(pending)          # (the previous batch's, while this one's run)
                 pending = futs
-                w.write_batch(out)
+                w.write_table(out)      # (one row group per batch, as write_batch)
                 n += out.num_rows
             _settle(pending)
     except BaseException:
@@ -639,6 +696,8 @@ def shape_mpc_table(table, src, dst, schema=None, workers=1, batch_rows=MPC_BATC
         if pool is not None:
             pool.shutdown(cancel_futures=True)
     os.replace(tmp, dst)
+    for i, k in n_escaped.items():
+        log(f"{table}.{columns[i]['name']}: escaped the non-ASCII characters of {k:,} values")
     log(f"{table}: wrote {dst}: {n:,} rows")
     return n
 
