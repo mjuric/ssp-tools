@@ -108,3 +108,40 @@
   - the results here;
   - the draft question to the PPDB team about the deployed loader's table set, for the owner to send.
 - **Merge to master** with the owner's approval. Then tell ssp-daily.
+
+## Results (2026-11-12)
+
+WP-U was reviewed by the integrator and independently, fixed, and merged into `sso-upload-int` through PR #109 (5f0771d).
+- **The review's fixes:**
+  - once the message is handed to Pub/Sub, a timeout, error or interrupt keeps the objects and records `published: null`;
+  - per-process temporary names;
+  - a `--no-publish` upload doesn't block `ssp-build-sso`'s rebuild.
+- **Tests:** the full suite, 1299 passed.
+- **The test run:** a hard-linked copy of the 2026-10-12 delivery (`ssp-tools/2026-10-12/run`).
+
+**The combined SSObservation:**
+
+| | |
+|---|---|
+| rows | 8,078,546, in 10 row groups, the parts' row groups one for one |
+| bytes, md5 | 3,302,438,055, `273b69b17b7bf95f76aae87a6110463b` |
+| build | 45.7 s, peak RSS 2.49 GB (first dry run: 7 min 24 s, mostly cold md5 checks of the delivery); a second run reuses it (16 s, 42 MB) |
+| independent read-back | every row equal to the parts', in order; schema with metadata, row groups, zstd, md5 identical |
+
+**The `upload` extra:** a fresh Python 3.12 venv without the stack: `pip install '.[upload]'` brings google-cloud-storage 3.17.1 and google-cloud-pubsub 2.44.0, and `ssp.sso_upload` imports.
+
+**The upload without the message, against the stack's** (the int bucket `ppdb-int-sso-ingest`, the `sso-uploader@ppdb-int-6c62` key):
+
+| | ours (`ssp-upload-sso int RUN --no-publish`) | the stack's (`SSOUploader.from_directory`, `_publish` stubbed) |
+|---|---|---|
+| software | ssp-tools 5f0771d, google-cloud-storage 3.15.1 | d_2026_11_11 + dax_ppdb `tickets/DM-55375` fb4108b; Google libraries the stack lacks from a side directory after it on `PYTHONPATH` (google-cloud-storage 3.17.1) |
+| prefix | `20261113T023723315` | `20261113T024307684` |
+| wall time, peak RSS | 5 min 37 s (about 20 s of it the md5 checks before uploading), 0.44 GB | 4 min 19 s, 0.48 GB |
+| transfer | 317 s, about 20 MB/s per stream | 252 s |
+
+- **The objects:** the same six names, and for each the same size, md5, crc32c, content type (`application/octet-stream`), storage class (STANDARD) and metadata (none). Each md5 equals the local file's: the report's, and for SSObservation the combined file's.
+- **The message:** identical byte for byte apart from the prefix: `{"bucket": "ppdb-int-sso-ingest", "object_prefix": …, "uploaded_tables": ["SSObservation", "NearbySSO", "SSObject", "mpc_orbits", "current_identifications", "numbered_identifications"]}`.
+- **The transfer gap** (about 20–25% on every file) is from one run each. It may be the library version or network variance; not established.
+- **Cleanup:** both prefixes deleted (6 objects each, none left).
+- **Still to settle with the PPDB team:** whether the bucket keeps noncurrent versions of them.
+- **Follow-up (owner, 2026-11-12):** parallel chunked uploads for the two big files, measured separately.
