@@ -28,6 +28,7 @@
 | Where the single SSObservation file is made | At upload. `ssp-upload-sso` combines the manifest's parts after their md5 checks. The delivery, its checks and `ssp-build-sso` are unchanged. |
 | The combined file | Kept, as `RUN_DIR/upload/SSObservation.parquet`. |
 | The message's `files` field | Dropped. The message is exactly dax_ppdb's: `{"bucket", "object_prefix", "uploaded_tables"}`. |
+| Validation against the stack | A full upload to the int bucket without the Pub/Sub message is allowed. It must be shown identical to an upload by dax_ppdb's `SSOUploader` (the latest daily stack, with dax_ppdb from `tickets/DM-55375`). |
 
 ## Outputs
 
@@ -51,6 +52,8 @@
    - cleanup on any failure;
    - the publish timeout keeps the objects;
    - one upload per load window.
+   - **Table order:** tables are uploaded, and listed in `uploaded_tables`, in dax_ppdb's `SSO_TABLES` order (SSObservation, NearbySSO, SSObject, mpc_orbits, current_identifications, numbered_identifications), as `SSOUploader.from_directory` does. load_sso doesn't depend on the order, but this makes the message byte-identical to the stack's.
+   - **`--no-publish`** (new): upload the objects and stop. Nothing is published, so no load starts. The objects are kept and the run prints their prefix. The record gets `"published": false`, and like a dry run it doesn't count as an earlier upload for `--force`. For tests such as the validation below; the objects are deleted by hand afterwards.
 3. **NearbySSO is accepted.** `UNSUPPORTED_TABLES` becomes empty, so the default complete set is all six `DELIVERY_TABLES`. `--include-unsupported` stays as a no-op hook, ready for the next table the loader lags on.
 4. **The contract** (`ssp/delivery_contract.py`):
    - `UPLOAD_MESSAGE_FIELDS` = `("bucket", "object_prefix", "uploaded_tables")`;
@@ -68,7 +71,8 @@
   - the combined file has the parts' rows in order, their schema, no sidecar columns, and row groups no bigger than the parts';
   - reuse and rebuild: the manifest changes, or the file is damaged;
   - a schema mismatch between parts is refused;
-  - one object per table and the exact message;
+  - one object per table, in `SSO_TABLES` order, and the exact message;
+  - `--no-publish` uploads, publishes nothing, keeps the objects, and doesn't block a later real upload;
   - NearbySSO is in the default set;
   - the int config loads.
 - **The `upload` extra:** in a fresh venv without the stack, `pip install '.[upload]'` brings `google-cloud-storage` and `google-cloud-pubsub`, and both import.
@@ -76,7 +80,21 @@
   - The planned objects and the message.
   - The combined file's rows (8,078,546), bytes, md5, row groups and build time.
   - A full read-back against the parts: every row equal, in order.
-- **No real upload.** The owner approves that separately.
+- **A full upload without the message, compared with the stack's** (owner, 2026-11-12), on a hard-linked copy of the run at `/sdf/data/rubin/user/mjuric/sso-upload-int/run`, so ssp-daily's run directory is untouched:
+  1. **Ours:** `ssp-upload-sso int RUN --no-publish` uploads to the int bucket under prefix A, with the int service-account key.
+  2. **The stack's:** on the latest daily stack (`d_2026_11_11` today), with dax_ppdb's `tickets/DM-55375` set up over it:
+     - `SSOUploader.from_directory` runs on a directory holding the same six files (hard links to the delivery and to our combined SSObservation), with `allow_partial_upload: false`;
+     - its `_publish` is replaced by a stub that records the message instead of sending it;
+     - it uploads under prefix B, with the same key.
+  3. **Compare** A with B:
+     - the object names relative to the prefix;
+     - size, md5, crc32c, content type and encoding, custom metadata and storage class;
+     - the message ours would publish and the one the stub recorded, byte for byte apart from the prefix.
+  4. **Delete** both prefixes and check that they're empty.
+     - The bucket's versioning is a Terraform variable. If it is on, the deleted objects stay as noncurrent versions, which the uploader account can't list or purge.
+     - That's about 12 GB for both uploads. It is noted for the PPDB team.
+  - Checked beforehand: `load_sso` runs only from a push subscription on `load-sso-topic`, and the PPDB Terraform (lsst/idf_deploy `environment/deployments/ppdb/services/`) has no bucket notification. So objects without a message start no load.
+- **No real upload** (with the message). The owner approves that separately.
 
 ## Implementation plan
 
@@ -84,6 +102,7 @@
 - **Then an independent review:** read the combined file back against the parts on the real delivery, and probe reuse, rebuild and cleanup.
 - **Then the integrator's work:**
   - the dry run on the 2026-10-12 delivery;
+  - the full upload without the message and its comparison with the stack's, then deleting both;
   - the `upload` extra check;
   - the results here;
   - the draft question to the PPDB team about the deployed loader's table set, for the owner to send.
