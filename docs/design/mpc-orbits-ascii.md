@@ -44,3 +44,23 @@ Querying `mpc_orbits` through the data-int PPDB TAP fails with `'ascii' codec ca
 - **One WP:** the escape, the check and their tests.
 - **Then a review by the integrator,** with the real-data comparison.
 - **Merge to master** with the owner's approval. Then tell ssp-daily the commit to pin.
+
+## Results (2026-11-13)
+
+The WP was merged into `mpc-orbits-ascii` through PR #110 (f10f41c), after the integrator's review.
+- **Tests:** the full suite, 1328 passed.
+
+**Real data:** `mpc_orbits` rebuilt from the 2026-10-12 inputs into `/sdf/data/rubin/user/mjuric/mpc-orbits-ascii/`, compared with that day's delivered file.
+
+| | |
+|---|---|
+| rows | 1,578,004, in 13 row groups, as before |
+| changed | exactly 3,206 rows. Each is the original with every non-ASCII character replaced by its `json.dumps` escape and is `json.loads`-equal to it (checked by the WP and independently by the integrator). |
+| unchanged | the other 1,574,798 rows byte-identical; the NULLs (2,624) and every other column equal |
+| non-ASCII values after | 0 |
+| step time (`mpc`, 32 workers) | old code 105.7–137.4 s (3 runs), new 95.7 s: no slowdown within the filesystem's noise. The escape itself takes about 4.5 s. Peak RSS 8.0 GB, unchanged. |
+
+**The check, `ascii`:**
+- It passes on the rebuilt delivery and fails on the original, naming `mpc_orb_jsonb` with 3,206 values.
+- It costs about 20 s (19–36 s across runs), nearly all of it reading and decompressing `mpc_orb_jsonb`'s ~11 GB of text; all the other tables together add about 1 s.
+- Restricting it to `mpc_orbits` would save nothing, so it covers every string column of every delivered table. That's slightly over the design's 30 s guide when the cache is cold; the integrator accepted it, since the build itself takes over an hour.

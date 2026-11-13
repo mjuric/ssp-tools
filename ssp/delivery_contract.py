@@ -220,7 +220,8 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 #   long -> int64, int -> int32,
 #   short -> int16, float -> float32, double -> float64,
 #   boolean -> bool, timestamp -> timestamp) and no extra columns; no NULLs
-#   in nullable: false columns; the primary key unique and non-NULL.
+#   in nullable: false columns; the primary key unique and non-NULL; every
+#   string column ASCII (Felis char/text; docs/design/mpc-orbits-ascii.md).
 # check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES)
 #     -> dict[table, list[CheckResult]]
 #   Fails (a FAIL result) for a missing file. SSObservation is checked
