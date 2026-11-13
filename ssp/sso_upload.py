@@ -32,13 +32,14 @@ reads exactly gs://<bucket>/<prefix>/<Table>.parquet, one object per table
    the UTC time to the millisecond, with if_generation_match=0 so nothing
    is ever overwritten. No manifest, part or sidecar
    (SSObservation_internal.parquet, NearbySSO_internal.parquet) is ever
-   uploaded. On any failure, including a failure to publish, delete every
-   object this upload wrote and fail.
+   uploaded. On any failure, including a failure to hand the message to
+   Pub/Sub, delete every object this upload wrote and fail.
 4. Publish one JSON message, exactly dax_ppdb SSOUploader's,
    {"bucket", "object_prefix", "uploaded_tables"} (the tables in upload
    order), to projects/<project>/topics/<topic>, and wait (up to
-   PUBLISH_TIMEOUT_S) for its message id. If the wait times out, the
-   objects are kept: the message may have gone through.
+   PUBLISH_TIMEOUT_S) for its message id. If the wait times out, fails or
+   is interrupted (e.g. Ctrl-C), the objects are kept and the upload is
+   recorded with published null: the message may have gone through.
    With --no-publish, stop before this step: nothing is published, so no
    load starts. The objects are kept (delete them by hand when done), and
    the prefix and the message that would have been sent are printed.
@@ -86,6 +87,7 @@ import json
 import logging
 import os
 import posixpath
+import secrets
 import sys
 import time
 from datetime import datetime, timezone
@@ -362,6 +364,15 @@ def verify_delivery(run_dir, report, tables):
 # The combined SSObservation (RUN_DIR/upload/SSObservation.parquet)
 # --------------------------------------------------------------------------
 
+def _tmp_name(path):
+    """A temporary name next to ``path``, unique to this process and call
+    (<name>.<pid>.<random>.tmp), so concurrent runs on one RUN_DIR never
+    write into each other's file. A run killed mid-write leaves its .tmp
+    behind; such files are never read, and can be removed by hand."""
+    path = Path(path)
+    return path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+
+
 def combined_paths(run_dir):
     """(the combined file, its record) under RUN_DIR/UPLOAD_DIR."""
     d = Path(run_dir) / UPLOAD_DIR
@@ -470,7 +481,7 @@ def combine_ssobservation(run_dir, manifest_md5):
 
     path.parent.mkdir(parents=True, exist_ok=True)
     rec_path.unlink(missing_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = _tmp_name(path)
     t0 = time.monotonic()
     try:
         schema, rg_rows = _write_combined([run_dir / DELIVERY_DIR / f for f, _, _ in parts], tmp)
@@ -494,7 +505,7 @@ def combine_ssobservation(run_dir, manifest_md5):
 def _write_json(path, obj):
     """Write ``obj`` to ``path`` atomically."""
     path = Path(path)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = _tmp_name(path)
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=2)
         f.write("\n")
@@ -578,17 +589,22 @@ def _publisher_client():
     return pubsub_v1.PublisherClient()
 
 
-def upload(cfg, file_map, object_prefix=None, publish_timeout=PUBLISH_TIMEOUT_S, publish=True):
+def upload(cfg, file_map, object_prefix=None, publish_timeout=PUBLISH_TIMEOUT_S, publish=True,
+           on_unconfirmed=None):
     """Upload ``file_map`` ({Table: Path}), each table as
     <prefix>/<Table>.parquet in UPLOAD_TABLE_ORDER, and publish the message
     (unless ``publish`` is false: then the objects are kept and nothing is
     published).
 
     Returns (object_prefix, message_id); message_id is None without
-    ``publish``. On any failure, deletes the objects this call uploaded and
-    raises SSOUploadError -- except when the publish isn't confirmed within
-    ``publish_timeout``: then it keeps the objects and raises
-    PublishUnconfirmedError.
+    ``publish``. On any failure before the message is handed to Pub/Sub
+    (publisher.publish() returned), deletes the objects this call uploaded
+    and raises SSOUploadError. After that, the message may have gone
+    through, so anything that stops the wait for its confirmation (a
+    timeout, an error, KeyboardInterrupt, SystemExit, ...) keeps the
+    objects, calls ``on_unconfirmed(object_prefix, message)`` if given, and
+    raises PublishUnconfirmedError for an Exception, or re-raises a
+    BaseException that isn't one.
     """
     try:
         from google.api_core.exceptions import PreconditionFailed
@@ -605,6 +621,7 @@ def upload(cfg, file_map, object_prefix=None, publish_timeout=PUBLISH_TIMEOUT_S,
 
     uploaded = []
     message_id = None
+    handed_over = False
     try:
         for table in tables:
             path = file_map[table]
@@ -632,21 +649,30 @@ def upload(cfg, file_map, object_prefix=None, publish_timeout=PUBLISH_TIMEOUT_S,
             future = publisher.publish(topic_path, data)
         except Exception as e:
             raise SSOUploadError(f"failed to publish to {topic_path}: {data.decode()}: {e!r}") from e
+        handed_over = True      # from here on the message may go through
         try:
             message_id = future.result(timeout=publish_timeout)
-        except (concurrent.futures.TimeoutError, TimeoutError) as e:
-            raise PublishUnconfirmedError(
-                f"the publish to {topic_path} wasn't confirmed within {publish_timeout} s; it may or "
-                f"may not have gone through. The objects are KEPT at gs://{bucket_name}/{object_prefix}/. "
-                f"Check whether the load ran before uploading again or deleting them. "
-                f"Message: {data.decode()}", object_prefix) from e
-        except Exception as e:
-            raise SSOUploadError(f"failed to publish to {topic_path}: {data.decode()}: {e!r}") from e
+        except BaseException as e:
+            if isinstance(e, (concurrent.futures.TimeoutError, TimeoutError)):
+                what = f"wasn't confirmed within {publish_timeout} s"
+            else:
+                what = f"was interrupted or failed before it was confirmed ({e!r})"
+            msg = (f"the publish to {topic_path} {what}; it may or may not have gone through. "
+                   f"The objects are KEPT at gs://{bucket_name}/{object_prefix}/. Check whether the "
+                   f"load ran before uploading again or deleting them. Message: {data.decode()}")
+            _LOG.error("%s", msg)
+            if on_unconfirmed is not None:
+                try:
+                    on_unconfirmed(object_prefix, msg)
+                except Exception:
+                    _LOG.exception("failed to record the unconfirmed publish")
+            if isinstance(e, Exception):
+                raise PublishUnconfirmedError(msg, object_prefix) from e
+            raise
         _LOG.info("published message %s to %s: %s", message_id, topic_path, data.decode())
-    except PublishUnconfirmedError:
-        raise
     except BaseException:
-        _cleanup(bucket, bucket_name, uploaded)
+        if not handed_over:
+            _cleanup(bucket, bucket_name, uploaded)
         raise
     return object_prefix, message_id
 
@@ -719,14 +745,15 @@ def run(config, run_dir, tables=None, dry_run=False, force=False, allow_partial=
         print(f"    {message_body(cfg['bucket_name'], record['object_prefix'], upload_map).decode()}",
               file=out)
     else:
-        try:
-            record["object_prefix"], record["message_id"] = upload(cfg, upload_map,
-                                                                   publish=not no_publish)
-        except PublishUnconfirmedError as e:
-            record.update(object_prefix=e.object_prefix, published=None,
-                          utc=_now().isoformat(timespec="seconds"), error=str(e))
+        def unconfirmed(object_prefix, msg):
+            # the publish may have gone through: record it (published null),
+            # whatever stopped the wait (upload() then raises)
+            record.update(object_prefix=object_prefix, published=None,
+                          utc=_now().isoformat(timespec="seconds"), error=msg)
             record_upload(run_dir, report, record)
-            raise
+
+        record["object_prefix"], record["message_id"] = upload(
+            cfg, upload_map, publish=not no_publish, on_unconfirmed=unconfirmed)
         where = f"gs://{cfg['bucket_name']}/{record['object_prefix']}"
         if no_publish:
             print(f"uploaded {len(upload_map)} tables to {where}/ and published NOTHING (--no-publish); "

@@ -111,7 +111,7 @@ ssp-build-ssobject RUN_DIR/delivery RUN_DIR/delivery/mpc_orbits.parquet -o ssobj
   - `deliverable` is true only if every step and every expected check passed.
   - It refuses to rebuild a run that has been uploaded, unless `--force-rebuild`. A dry run or a `--no-publish` upload (nothing loaded) doesn't count; an upload whose publish wasn't confirmed does.
 - **Stage 3 refuses** unless `report.json` is deliverable and every file matches its md5: for SSObservation, the manifest must have the md5 the report recorded (`manifest_md5`) and list the parts, rows and bytes the report recorded, and every part must have the manifest's size and md5.
-  - It never overwrites an object, and removes its own uploads on any failure.
+  - It never overwrites an object, and removes its own uploads on any failure, except once the message has been handed to Pub/Sub: if the publish then isn't confirmed (a timeout, an error, or an interrupt such as Ctrl-C), the message may have gone through, so the objects are kept and the upload is recorded with `"published": null` and an `error`, the same as `--no-publish` keeps them. Check whether the load ran before deleting them or uploading again (`--force`).
   - It refuses a second real upload of a run unless `--force`, and a partial table set unless `--allow-partial`. A dry run or a `--no-publish` run doesn't count as an upload.
   - Inputs from another source (not ClickHouse or the MPC replica) can replace stage 1, provided they honour `ssp/delivery_contract.py`'s `INPUT_FILES` and `MANIFEST_FIELDS`.
 

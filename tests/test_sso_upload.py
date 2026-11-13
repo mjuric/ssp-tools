@@ -75,14 +75,17 @@ class FakeFuture:
 
 
 class FakePublisher:
-    def __init__(self, exc=None):
+    def __init__(self, exc=None, publish_exc=None):
         self.published, self.exc, self.futures = [], exc, []
+        self.publish_exc = publish_exc
 
     @staticmethod
     def topic_path(project, topic):
         return f"projects/{project}/topics/{topic}"
 
     def publish(self, topic, data):
+        if self.publish_exc:
+            raise self.publish_exc
         self.published.append((topic, data))
         self.futures.append(FakeFuture(self.exc))
         return self.futures[-1]
@@ -500,7 +503,30 @@ def test_combined_check_failure_leaves_nothing(no_remote, tmp_path, monkeypatch)
     (run / C.REPORT_FILE).write_text(json.dumps(r))
     with pytest.raises(U.SSOUploadError, match="combined .* has .* rows, the manifest says 999"):
         U.run("dev", run, dry_run=True)
-    assert not combined(run).exists() and not list((run / C.UPLOAD_DIR).glob("*"))
+    assert not combined(run).exists() and not list((run / C.UPLOAD_DIR).glob("*"))   # its .tmp too
+
+
+def test_combined_tmp_name_is_per_process(no_remote, tmp_path, monkeypatch):
+    """The combined file is written to a temporary name unique to the
+    process and call, then renamed into place."""
+    seen = []
+    orig = U._write_combined
+
+    def spy(parts, out):
+        seen.append(out)
+        return orig(parts, out)
+    monkeypatch.setattr(U, "_write_combined", spy)
+    run = make_run(tmp_path)
+    stale = run / C.UPLOAD_DIR / f"{SSOBS}.1.deadbeef.tmp"     # another run's
+    stale.parent.mkdir()
+    stale.write_bytes(b"someone else's")
+    U.run("dev", run, dry_run=True)
+    (out,) = seen
+    assert out.parent == run / C.UPLOAD_DIR
+    assert re.fullmatch(rf"{re.escape(SSOBS)}\.{os.getpid()}\.[0-9a-f]{{8}}\.tmp", out.name)
+    assert not out.exists() and combined(run).is_file()
+    assert stale.read_bytes() == b"someone else's"          # never touched
+    assert U._tmp_name(combined(run)) != U._tmp_name(combined(run))
 
 
 def test_combined_refuses_a_changed_manifest(tmp_path):
@@ -629,16 +655,84 @@ def test_cleanup_keeps_going_and_reraises_the_original(fakes, tmp_path, fixed_pr
 
 
 def test_publish_failure_cleans_up(fakes, tmp_path, monkeypatch):
+    """publish() itself fails: the message never left, so the objects are
+    deleted."""
+    from google.api_core.exceptions import ServiceUnavailable
+    st, _ = fakes
+    pub = FakePublisher(publish_exc=ServiceUnavailable("injected"))
+    monkeypatch.setattr(U, "_publisher_client", lambda: pub)
+    run = make_run(tmp_path)
+    with pytest.raises(U.SSOUploadError, match="failed to publish"):
+        U.run("dev", run)
+    assert pub.published == []
+    assert st.objects == {}
+    assert len([c for c in st.calls if c[0] == "delete"]) == len(SIX)
+    assert "upload" not in report(run)
+
+
+def test_publisher_creation_failure_cleans_up(fakes, tmp_path, monkeypatch):
+    st, _ = fakes
+
+    def boom():
+        raise RuntimeError("no publisher")
+    monkeypatch.setattr(U, "_publisher_client", boom)
+    run = make_run(tmp_path)
+    with pytest.raises(U.SSOUploadError, match="failed to publish"):
+        U.run("dev", run)
+    assert st.objects == {} and "upload" not in report(run)
+
+
+def test_publish_error_after_handover_keeps_objects(fakes, tmp_path, monkeypatch, fixed_prefix):
+    """The message was handed to Pub/Sub, then the wait failed: it may have
+    gone through, so the objects are kept and the upload recorded."""
     from google.api_core.exceptions import ServiceUnavailable
     st, _ = fakes
     pub = FakePublisher(exc=ServiceUnavailable("injected"))
     monkeypatch.setattr(U, "_publisher_client", lambda: pub)
     run = make_run(tmp_path)
-    with pytest.raises(U.SSOUploadError, match="failed to publish"):
+    with pytest.raises(U.PublishUnconfirmedError, match="interrupted or failed.*KEPT") as ei:
         U.run("dev", run)
-    assert len(pub.published) == 1
-    assert st.objects == {}
-    assert len([c for c in st.calls if c[0] == "delete"]) == len(SIX)
+    assert isinstance(ei.value.__cause__, ServiceUnavailable)
+    assert sorted(st.objects) == sorted(objects_of(SIX, PREFIX))
+    assert not [c for c in st.calls if c[0] == "delete"]
+    up = report(run)["upload"]
+    assert up["published"] is None and up["object_prefix"] == PREFIX and "ServiceUnavailable" in up["error"]
+    with pytest.raises(U.SSOUploadError, match="--force"):
+        U.run("dev", run)
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+def test_publish_interrupted_keeps_objects(fakes, tmp_path, monkeypatch, fixed_prefix, exc):
+    """Ctrl-C (or SystemExit) while waiting for the confirmation: the
+    objects are kept, the upload recorded with published null, and the
+    interrupt propagates."""
+    st, _ = fakes
+    pub = FakePublisher(exc=exc())
+    monkeypatch.setattr(U, "_publisher_client", lambda: pub)
+    run = make_run(tmp_path)
+    with pytest.raises(exc):
+        U.run("dev", run)
+    assert sorted(st.objects) == sorted(objects_of(SIX, PREFIX))
+    assert not [c for c in st.calls if c[0] == "delete"]
+    r = report(run)
+    assert r["upload"]["published"] is None and r["upload"]["object_prefix"] == PREFIX
+    err = r["upload"]["error"]
+    assert "interrupted" in err and "may or may not have gone through" in err
+    assert r["uploads"] == [r["upload"]]
+    with pytest.raises(U.SSOUploadError, match="--force"):
+        U.run("dev", run)
+
+
+def test_interrupt_during_upload_still_cleans_up(fakes, tmp_path, fixed_prefix):
+    """Before the message is handed over, even a KeyboardInterrupt cleans
+    up."""
+    st, pub = fakes
+    run = make_run(tmp_path)
+    st.fail_on[f"{PREFIX}/{SIX[2]}.parquet"] = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        U.run("dev", run)
+    assert st.objects == {} and pub.published == []
+    assert "upload" not in report(run)
 
 
 def test_publish_timeout_keeps_objects(fakes, tmp_path, monkeypatch, fixed_prefix):
