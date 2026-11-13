@@ -3,6 +3,7 @@ ingestion (DM-55678).
 
     ssp-upload-sso CONFIG RUN_DIR [--dry-run | --no-publish] [--tables T ...]
                    [--force] [--allow-partial] [--include-unsupported]
+                   [--parallel [--chunk-mib N] [--parallel-workers N]]
 
 It follows the contract in ssp/delivery_contract.py, which mirrors
 lsst/dax_ppdb python/lsst/dax/ppdb/bigquery/sso_uploader.py (tickets/
@@ -48,6 +49,31 @@ reads exactly gs://<bucket>/<prefix>/<Table>.parquet, one object per table
    ``published`` is true for a published upload, false for a dry run or a
    --no-publish run, and null when the publish wasn't confirmed.
 
+Parallel chunked uploads (--parallel; an experiment)
+----------------------------------------------------
+With --parallel (or ``parallel: true`` in the config; default off), each
+file of at least PARALLEL_MIN_BYTES (today SSObservation and mpc_orbits) is
+uploaded in chunks over parallel streams, with google-cloud-storage's
+transfer_manager.upload_chunks_concurrently (GCS's XML multipart upload,
+threads; --chunk-mib, --parallel-workers). Smaller files go as above
+(docs/design/sso-upload-parallel.md). Such an object differs in three ways:
+
+- It has a CRC32C but no MD5. After the upload, its CRC32C (and size) must
+  equal the local file's (google-crc32c), or the object is deleted and the
+  upload fails.
+- GCS refuses preconditions on multipart uploads ("Object preconditions are
+  not supported for multipart uploads"), so if_generation_match=0 can't be
+  given. Instead the object is checked not to exist just before the upload,
+  under the fresh, per-upload prefix.
+- On any failure (or interrupt), the incomplete multipart uploads of the
+  object are aborted (listed with the XML API, ?uploads) and the object is
+  deleted if it was written; an upload killed outright (SIGKILL, power
+  loss) can leave an incomplete multipart upload, which only a bucket
+  lifecycle rule (AbortIncompleteMultipartUpload) or a manual abort
+  removes.
+
+The message is unchanged.
+
 Which tables
 ------------
 The config's ``tables`` (default: ACCEPTED_TABLES, all six delivery
@@ -81,6 +107,7 @@ account's key. The Google client libraries are the ``upload`` extra
 """
 
 import argparse
+import base64
 import concurrent.futures
 import hashlib
 import json
@@ -89,7 +116,9 @@ import os
 import posixpath
 import secrets
 import sys
+import threading
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -122,7 +151,7 @@ _LOG = logging.getLogger("ssp.sso_upload")
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config" / "sso-upload"
 
 CONFIG_KEYS_REQUIRED = ("bucket_name", "topic", "project")
-CONFIG_KEYS_OPTIONAL = ("tables",)
+CONFIG_KEYS_OPTIONAL = ("tables", "parallel")
 
 #: Delivery tables the DM-55678 side (dax_ppdb SSO_TABLES, load_sso) doesn't
 #: accept yet; sending one fails the whole load. None today: a hook for the
@@ -136,6 +165,19 @@ ACCEPTED_TABLES = tuple(t for t in UPLOAD_TABLE_ORDER if t not in UNSUPPORTED_TA
 
 #: How long to wait for Pub/Sub to confirm the message.
 PUBLISH_TIMEOUT_S = 120
+
+#: With --parallel, files at least this big are uploaded in parallel chunks.
+PARALLEL_MIN_BYTES = 1 << 30
+#: The default chunk size (MiB) and number of upload threads for --parallel.
+PARALLEL_CHUNK_MIB = 128
+PARALLEL_WORKERS = 16
+#: At most this many upload threads (the shared nodes' limits).
+PARALLEL_MAX_WORKERS = 16
+#: GCS XML multipart limits: parts of at least 5 MiB (but the last), at
+#: most 5 GiB, at most 10,000 of them.
+MPU_MIN_PART_BYTES = 5 << 20
+MPU_MAX_PART_BYTES = 5 << 30
+MPU_MAX_PARTS = 10000
 
 
 class SSOUploadError(RuntimeError):
@@ -199,7 +241,21 @@ def load_config(spec):
             raise SSOUploadError(f"{path}: {k} must be a string")
     if "tables" in cfg:
         check_tables(cfg["tables"], f"{path}: tables")
+    if "parallel" in cfg and not isinstance(cfg["parallel"], bool):
+        raise SSOUploadError(f"{path}: parallel must be true or false")
     return path, cfg
+
+
+def parallel_options(chunk_mib=PARALLEL_CHUNK_MIB, workers=PARALLEL_WORKERS):
+    """The --parallel settings, {"chunk_bytes", "workers"}, checked against
+    GCS's multipart limits and PARALLEL_MAX_WORKERS."""
+    if not isinstance(workers, int) or not 1 <= workers <= PARALLEL_MAX_WORKERS:
+        raise SSOUploadError(f"--parallel-workers must be 1 to {PARALLEL_MAX_WORKERS}, not {workers!r}")
+    chunk = int(chunk_mib * (1 << 20)) if isinstance(chunk_mib, (int, float)) else None
+    if chunk is None or not MPU_MIN_PART_BYTES <= chunk <= MPU_MAX_PART_BYTES:
+        raise SSOUploadError(f"--chunk-mib must be {MPU_MIN_PART_BYTES >> 20} to {MPU_MAX_PART_BYTES >> 20} "
+                             f"(GCS multipart part sizes), not {chunk_mib!r}")
+    return {"chunk_bytes": chunk, "workers": workers}
 
 
 def check_tables(tables, what="tables"):
@@ -255,6 +311,17 @@ def md5_file(path, bufsize=1 << 22):
         while chunk := f.read(bufsize):
             h.update(chunk)
     return h.hexdigest()
+
+
+def crc32c_file(path, bufsize=1 << 22):
+    """A file's CRC32C as GCS gives it (``Blob.crc32c``): base64 of the
+    big-endian 4 bytes."""
+    import google_crc32c
+    c = google_crc32c.Checksum()
+    with open(path, "rb") as f:
+        while chunk := f.read(bufsize):
+            c.update(chunk)
+    return base64.b64encode(c.digest()).decode("ascii")
 
 
 def read_report(run_dir):
@@ -589,12 +656,19 @@ def _publisher_client():
     return pubsub_v1.PublisherClient()
 
 
+def is_chunked(path, parallel):
+    """Whether ``path`` goes in parallel chunks with the ``parallel``
+    settings (None: never)."""
+    return bool(parallel) and Path(path).stat().st_size >= PARALLEL_MIN_BYTES
+
+
 def upload(cfg, file_map, object_prefix=None, publish_timeout=PUBLISH_TIMEOUT_S, publish=True,
-           on_unconfirmed=None):
+           on_unconfirmed=None, parallel=None):
     """Upload ``file_map`` ({Table: Path}), each table as
     <prefix>/<Table>.parquet in UPLOAD_TABLE_ORDER, and publish the message
     (unless ``publish`` is false: then the objects are kept and nothing is
-    published).
+    published). With ``parallel`` (parallel_options()), files of at least
+    PARALLEL_MIN_BYTES go in parallel chunks (_upload_chunked).
 
     Returns (object_prefix, message_id); message_id is None without
     ``publish``. On any failure before the message is handed to Pub/Sub
@@ -614,6 +688,8 @@ def upload(cfg, file_map, object_prefix=None, publish_timeout=PUBLISH_TIMEOUT_S,
     bucket_name, topic, project = cfg["bucket_name"], cfg["topic"], cfg["project"]
     object_prefix = object_prefix or generate_prefix()
     tables = _upload_order(file_map)
+    if any(is_chunked(file_map[t], parallel) for t in tables):
+        _require_crc32c_c()
     try:
         bucket = _storage_client().bucket(bucket_name)
     except Exception as e:      # e.g. GoogleAuthError: no application-default credentials
@@ -626,16 +702,25 @@ def upload(cfg, file_map, object_prefix=None, publish_timeout=PUBLISH_TIMEOUT_S,
         for table in tables:
             path = file_map[table]
             name = object_name(object_prefix, table)
-            try:
-                _LOG.info("uploading %s to gs://%s/%s", path, bucket_name, name)
-                bucket.blob(name).upload_from_filename(str(path), if_generation_match=0)
-            except PreconditionFailed as e:
-                raise SSOUploadError(f"gs://{bucket_name}/{name} already exists; "
-                                     "a naming collision for this upload prefix") from e
-            except Exception as e:      # GoogleAPIError, GoogleAuthError, OSError, ...
-                raise SSOUploadError(f"failed to upload {path} to gs://{bucket_name}/{name}: "
-                                     f"{e!r}") from e
+            size = Path(path).stat().st_size
+            t0 = time.monotonic()
+            if is_chunked(path, parallel):
+                # cleans up after itself on failure
+                _upload_chunked(bucket, bucket_name, name, path, size, **parallel)
+            else:
+                try:
+                    _LOG.info("uploading %s to gs://%s/%s", path, bucket_name, name)
+                    bucket.blob(name).upload_from_filename(str(path), if_generation_match=0)
+                except PreconditionFailed as e:
+                    raise SSOUploadError(f"gs://{bucket_name}/{name} already exists; "
+                                         "a naming collision for this upload prefix") from e
+                except Exception as e:      # GoogleAPIError, GoogleAuthError, OSError, ...
+                    raise SSOUploadError(f"failed to upload {path} to gs://{bucket_name}/{name}: "
+                                         f"{e!r}") from e
             uploaded.append(name)
+            dt = time.monotonic() - t0
+            _LOG.info("uploaded %s: %d bytes in %.1f s (%.1f MB/s)", name, size, dt,
+                      size / dt / 1e6 if dt > 0 else float("nan"))
         _LOG.info("uploaded %d tables to gs://%s/%s", len(uploaded), bucket_name, object_prefix)
 
         data = message_body(bucket_name, object_prefix, tables)
@@ -689,16 +774,180 @@ def _cleanup(bucket, bucket_name, names):
 
 
 # --------------------------------------------------------------------------
+# Parallel chunked uploads (--parallel; docs/design/sso-upload-parallel.md)
+# --------------------------------------------------------------------------
+
+def _require_crc32c_c():
+    """Refuse without google-crc32c's C extension: the whole-file CRC32C of
+    a few GB would take minutes in pure Python."""
+    try:
+        import google_crc32c
+    except ImportError as e:
+        raise SSOUploadError("--parallel needs google-crc32c (it comes with google-cloud-storage)") from e
+    if google_crc32c.implementation != "c":
+        raise SSOUploadError("--parallel needs google-crc32c's C extension; it has the "
+                             f"{google_crc32c.implementation!r} one")
+
+
+def _chunks_concurrently(path, blob, chunk_bytes, workers):
+    """One XML multipart upload of ``path`` to ``blob``, in parts of
+    ``chunk_bytes`` sent by ``workers`` threads, each part checked with
+    CRC32C (patched in tests). The library cancels the multipart upload if a
+    part fails."""
+    from google.cloud.storage import transfer_manager
+    transfer_manager.upload_chunks_concurrently(
+        str(path), blob, chunk_size=chunk_bytes, worker_type=transfer_manager.THREAD,
+        max_workers=workers, checksum="crc32c")
+
+
+def _xml_api(bucket):
+    """(the bucket's XML API URL, an authorized session)."""
+    from google.cloud.storage.blob import _get_host_name
+    client = bucket.client
+    return f"{_get_host_name(client._connection)}/{bucket.name}", client._http
+
+
+def _list_multipart_uploads(bucket, prefix):
+    """[(object name, upload id), ...] of the incomplete XML multipart
+    uploads under ``prefix`` (GET ?uploads; patched in tests)."""
+    url, http = _xml_api(bucket)
+    out, params = [], {"uploads": "", "prefix": prefix}
+    while True:
+        r = http.get(url, params=params)
+        if r.status_code != 200:
+            raise SSOUploadError(f"listing the multipart uploads under {prefix} failed: HTTP {r.status_code} "
+                                 f"{r.text[:300]}")
+        root = ET.fromstring(r.content)
+
+        def text(e, tag):
+            x = e.find(f"{{*}}{tag}")
+            return x.text if x is not None else None
+
+        out += [(text(e, "Key"), text(e, "UploadId")) for e in root if e.tag.endswith("}Upload")]
+        if text(root, "IsTruncated") != "true":
+            return out
+        params = {**params, "key-marker": text(root, "NextKeyMarker"),
+                  "upload-id-marker": text(root, "NextUploadIdMarker")}
+
+
+def _abort_multipart_upload(bucket, name, upload_id):
+    """Abort one incomplete XML multipart upload (patched in tests)."""
+    from urllib.parse import quote
+    url, http = _xml_api(bucket)
+    r = http.delete(f"{url}/{quote(name, safe='/')}", params={"uploadId": upload_id})
+    if r.status_code not in (200, 204, 404):
+        raise SSOUploadError(f"aborting multipart upload {upload_id} of {name} failed: HTTP {r.status_code} "
+                             f"{r.text[:300]}")
+
+
+def _abort_multipart(bucket, bucket_name, name):
+    """Abort every incomplete multipart upload of object ``name``; never
+    raises."""
+    try:
+        ups = [u for k, u in _list_multipart_uploads(bucket, name) if k == name]
+    except Exception:
+        _LOG.exception("failed to list the multipart uploads of gs://%s/%s during cleanup; check for "
+                       "incomplete ones by hand", bucket_name, name)
+        return
+    for u in ups:
+        try:
+            _abort_multipart_upload(bucket, name, u)
+            _LOG.warning("aborted multipart upload %s of gs://%s/%s during cleanup", u, bucket_name, name)
+        except Exception:
+            _LOG.exception("failed to abort multipart upload %s of gs://%s/%s during cleanup; "
+                           "abort it by hand", u, bucket_name, name)
+
+
+class _Background:
+    """``fn(*args)`` in a daemon thread (an interrupt doesn't wait for it)."""
+
+    def __init__(self, fn, *args):
+        self._result = self._exc = None
+        self._t = threading.Thread(target=self._run, args=(fn, args), daemon=True)
+        self._t.start()
+
+    def _run(self, fn, args):
+        try:
+            self._result = fn(*args)
+        except BaseException as e:
+            self._exc = e
+
+    def result(self):
+        self._t.join()
+        if self._exc is not None:
+            raise self._exc
+        return self._result
+
+
+def _upload_chunked(bucket, bucket_name, name, path, size, chunk_bytes, workers):
+    """Upload ``path`` (``size`` bytes) to ``name`` in parallel chunks.
+
+    GCS takes no preconditions on multipart uploads, so the object is
+    checked not to exist first (the prefix is fresh). The local CRC32C is
+    computed while the upload runs; the object's CRC32C and size must equal
+    the local file's. On any failure or interrupt after the check, aborts
+    the object's incomplete multipart uploads, deletes the object if it was
+    written, and raises (SSOUploadError for an Exception)."""
+    uri = f"gs://{bucket_name}/{name}"
+    parts = -(-size // chunk_bytes)
+    if parts > MPU_MAX_PARTS:
+        raise SSOUploadError(f"{path}: {parts} parts of {chunk_bytes} bytes; "
+                             f"GCS takes at most {MPU_MAX_PARTS}")
+    blob = bucket.blob(name)
+    try:
+        exists = blob.exists()
+    except Exception as e:
+        raise SSOUploadError(f"can't check whether {uri} exists: {e!r}") from e
+    if exists:
+        raise SSOUploadError(f"{uri} already exists; a naming collision for this upload prefix")
+
+    _LOG.info("uploading %s to %s in %d chunks of %d MiB, %d threads (no MD5: checked by CRC32C)",
+              path, uri, parts, chunk_bytes >> 20, workers)
+    local = _Background(crc32c_file, path)
+    try:
+        try:
+            _chunks_concurrently(path, blob, chunk_bytes, workers)
+        except Exception as e:
+            raise SSOUploadError(f"failed to upload {path} to {uri} in chunks: {e!r}") from e
+        try:
+            blob.reload()
+        except Exception as e:
+            raise SSOUploadError(f"can't read back {uri} after uploading it: {e!r}") from e
+        try:
+            want = local.result()
+        except Exception as e:
+            raise SSOUploadError(f"can't compute the CRC32C of {path}: {e!r}") from e
+        if blob.crc32c != want or blob.size != size:
+            raise SSOUploadError(f"{uri} has CRC32C {blob.crc32c} and {blob.size} bytes; {path} has "
+                                 f"{want} and {size}: the upload is corrupt")
+        _LOG.info("%s: CRC32C %s, %d bytes, equal to %s's", uri, want, size, path)
+    except BaseException:
+        _abort_multipart(bucket, bucket_name, name)
+        try:
+            gone = not blob.exists()
+        except Exception:
+            gone = False        # try the delete anyway
+        if not gone:
+            _cleanup(bucket, bucket_name, [name])
+        raise
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
 def run(config, run_dir, tables=None, dry_run=False, force=False, allow_partial=False,
-        include_unsupported=False, no_publish=False, out=None):
-    """The whole of stage 3. Returns the upload record."""
+        include_unsupported=False, no_publish=False, out=None, parallel=None,
+        chunk_mib=PARALLEL_CHUNK_MIB, workers=PARALLEL_WORKERS):
+    """The whole of stage 3. Returns the upload record. ``parallel``: True or
+    False, or None for the config's ``parallel`` (default False)."""
     out = out or sys.stdout
     if dry_run and no_publish:
         raise SSOUploadError("--no-publish uploads and --dry-run doesn't: give one or the other")
     cfg_path, cfg = load_config(config)
+    if parallel is None:
+        parallel = cfg.get("parallel", False)
+    par = parallel_options(chunk_mib, workers) if parallel else None
     tables = select_tables(cfg, cfg_path, tables, allow_partial, include_unsupported)
 
     run_dir = resolve_run_dir(run_dir)
@@ -735,12 +984,18 @@ def run(config, run_dir, tables=None, dry_run=False, force=False, allow_partial=
     }
     if ssobs is not None:
         record["ssobservation"] = ssobs
+    chunked = [t for t in upload_map if is_chunked(upload_map[t], par)]
+    if par is not None:
+        # which objects go in chunks (they get a CRC32C but no MD5)
+        record["parallel"] = {**par, "min_bytes": PARALLEL_MIN_BYTES, "tables": chunked}
     topic_path = f"projects/{cfg['project']}/topics/{cfg['topic']}"
     if dry_run:
         record["object_prefix"] = generate_prefix()
         print(f"dry run: config {cfg_path}; nothing is uploaded or published", file=out)
         for t, uri in planned_objects(cfg["bucket_name"], record["object_prefix"], upload_map).items():
-            print(f"  {upload_map[t]} -> {uri}  (if_generation_match=0)", file=out)
+            how = (f"in chunks of {par['chunk_bytes'] >> 20} MiB, {par['workers']} threads; checked not "
+                   "to exist, CRC32C verified" if t in chunked else "if_generation_match=0")
+            print(f"  {upload_map[t]} -> {uri}  ({how})", file=out)
         print(f"  publish to {topic_path}:", file=out)
         print(f"    {message_body(cfg['bucket_name'], record['object_prefix'], upload_map).decode()}",
               file=out)
@@ -753,7 +1008,7 @@ def run(config, run_dir, tables=None, dry_run=False, force=False, allow_partial=
             record_upload(run_dir, report, record)
 
         record["object_prefix"], record["message_id"] = upload(
-            cfg, upload_map, publish=not no_publish, on_unconfirmed=unconfirmed)
+            cfg, upload_map, publish=not no_publish, on_unconfirmed=unconfirmed, parallel=par)
         where = f"gs://{cfg['bucket_name']}/{record['object_prefix']}"
         if no_publish:
             print(f"uploaded {len(upload_map)} tables to {where}/ and published NOTHING (--no-publish); "
@@ -804,12 +1059,23 @@ def main(argv=None):
                              f"({', '.join(UNSUPPORTED_TABLES) or 'none today'})")
     parser.add_argument("--force", action="store_true",
                         help="upload even though report.json records an earlier upload")
+    parser.add_argument("--parallel", action=argparse.BooleanOptionalAction, default=None,
+                        help=f"upload files of at least {PARALLEL_MIN_BYTES >> 30} GiB in parallel chunks "
+                             "(GCS multipart; the objects get a CRC32C, verified, but no MD5); default: the "
+                             "config's 'parallel', else off. An experiment: "
+                             "docs/design/sso-upload-parallel.md")
+    parser.add_argument("--chunk-mib", type=float, default=PARALLEL_CHUNK_MIB, metavar="MIB",
+                        help=f"--parallel chunk size in MiB (default {PARALLEL_CHUNK_MIB})")
+    parser.add_argument("--parallel-workers", type=int, default=PARALLEL_WORKERS, metavar="N",
+                        help=f"--parallel upload threads, at most {PARALLEL_MAX_WORKERS} "
+                             f"(default {PARALLEL_WORKERS})")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         run(args.config, args.run_dir, tables=args.tables, dry_run=args.dry_run, force=args.force,
             allow_partial=args.allow_partial, include_unsupported=args.include_unsupported,
-            no_publish=args.no_publish)
+            no_publish=args.no_publish, parallel=args.parallel, chunk_mib=args.chunk_mib,
+            workers=args.parallel_workers)
     except SSOUploadError as e:
         _LOG.error("%s", e)
         return 1
