@@ -81,7 +81,7 @@
   - The planned objects and the message.
   - The combined file's rows (8,078,546), bytes, md5, row groups and build time.
   - A full read-back against the parts: every row equal, in order.
-- **A full upload without the message, compared with the stack's** (owner, 2026-11-12), on a hard-linked copy of the run at `/sdf/data/rubin/user/mjuric/sso-upload-int/run`, so ssp-daily's run directory is untouched:
+- **A full upload without the message, compared with the stack's** (owner, 2026-11-12), on a hard-linked copy of the run at `/sdf/data/rubin/repo/dp2_prep/u/mjuric/sso-upload-int/run` (the same filesystem as ssp-daily's runs; `report.json` copied, the delivery hard-linked and only read), so ssp-daily's run directory is untouched:
   1. **Ours:** `ssp-upload-sso int RUN --no-publish` uploads to the int bucket under prefix A, with the int service-account key.
   2. **The stack's:** on the latest daily stack (`d_2026_11_11` today), with dax_ppdb's `tickets/DM-55375` set up over it:
      - `SSOUploader.from_directory` runs on a directory holding the same six files (hard links to the delivery and to our combined SSObservation), with `allow_partial_upload: false`;
