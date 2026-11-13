@@ -168,8 +168,10 @@ PUBLISH_TIMEOUT_S = 120
 
 #: With --parallel, files at least this big are uploaded in parallel chunks.
 PARALLEL_MIN_BYTES = 1 << 30
-#: The default chunk size (MiB) and number of upload threads for --parallel.
-PARALLEL_CHUNK_MIB = 128
+#: The default chunk size (MiB) and number of upload threads for --parallel:
+#: the fastest setting measured, at about 1.2 GB peak memory
+#: (docs/design/sso-upload-parallel.md, Results).
+PARALLEL_CHUNK_MIB = 64
 PARALLEL_WORKERS = 16
 #: At most this many upload threads (the shared nodes' limits).
 PARALLEL_MAX_WORKERS = 16
