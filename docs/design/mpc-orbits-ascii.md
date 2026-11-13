@@ -65,3 +65,16 @@ The WP was merged into `mpc-orbits-ascii` through PR #110 (f10f41c), after the i
 - It passes on the rebuilt delivery and fails on the original, naming `mpc_orb_jsonb` with 3,206 values.
 - It costs about 20 s (19–36 s across runs), nearly all of it reading and decompressing `mpc_orb_jsonb`'s ~11 GB of text; all the other tables together add about 1 s.
 - Restricting it to `mpc_orbits` would save nothing, so it covers every string column of every delivered table. That's slightly over the design's 30 s guide when the cache is cold; the integrator accepted it, since the build itself takes over an hour.
+
+**The checks made optional** (owner, 2026-11-13; merged through PR #116, 6acc801):
+- `--text-checks`, off by default, turns on the `mpc` step's JSON validation and the `ascii` delivery check. When off, neither runs and `ascii` is absent from the check reports.
+- Measured on the 2026-10-12 inputs, on a loaded node (load 44–57):
+
+| | off (default) | `--text-checks` |
+|---|---|---|
+| `mpc` step, mpc_orbits, 32 workers | 133.6, 141.8 s; 5.8 GB | 188.0, 140.0 s; 7.6 GB |
+| delivery check, whole run | 19.1 s (40.1 s in a load spike) | 61.8, 51.9 s |
+| output | md5 `6ea8fcfafb0e4019f63c7165e62e170e` | identical |
+
+- On the original 2026-10-12 delivery, the check passes with the option off, and with it on fails `ascii` on `mpc_orb_jsonb`.
+- Full suite, merged with master 642b846: 1408 passed.
