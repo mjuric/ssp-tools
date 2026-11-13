@@ -102,6 +102,21 @@ def test_ssobservation_options_passed_to_build(stubs, tmp_path):
         D.main([str(w), "--reuse-inputs", str(inputs), "--stamp", "d", "--part-rows", "0"])
 
 
+def test_text_checks_passed_to_build(stubs, tmp_path):
+    """--text-checks goes to ssp-build-sso; without it (the default),
+    nothing is added."""
+    inputs = tmp_path / "in"
+    inputs.mkdir()
+    w = tmp_path / "w"
+    assert D.main([str(w), "--reuse-inputs", str(inputs), "--stamp", "a", "--text-checks",
+                   "--part-rows", "5"]) == 0
+    assert D.main([str(w), "--reuse-inputs", str(inputs), "--stamp", "b"]) == 0
+    assert stubs() == [f"ssp-build-sso {inputs} {w}/a/run --part-rows 5 --text-checks",
+                       f"ssp-build-sso {inputs} {w}/b/run"]
+    assert D.plan(w / "c", text_checks=True)[-1] == (
+        "build", [D.BUILD, str(w / "c" / "inputs"), str(w / "c" / "run"), "--text-checks"])
+
+
 def test_reuse_inputs(stubs, tmp_path):
     inputs = tmp_path / "old" / "inputs"
     inputs.mkdir(parents=True)

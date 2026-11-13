@@ -2,7 +2,7 @@
 
     ssp-sso-daily WORK_DIR [--upload CONFIG] [--dry-run] [--reuse-inputs DIR]
                   [--stamp STAMP] [--correction-table DIR] [--part-rows N]
-                  [--internal-columns A,B,...]
+                  [--internal-columns A,B,...] [--text-checks]
 
 runs, in a fresh dated directory DAY = WORK_DIR/<stamp> (default: today's
 UTC date, YYYY-MM-DD):
@@ -10,14 +10,16 @@ UTC date, YYYY-MM-DD):
     ssp-extract-sso-inputs DAY/inputs --correction-table CT
                                              (skipped with --reuse-inputs DIR)
     ssp-build-sso DAY/inputs DAY/run [--part-rows N]
-                  [--internal-columns A,B,...]
+                  [--internal-columns A,B,...] [--text-checks]
                                              (or DIR in place of DAY/inputs)
     ssp-upload-sso CONFIG DAY/run [--dry-run]   (only with --upload)
 
 --part-rows and --internal-columns go to ssp-build-sso as given (and so
 to the SSObservation builder); without them, its defaults
 (ssp.ssobservation_contract PART_ROWS_DEFAULT and
-SSOBSERVATION_INTERNAL_DEFAULT) apply.
+SSOBSERVATION_INTERNAL_DEFAULT) apply. --text-checks goes to ssp-build-sso
+(the mpc step's JSON validation and the ascii delivery check; off by
+default).
 
 CT, the shutter-timing correction table, defaults to
 DEFAULT_CORRECTION_TABLE. It is read as it is: ssp-daily keeps it up to
@@ -81,10 +83,11 @@ def utc_stamp():
 
 
 def plan(day, upload=None, dry_run=False, reuse_inputs=None, correction_table=DEFAULT_CORRECTION_TABLE,
-         part_rows=None, internal_columns=None):
+         part_rows=None, internal_columns=None, text_checks=False):
     """The commands to run, as [(stage, argv)]. ``part_rows`` and
     ``internal_columns`` (a comma-separated string; '' for none) go to
-    ssp-build-sso when given (not None)."""
+    ssp-build-sso when given (not None), and ``--text-checks`` when
+    ``text_checks``."""
     inputs = Path(reuse_inputs) if reuse_inputs else day / "inputs"
     run_dir = day / "run"
     cmds = []
@@ -95,6 +98,8 @@ def plan(day, upload=None, dry_run=False, reuse_inputs=None, correction_table=DE
         build += ["--part-rows", str(part_rows)]
     if internal_columns is not None:
         build += ["--internal-columns", internal_columns]
+    if text_checks:
+        build += ["--text-checks"]
     cmds.append(("build", build))
     if upload:
         cmds.append(("upload", [UPLOAD, str(upload), str(run_dir)] + (["--dry-run"] if dry_run else [])))
@@ -109,7 +114,8 @@ def _log(day, msg):
 
 
 def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None,
-        correction_table=DEFAULT_CORRECTION_TABLE, part_rows=None, internal_columns=None):
+        correction_table=DEFAULT_CORRECTION_TABLE, part_rows=None, internal_columns=None,
+        text_checks=False):
     """Run the stages. Returns the exit status (0, or the first failure's)."""
     if part_rows is not None and int(part_rows) < 1:
         raise SystemExit(f"ssp-sso-daily: --part-rows {part_rows}: must be at least 1")
@@ -126,7 +132,8 @@ def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None,
     day.mkdir(parents=True, exist_ok=True)
 
     _log(day, f"ssp-sso-daily in {day}" + (f", reusing inputs {reuse_inputs}" if reuse_inputs else ""))
-    stages = plan(day, upload, dry_run, reuse_inputs, correction_table, part_rows, internal_columns)
+    stages = plan(day, upload, dry_run, reuse_inputs, correction_table, part_rows, internal_columns,
+                  text_checks)
     for stage, argv in stages:
         argv = [resolve_command(argv[0])] + argv[1:]
         _log(day, f"{stage}: {shlex.join(argv)}")
@@ -173,11 +180,15 @@ def main(argv=None):
                         help="passed to ssp-build-sso: the SSObservation columns written to the sidecar "
                              "(not uploaded) instead of the delivered table; '' for none (default: "
                              f"{','.join(SSOBSERVATION_INTERNAL_DEFAULT)})")
+    parser.add_argument("--text-checks", action="store_true",
+                        help="passed to ssp-build-sso: also validate the MPC JSON columns in the mpc step "
+                             "and check that every delivered string is ASCII (default: off)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     return run(args.work_dir, upload=args.upload, dry_run=args.dry_run,
                reuse_inputs=args.reuse_inputs, stamp=args.stamp, correction_table=args.correction_table,
-               part_rows=args.part_rows, internal_columns=args.internal_columns)
+               part_rows=args.part_rows, internal_columns=args.internal_columns,
+               text_checks=args.text_checks)
 
 
 if __name__ == "__main__":

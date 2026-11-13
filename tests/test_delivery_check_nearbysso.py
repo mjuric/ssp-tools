@@ -61,6 +61,10 @@ def test_check_delivery_runs_it(tmp_path):
     names = [r.name for r in rs]
     assert names[:6] == ["file", "columns", "types", "nulls", "char lengths", "primary key"]
     assert names[6:] == CHECKS and all(r.ok for r in rs)
+    rs = D.check_delivery(tmp_path, tables=["NearbySSO"], text_checks=True)["NearbySSO"]
+    names = [r.name for r in rs]
+    assert names[:7] == ["file", "columns", "types", "nulls", "char lengths", "primary key", "ascii"]
+    assert names[7:] == CHECKS and all(r.ok for r in rs)
 
 
 def test_check_delivery_reports_a_crash_as_fail(tmp_path, monkeypatch):

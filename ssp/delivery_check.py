@@ -11,7 +11,12 @@ builders. Per table it checks
   * the primary key (ppdb.yaml's ``primaryKey``): unique, NULL counting
     as a value, and non-NULL in its ``nullable: false`` columns (NearbySSO's
     key has a nullable diaSourceId, NULL on its unmatched rows);
-  * char lengths: string values no longer than the column's ``length``.
+  * char lengths: string values no longer than the column's ``length``;
+  * ASCII, only with ``text_checks`` (``--text-checks``; off by default,
+    as it reads every string, about 20-40 s for mpc_orbits.mpc_orb_jsonb):
+    every value of every string column ASCII (Felis char/text is VOTable
+    char; docs/design/mpc-orbits-ascii.md). Off, the check is absent from
+    the results.
 
 SSObservation is delivered as parts plus a manifest and a sidecar
 (ssp.ssobservation_contract, "The partitioned delivery"):
@@ -27,7 +32,8 @@ corrected times").
 Columns are read one at a time (per part), to bound memory; everything is
 Arrow.
 
-    python -m ssp.delivery_check DELIVERY_DIR [--tables T ...] [--schema-dir D]
+    python -m ssp.delivery_check DELIVERY_DIR [--tables T ...]
+                                 [--schema-dir D] [--text-checks]
 
 Exit status 0 only if every result is ok.
 """
@@ -163,14 +169,59 @@ def _max_length(col):
     return m, None
 
 
+#: Rows per batch read by the ASCII check.
+ASCII_BATCH_ROWS = 32_768
+
+
+def _non_ascii_snippet(s, width=24):
+    """``s`` around its first non-ASCII character, for a detail, with the
+    non-ASCII characters written as Python escapes (so the report is ASCII)."""
+    k = next(i for i, ch in enumerate(s) if not ch.isascii())
+    out = (("..." if k > width else "") + s[max(0, k - width):k + width]
+           + ("..." if k + width < len(s) else ""))
+    return out.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _check_ascii(pf, arrow):
+    """CheckResult "ascii": every value of every string (string,
+    large_string, dictionary<string>) column of ParquetFile ``pf`` is ASCII
+    (Felis char/text is VOTable char: docs/design/mpc-orbits-ascii.md). Read
+    in batches, to bound memory; for a dictionary column only the values of
+    a batch whose dictionary has a non-ASCII entry are looked at."""
+    cols = [f.name for f in arrow if _is_string(f.type)]
+    if not cols:
+        return CheckResult("ascii", True, "no string columns")
+    counts = dict.fromkeys(cols, 0)
+    examples = {c: [] for c in cols}
+    for batch in pf.iter_batches(batch_size=ASCII_BATCH_ROWS, columns=cols, use_threads=True):
+        for c, arr in zip(cols, batch.columns):
+            if pa.types.is_dictionary(arr.type):
+                if pc.all(pc.string_is_ascii(arr.dictionary)).as_py() is not False:
+                    continue
+                arr = arr.dictionary_decode()
+            bad = pc.fill_null(pc.invert(pc.string_is_ascii(arr)), False)
+            idx = pc.indices_nonzero(bad)
+            if not len(idx):
+                continue
+            counts[c] += len(idx)
+            if len(examples[c]) < N_EXAMPLES:
+                examples[c] += [_non_ascii_snippet(s) for s in
+                                arr.take(idx.slice(0, N_EXAMPLES - len(examples[c]))).to_pylist()]
+    bad = [f"{c} ({counts[c]:,} values with non-ASCII characters; e.g. {' | '.join(examples[c])})"
+           for c in cols if counts[c]]
+    return CheckResult("ascii", not bad, "; ".join(bad) if bad
+                       else f"{len(cols)} string columns ASCII")
+
+
 def _fmt_names(names, n=8):
     s = ", ".join(names[:n])
     return s + (f", ... ({len(names)} in all)" if len(names) > n else "")
 
 
-def check_table(table, parquet_path, schema_dir=SCHEMA_DIR):
+def check_table(table, parquet_path, schema_dir=SCHEMA_DIR, text_checks=False):
     """Check one delivered table's Parquet file against the schema; a list
-    of CheckResult (name, ok, detail)."""
+    of CheckResult (name, ok, detail). ``text_checks``: also the ASCII
+    check (_check_ascii), absent otherwise."""
     schema_dir = str(schema_dir)
     cols = _schema(schema_dir)[table]
     spec = {c["name"]: c for c in cols}
@@ -249,6 +300,8 @@ def check_table(table, parquet_path, schema_dir=SCHEMA_DIR):
     keys = primary_keys(schema_dir).get(table, [])
     res.append(_check_key(pf, keys, got, nrows,
                           nullable=[k for k in keys if spec.get(k, {}).get("nullable", True) is not False]))
+    if text_checks:
+        res.append(_check_ascii(pf, arrow))
     return res
 
 
@@ -1160,11 +1213,12 @@ def ssobservation_part_files(delivery_dir):
         return sorted(d.glob(PART_GLOB))
 
 
-def check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES):
+def check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES, text_checks=False):
     """{Table: [CheckResult, ...]}: each table's DELIVERY_DIR/<Table>.parquet,
     except SSObservation, checked through its manifest
     (check_ssobservation_parts) with check_table on every part (results
-    named '<check> [<part file>]'); a missing file is a FAIL."""
+    named '<check> [<part file>]'); a missing file is a FAIL.
+    ``text_checks``: check_table's ASCII check too."""
     out = {}
     for table in tables:
         if table == "SSObservation":
@@ -1177,7 +1231,7 @@ def check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES):
                 res.append(CheckResult("parts", False, f"{Path(delivery_dir)}: no {PART_GLOB}"))
             for f in files:
                 try:
-                    rs = check_table(table, f, schema_dir)
+                    rs = check_table(table, f, schema_dir, text_checks)
                 except Exception as e:
                     rs = [CheckResult("file", False, f"{f}: cannot check ({type(e).__name__}: {e})")]
                 for r in rs:
@@ -1188,7 +1242,7 @@ def check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES):
         if not path.exists():
             out[table] = [CheckResult("file", False, f"{path}: missing")]
         else:
-            out[table] = check_table(table, path, schema_dir)
+            out[table] = check_table(table, path, schema_dir, text_checks)
             if table == "NearbySSO" and out[table][0].ok:
                 try:
                     out[table].extend(check_nearbysso(delivery_dir))
@@ -1221,6 +1275,9 @@ def main(argv=None):
                     help=f"tables to check (default: all of {', '.join(DELIVERY_TABLES)})")
     ap.add_argument("--schema-dir", default=str(SCHEMA_DIR),
                     help="directory with ppdb.yaml and sso_base.yaml (default: the vendored copy)")
+    ap.add_argument("--text-checks", action="store_true",
+                    help="also check that every string value is ASCII (reads every string column: "
+                         "about 20-40 s more, nearly all for mpc_orbits.mpc_orb_jsonb; default: off)")
     args = ap.parse_args(argv)
     unknown = [t for t in args.tables if t not in DELIVERY_TABLES]
     if unknown:
@@ -1229,7 +1286,7 @@ def main(argv=None):
     results, timings = {}, {}
     for table in args.tables:
         t0 = time.perf_counter()
-        results.update(check_delivery(args.delivery_dir, args.schema_dir, [table]))
+        results.update(check_delivery(args.delivery_dir, args.schema_dir, [table], args.text_checks))
         timings[table] = time.perf_counter() - t0
     print(f"delivery check: {args.delivery_dir} (schema: {args.schema_dir})")
     print(format_report(results, timings))

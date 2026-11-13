@@ -49,8 +49,8 @@ def write(tmp_path, table, t):
     return p
 
 
-def results(table, path, schema_dir=SCHEMA_DIR):
-    return {r.name: r for r in D.check_table(table, path, schema_dir)}
+def results(table, path, schema_dir=SCHEMA_DIR, text_checks=False):
+    return {r.name: r for r in D.check_table(table, path, schema_dir, text_checks=text_checks)}
 
 
 def failed(rs):
@@ -65,11 +65,13 @@ def replace(t, name, arr):
 # passing cases
 # --------------------------------------------------------------------------
 
+@pytest.mark.parametrize("text_checks", [False, True])
 @pytest.mark.parametrize("table", DELIVERY_TABLES)
-def test_pass(tmp_path, table):
-    rs = results(table, write(tmp_path, table, make_table(table)))
+def test_pass(tmp_path, table, text_checks):
+    rs = results(table, write(tmp_path, table, make_table(table)), text_checks=text_checks)
     assert failed(rs) == [], rs
-    assert set(rs) == {"file", "columns", "types", "nulls", "char lengths", "primary key"}
+    assert set(rs) == {"file", "columns", "types", "nulls", "char lengths", "primary key"} | (
+        {"ascii"} if text_checks else set())
 
 
 @pytest.mark.parametrize("table", ["SSObservation", "mpc_orbits"])
@@ -102,6 +104,7 @@ def test_check_delivery_all_pass(tmp_path):
     assert list(out) == list(DELIVERY_TABLES)
     assert all(r.ok for rs in out.values() for r in rs)
     assert D.main([str(tmp_path)]) == 0
+    assert D.main([str(tmp_path), "--text-checks"]) == 0
 
 
 # --------------------------------------------------------------------------
@@ -284,6 +287,111 @@ def test_unused_dictionary_entry_is_not_a_value(tmp_path):
     arr = pa.DictionaryArray.from_arrays(pa.array([0, 1, 0, 1, 0, 1], pa.int32()), dictionary)
     t = replace(t, "status", arr)
     assert failed(results("SSObservation", write(tmp_path, "SSObservation", t))) == []
+
+
+# --------------------------------------------------------------------------
+# ASCII (docs/design/mpc-orbits-ascii.md)
+# --------------------------------------------------------------------------
+
+def _string_columns(table):
+    return [c["name"] for c in delivery_schema()[table] if c["datatype"] in D.STRING_TYPES]
+
+
+def _with_non_ascii(t, name, rows=(2,), kind="string"):
+    """``t`` with the first character of column ``name``'s values at
+    ``rows`` replaced by an e-acute (same length, so char lengths still
+    pass)."""
+    vals = t[name].to_pylist()
+    for i in rows:
+        vals[i] = "é" + vals[i][1:]
+    arr = pa.array(vals, pa.large_string() if kind == "large_string" else pa.string())
+    return replace(t, name, arr.dictionary_encode() if kind == "dictionary" else arr)
+
+
+@pytest.mark.parametrize("kind", ["string", "large_string", "dictionary"])
+@pytest.mark.parametrize("table", DELIVERY_TABLES)
+def test_non_ascii_fails(tmp_path, table, kind):
+    """With text_checks, a non-ASCII value in any string column of any
+    delivered table fails the check, naming the column, the number of
+    values and examples; without (the default), there is no ascii check
+    and it passes."""
+    for name in _string_columns(table):
+        t = _with_non_ascii(make_table(table), name, rows=(1, 3), kind=kind)
+        p = write(tmp_path, table, t)
+        rs = results(table, p)
+        assert failed(rs) == [] and "ascii" not in rs, (name, rs)
+        rs = results(table, p, text_checks=True)
+        assert failed(rs) == ["ascii"], (name, rs)
+        d = rs["ascii"].detail
+        assert d.startswith(f"{name} (2 values with non-ASCII characters; e.g. ")
+        assert "\\xe9" in d and d.isascii()
+
+
+def test_non_ascii_every_column_reported(tmp_path):
+    t = make_table("mpc_orbits")
+    names = _string_columns("mpc_orbits")
+    assert "mpc_orb_jsonb" in names and len(names) > 1
+    for name in names:
+        t = _with_non_ascii(t, name)
+    rs = results("mpc_orbits", write(tmp_path, "mpc_orbits", t), text_checks=True)
+    assert failed(rs) == ["ascii"]
+    for name in names:
+        assert f"{name} (1 values with non-ASCII" in rs["ascii"].detail
+
+
+def test_non_ascii_examples(tmp_path, monkeypatch):
+    """At most N_EXAMPLES examples, around the first non-ASCII character
+    (beyond the BMP too), across batches; NULLs pass."""
+    t = make_table("mpc_orbits", n=10)
+    vals = ['{"a": %d, "pad": "%s", "name": "X\U0001d504Y"}' % (i, "p" * 40) for i in range(10)]
+    vals[0] = vals[5] = None
+    t = replace(t, "mpc_orb_jsonb", pa.array(vals))
+    pf = pq.ParquetFile(write(tmp_path, "mpc_orbits", t))
+    monkeypatch.setattr(D, "ASCII_BATCH_ROWS", 3)
+    r = D._check_ascii(pf, pf.schema_arrow)
+    assert not r.ok
+    assert r.detail.startswith("mpc_orb_jsonb (8 values with non-ASCII characters")
+    assert r.detail.count("\\U0001d504") == D.N_EXAMPLES
+    assert '"name": "X\\U0001d504Y"' in r.detail and "..." in r.detail
+
+
+def test_escaped_json_is_ascii(tmp_path):
+    """JSON escapes (\\u00e9) are ASCII: they pass."""
+    t = make_table("mpc_orbits")
+    t = replace(t, "mpc_orb_jsonb", pa.array(['{"name": "Jos\\u00e9 \\ud834\\udd1e"}'] * N))
+    rs = results("mpc_orbits", write(tmp_path, "mpc_orbits", t), text_checks=True)
+    assert failed(rs) == []
+    assert rs["ascii"].detail == f"{len(_string_columns('mpc_orbits'))} string columns ASCII"
+
+
+def test_unused_non_ascii_dictionary_entry_passes(tmp_path):
+    t = make_table("SSObservation")
+    dictionary = pa.array(["X", "Y", "é"])
+    arr = pa.DictionaryArray.from_arrays(pa.array([0, 1, 0, 1, 0, 1], pa.int32()), dictionary)
+    t = replace(t, "status", arr)
+    assert failed(results("SSObservation", write(tmp_path, "SSObservation", t), text_checks=True)) == []
+
+
+def test_non_ascii_in_ssobservation_part_fails_delivery(tmp_path):
+    """check_delivery runs the ASCII check on every SSObservation part."""
+    write_delivery(tmp_path)
+    p = tmp_path / PART_FILE_FORMAT.format(3)
+    t = pq.read_table(p)
+    name = next(n for n in _string_columns("SSObservation")       # (obsid is also the sidecar's)
+                if n != "obsid" and t[n].null_count < len(t))
+    vals = t[name].to_pylist()
+    k = next(i for i, v in enumerate(vals) if v)
+    vals[k] = "é" + vals[k][1:]
+    pq.write_table(replace(t, name, pa.array(vals, t[name].type)), p)
+    refresh(tmp_path)
+    rs = D.check_delivery(tmp_path, tables=["SSObservation"])["SSObservation"]
+    assert all(r.ok for r in rs) and not any(r.name.startswith("ascii") for r in rs)   # (off)
+    rs = D.check_delivery(tmp_path, tables=["SSObservation"], text_checks=True)["SSObservation"]
+    bad = [r for r in rs if not r.ok]
+    assert [r.name for r in bad] == [f"ascii [{PART_FILE_FORMAT.format(3)}]"], bad
+    assert bad[0].detail.startswith(f"{name} (1 values with non-ASCII")
+    assert D.main([str(tmp_path), "--tables", "SSObservation"]) == 0
+    assert D.main([str(tmp_path), "--tables", "SSObservation", "--text-checks"]) == 1
 
 
 # --------------------------------------------------------------------------
