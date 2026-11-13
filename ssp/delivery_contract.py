@@ -139,7 +139,8 @@ REPORT_FIELDS = {
     "deliverable": "true only if every step and check passed; stage 3 refuses otherwise",
     "upload": "set by stage 3: {config, bucket, object_prefix, tables, message_id, dry_run, published, "
               "utc, ssobservation}; ssobservation is the combined file uploaded as SSObservation.parquet: "
-              "{file, rows, bytes, md5, manifest_md5} (UPLOAD_SSOBSERVATION_*)",
+              "{file, rows, bytes, md5, manifest_md5} (UPLOAD_SSOBSERVATION_*); error, when the "
+              "publish wasn't confirmed (published null: the objects are kept)",
 }
 
 # --------------------------------------------------------------------------
