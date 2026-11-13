@@ -305,6 +305,103 @@ def test_shape_bad_json(tmp_path, workers, bad, match):
     assert not dst.exists() and not os.path.exists(f"{dst}.tmp")
 
 
+# ---------------------------------------------------------------------------
+# Step mpc: mpc_orbits.mpc_orb_jsonb escaped to ASCII
+# (docs/design/mpc-orbits-ascii.md)
+# ---------------------------------------------------------------------------
+
+#: An en dash, curly quotes and apostrophe, accented letters, and a
+#: character beyond the BMP (U+1D504), in strings, keys and next to escapes;
+#: with number literals json.dumps would rewrite.
+NON_ASCII_JSON = ('{"designation_data": {"citation": "Named for a composer (1937–2003), '
+                  '“the dean” of the city’s school. Émile Juhász Jasevičius '
+                  'Müller \U0001d504 \\"q\\" \\u00e9", "náme": "Šöé"}, '
+                  '"a": 0.000000000397875827896837, "b": 1E5, "c": 2.50}')
+
+
+def _escaped(s):
+    """The reference: each non-ASCII character replaced by json.dumps's
+    escape of it, nothing else."""
+    return "".join(c if c.isascii() else json.dumps(c)[1:-1] for c in s)
+
+
+@pytest.mark.parametrize("type_", [pa.string(), pa.large_string()])
+def test_escape_json_non_ascii(type_):
+    ascii_vals = ['{"i": 1, "x": 1.50e-3}', '{"name": "Jos\\u00e9"}', '{}']
+    vals = [ascii_vals[0], NON_ASCII_JSON, None, ascii_vals[1], "{\"k\": \"–\"}", ascii_vals[2], None]
+    arr = pa.array(vals, type_)
+    out, n = B.escape_json_non_ascii(arr)
+    assert n == 2 and out.type == type_ and len(out) == len(vals)
+    got = out.to_pylist()
+    assert [i for i, v in enumerate(got) if v is None] == [2, 6]
+    for v, w in zip(vals, got):
+        if v is None:
+            continue
+        assert w.isascii()
+        assert w == _escaped(v)                       # exactly json.dumps's escapes
+        assert json.loads(w) == json.loads(v)
+        if v.isascii():
+            assert w == v                             # byte-identical
+    w = got[1]
+    assert "\\u2013" in w and "\\u201c" in w and "\\ud835\\udd04" in w and "n\\u00e1me" in w
+    assert "0.000000000397875827896837" in w and "1E5" in w and "2.50" in w   # literals kept
+
+
+def test_escape_json_non_ascii_all_ascii_is_a_no_op():
+    arr = pa.array(['{"a": 1}', None, '{"b": "\\u2013"}'])
+    out, n = B.escape_json_non_ascii(arr)
+    assert n == 0 and out is arr
+    out, n = B.escape_json_non_ascii(pa.array([], pa.string()))
+    assert n == 0 and len(out) == 0
+    out, n = B.escape_json_non_ascii(pa.array([None, None], pa.string()))
+    assert n == 0 and out.null_count == 2
+
+
+@pytest.mark.parametrize("workers", [1, 3])
+def test_shape_mpc_orbits_escapes_non_ascii(tmp_path, workers):
+    """The mpc step escapes mpc_orbits.mpc_orb_jsonb: the non-ASCII rows
+    come out ASCII and json.loads-equal; every other value, and every other
+    column, as before; the count logged."""
+    t = mpc_input("mpc_orbits", n=40)
+    vals = t["mpc_orb_jsonb"].to_pylist()
+    vals[3] = NON_ASCII_JSON
+    vals[17] = '{"name": "é"}'
+    vals[20] = None
+    vals[39] = '{"n": "\U0001f600"}'
+    t = t.set_column(t.schema.get_field_index("mpc_orb_jsonb"), "mpc_orb_jsonb", pa.array(vals))
+    pq.write_table(t, tmp_path / "in.parquet")
+    dst = tmp_path / "mpc_orbits.parquet"
+    logged = []
+    assert B.shape_mpc_table("mpc_orbits", tmp_path / "in.parquet", dst, SCHEMA, workers=workers,
+                             batch_rows=16, log=logged.append) == 40
+    out = pq.read_table(dst)
+    assert out.schema == B.arrow_schema(SCHEMA["mpc_orbits"])
+    assert pq.ParquetFile(dst).num_row_groups == 3        # (one per batch)
+    got = out["mpc_orb_jsonb"].to_pylist()
+    for i, (v, w) in enumerate(zip(vals, got)):
+        if i in (3, 17, 39):
+            assert w.isascii() and w == _escaped(v) and json.loads(w) == json.loads(v), i
+        else:
+            assert w == v, i
+    assert got[39] == '{"n": "\\ud83d\\ude00"}'
+    for c in out.column_names:
+        if c != "mpc_orb_jsonb":
+            src = B.MPC_DERIVED.get(("mpc_orbits", c), c)
+            assert out[c].equals(t[src].cast(out.schema.field(c).type)), c
+    assert "mpc_orbits.mpc_orb_jsonb: escaped the non-ASCII characters of 3 values" in logged
+
+
+def test_shape_other_tables_not_escaped(tmp_path):
+    """Only mpc_orbits.mpc_orb_jsonb is escaped: nothing is logged for the
+    other tables (the delivery check catches non-ASCII elsewhere)."""
+    assert B.MPC_ASCII_ESCAPED == (("mpc_orbits", "mpc_orb_jsonb"),)
+    for table in ("current_identifications", "numbered_identifications"):
+        pq.write_table(mpc_input(table, n=5), tmp_path / "in.parquet")
+        logged = []
+        B.shape_mpc_table(table, tmp_path / "in.parquet", tmp_path / "out.parquet", SCHEMA, log=logged.append)
+        assert not any("escaped" in m for m in logged)
+
+
 def test_shape_missing_column(tmp_path):
     t = mpc_input("mpc_orbits").drop_columns(["unpacked_primary_provisional_designation", "h"])
     pq.write_table(t, tmp_path / "in.parquet")
