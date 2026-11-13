@@ -11,7 +11,13 @@ This builds and delivers the six PPDB Solar System tables (RFC-1188), in three s
 
 The tables: SSObservation, SSObject, NearbySSO, `mpc_orbits`, `current_identifications` and `numbered_identifications`, per `sdm_schemas` `ppdb.yaml`/`sso_base.yaml` (tickets/DM-55375, lsst/sdm_schemas#549; copies in `tests/data/sdm_schemas/`).
 
-Every delivered string is ASCII, as Felis `char`/`text` (VOTable `char`) requires (`docs/design/mpc-orbits-ascii.md`). The build's `mpc` step escapes the non-ASCII characters of `mpc_orbits.mpc_orb_jsonb` (the MPC's naming citations) as JSON `\uXXXX` escapes, editing the text, not re-serialising it, and logs how many values it escaped (`logs/mpc.log`; about 3,200 a day). The delivery check (`ascii`) fails any table, or SSObservation part, with a non-ASCII value in any string column, naming the column, the count and examples.
+Every delivered string is ASCII, as Felis `char`/`text` (VOTable `char`) requires (`docs/design/mpc-orbits-ascii.md`). The build's `mpc` step escapes the non-ASCII characters of `mpc_orbits.mpc_orb_jsonb` (the MPC's naming citations) as JSON `\uXXXX` escapes, editing the text, not re-serialising it, and logs how many values it escaped (`logs/mpc.log`; about 3,200 a day). The escape always runs.
+
+**`--text-checks`** (`ssp-build-sso`, `ssp-sso-daily`, `python -m ssp.delivery_check`; **off by default**) turns on two checks of the text:
+- the `mpc` step's JSON validation: `json.loads` of every value of the `*_json`/`*_jsonb` columns, which must be JSON objects;
+- the delivery check `ascii`, which fails any table, or SSObservation part, with a non-ASCII value in any string column, naming the column, the count and examples.
+
+Off, neither runs, and `ascii` is absent from the check reports. The run's `report.json` records the setting as `text_checks` in `steps.mpc` and `steps.check`. A `--from` rerun uses what it's given. Both checks read every JSON text of `mpc_orbits` (about 11 GB uncompressed), so they cost time. On the 2026-10-12 data, on a busy node, the `mpc` step took up to about 55 s longer with the option (noisy), and the delivery check about 20–40 s longer (nearly all of it on `mpc_orbits`).
 
 Design: `docs/design/sso-delivery.md` (the stages), `docs/design/sssource-widened.md` (SSObservation, SSObject), `docs/design/nearbysso.md` (NearbySSO) and `docs/design/nongrav.md` (non-gravitational forces, and comets in NearbySSO). The contract between the stages is `ssp/delivery_contract.py`.
 
@@ -53,7 +59,7 @@ The run happens in `WORK_DIR/<UTC date>/`. `--stamp NAME` uses a different name,
 | `inputs/` | stage 1: `obs_sbn`, `mpc_orbits`, `current_identifications`, `numbered_identifications` (raw MPC, one snapshot), `dia_sources`, `ppdb_dia_sources` and `manifest.json` |
 | `run/delivery/` | stage 2: `<Table>.parquet` for five of the six tables; SSObservation as parts, a manifest and a sidecar (below); NearbySSO's sidecar `NearbySSO_internal.parquet` (below) |
 | `run/upload/` | stage 3: `SSObservation.parquet`, the parts combined into the one file that is uploaded, and its record `SSObservation.json` (below) |
-| `run/report.json` | the steps (status, time, peak memory of the largest process, commit; for `ssobservation` also `part_rows` and `internal_columns`), the tables (rows, md5; for NearbySSO also its sidecar and the sidecar's md5 and bytes; for SSObservation the manifest and its md5, the parts, the sidecar and the total rows and bytes), the checks, `deliverable`, and the uploads |
+| `run/report.json` | the steps (status, time, peak memory of the largest process, commit; for `ssobservation` also `part_rows` and `internal_columns`; for `mpc` and `check`, `text_checks`), the tables (rows, md5; for NearbySSO also its sidecar and the sidecar's md5 and bytes; for SSObservation the manifest and its md5, the parts, the sidecar and the total rows and bytes), the checks, `deliverable`, and the uploads |
 | `run/checks/`, `run/logs/` | the check reports and each step's log |
 | `daily.log` | the commands run, their durations and exit codes |
 
@@ -61,6 +67,7 @@ The run happens in `WORK_DIR/<UTC date>/`. `--stamp NAME` uses a different name,
 
 - `--reuse-inputs DIR` skips the extract and builds from DIR.
 - `--part-rows N` and `--internal-columns A,B,...` go to `ssp-build-sso` (below). Without them, its defaults apply.
+- `--text-checks` goes to `ssp-build-sso`: the JSON and ASCII checks, off by default (above).
 
 ## The partitioned SSObservation
 
@@ -98,7 +105,7 @@ The extract refuses a table it can't use (`CorrectionError`): one that is missin
 ```bash
 ssp-extract-sso-inputs INPUTS_DIR              # --force to replace, --only/--skip STEP (with --force), --reuse NAME=PATH
 ssp-build-sso INPUTS_DIR RUN_DIR --workers 32  # --from STEP to resume
-python -m ssp.delivery_check RUN_DIR/delivery  # the schema check alone
+python -m ssp.delivery_check RUN_DIR/delivery  # the schema check alone (--text-checks: and ASCII)
 ssp-upload-sso dev RUN_DIR --dry-run           # builds run/upload/SSObservation.parquet; prints the planned objects and the Pub/Sub message
 ssp-upload-sso int RUN_DIR --no-publish        # uploads the objects, publishes nothing (tests; delete the objects by hand)
 ssp-build-ssobject RUN_DIR/delivery RUN_DIR/delivery/mpc_orbits.parquet -o ssobject.parquet  # SSObject alone

@@ -5,7 +5,7 @@ See docs/design/sso-delivery.md ("Stage 2, build") and the contract,
 ssp/delivery_contract.py. Files in, files out: no database access.
 
     ssp-build-sso INPUTS_DIR RUN_DIR [--from STEP] [--workers N]
-                  [--part-rows N] [--internal-columns A,B,...]
+                  [--part-rows N] [--internal-columns A,B,...] [--text-checks]
 
 1. Validate ``INPUTS_DIR/manifest.json``: every input file present, with
    the manifest's row count and md5, and the required columns.
@@ -13,7 +13,8 @@ ssp/delivery_contract.py. Files in, files out: no database access.
    ``RUN_DIR/logs/<step>.log`` and its wall time and peak RSS in the
    report:
 
-   - ``mpc``: shape the three MPC tables to delivery_schema();
+   - ``mpc``: shape the three MPC tables to delivery_schema(), escaping
+     mpc_orbits.mpc_orb_jsonb to ASCII (docs/design/mpc-orbits-ascii.md);
    - ``ssobservation``, ``ssobject``, ``nearbysso``: the existing builders,
      reading the shaped MPC tables (as delivered) and the other inputs
      as given;
@@ -27,8 +28,11 @@ ssp/delivery_contract.py. Files in, files out: no database access.
    columns, ``SSObservation_internal.parquet`` (not uploaded; see
    ssp.ssobservation_contract, "The partitioned delivery"). ``--part-rows``
    and ``--internal-columns`` go to the ssobservation builder, and are
-   recorded in the report's ``steps.ssobservation``. The builders' other
-   outputs stay in ``RUN_DIR/work/``.
+   recorded in the report's ``steps.ssobservation``. ``--text-checks``
+   (off by default) turns on the ``mpc`` step's JSON validation of the
+   ``*_json``/``*_jsonb`` columns and the delivery check's ``ascii``; it is
+   recorded as ``text_checks`` in the report's ``steps.mpc`` and
+   ``steps.check``. The builders' other outputs stay in ``RUN_DIR/work/``.
 3. ``RUN_DIR/report.json`` (REPORT_FIELDS), rewritten after every step, so
    a failed run shows how far it got. ``deliverable`` is true only if every
    step and check passed.
@@ -628,12 +632,14 @@ def shape_batch(table, batch, columns):
     return pa.RecordBatch.from_arrays(arrays, schema=arrow_schema(columns))
 
 
-def shape_mpc_table(table, src, dst, schema=None, workers=1, batch_rows=MPC_BATCH_ROWS, log=_log):
+def shape_mpc_table(table, src, dst, schema=None, workers=1, batch_rows=MPC_BATCH_ROWS, log=_log,
+                    text_checks=False):
     """Shape MPC input ``src`` to delivered ``table`` at ``dst``
     (zstd Parquet): exactly delivery_schema()'s columns, in order, cast to
     their types (cast_column), with the MPC_DERIVED columns added and the
-    input's other columns dropped; JSON columns must hold JSON objects;
-    the MPC_ASCII_ESCAPED columns have their non-ASCII characters escaped
+    input's other columns dropped; with ``text_checks``, JSON columns must
+    hold JSON objects (_check_json, in ``workers`` processes); the
+    MPC_ASCII_ESCAPED columns have their non-ASCII characters escaped
     (escape_json_non_ascii). The rows keep the input's order. Written to a
     temporary file first, so a failure leaves no ``dst``. Returns the row
     count."""
@@ -648,7 +654,7 @@ def shape_mpc_table(table, src, dst, schema=None, workers=1, batch_rows=MPC_BATC
     dropped = [c for c in present if c not in need]
     log(f"{table}: {pf.metadata.num_rows:,} rows; {len(columns)} delivered columns; "
         f"dropped input columns {dropped}")
-    json_cols = [i for i, c in enumerate(columns) if is_json_column(c)]
+    json_cols = [i for i, c in enumerate(columns) if is_json_column(c)] if text_checks else []
     escaped_cols = [i for i, c in enumerate(columns) if (table, c["name"]) in MPC_ASCII_ESCAPED]
     n_escaped = dict.fromkeys(escaped_cols, 0)
 
@@ -710,13 +716,13 @@ class _Done:
         return self.value
 
 
-def step_mpc(inputs_dir, run_dir, workers=1):
+def step_mpc(inputs_dir, run_dir, workers=1, text_checks=False):
     manifest = read_manifest(inputs_dir)
     schema = delivery_schema()
     out = Path(run_dir) / DELIVERY_DIR
     for table in MPC_TABLES:
         shape_mpc_table(table, input_path(inputs_dir, manifest, table), out / f"{table}.parquet", schema,
-                        workers=workers)
+                        workers=workers, text_checks=text_checks)
 
 
 # --------------------------------------------------------------------------
@@ -727,7 +733,7 @@ def have_ssobservation_validate():
     return (REPO_ROOT / "bench" / "ssobservation_validate.py").is_file()
 
 
-def step_check(run_dir, log=_log):
+def step_check(run_dir, log=_log, text_checks=False):
     """The delivery check of every delivered table, and SSObservation's content
     checks; writes ``RUN_DIR/checks/<check>.txt`` and ``results.json``
     ({check: {status, report}}). Returns True if every check passed. The
@@ -765,7 +771,7 @@ def step_check(run_dir, log=_log):
             record(f"ssobservation:{name}", False, rep)
 
     # The delivery check (ssp.delivery_check, WP H)
-    per_table = check_delivery(delivery)
+    per_table = check_delivery(delivery, text_checks=text_checks)
     for table in DELIVERY_TABLES:
         res = per_table.get(table)
         rep = checks / f"delivery-{table}.txt"
@@ -827,7 +833,8 @@ def step_command(step, inputs_dir, run_dir, manifest, workers, options=None):
     moved to the delivered file; or (SSObservation) the builder's output
     directory, whose parts, sidecar and manifest move into the delivered
     directory (move_ssobservation). ``options``: the ssobservation step's
-    ``part_rows`` and ``internal_columns`` (default: the contract's)."""
+    ``part_rows`` and ``internal_columns`` (default: the contract's), and
+    ``text_checks`` (the mpc and check steps'; default off)."""
     options = options or {}
     inputs_dir, run_dir = Path(inputs_dir).resolve(), Path(run_dir).resolve()
     work = run_dir / WORK_DIR / step
@@ -835,7 +842,7 @@ def step_command(step, inputs_dir, run_dir, manifest, workers, options=None):
     me = [*_entry_point("ssp.sso_build"), str(inputs_dir), str(run_dir), "--workers", str(workers),
           "--run-step"]
     if step in ("mpc", "check"):
-        return me + [step], {}
+        return me + [step] + (["--text-checks"] if options.get("text_checks") else []), {}
     if step == "ssobservation":
         d = _ssobservation_input_dir(inputs_dir, run_dir, manifest)
         out = work / "out"
@@ -992,7 +999,7 @@ def real_uploads(report):
 
 
 def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, allow_mixed_commits=False,
-          part_rows=None, internal_columns=None, log=_log):
+          part_rows=None, internal_columns=None, text_checks=False, log=_log):
     """Run stage 2 (see the module docstring); return the report. A failed
     step or invalid inputs do not raise: see the report's ``deliverable``
     (and, for the inputs, ``error``).
@@ -1008,6 +1015,9 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
     options; None: the contract's defaults, PART_ROWS_DEFAULT and
     SSOBSERVATION_INTERNAL_DEFAULT) are invalid, or are given with a
     ``from_step`` that keeps an ssobservation step built with others.
+    ``text_checks`` (the mpc and check steps': JSON validation and the
+    ascii check) is recorded in their report entries; a ``from_step`` rerun
+    uses what it is given.
     """
     inputs_dir, run_dir = Path(inputs_dir), Path(run_dir)
     if from_step is not None and from_step not in BUILD_STEPS:
@@ -1017,6 +1027,8 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
         raise ValueError(f"--part-rows {part_rows!r}: must be a positive integer")
     options = dict(part_rows=PART_ROWS_DEFAULT if part_rows is None else part_rows,
                    internal_columns=parse_internal_columns(internal_columns))
+    step_options = {"ssobservation": options, "mpc": dict(text_checks=bool(text_checks)),
+                    "check": dict(text_checks=bool(text_checks))}
     report_path = run_dir / REPORT_FILE
     start = BUILD_STEPS.index(from_step) if from_step else 0
     previous = None
@@ -1080,8 +1092,7 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
         log_path = run_dir / LOGS_DIR / f"{step}.log"
         entry = dict(status="running", started_utc=_utcnow(), wall_s=None, max_rss_gb=None,
                      log=str(log_path.relative_to(run_dir)), ssp_tools_commit=commit)
-        if step == "ssobservation":
-            entry.update(options)
+        entry.update(step_options.get(step, {}))
         report["steps"][step] = entry
         save()
         (run_dir / WORK_DIR / step).mkdir(parents=True, exist_ok=True)
@@ -1091,7 +1102,8 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
             if step == "check":
                 error = _inputs_changed(inputs_dir, manifest, workers)
             if error is None:
-                cmd, moves = step_command(step, inputs_dir, run_dir, manifest, workers, options)
+                cmd, moves = step_command(step, inputs_dir, run_dir, manifest, workers,
+                                          dict(options, text_checks=bool(text_checks)))
                 code, wall, rss = run_logged(cmd, log_path)
                 entry.update(wall_s=round(wall, 1), max_rss_gb=None if rss is None else round(rss, 3))
                 if code != 0:
@@ -1259,6 +1271,10 @@ def main(argv=None):
                              f"({SIDECAR_FILE}, not uploaded) instead of the delivered table; '' for none "
                              f"(default: {','.join(SSOBSERVATION_INTERNAL_DEFAULT)}; possible: "
                              f"{', '.join(SSOBSERVATION_INTERNAL_DTYPE)})")
+    parser.add_argument("--text-checks", action="store_true",
+                        help="Also validate the MPC tables' JSON columns (json.loads of every value) in "
+                             "the mpc step, and check that every delivered string is ASCII in the check "
+                             "step (default: off; see docs/runbooks/sso-daily.md for the cost)")
     parser.add_argument("--run-step", choices=("mpc", "check"), default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.workers < 1:
@@ -1271,15 +1287,16 @@ def main(argv=None):
         parser.error(f"--internal-columns: {e}")
 
     if args.run_step == "mpc":
-        step_mpc(args.inputs_dir, args.run_dir, workers=args.workers)
+        step_mpc(args.inputs_dir, args.run_dir, workers=args.workers, text_checks=args.text_checks)
         return 0
     if args.run_step == "check":
-        return 0 if step_check(args.run_dir) else 1
+        return 0 if step_check(args.run_dir, text_checks=args.text_checks) else 1
 
     try:
         report = build(args.inputs_dir, args.run_dir, from_step=args.from_step, workers=args.workers,
                        force_rebuild=args.force_rebuild, allow_mixed_commits=args.allow_mixed_commits,
-                       part_rows=args.part_rows, internal_columns=args.internal_columns)
+                       part_rows=args.part_rows, internal_columns=args.internal_columns,
+                       text_checks=args.text_checks)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
