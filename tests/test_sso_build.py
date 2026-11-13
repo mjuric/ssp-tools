@@ -301,8 +301,30 @@ def test_shape_bad_json(tmp_path, workers, bad, match):
     dst = tmp_path / "out.parquet"
     with pytest.raises(B.ShapeError, match=f"mpc_orbits.mpc_orb_jsonb: row 37: {match}"):
         B.shape_mpc_table("mpc_orbits", tmp_path / "in.parquet", dst, SCHEMA, workers=workers,
-                          batch_rows=16, log=lambda *a: None)
+                          batch_rows=16, log=lambda *a: None, text_checks=True)
     assert not dst.exists() and not os.path.exists(f"{dst}.tmp")
+
+
+@pytest.mark.parametrize("workers", [1, 3])
+def test_shape_no_json_validation_by_default(tmp_path, workers, monkeypatch):
+    """Without text_checks (the default), the JSON columns are not
+    validated: an invalid value is written as it is, and no process pool is
+    made."""
+    t = mpc_input("mpc_orbits", n=50)
+    vals = t["mpc_orb_jsonb"].to_pylist()
+    vals[37] = '{"a": 1'
+    t = t.set_column(t.schema.get_field_index("mpc_orb_jsonb"), "mpc_orb_jsonb", pa.array(vals))
+    pq.write_table(t, tmp_path / "in.parquet")
+
+    def no_pool(*a, **k):
+        raise AssertionError("a process pool without text_checks")
+
+    monkeypatch.setattr(B, "ProcessPoolExecutor", no_pool)
+    monkeypatch.setattr(B, "_check_json", no_pool)
+    dst = tmp_path / "out.parquet"
+    assert B.shape_mpc_table("mpc_orbits", tmp_path / "in.parquet", dst, SCHEMA, workers=workers,
+                             batch_rows=16, log=lambda *a: None) == 50
+    assert pq.read_table(dst)["mpc_orb_jsonb"].to_pylist() == vals
 
 
 # ---------------------------------------------------------------------------
@@ -357,8 +379,9 @@ def test_escape_json_non_ascii_all_ascii_is_a_no_op():
     assert n == 0 and out.null_count == 2
 
 
+@pytest.mark.parametrize("text_checks", [False, True])
 @pytest.mark.parametrize("workers", [1, 3])
-def test_shape_mpc_orbits_escapes_non_ascii(tmp_path, workers):
+def test_shape_mpc_orbits_escapes_non_ascii(tmp_path, workers, text_checks):
     """The mpc step escapes mpc_orbits.mpc_orb_jsonb: the non-ASCII rows
     come out ASCII and json.loads-equal; every other value, and every other
     column, as before; the count logged."""
@@ -373,7 +396,7 @@ def test_shape_mpc_orbits_escapes_non_ascii(tmp_path, workers):
     dst = tmp_path / "mpc_orbits.parquet"
     logged = []
     assert B.shape_mpc_table("mpc_orbits", tmp_path / "in.parquet", dst, SCHEMA, workers=workers,
-                             batch_rows=16, log=logged.append) == 40
+                             batch_rows=16, log=logged.append, text_checks=text_checks) == 40
     out = pq.read_table(dst)
     assert out.schema == B.arrow_schema(SCHEMA["mpc_orbits"])
     assert pq.ParquetFile(dst).num_row_groups == 3        # (one per batch)
@@ -720,7 +743,7 @@ def test_check_delivery_results(tmp_path, monkeypatch):
     from collections import namedtuple
     R = namedtuple("CheckResult", "name ok detail")
 
-    def check_delivery(delivery_dir, schema_dir=None, tables=DELIVERY_TABLES):
+    def check_delivery(delivery_dir, schema_dir=None, tables=DELIVERY_TABLES, text_checks=False):
         return {t: [R("columns", True, "ok"), R("pk", t != "SSObject", "dup")] for t in tables}
 
     monkeypatch.setattr(B, "check_delivery", check_delivery)
@@ -974,7 +997,7 @@ def test_ssobservation_options_in_the_report(tmp_path, fake_steps):
     rep = B.build(tmp_path / "in", tmp_path / "run", part_rows=2, internal_columns="matchMethod", log=_quiet)
     assert rep["deliverable"] is True
     opts = fake_steps["options"][fake_steps["calls"].index("ssobservation")]
-    assert opts == dict(part_rows=2, internal_columns=["matchMethod"])
+    assert opts == dict(part_rows=2, internal_columns=["matchMethod"], text_checks=False)
     st = rep["steps"]["ssobservation"]
     assert st["status"] == "ok" and st["part_rows"] == 2 and st["internal_columns"] == ["matchMethod"]
     e = rep["tables"]["SSObservation"]
@@ -991,9 +1014,74 @@ def test_ssobservation_options_in_the_report(tmp_path, fake_steps):
                    "--internal-columns", ""]) == 0
     st = json.loads((tmp_path / "run2" / "report.json").read_text())["steps"]["ssobservation"]
     assert st["part_rows"] == 1 and st["internal_columns"] == []
-    assert fake_steps["options"][fake_steps["calls"].index("ssobservation")] == dict(part_rows=1,
-                                                                                     internal_columns=[])
+    assert fake_steps["options"][fake_steps["calls"].index("ssobservation")] == dict(
+        part_rows=1, internal_columns=[], text_checks=False)
     assert len(SP.part_paths(tmp_path / "run2" / "delivery")) == 3
+
+
+def test_text_checks_step_commands(tmp_path):
+    """--text-checks on the mpc and check steps' command lines (the real
+    step_command) only when text_checks is set; never on the builders'."""
+    m = write_inputs(tmp_path / "in")
+    for step in ("mpc", "check"):
+        argv, _ = B.step_command(step, tmp_path / "in", tmp_path / "run", m, 1)
+        assert argv[-2:] == ["--run-step", step]
+        argv, _ = B.step_command(step, tmp_path / "in", tmp_path / "run", m, 1, dict(text_checks=False))
+        assert argv[-2:] == ["--run-step", step]
+        argv, _ = B.step_command(step, tmp_path / "in", tmp_path / "run", m, 1, dict(text_checks=True))
+        assert argv[-3:] == ["--run-step", step, "--text-checks"]
+    argv, _ = B.step_command("ssobservation", tmp_path / "in", tmp_path / "run", m, 1,
+                             dict(part_rows=5, internal_columns=[], text_checks=True))
+    assert "--text-checks" not in argv
+
+
+def test_step_check_passes_text_checks(tmp_path, monkeypatch):
+    from collections import namedtuple
+    R = namedtuple("CheckResult", "name ok detail")
+    given = []
+
+    def check_delivery(delivery_dir, **kw):
+        given.append(kw)
+        return {t: [R("x", True, "ok")] for t in DELIVERY_TABLES}
+
+    monkeypatch.setattr(B, "check_delivery", check_delivery)
+    monkeypatch.setattr(B, "have_ssobservation_validate", lambda: False)
+    (tmp_path / "delivery").mkdir()
+    B.step_check(tmp_path, log=_quiet)
+    B.step_check(tmp_path, log=_quiet, text_checks=True)
+    assert given == [dict(text_checks=False), dict(text_checks=True)]
+
+
+def test_text_checks_reach_the_mpc_subprocess(tmp_path, fake_steps):
+    """build(text_checks=) runs the real mpc step with it, as a subprocess:
+    off (the default), an invalid JSON value passes; on, it fails the step.
+    Recorded as text_checks in steps.mpc and steps.check; a --from rerun
+    uses what it is given."""
+    t = mpc_input("mpc_orbits", n=4)
+    vals = t["mpc_orb_jsonb"].to_pylist()
+    vals[2] = '{"a": 1'
+    t = t.set_column(t.schema.get_field_index("mpc_orb_jsonb"), "mpc_orb_jsonb", pa.array(vals))
+    write_inputs(tmp_path / "in", mpc_orbits=t)
+
+    rep = B.build(tmp_path / "in", tmp_path / "run", log=_quiet)
+    assert rep["deliverable"] is True
+    assert rep["steps"]["mpc"]["text_checks"] is False and rep["steps"]["check"]["text_checks"] is False
+    assert "text_checks" not in rep["steps"]["ssobservation"]
+    assert fake_steps["options"][fake_steps["calls"].index("check")]["text_checks"] is False
+
+    rep = B.build(tmp_path / "in", tmp_path / "run", from_step="check", text_checks=True, log=_quiet)
+    assert rep["steps"]["mpc"]["text_checks"] is False        # (kept)
+    assert rep["steps"]["check"]["text_checks"] is True
+    assert fake_steps["options"][-1]["text_checks"] is True
+
+    rep = B.build(tmp_path / "in", tmp_path / "run2", text_checks=True, log=_quiet)
+    assert rep["steps"]["mpc"]["status"] == "failed" and rep["steps"]["mpc"]["text_checks"] is True
+    log = (tmp_path / "run2" / rep["steps"]["mpc"]["log"]).read_text()
+    assert "--text-checks" in log and "mpc_orbits.mpc_orb_jsonb: row 2: invalid JSON" in log
+
+    assert B.main([str(tmp_path / "in"), str(tmp_path / "run3"), "--text-checks"]) == 1
+    st = json.loads((tmp_path / "run3" / "report.json").read_text())["steps"]["mpc"]
+    assert st["status"] == "failed" and st["text_checks"] is True
 
 
 @pytest.mark.parametrize("args, match", [
