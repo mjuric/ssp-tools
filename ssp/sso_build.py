@@ -81,6 +81,7 @@ from .ssobservation_contract import (
     SSOBSERVATION_INTERNAL_DTYPE,
     SSOBSERVATION_MANIFEST_FILE,
 )
+from .sso_upload import counts_as_upload
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -923,9 +924,12 @@ UPLOAD_FIELDS = ("upload", "uploads")
 
 
 def real_uploads(report):
-    """The upload records of ``report`` that are not dry runs."""
+    """The upload records of ``report`` that count as uploads
+    (ssp.sso_upload.counts_as_upload): not dry runs, and not --no-publish
+    runs (published false; nothing was loaded). An unconfirmed publish
+    (published null) and records from before ``published`` existed count."""
     recs = [report.get("upload")] + list(report.get("uploads") or [])
-    return [r for r in recs if isinstance(r, dict) and r.get("dry_run") is not True]
+    return [r for r in recs if counts_as_upload(r)]
 
 
 def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, allow_mixed_commits=False,
@@ -935,7 +939,8 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
     (and, for the inputs, ``error``).
 
     Raises ValueError, changing nothing, if RUN_DIR was uploaded (a real
-    upload in its report) and not ``force_rebuild`` (which keeps the upload
+    upload in its report: real_uploads; dry runs and --no-publish runs
+    don't count) and not ``force_rebuild`` (which keeps the upload
     history); or if ``from_step`` cannot rerun this RUN_DIR: no earlier
     report, other inputs, an earlier step that failed, a kept table missing
     or changed since, or kept steps built by another commit (unless
