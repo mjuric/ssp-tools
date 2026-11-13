@@ -6,7 +6,7 @@ This builds and delivers the six PPDB Solar System tables (RFC-1188), in three s
 |---|---|---|
 | 1. extract | `ssp-extract-sso-inputs INPUTS_DIR --correction-table CT` | the MPC replica at USDF, ClickHouse, the correction table CT (read) |
 | 2. build | `ssp-build-sso INPUTS_DIR RUN_DIR` | files only |
-| 3. deliver | `ssp-upload-sso CONFIG RUN_DIR [--dry-run]` | GCS, Pub/Sub |
+| 3. deliver | `ssp-upload-sso CONFIG RUN_DIR [--dry-run \| --no-publish]` | GCS, Pub/Sub; writes `RUN_DIR/upload/` |
 | all of them | `ssp-sso-daily WORK_DIR [--upload CONFIG] [--dry-run]` | runs 1–3 in `WORK_DIR/<UTC date>/` (by hand; production runs on ssp-daily's schedule) |
 
 The tables: SSObservation, SSObject, NearbySSO, `mpc_orbits`, `current_identifications` and `numbered_identifications`, per `sdm_schemas` `ppdb.yaml`/`sso_base.yaml` (tickets/DM-55375, lsst/sdm_schemas#549; copies in `tests/data/sdm_schemas/`).
@@ -30,9 +30,9 @@ Design: `docs/design/sso-delivery.md` (the stages), `docs/design/sssource-widene
   - The step fetches visit ranges of about 1M rows as async jobs, one at a time, and deletes every job. A job that hangs for 5 min is aborted and retried once. If it fails again, the step fails and names the job URLs: add them to DM-56627 (concurrent jobs hang on data-int) or report them to the PPDB TAP operators, rather than retrying in a loop.
   - A chunk whose rows differ from the visit count taken at the start fails the step ("the PPDB changed during the extract; rerun"): rerun with `--force --only ppdb_dia_sources`.
   - The manifest's `files.ppdb_dia_sources.ppdb_tap` records the service, the visits (count, first, last), the chunks, and the jobs retried.
-- **Uploads:** Google application-default credentials for the `sso-uploader` service account, which has object-user access on the bucket and publish access on the topic (`lsst/idf_deploy` `services/sso-uploader.tf`). **Not yet issued to SSP**; ask the DM-55678 owners.
+- **Uploads:** Google application-default credentials for the `sso-uploader` service account, which has object-user access on the bucket and publish access on the topic (`lsst/idf_deploy` `services/sso-uploader.tf`). For int, that is `sso-uploader@ppdb-int-6c62`: point `GOOGLE_APPLICATION_CREDENTIALS` at its key. Never print the key or copy it into the repository.
 - **Machine:** about 30 GB of RAM (the extract peaks at 28 GB), and 32 or more cores for the build.
-  - Disk: about 5.5 GB for the inputs and about 5.5 GB for the delivery, per day.
+  - Disk: about 5.5 GB for the inputs and about 5.5 GB for the delivery, per day, and about 3.3 GB more for the combined SSObservation an upload (or a dry run) writes to `run/upload/`.
   - `fast-export`'s temporary CSVs (about 15 GB) go inside `INPUTS_DIR/.partial`, not `/tmp`.
 
 ## The daily run
@@ -50,6 +50,7 @@ The run happens in `WORK_DIR/<UTC date>/`. `--stamp NAME` uses a different name,
 |---|---|
 | `inputs/` | stage 1: `obs_sbn`, `mpc_orbits`, `current_identifications`, `numbered_identifications` (raw MPC, one snapshot), `dia_sources`, `ppdb_dia_sources` and `manifest.json` |
 | `run/delivery/` | stage 2: `<Table>.parquet` for five of the six tables; SSObservation as parts, a manifest and a sidecar (below); NearbySSO's sidecar `NearbySSO_internal.parquet` (below) |
+| `run/upload/` | stage 3: `SSObservation.parquet`, the parts combined into the one file that is uploaded, and its record `SSObservation.json` (below) |
 | `run/report.json` | the steps (status, time, peak memory of the largest process, commit; for `ssobservation` also `part_rows` and `internal_columns`), the tables (rows, md5; for NearbySSO also its sidecar and the sidecar's md5 and bytes; for SSObservation the manifest and its md5, the parts, the sidecar and the total rows and bytes), the checks, `deliverable`, and the uploads |
 | `run/checks/`, `run/logs/` | the check reports and each step's log |
 | `daily.log` | the commands run, their durations and exit codes |
@@ -71,7 +72,7 @@ run/delivery/SSObservation.manifest.json      the parts: rows, ssObjectId range,
 run/delivery/SSObservation_internal.parquet   the sidecar: obsid + the internal columns (NOT uploaded)
 ```
 
-- **Parts.** Rows are in (`ssObjectId`, `midpointMjdTai`, `obsid`) order across the parts taken in order. A part holds whole objects: it closes at the first object boundary at or after `--part-rows` rows (default 2,000,000), so its `ssObjectId` range is disjoint from the others'. The rows the MPC hasn't linked to an object (NULL `ssObjectId`) come last, in their own part(s). Every part has exactly the Felis schema of SSObservation. BigQuery loads them with `uris = ['gs://.../SSObservation.part*.parquet']`.
+- **Parts.** Rows are in (`ssObjectId`, `midpointMjdTai`, `obsid`) order across the parts taken in order. A part holds whole objects: it closes at the first object boundary at or after `--part-rows` rows (default 2,000,000), so its `ssObjectId` range is disjoint from the others'. The rows the MPC hasn't linked to an object (NULL `ssObjectId`) come last, in their own part(s). Every part has exactly the Felis schema of SSObservation. For the upload, `ssp-upload-sso` combines them into one file ("The combined SSObservation", below).
 - **The manifest** is written last; the delivery check (`ssp.delivery_check`) checks every part, and the sidecar, against it.
 - **The sidecar** holds the internal columns: computed by the build, kept for our own use, but not in the Felis schema or the delivered table. One row per SSObservation row, in the same order, keyed by `obsid`. It stays in `run/delivery/` but is **never uploaded**. The default internal columns are `matchMethod` and `midpointMjdTai_flag_degraded`.
 - **Options** (`ssp-build-sso` and `ssp-sso-daily`, passed to the builder and recorded in `report.json`'s `steps.ssobservation`):
@@ -96,7 +97,8 @@ The extract refuses a table it can't use (`CorrectionError`): one that is missin
 ssp-extract-sso-inputs INPUTS_DIR              # --force to replace, --only/--skip STEP (with --force), --reuse NAME=PATH
 ssp-build-sso INPUTS_DIR RUN_DIR --workers 32  # --from STEP to resume
 python -m ssp.delivery_check RUN_DIR/delivery  # the schema check alone
-ssp-upload-sso dev RUN_DIR --dry-run           # prints the planned objects and the Pub/Sub message
+ssp-upload-sso dev RUN_DIR --dry-run           # builds run/upload/SSObservation.parquet; prints the planned objects and the Pub/Sub message
+ssp-upload-sso int RUN_DIR --no-publish        # uploads the objects, publishes nothing (tests; delete the objects by hand)
 ssp-build-ssobject RUN_DIR/delivery RUN_DIR/delivery/mpc_orbits.parquet -o ssobject.parquet  # SSObject alone
 ```
 
@@ -110,28 +112,34 @@ ssp-build-ssobject RUN_DIR/delivery RUN_DIR/delivery/mpc_orbits.parquet -o ssobj
   - It refuses to rebuild a run that has been uploaded, unless `--force-rebuild`.
 - **Stage 3 refuses** unless `report.json` is deliverable and every file matches its md5: for SSObservation, the manifest must have the md5 the report recorded (`manifest_md5`) and list the parts, rows and bytes the report recorded, and every part must have the manifest's size and md5.
   - It never overwrites an object, and removes its own uploads on any failure.
-  - It refuses a second real upload of a run unless `--force`, and a partial table set unless `--allow-partial`.
+  - It refuses a second real upload of a run unless `--force`, and a partial table set unless `--allow-partial`. A dry run or a `--no-publish` run doesn't count as an upload.
   - Inputs from another source (not ClickHouse or the MPC replica) can replace stage 1, provided they honour `ssp/delivery_contract.py`'s `INPUT_FILES` and `MANIFEST_FIELDS`.
 
 ## Upload configs and the DM-55678 loader
 
 - **Configs** are in `config/sso-upload/`; pass the name or the path.
   - **`dev`:** bucket `ppdb-dev-sso-ingest`, topic `load-sso-topic`, project `ppdb-dev-5c07`.
-  - **`int`, `prod`:** commented templates from `lsst/idf_deploy`. The int project `ppdb-int-6c62` and all the prod names need confirming.
-- **Layout:** `gs://<bucket>/<YYYYMMDDTHHMMSSmmm>/<Table>.parquet`; SSObservation as its parts, in order, then `SSObservation.manifest.json`, each under its own name (never the sidecar). Then a Pub/Sub message `{"bucket", "object_prefix", "uploaded_tables", "files"}`, `files` being `{Table: [object names relative to the prefix]}`. The rest is the contract of `lsst/dax_ppdb` `bigquery/sso_uploader.py`; the parts and `files` are new with the partitioned SSObservation and are with the PPDB loader owners for review.
+  - **`int`:** bucket `ppdb-int-sso-ingest`, topic `load-sso-topic`, project `ppdb-int-6c62`, all six tables.
+  - **`prod`:** a commented template from `lsst/idf_deploy`; all the prod names need confirming.
+  - Every config's complete set is all six tables.
+- **Layout:** one object per table, `gs://<bucket>/<YYYYMMDDTHHMMSSmmm>/<Table>.parquet`, uploaded in `dax_ppdb`'s `SSO_TABLES` order (SSObservation, NearbySSO, SSObject, `mpc_orbits`, `current_identifications`, `numbered_identifications`). No manifest, part or sidecar is uploaded. Then one Pub/Sub message, `{"bucket", "object_prefix", "uploaded_tables"}`, the tables in that order. This is exactly what `lsst/dax_ppdb` `bigquery/sso_uploader.py` (tickets/DM-55375) uploads and sends, and what the loader (`lsst-dm/ppdb-cloud-functions` `load_sso`) reads (`docs/design/sso-upload-int.md`).
+- **The combined SSObservation.** The loader wants one file per table, so after the parts' md5 checks, `ssp-upload-sso` combines them, in manifest order, into `run/upload/SSObservation.parquet`, which is uploaded as `SSObservation.parquet`.
+  - It has the parts' schema (parts with different schemas are refused), zstd, and one row group per row group of the parts, streamed one row group at a time (about 2.5 GB peak memory). It must have the manifest's rows.
+  - `run/upload/SSObservation.json` records its rows, bytes, md5 and the `manifest_md5` it was built from; the report's upload record has a copy (`ssobservation`).
+  - It is kept and reused while the record names the delivery's `manifest_md5` and the file has the recorded size and md5; otherwise it is rebuilt, and the log says why. A dry run builds (or reuses) it too.
+  - The delivery itself is only read, never changed.
+- **`--no-publish`** uploads the objects and stops before the message: no load starts. The objects are kept and the run prints their prefix and the message it would have sent; delete them by hand when done. The record has `"published": false`. For tests, such as comparing an upload with the stack's `SSOUploader`; not with `--dry-run`.
 - **NearbySSO's rows** (`docs/design/nearbysso-unmatched.md`): one per matched DiaSource (by `diaSourceId`), then one per eligible prediction that matched no DiaSource but lies on a detector or within 30″ of one, with NULL `diaSourceId`, `ephOffset` and `diaDistanceRank` (by `visit`, `designation`). Its sidecar `run/delivery/NearbySSO_internal.parquet` has, row for row, the pixel position (`eph_x`, `eph_y`), the edge distance and the time each row is evaluated at, with `midpointMjdTai_flag`; it is **never uploaded**. The step's own report (`run/work/nearbysso/nearbysso.report.json`) has the `placement` counts (unmatched rows, predictions dropped beyond the margin or in visits without a WCS, rows whose time is not corrected, by cause).
-- **NearbySSO is built and staged but not uploaded.** The loader (`lsst-dm/ppdb-cloud-functions` `load_sso`) fails the *whole* load when an unknown table is listed. NearbySSO joins the configs' `tables` once `dax_ppdb`'s `SSO_TABLES` and `load_sso` add it.
+- **NearbySSO is uploaded,** with the other five. The loader's DM-55375 tables, NearbySSO included, are live in int since 2026-10-13. `--include-unsupported` is kept as a hook for a table the loader doesn't accept yet (none today): the loader fails the *whole* load when an unknown table is listed.
 - **Upload at most once per load window.** `load_sso` starts Dataflow under a fixed job name, `load-sso`, so a message that arrives while a load is running is acknowledged and dropped. Check that the previous load has finished before `--force`.
 - **The PPDB dataset must match the schema.** The loader writes into BigQuery tables built from the deployed `ppdb.yaml`, so SSObservation and the new columns load only once DM-55375 (lsst/sdm_schemas#549) is merged and the dataset rebuilt.
 
 ## Open items with the DM-55678 owners
 
-1. The `sso-uploader` service account credentials for SSP.
-2. NearbySSO in `dax_ppdb` `SSO_TABLES` and `load_sso`.
-3. Rebuilding the PPDB dataset from DM-55375's `ppdb.yaml`.
-4. Confirming the int project id (`ppdb-int-6c62`) and the prod names.
-5. Whether naive (UTC wall-time) Parquet timestamps, which match the MPC's `timestamp without time zone`, load correctly into the PPDB's TIMESTAMP columns.
-6. The partitioned SSObservation: the manifest's format and the message's `files` field (review).
+1. Which table set the deployed `load_sso` runs with in int and dev: its main branch pins `dax_ppdb` `cloudrun-v3.0.0`, whose `SSO_TABLES` still names SSSource (`docs/design/sso-upload-int.md`).
+2. Rebuilding the PPDB dataset from DM-55375's `ppdb.yaml`.
+3. The prod names.
+4. Whether naive (UTC wall-time) Parquet timestamps, which match the MPC's `timestamp without time zone`, load correctly into the PPDB's TIMESTAMP columns.
 
 ## A reference run
 
