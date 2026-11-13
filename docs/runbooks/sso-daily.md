@@ -109,7 +109,7 @@ ssp-build-ssobject RUN_DIR/delivery RUN_DIR/delivery/mpc_orbits.parquet -o ssobj
 - **Stage 2 refuses inputs** whose manifest doesn't match the files (md5, rows, columns), where `dia_sources` wasn't built from this `obs_sbn`, or where the four MPC files aren't from one snapshot.
   - It re-hashes the inputs before checking.
   - `deliverable` is true only if every step and every expected check passed.
-  - It refuses to rebuild a run that has been uploaded, unless `--force-rebuild`.
+  - It refuses to rebuild a run that has been uploaded, unless `--force-rebuild`. A dry run or a `--no-publish` upload (nothing loaded) doesn't count; an upload whose publish wasn't confirmed does.
 - **Stage 3 refuses** unless `report.json` is deliverable and every file matches its md5: for SSObservation, the manifest must have the md5 the report recorded (`manifest_md5`) and list the parts, rows and bytes the report recorded, and every part must have the manifest's size and md5.
   - It never overwrites an object, and removes its own uploads on any failure.
   - It refuses a second real upload of a run unless `--force`, and a partial table set unless `--allow-partial`. A dry run or a `--no-publish` run doesn't count as an upload.
