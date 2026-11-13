@@ -312,6 +312,127 @@ def credentials(host, port, database, user=None):
 
 
 #
+# ClickHouse clients (docs/design/clickhouse-timeouts.md)
+#
+
+#: The server's limit on one query (``max_execution_time``), in seconds.
+QUERY_TIMEOUT_S = 3600
+#: The client waits this much longer than the server's limit, so that the
+#: server's own (clear) error always comes first.
+TIMEOUT_MARGIN_S = 120
+#: How often the server writes an X-ClickHouse-Progress header while a
+#: query runs: keeps a silent query observably alive.
+PROGRESS_INTERVAL_MS = 10_000
+
+PARQUET_MAGIC = b"PAR1"
+#: How much of a result's end is searched for a server error message.
+_ERROR_TAIL = 1 << 16
+
+
+class ClickHouseResultError(RuntimeError):
+    """A ClickHouse result that is not a complete Parquet file: an error
+    that arrived after the HTTP status (e.g. a timeout mid-query), or a
+    truncated body."""
+
+
+def clickhouse_client(host, port, database, user=None, max_execution_time=QUERY_TIMEOUT_S, *,
+                      margin_s=TIMEOUT_MARGIN_S, progress_interval_ms=PROGRESS_INTERVAL_MS):
+    """A read-only clickhouse_connect client for ``host``: the server stops a
+    query after ``max_execution_time`` s, the client gives up ``margin_s``
+    later, and the server sends a progress header every
+    ``progress_interval_ms`` while it works. ``readonly=1`` and
+    ``cancel_http_readonly_queries_on_client_close=1`` make the server end
+    a query whose client has gone (it checks on progress, and only for
+    read-only queries). Credentials via ``credentials`` (``database`` picks
+    the ~/.chpass line); ``host`` is kept out of the HTTP proxy.
+
+    Read Parquet results with ``query_parquet``/``stream_parquet``: with
+    progress headers the HTTP status is sent before the query ends, and an
+    error midway arrives in the body."""
+    import clickhouse_connect
+
+    user, password = credentials(host, port, database, user)
+    bypass_proxy(host)
+    client = clickhouse_connect.get_client(
+        host=host, port=port, database=database, username=user, password=password,
+        send_receive_timeout=max_execution_time + margin_s,
+        settings={
+            "readonly": 1,
+            "max_execution_time": max_execution_time,
+            "cancel_http_readonly_queries_on_client_close": 1,
+            "send_progress_in_http_headers": 1,
+            "http_headers_progress_interval_ms": progress_interval_ms,
+        },
+    )
+    # clickhouse_connect (>= 0.8) sends the progress parameters itself, with
+    # an interval from send_receive_timeout (here: its 120 s cap) that wins
+    # over the client settings above; set ours where it keeps them.
+    backend = getattr(client, "_backend", client)
+    if getattr(backend, "progress_interval", None):
+        backend.progress_interval = str(int(progress_interval_ms))
+    return client
+
+
+def _server_error(tail):
+    """The server's error message in ``tail`` (the end of a body), or None."""
+    import re
+
+    m = re.search(rb"__exception__\r?\n[^\r\n]*\r?\n(.*?)\n\d+ [^\r\n]*\r?\n__exception__", tail, re.S)
+    if m:
+        return m.group(1).decode(errors="replace").strip()
+    m = re.search(rb"Code: \d+\. DB::Exception.*", tail, re.S)
+    if m:
+        return m.group(0).decode(errors="replace").strip()
+    return None
+
+
+def check_parquet(head, tail, size, what="result"):
+    """Raise ClickHouseResultError unless ``head``/``tail`` (the first and
+    last bytes of a ``size``-byte body) frame a Parquet file: magic at both
+    ends and a footer that fits."""
+    if size >= 12 and head[:4] == PARQUET_MAGIC and tail[-4:] == PARQUET_MAGIC:
+        footer = int.from_bytes(tail[-8:-4], "little")
+        if 0 < footer <= size - 12:
+            return
+    err = _server_error(tail)
+    if err:
+        raise ClickHouseResultError(f"ClickHouse error in the {what}: {err}")
+    raise ClickHouseResultError(f"the ClickHouse {what} is not a complete Parquet file ({size} bytes)")
+
+
+def query_parquet(client, sql, **kw):
+    """``client.raw_query(sql + FORMAT Parquet)`` as a pyarrow Table; raises
+    ClickHouseResultError on an error that arrived in the body (see
+    clickhouse_client), never returns it as data."""
+    raw = client.raw_query(sql + "\nFORMAT Parquet", **kw)
+    check_parquet(raw[:4], raw[-_ERROR_TAIL:], len(raw))
+    try:
+        return pq.read_table(io.BytesIO(raw))
+    except pa.ArrowException as e:
+        raise ClickHouseResultError(f"the ClickHouse result is not a valid Parquet file: {e}") from None
+
+
+def stream_parquet(client, sql, path, **kw):
+    """Stream ``client.raw_stream(sql, fmt="Parquet")`` to ``path``, then check
+    it is a complete Parquet file (ClickHouseResultError if not; the file is
+    then left for inspection, and must not be used)."""
+    import shutil
+
+    with open(path, "wb") as f, client.raw_stream(sql, fmt="Parquet", **kw) as stream:
+        shutil.copyfileobj(stream, f, 1 << 24)
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        head = f.read(4)
+        f.seek(max(0, size - _ERROR_TAIL))
+        tail = f.read()
+    check_parquet(head, tail, size, what=f"stream ({path})")
+    try:
+        pq.read_metadata(path)
+    except pa.ArrowException as e:
+        raise ClickHouseResultError(f"the ClickHouse stream ({path}) is not valid Parquet: {e}") from None
+
+
+#
 # obs_sbn
 #
 
@@ -665,24 +786,15 @@ def position_queries(obs, rows, database, shift_s=0.0):
 def run_queries(tasks, host, port, database, user, workers):
     """Run ``(key, sql, params, ext sets)`` tasks on a pool of ``workers``
     threads, one client each; returns ``[(key, pyarrow.Table)]``."""
-    import clickhouse_connect
-
-    user, password = credentials(host, port, database, user)
-    bypass_proxy(host)
+    credentials(host, port, database, user)  # fail before starting the pool
     local = threading.local()
 
     def run(task):
         key, sql, params, sets = task
         if not hasattr(local, "client"):
-            local.client = clickhouse_connect.get_client(
-                host=host, port=port, database=database, username=user, password=password,
-                # A killed client must not leave its queries running.
-                settings={"max_execution_time": 3600, "cancel_http_readonly_queries_on_client_close": 1},
-            )
+            local.client = clickhouse_client(host, port, database, user)
         # Parquet, not Arrow: Arrow arrives as thousands of tiny batches.
-        raw = local.client.raw_query(sql + "\nFORMAT Parquet", parameters=params,
-                                     external_data=ext_data(**sets))
-        return key, pq.read_table(io.BytesIO(raw))
+        return key, query_parquet(local.client, sql, parameters=params, external_data=ext_data(**sets))
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(run, tasks))

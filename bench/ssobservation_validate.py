@@ -118,6 +118,7 @@ CH_PORT = 8123
 CH_DATABASE = "ssp"
 CH_VIEW = "SubmittableSources"
 CH_MAX_WORKERS = 4
+CH_MAX_EXECUTION_S = 600  # per query, on the server
 CH_MAX_ROWS = 50_000
 CH_CHUNK = 2_000
 
@@ -1140,30 +1141,22 @@ def ch_fetch(keys, host=None, port=CH_PORT, database=CH_DATABASE, user=None, wor
              chunk=CH_CHUNK):
     """``{processing: ids}`` -> the view rows, one query per (processing,
     chunk of ids), at most ``workers`` (<= 4) at once. Read-only."""
-    import io
-
-    import clickhouse_connect
-
-    from ssp.export.submittable import bypass_proxy, credentials
+    from ssp.export.submittable import clickhouse_client, credentials, query_parquet
 
     if not 1 <= workers <= CH_MAX_WORKERS:
         raise ValueError(f"workers must be 1..{CH_MAX_WORKERS} (the server is shared)")
     host = host or current_host()
-    user, password = credentials(host, port, database, user)
-    bypass_proxy(host)
+    credentials(host, port, database, user)  # fail before starting the pool
     tasks = [(p, np.asarray(ids[k:k + chunk], dtype=np.int64))
              for p, ids in keys.items() for k in range(0, len(ids), chunk)]
 
     def run(task):
         p, ids = task
-        client = clickhouse_connect.get_client(
-            host=host, port=port, database=database, username=user, password=password,
-            settings={"readonly": 1, "max_execution_time": 600,
-                      "cancel_http_readonly_queries_on_client_close": 1})
+        client = clickhouse_client(host, port, database, user, max_execution_time=CH_MAX_EXECUTION_S)
         try:
             sql = (f"SELECT * FROM {database}.{CH_VIEW} WHERE processing = {{p:String}} "
-                   f"AND id IN ({','.join(map(str, ids.tolist()))}) FORMAT Parquet")
-            return pq.read_table(io.BytesIO(client.raw_query(sql, parameters={"p": p})))
+                   f"AND id IN ({','.join(map(str, ids.tolist()))})")
+            return query_parquet(client, sql, parameters={"p": p})
         finally:
             client.close()
 
