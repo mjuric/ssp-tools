@@ -61,8 +61,7 @@ threads; --chunk-mib, default PARALLEL_CHUNK_MIB, and --parallel-workers,
 default PARALLEL_WORKERS). Smaller files go as in step 3. Opt out with
 --no-parallel or ``parallel: false`` in the config; the command line wins
 over the config (docs/design/sso-upload-parallel.md); every file then goes
-in one stream with if_generation_match=0. A chunked object differs in
-three ways:
+in one stream with if_generation_match=0. A chunked upload differs:
 
 - It has a CRC32C but no MD5. After the upload, its CRC32C (and size) must
   equal the local file's (google-crc32c), or the object is deleted and the
@@ -72,11 +71,23 @@ three ways:
   given. Instead the object is checked not to exist just before the upload,
   under the fresh, per-upload prefix.
 - On any failure (or interrupt), the incomplete multipart uploads of the
-  object are aborted (listed with the XML API, ?uploads) and the object is
-  deleted if it was written; an upload killed outright (SIGKILL, power
-  loss) can leave an incomplete multipart upload, which is left to the
-  bucket's lifecycle rule (AbortIncompleteMultipartUpload, on the PPDB
-  side) or a manual abort.
+  object are aborted (listed with the XML API, ?uploads). The object
+  itself is deleted only if our multipart upload completed (e.g. a CRC32C
+  or size mismatch), with if_generation_match on the generation read back,
+  so never an object this run didn't write. An upload killed outright
+  (SIGKILL, power loss) can leave an incomplete multipart upload, which is
+  left to the bucket's lifecycle rule (AbortIncompleteMultipartUpload, on
+  the PPDB side) or a manual abort.
+- Interrupts: the library joins its thread pool, so a first Ctrl-C (or a
+  failed part) waits for the parts already queued to finish before the
+  abort and cleanup run; a second Ctrl-C stops at once (and may leave an
+  incomplete multipart upload).
+
+Permissions: besides storage.objects.create and .delete, the chunked path
+needs storage.objects.get (the existence check and the read-back) and
+storage.multipartUploads.create, .list and .abort. roles/storage.objectUser
+(what idf_deploy gives the sso-uploader account on the bucket) has them;
+roles/storage.objectCreator does not. --no-parallel needs none of these.
 
 The upload record's ``parallel`` is {chunk_bytes, workers, min_bytes,
 tables} (the tables that went in chunks), or null with --no-parallel.
@@ -121,6 +132,7 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import math
 import os
 import posixpath
 import secrets
@@ -261,9 +273,11 @@ def load_config(spec):
 def parallel_options(chunk_mib=PARALLEL_CHUNK_MIB, workers=PARALLEL_WORKERS):
     """The --parallel settings, {"chunk_bytes", "workers"}, checked against
     GCS's multipart limits and PARALLEL_MAX_WORKERS."""
-    if not isinstance(workers, int) or not 1 <= workers <= PARALLEL_MAX_WORKERS:
+    if (not isinstance(workers, int) or isinstance(workers, bool)
+            or not 1 <= workers <= PARALLEL_MAX_WORKERS):
         raise SSOUploadError(f"--parallel-workers must be 1 to {PARALLEL_MAX_WORKERS}, not {workers!r}")
-    chunk = int(chunk_mib * (1 << 20)) if isinstance(chunk_mib, (int, float)) else None
+    chunk = (int(chunk_mib * (1 << 20)) if isinstance(chunk_mib, (int, float))
+             and not isinstance(chunk_mib, bool) and math.isfinite(chunk_mib) else None)
     if chunk is None or not MPU_MIN_PART_BYTES <= chunk <= MPU_MAX_PART_BYTES:
         raise SSOUploadError(f"--chunk-mib must be {MPU_MIN_PART_BYTES >> 20} to {MPU_MAX_PART_BYTES >> 20} "
                              f"(GCS multipart part sizes), not {chunk_mib!r}")
@@ -786,7 +800,8 @@ def _cleanup(bucket, bucket_name, names):
 
 
 # --------------------------------------------------------------------------
-# Parallel chunked uploads (--parallel; docs/design/sso-upload-parallel.md)
+# Parallel chunked uploads (the default; --no-parallel opts out;
+# docs/design/sso-upload-parallel.md)
 # --------------------------------------------------------------------------
 
 def _require_crc32c_c():
@@ -795,10 +810,11 @@ def _require_crc32c_c():
     try:
         import google_crc32c
     except ImportError as e:
-        raise SSOUploadError("--parallel needs google-crc32c (it comes with google-cloud-storage)") from e
+        raise SSOUploadError("parallel chunked uploads (the default) need google-crc32c (it comes with "
+                             "google-cloud-storage); --no-parallel doesn't") from e
     if google_crc32c.implementation != "c":
-        raise SSOUploadError("--parallel needs google-crc32c's C extension; it has the "
-                             f"{google_crc32c.implementation!r} one")
+        raise SSOUploadError("parallel chunked uploads (the default) need google-crc32c's C extension; it "
+                             f"has the {google_crc32c.implementation!r} one. --no-parallel doesn't need it")
 
 
 def _size_pool(session, workers):
@@ -848,14 +864,18 @@ def _list_multipart_uploads(bucket, prefix):
         root = ET.fromstring(r.content)
 
         def text(e, tag):
+            # {*}: any namespace, or none
             x = e.find(f"{{*}}{tag}")
             return x.text if x is not None else None
 
-        out += [(text(e, "Key"), text(e, "UploadId")) for e in root if e.tag.endswith("}Upload")]
+        out += [(text(e, "Key"), text(e, "UploadId")) for e in root.findall("{*}Upload")]
         if text(root, "IsTruncated") != "true":
             return out
-        params = {**params, "key-marker": text(root, "NextKeyMarker"),
-                  "upload-id-marker": text(root, "NextUploadIdMarker")}
+        markers = (text(root, "NextKeyMarker"), text(root, "NextUploadIdMarker"))
+        if not all(markers) or markers == (params.get("key-marker"), params.get("upload-id-marker")):
+            raise SSOUploadError(f"listing the multipart uploads under {prefix}: the listing is truncated "
+                                 f"but its next markers are missing or unchanged ({markers}); stopping")
+        params = {**params, "key-marker": markers[0], "upload-id-marker": markers[1]}
 
 
 def _abort_multipart_upload(bucket, name, upload_id):
@@ -914,8 +934,11 @@ def _upload_chunked(bucket, bucket_name, name, path, size, chunk_bytes, workers)
     checked not to exist first (the prefix is fresh). The local CRC32C is
     computed while the upload runs; the object's CRC32C and size must equal
     the local file's. On any failure or interrupt after the check, aborts
-    the object's incomplete multipart uploads, deletes the object if it was
-    written, and raises (SSOUploadError for an Exception)."""
+    the object's incomplete multipart uploads and raises (SSOUploadError
+    for an Exception). The object is deleted only if our multipart upload
+    completed and its generation was read back (e.g. a CRC32C or size
+    mismatch), and then only that generation: never an object we didn't
+    write."""
     uri = f"gs://{bucket_name}/{name}"
     parts = -(-size // chunk_bytes)
     if parts > MPU_MAX_PARTS:
@@ -925,22 +948,29 @@ def _upload_chunked(bucket, bucket_name, name, path, size, chunk_bytes, workers)
     try:
         exists = blob.exists()
     except Exception as e:
-        raise SSOUploadError(f"can't check whether {uri} exists: {e!r}") from e
+        hint = ""
+        if getattr(e, "code", None) == 403:
+            hint = (" (HTTP 403: the account lacks storage.objects.get, which the parallel chunked "
+                    "upload needs; --no-parallel avoids it)")
+        raise SSOUploadError(f"can't check whether {uri} exists: {e!r}{hint}") from e
     if exists:
         raise SSOUploadError(f"{uri} already exists; a naming collision for this upload prefix")
 
     _LOG.info("uploading %s to %s in %d chunks of %d MiB, %d threads (no MD5: checked by CRC32C)",
               path, uri, parts, chunk_bytes >> 20, workers)
     local = _Background(crc32c_file, path)
+    completed, generation = False, None
     try:
         try:
             _chunks_concurrently(path, blob, chunk_bytes, workers)
         except Exception as e:
             raise SSOUploadError(f"failed to upload {path} to {uri} in chunks: {e!r}") from e
+        completed = True        # the multipart upload's complete succeeded: the object is ours
         try:
             blob.reload()
         except Exception as e:
             raise SSOUploadError(f"can't read back {uri} after uploading it: {e!r}") from e
+        generation = blob.generation
         try:
             want = local.result()
         except Exception as e:
@@ -951,12 +981,17 @@ def _upload_chunked(bucket, bucket_name, name, path, size, chunk_bytes, workers)
         _LOG.info("%s: CRC32C %s, %d bytes, equal to %s's", uri, want, size, path)
     except BaseException:
         _abort_multipart(bucket, bucket_name, name)
-        try:
-            gone = not blob.exists()
-        except Exception:
-            gone = False        # try the delete anyway
-        if not gone:
-            _cleanup(bucket, bucket_name, [name])
+        if completed and generation is not None:
+            try:
+                bucket.blob(name).delete(if_generation_match=generation)
+                _LOG.warning("deleted gs://%s/%s (generation %s) during cleanup", bucket_name, name,
+                             generation)
+            except Exception:
+                _LOG.exception("failed to delete gs://%s/%s (generation %s) during cleanup; remove it "
+                               "by hand", bucket_name, name, generation)
+        elif completed:
+            _LOG.error("gs://%s/%s was uploaded but its generation couldn't be read back, so it is not "
+                       "deleted; check it and remove it by hand", bucket_name, name)
         raise
 
 

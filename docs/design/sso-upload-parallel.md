@@ -21,7 +21,7 @@ Splitting a file into pieces sent in parallel streams should be faster. Two ways
 
 ## Approach
 
-- **Opt-in:** `ssp-upload-sso --parallel` (default off), and a config key `parallel` for later.
+- **Opt-in:** `ssp-upload-sso --parallel` (default off), and a config key `parallel` for later. *Superseded by the owner's 2026-11-13 decision: parallel is the default, with `--no-parallel` / `parallel: false` to opt out (Results).*
   - Files of at least `PARALLEL_MIN_BYTES` (1 GiB, which today means the two big ones) go in chunks: `transfer_manager.upload_chunks_concurrently`, threads, a chunk size and worker count to be measured.
   - Smaller files go as today.
 - **Kept from today:**
@@ -65,10 +65,12 @@ The WP is on branch `wp-parallel`, not merged.
   So `if_generation_match=0` can't be given. Instead, the object is checked not to exist just before its upload, under the fresh per-upload prefix. A writer that slips in between the check and the complete would be overwritten. Only another upload under the same millisecond prefix could do that.
 - **Cleanup.**
   - The library cancels the multipart upload when a part fails.
-  - On top of that, on any failure or interrupt (Ctrl-C included), the run lists the object's incomplete multipart uploads (XML `GET ?uploads&prefix=`) and aborts them (`DELETE ?uploadId=`), then deletes the object if it was written. The earlier objects of the run are deleted as before.
+  - On top of that, on any failure or interrupt (Ctrl-C included), the run lists the object's incomplete multipart uploads (XML `GET ?uploads&prefix=`) and aborts them (`DELETE ?uploadId=`). The object itself is deleted only if our multipart upload completed (e.g. a CRC32C or size mismatch), with `if_generation_match` on the generation read back, so never an object the run didn't write. The earlier objects of the run are deleted as before.
+  - The library joins its thread pool, so a first Ctrl-C (or a failed part) waits for the queued parts before the abort; a second Ctrl-C stops at once.
+  - The chunked path needs `storage.objects.get` and `storage.multipartUploads.create`/`list`/`abort` beyond creating and deleting objects. `roles/storage.objectUser` (the `sso-uploader` account's, per `idf_deploy`) has them; `roles/storage.objectCreator` would not. A 403 on the existence check says so and points to `--no-parallel`.
   - A run killed outright (SIGKILL, node loss) can still leave an incomplete multipart upload. The library's docs suggest a bucket lifecycle rule, `AbortIncompleteMultipartUpload`; that is the PPDB team's to set.
   - Checked live with an injected failure after the initiate: the incomplete upload was listed, aborted, and nothing was left.
-- **Verification.** The local CRC32C (`google-crc32c` 1.9.0, C extension; required) is computed in a thread while the upload runs. The object's CRC32C and size must equal the local file's, or the object is deleted and the run fails.
+- **Verification.** The local CRC32C (`google-crc32c` 1.9.0, C extension; required) is computed in a thread while the upload runs. The object's CRC32C and size must equal the local file's, or the object (that generation) is deleted and the run fails.
 - **Tests:** 24 new network-free tests with fakes:
   - only the big files go in chunks, and the default path is unchanged;
   - an existing object is refused and left untouched;
