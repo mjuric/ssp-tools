@@ -156,10 +156,9 @@ ssp-build-ssobject RUN_DIR/delivery RUN_DIR/delivery/mpc_orbits.parquet -o ssobj
 
 ## Open items with the DM-55678 owners
 
-1. Which table set the deployed `load_sso` runs with in int and dev: its main branch pins `dax_ppdb` `cloudrun-v3.0.0`, whose `SSO_TABLES` still names SSSource (`docs/design/sso-upload-int.md`).
-2. Rebuilding the PPDB dataset from DM-55375's `ppdb.yaml`.
-3. The prod names.
-4. Whether naive (UTC wall-time) Parquet timestamps, which match the MPC's `timestamp without time zone`, load correctly into the PPDB's TIMESTAMP columns.
+1. Rebuilding the PPDB dataset from DM-55375's `ppdb.yaml`.
+2. The prod names.
+3. Whether naive (UTC wall-time) Parquet timestamps, which match the MPC's `timestamp without time zone`, load correctly into the PPDB's TIMESTAMP columns.
 
 ## A reference run
 
