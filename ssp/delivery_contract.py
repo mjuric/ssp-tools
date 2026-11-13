@@ -151,7 +151,7 @@ REPORT_FIELDS = {
 #   bucket_name: ppdb-int-sso-ingest
 #   topic: load-sso-topic
 #   project: ppdb-int-6c62          # the Pub/Sub topic's project
-#   tables: [...]                   # optional, default: all of UPLOAD_TABLE_ORDER
+#   tables: [...]                   # optional; default UPLOAD_TABLE_ORDER
 # Credentials: Google application-default credentials (the sso-uploader
 # service account: object-user access to the bucket, publish access to the
 # topic), e.g. GOOGLE_APPLICATION_CREDENTIALS pointing at its key.
