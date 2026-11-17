@@ -119,9 +119,8 @@ predictions_start, age_days, reused}` (`IERS_A_REPORT_FIELDS`), next to
 ### `ssp-sso-daily`
 
 The by-hand wrapper passes `--iers-a-store` to the extract; its default is
-ssp-daily's store, `/sdf/home/m/mjuric/ssp_daily_data/iers-a` (named
-through the `ssp_daily_data` link, like the correction table), and
-`--iers-a-store DIR` changes it.
+`WORK_DIR/iers-a`, so a run by hand keeps its own store and never updates
+ssp-daily's. `--iers-a-store DIR` changes it.
 
 ## Validation
 

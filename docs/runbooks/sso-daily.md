@@ -66,7 +66,7 @@ The run happens in `WORK_DIR/<UTC date>/`. `--stamp NAME` uses a different name,
 `ssp-sso-daily` stops at the first failing stage and exits with its status.
 
 - `--reuse-inputs DIR` skips the extract and builds from DIR.
-- `--iers-a-store DIR` goes to the extract (default: ssp-daily's store, `/sdf/home/m/mjuric/ssp_daily_data/iers-a`; below).
+- `--iers-a-store DIR` goes to the extract (default: `WORK_DIR/iers-a`, the wrapper's own store, never ssp-daily's; below).
 - `--part-rows N` and `--internal-columns A,B,...` go to `ssp-build-sso` (below). Without them, its defaults apply.
 - `--text-checks` goes to `ssp-build-sso`: the JSON and ASCII checks, off by default (above).
 

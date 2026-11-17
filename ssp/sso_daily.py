@@ -30,7 +30,8 @@ docs/runbooks/sso-daily.md, "The correction table".
 
 STORE, the IERS-A store (the last good download of finals2000A.all,
 reused when a download fails; docs/design/iers-a.md), defaults to
-DEFAULT_IERS_A_STORE, ssp-daily's.
+WORK_DIR/iers-a (IERS_A_STORE_SUBDIR): runs by hand keep their own store
+and never write to ssp-daily's.
 
 The production schedule is ssp-daily's, which runs the extract and the
 build itself; this wrapper is for running a day by hand.
@@ -70,9 +71,9 @@ UPLOAD = "ssp-upload-sso"
 #: that it can be repointed.
 DEFAULT_CORRECTION_TABLE = "/sdf/home/m/mjuric/ssp_daily_data/shutter-timing"
 
-#: The production IERS-A store (ssp-daily's IERS_A_STORE, $DATA_ROOT/iers-a),
-#: named the same way.
-DEFAULT_IERS_A_STORE = "/sdf/home/m/mjuric/ssp_daily_data/iers-a"
+#: The default IERS-A store, in WORK_DIR: not ssp-daily's, which a run by
+#: hand must not update.
+IERS_A_STORE_SUBDIR = "iers-a"
 
 
 def _local_bin():
@@ -93,7 +94,7 @@ def utc_stamp():
 
 
 def plan(day, upload=None, dry_run=False, reuse_inputs=None, correction_table=DEFAULT_CORRECTION_TABLE,
-         part_rows=None, internal_columns=None, text_checks=False, iers_a_store=DEFAULT_IERS_A_STORE):
+         part_rows=None, internal_columns=None, text_checks=False, iers_a_store=None):
     """The commands to run, as [(stage, argv)]. ``part_rows`` and
     ``internal_columns`` (a comma-separated string; '' for none) go to
     ssp-build-sso when given (not None), and ``--text-checks`` when
@@ -102,8 +103,9 @@ def plan(day, upload=None, dry_run=False, reuse_inputs=None, correction_table=DE
     run_dir = day / "run"
     cmds = []
     if not reuse_inputs:
+        store = iers_a_store if iers_a_store is not None else day.parent / IERS_A_STORE_SUBDIR
         cmds.append(("extract", [EXTRACT, str(inputs), "--correction-table", str(correction_table),
-                                 "--iers-a-store", str(iers_a_store)]))
+                                 "--iers-a-store", str(store)]))
     build = [BUILD, str(inputs), str(run_dir)]
     if part_rows is not None:
         build += ["--part-rows", str(part_rows)]
@@ -126,7 +128,7 @@ def _log(day, msg):
 
 def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None,
         correction_table=DEFAULT_CORRECTION_TABLE, part_rows=None, internal_columns=None,
-        text_checks=False, iers_a_store=DEFAULT_IERS_A_STORE):
+        text_checks=False, iers_a_store=None):
     """Run the stages. Returns the exit status (0, or the first failure's)."""
     if part_rows is not None and int(part_rows) < 1:
         raise SystemExit(f"ssp-sso-daily: --part-rows {part_rows}: must be at least 1")
@@ -184,9 +186,9 @@ def main(argv=None):
     parser.add_argument("--correction-table", metavar="DIR", default=DEFAULT_CORRECTION_TABLE,
                         help="the shutter-timing correction table, read by the extract as it is "
                              f"(kept up to date by ssp-daily; default: {DEFAULT_CORRECTION_TABLE})")
-    parser.add_argument("--iers-a-store", metavar="DIR", default=DEFAULT_IERS_A_STORE,
+    parser.add_argument("--iers-a-store", metavar="DIR", default=None,
                         help="the IERS-A store passed to the extract: the last good finals2000A.all, "
-                             f"reused when the download fails (default: {DEFAULT_IERS_A_STORE})")
+                             f"reused when the download fails (default: WORK_DIR/{IERS_A_STORE_SUBDIR})")
     parser.add_argument("--part-rows", type=int, default=None, metavar="N",
                         help="passed to ssp-build-sso: SSObservation parts close at the first object "
                              f"boundary at or after N rows (default: {PART_ROWS_DEFAULT:,})")
