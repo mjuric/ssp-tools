@@ -68,7 +68,8 @@ MANIFEST_FIELDS = {
     "producer": "what produced the inputs, e.g. 'ssp-extract-sso-inputs <version> (<commit>)'",
     "mpc_snapshot_utc": "ISO 8601 time of the MPC snapshot (the transaction's start)",
     "files": "{name: {file, rows, md5, source, extracted_utc}} for every INPUT_FILES name;"
-             " the dia_sources entry also has obs_sbn_md5",
+             " the dia_sources entry also has obs_sbn_md5; and IERS_A_NAME:"
+             " {IERS_A_MANIFEST_FIELDS} (the build requires it)",
 }
 
 #: The manifest field the shutter-motion correction adds (WP S1); it joins
@@ -99,6 +100,45 @@ SHUTTER_INPUT_COLUMNS = ["midpointMjdTaiVisit", "midpointMjdTai_flag",
 # (shutter-timing-table, hourly). A table the extract can't use (missing,
 # mixed calibrations, unknown format, failing integrity) fails the extract.
 
+#: The IERS-A Earth-orientation file (docs/design/iers-a.md; ssp-daily's
+#: docs/design/iers-a.md is the approved source). ``ssp-extract-sso-inputs
+#: --iers-a-store DIR`` downloads it into INPUTS_DIR (or, when the download
+#: fails, copies the store's last good copy) and records it in the manifest
+#: as ``files[IERS_A_NAME]``; it is not one of INPUT_FILES (not Parquet). The
+#: build requires that entry and uses exactly that file for UT1-UTC and polar
+#: motion, never astropy's bundled table or a download. ssp-daily reads these
+#: fields with strict type checks: keep the names and types.
+IERS_A_NAME = "iers_a"
+IERS_A_FILE = "finals2000A.all"
+IERS_A_MANIFEST_FIELDS = {
+    "file": "str: IERS_A_FILE",
+    "md5": "str: as for the other files",
+    "rows": "int: lines of the table file",
+    "source": "str: the URL it came from, or 'reused <store path> (download failed: <error>)'",
+    "extracted_utc": "str: ISO 8601 UTC, when it was downloaded, or copied from the store",
+    "predictions_start": "str: ISO date (YYYY-MM-DD) of the first predicted (not measured) row",
+    "age_days": "number (float, 2 decimals): extracted_utc minus predictions_start (its 00:00 UTC), "
+                "in days",
+    "reused": "bool: false for a fresh download, true for the store's copy",
+}
+#: The store's copy: DIR/IERS_A_FILE (the last good download).
+#: A reused copy older than IERS_A_STALE_DAYS gets the stronger warning; one
+#: older than IERS_A_MAX_AGE_DAYS fails the extract, and the build refuses
+#: a manifest whose age_days exceeds it.
+IERS_A_STALE_DAYS = 30
+IERS_A_MAX_AGE_DAYS = 90
+#: A usable file's predictions span at least this many days (from its first
+#: predicted row to its last row with predicted UT1-UTC and polar motion);
+#: finals2000A.all carries about a year. A shorter one (e.g. a truncated
+#: download) is refused.
+IERS_A_MIN_PREDICTION_DAYS = 180
+#: The build passes the file to every step subprocess in this environment
+#: variable; ssp.iers.install_from_env() installs it there.
+IERS_A_ENV = "SSP_IERS_A_FILE"
+#: The manifest fields the build copies to report.json's ``iers_a`` (with
+#: ``file``, the absolute path it used).
+IERS_A_REPORT_FIELDS = ("md5", "predictions_start", "age_days", "reused")
+
 #: dia_sources is derived from obs_sbn: its manifest entry records the md5 of
 #: the obs_sbn it was built from (``obs_sbn_md5``), and every stage refuses
 #: inputs where it differs from files.obs_sbn.md5.
@@ -127,6 +167,7 @@ BUILD_STEPS = ("mpc", "ssobservation", "ssobject", "nearbysso", "check")
 REPORT_FILE = "report.json"
 REPORT_FIELDS = {
     "inputs": "the input manifest, as read",
+    "iers_a": "{file (the absolute path used), IERS_A_REPORT_FIELDS...}: the IERS-A file the steps used",
     "ssp_tools_commit": "git commit of the code that built the delivery",
     "steps": "{step: {status: 'ok'|'failed'|'skipped', started_utc, wall_s, max_rss_gb, log}}",
     "tables": "{Table: {file, rows, md5, bytes}} for every delivered table; NearbySSO's also "

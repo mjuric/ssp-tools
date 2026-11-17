@@ -551,3 +551,140 @@ def test_tap_options():
     args.ch_host = "h"
     assert M.tap_url(args) is None
     assert M.ppdb_source(args) == f"ClickHouse h:8123: {M.PPDB_SQL}"
+
+
+# ---------------------------------------------------------------------------
+# --iers-a-store (docs/design/iers-a.md); the download is stubbed
+# ---------------------------------------------------------------------------
+
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from ssp import iers as I  # noqa: E402
+from ssp.delivery_contract import IERS_A_FILE, IERS_A_MANIFEST_FIELDS, IERS_A_NAME  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).parent))
+from iers_fixture import write_finals  # noqa: E402
+
+
+@pytest.fixture
+def iers_net(monkeypatch, tmp_path, stubs):
+    """A stubbed download of a small IERS-A file, recorded in the stubs'
+    call order (``stubs["order"]``); ``state["fail"]`` makes it fail."""
+    state = {"fail": False, "file": write_finals(tmp_path / "download.all")}
+    order = stubs.setdefault("order", [])
+
+    def fetch(url, dest, timeout=None, deadline=None):
+        order.append("iers")
+        if state["fail"]:
+            raise OSError("no route to host")
+        Path(dest).write_bytes(state["file"].read_bytes())
+
+    stub_mpc = M.export_mpc
+
+    def export_mpc(tmp, args):
+        order.append("mpc")
+        return stub_mpc(tmp, args)
+
+    monkeypatch.setattr(I, "urls", lambda: ["https://a.invalid/f", "https://b.invalid/f"])
+    monkeypatch.setattr(I, "fetch", fetch)
+    # the clock, 5 days after the test files' predictions start (not the
+    # date the tests run)
+    start = datetime.datetime.fromisoformat(I.predictions_start(I.read(state["file"])))
+    now = start.replace(tzinfo=datetime.timezone.utc) + datetime.timedelta(days=5)
+    monkeypatch.setattr(I, "utcnow", lambda: now)
+    monkeypatch.setattr(M, "export_mpc", export_mpc)
+    return state
+
+
+def test_iers_a_downloaded_first(tmp_path, stubs, iers_net):
+    store = tmp_path / "store"
+    m = run(tmp_path, "--iers-a-store", str(store))
+    assert stubs["order"][0] == "iers" and "mpc" in stubs["order"]
+    e = m["files"][IERS_A_NAME]
+    assert list(m["files"]) == list(INPUT_FILES) + [IERS_A_NAME]
+    assert set(e) == set(IERS_A_MANIFEST_FIELDS)
+    assert e["reused"] is False and e["source"] == "https://a.invalid/f"
+    out = tmp_path / "inputs"
+    assert (out / IERS_A_FILE).read_bytes() == iers_net["file"].read_bytes()
+    assert (store / IERS_A_FILE).read_bytes() == iers_net["file"].read_bytes()
+    assert e["md5"] == M.md5sum(out / IERS_A_FILE)
+    assert_valid(tmp_path, m)
+    assert not (out / M.PARTIAL).exists()
+
+
+def test_iers_a_manifest_types(tmp_path, stubs, iers_net):
+    """ssp-daily reads these with strict type checks: reused a JSON boolean,
+    age_days a JSON number, source a string (fresh and reused)."""
+    store = tmp_path / "store"
+    run(tmp_path, "--iers-a-store", str(store))
+    iers_net["fail"] = True
+    run(tmp_path, "--iers-a-store", str(store), "--force")
+    for path in (tmp_path / "inputs" / M.PREVIOUS_MANIFEST, tmp_path / "inputs" / MANIFEST_FILE):
+        e = json.loads(path.read_text())["files"]["iers_a"]
+        assert type(e["reused"]) is bool
+        assert type(e["age_days"]) in (int, float)
+        assert type(e["source"]) is str
+    assert e["reused"] is True and e["age_days"] == 5.0
+    assert e["source"].startswith(f"reused {store / IERS_A_FILE} (download failed: ")
+    assert "no route to host" in e["source"]
+    assert '"reused": true' in (tmp_path / "inputs" / MANIFEST_FILE).read_text()
+
+
+def test_iers_a_failure_stops_before_mpc(tmp_path, stubs, iers_net):
+    iers_net["fail"] = True
+    with pytest.raises(M.ExtractError, match="has no copy"):
+        run(tmp_path, "--iers-a-store", str(tmp_path / "store"))
+    assert stubs["order"] == ["iers", "iers"] and stubs["mpc"] == 0
+    assert not (tmp_path / "inputs" / MANIFEST_FILE).exists()
+    assert not (tmp_path / "inputs" / IERS_A_FILE).exists()
+
+
+def test_iers_a_later_failure_changes_nothing(tmp_path, stubs, iers_net):
+    """The day's file is staged like the others: a later step's failure
+    leaves INPUTS_DIR as it was (the store, though, keeps the new download)."""
+    first = run(tmp_path, "--iers-a-store", str(tmp_path / "store"))
+    iers_net["file"] = write_finals(tmp_path / "newer.all", promote=2)
+    stubs["fail"] = "ppdb_dia_sources"
+    with pytest.raises(RuntimeError):
+        run(tmp_path, "--iers-a-store", str(tmp_path / "store"), "--force")
+    assert_valid(tmp_path, first)
+    assert (tmp_path / "store" / IERS_A_FILE).read_bytes() == iers_net["file"].read_bytes()
+
+
+def test_without_flag_no_iers_a(tmp_path, stubs, iers_net):
+    m = run(tmp_path)
+    assert IERS_A_NAME not in m["files"] and "iers" not in stubs["order"]
+    assert not (tmp_path / "inputs" / IERS_A_FILE).exists()
+
+
+def test_add_iers_a_to_existing_inputs(tmp_path, stubs, iers_net, capsys):
+    """The command the build's error gives adds the file to inputs extracted
+    without it, running nothing else and keeping the other files."""
+    from ssp import sso_build as B
+
+    first = run(tmp_path)
+    with pytest.raises(B.ManifestError) as ex:
+        B.validate_manifest(tmp_path / "inputs")
+    cmd = ex.value.args[0].split("`")[1].split()
+    assert cmd[:2] == ["ssp-extract-sso-inputs", "INPUTS_DIR"] and cmd[-2:] == ["--iers-a-store", "DIR"]
+    m = run(tmp_path, *cmd[2:-1], str(tmp_path / "store"))
+    assert stubs["mpc"] == 1 and stubs["dia_sources"] == 1 and stubs["ppdb_dia_sources"] == 1
+    assert {k: v for k, v in m["files"].items() if k != IERS_A_NAME} == first["files"]
+    assert m["files"][IERS_A_NAME]["reused"] is False
+    assert_valid(tmp_path, m)
+
+
+def test_iers_a_with_only_and_carry_over(tmp_path, stubs, iers_net):
+    """With the flag the step always runs; without it a --force rerun carries
+    the previous entry over (md5 checked)."""
+    run(tmp_path, "--iers-a-store", str(tmp_path / "store"))
+    m = run(tmp_path, "--force", "--only", "ppdb_dia_sources", "--iers-a-store", str(tmp_path / "store"))
+    assert stubs["order"].count("iers") == 2
+    m2 = run(tmp_path, "--force", "--only", "ppdb_dia_sources")
+    assert stubs["order"].count("iers") == 2
+    assert m2["files"][IERS_A_NAME] == m["files"][IERS_A_NAME]
+    assert_valid(tmp_path, m2)
+    (tmp_path / "inputs" / IERS_A_FILE).write_text("changed\n")
+    with pytest.raises(M.ExtractError, match="no longer matches"):
+        run(tmp_path, "--force", "--only", "ppdb_dia_sources")
