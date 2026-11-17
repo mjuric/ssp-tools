@@ -8,6 +8,7 @@ import pytest
 from ssp import sso_daily as D
 
 CT = D.DEFAULT_CORRECTION_TABLE
+STORE = D.DEFAULT_IERS_A_STORE
 
 STUB = """#!{python}
 import os, sys
@@ -42,7 +43,7 @@ def test_all_three_in_order(stubs, tmp_path):
     assert D.main([str(w), "--upload", "dev", "--dry-run", "--stamp", "2026-10-01"]) == 0
     day = w / "2026-10-01"
     assert stubs() == [
-        f"ssp-extract-sso-inputs {day}/inputs --correction-table {CT}",
+        f"ssp-extract-sso-inputs {day}/inputs --correction-table {CT} --iers-a-store {STORE}",
         f"ssp-build-sso {day}/inputs {day}/run",
         f"ssp-upload-sso dev {day}/run --dry-run",
     ]
@@ -54,7 +55,7 @@ def test_default_stamp_is_utc_date(stubs, tmp_path):
     assert D.main([str(w)]) == 0
     day = w / datetime.now(timezone.utc).strftime("%Y-%m-%d")
     assert day.is_dir()
-    assert stubs() == [f"ssp-extract-sso-inputs {day}/inputs --correction-table {CT}",
+    assert stubs() == [f"ssp-extract-sso-inputs {day}/inputs --correction-table {CT} --iers-a-store {STORE}",
                        f"ssp-build-sso {day}/inputs {day}/run"]
 
 
@@ -187,7 +188,8 @@ def test_bad_stamp(stubs, tmp_path, stamp):
 def test_correction_table_option(stubs, tmp_path):
     ct = tmp_path / "ct"
     assert D.main([str(tmp_path / "w"), "--stamp", "a", "--correction-table", str(ct)]) == 0
-    assert stubs() == [f"ssp-extract-sso-inputs {tmp_path}/w/a/inputs --correction-table {ct}",
+    assert stubs() == [f"ssp-extract-sso-inputs {tmp_path}/w/a/inputs --correction-table {ct} "
+                       f"--iers-a-store {STORE}",
                        f"ssp-build-sso {tmp_path}/w/a/inputs {tmp_path}/w/a/run"]
 
 
@@ -196,3 +198,10 @@ def test_stage0_options_gone(stubs, tmp_path, opt):
     with pytest.raises(SystemExit):
         D.main([str(tmp_path / "w"), "--stamp", "a"] + opt)
     assert stubs() == []
+
+
+def test_iers_a_store_option(stubs, tmp_path):
+    store = tmp_path / "store"
+    assert D.main([str(tmp_path / "w"), "--stamp", "a", "--iers-a-store", str(store)]) == 0
+    assert stubs()[0] == (f"ssp-extract-sso-inputs {tmp_path}/w/a/inputs --correction-table {CT} "
+                          f"--iers-a-store {store}")

@@ -1,13 +1,15 @@
 """The daily SSO build and delivery: the stages in sequence.
 
     ssp-sso-daily WORK_DIR [--upload CONFIG] [--dry-run] [--reuse-inputs DIR]
-                  [--stamp STAMP] [--correction-table DIR] [--part-rows N]
+                  [--stamp STAMP] [--correction-table DIR] [--iers-a-store DIR]
+                  [--part-rows N]
                   [--internal-columns A,B,...] [--text-checks]
 
 runs, in a fresh dated directory DAY = WORK_DIR/<stamp> (default: today's
 UTC date, YYYY-MM-DD):
 
     ssp-extract-sso-inputs DAY/inputs --correction-table CT
+                           --iers-a-store STORE
                                              (skipped with --reuse-inputs DIR)
     ssp-build-sso DAY/inputs DAY/run [--part-rows N]
                   [--internal-columns A,B,...] [--text-checks]
@@ -25,6 +27,10 @@ CT, the shutter-timing correction table, defaults to
 DEFAULT_CORRECTION_TABLE. It is read as it is: ssp-daily keeps it up to
 date (shutter-timing-table, hourly), not this wrapper; see
 docs/runbooks/sso-daily.md, "The correction table".
+
+STORE, the IERS-A store (the last good download of finals2000A.all,
+reused when a download fails; docs/design/iers-a.md), defaults to
+DEFAULT_IERS_A_STORE, ssp-daily's.
 
 The production schedule is ssp-daily's, which runs the extract and the
 build itself; this wrapper is for running a day by hand.
@@ -64,6 +70,10 @@ UPLOAD = "ssp-upload-sso"
 #: that it can be repointed.
 DEFAULT_CORRECTION_TABLE = "/sdf/home/m/mjuric/ssp_daily_data/shutter-timing"
 
+#: The production IERS-A store (ssp-daily's IERS_A_STORE, $DATA_ROOT/iers-a),
+#: named the same way.
+DEFAULT_IERS_A_STORE = "/sdf/home/m/mjuric/ssp_daily_data/iers-a"
+
 
 def _local_bin():
     """The running Python's bin/ (the venv's), searched before PATH."""
@@ -83,7 +93,7 @@ def utc_stamp():
 
 
 def plan(day, upload=None, dry_run=False, reuse_inputs=None, correction_table=DEFAULT_CORRECTION_TABLE,
-         part_rows=None, internal_columns=None, text_checks=False):
+         part_rows=None, internal_columns=None, text_checks=False, iers_a_store=DEFAULT_IERS_A_STORE):
     """The commands to run, as [(stage, argv)]. ``part_rows`` and
     ``internal_columns`` (a comma-separated string; '' for none) go to
     ssp-build-sso when given (not None), and ``--text-checks`` when
@@ -92,7 +102,8 @@ def plan(day, upload=None, dry_run=False, reuse_inputs=None, correction_table=DE
     run_dir = day / "run"
     cmds = []
     if not reuse_inputs:
-        cmds.append(("extract", [EXTRACT, str(inputs), "--correction-table", str(correction_table)]))
+        cmds.append(("extract", [EXTRACT, str(inputs), "--correction-table", str(correction_table),
+                                 "--iers-a-store", str(iers_a_store)]))
     build = [BUILD, str(inputs), str(run_dir)]
     if part_rows is not None:
         build += ["--part-rows", str(part_rows)]
@@ -115,7 +126,7 @@ def _log(day, msg):
 
 def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None,
         correction_table=DEFAULT_CORRECTION_TABLE, part_rows=None, internal_columns=None,
-        text_checks=False):
+        text_checks=False, iers_a_store=DEFAULT_IERS_A_STORE):
     """Run the stages. Returns the exit status (0, or the first failure's)."""
     if part_rows is not None and int(part_rows) < 1:
         raise SystemExit(f"ssp-sso-daily: --part-rows {part_rows}: must be at least 1")
@@ -133,7 +144,7 @@ def run(work_dir, upload=None, dry_run=False, reuse_inputs=None, stamp=None,
 
     _log(day, f"ssp-sso-daily in {day}" + (f", reusing inputs {reuse_inputs}" if reuse_inputs else ""))
     stages = plan(day, upload, dry_run, reuse_inputs, correction_table, part_rows, internal_columns,
-                  text_checks)
+                  text_checks, iers_a_store)
     for stage, argv in stages:
         argv = [resolve_command(argv[0])] + argv[1:]
         _log(day, f"{stage}: {shlex.join(argv)}")
@@ -173,6 +184,9 @@ def main(argv=None):
     parser.add_argument("--correction-table", metavar="DIR", default=DEFAULT_CORRECTION_TABLE,
                         help="the shutter-timing correction table, read by the extract as it is "
                              f"(kept up to date by ssp-daily; default: {DEFAULT_CORRECTION_TABLE})")
+    parser.add_argument("--iers-a-store", metavar="DIR", default=DEFAULT_IERS_A_STORE,
+                        help="the IERS-A store passed to the extract: the last good finals2000A.all, "
+                             f"reused when the download fails (default: {DEFAULT_IERS_A_STORE})")
     parser.add_argument("--part-rows", type=int, default=None, metavar="N",
                         help="passed to ssp-build-sso: SSObservation parts close at the first object "
                              f"boundary at or after N rows (default: {PART_ROWS_DEFAULT:,})")
@@ -188,7 +202,7 @@ def main(argv=None):
     return run(args.work_dir, upload=args.upload, dry_run=args.dry_run,
                reuse_inputs=args.reuse_inputs, stamp=args.stamp, correction_table=args.correction_table,
                part_rows=args.part_rows, internal_columns=args.internal_columns,
-               text_checks=args.text_checks)
+               text_checks=args.text_checks, iers_a_store=args.iers_a_store)
 
 
 if __name__ == "__main__":

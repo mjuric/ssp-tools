@@ -4,8 +4,8 @@ This builds and delivers the six PPDB Solar System tables (RFC-1188), in three s
 
 | stage | command | touches |
 |---|---|---|
-| 1. extract | `ssp-extract-sso-inputs INPUTS_DIR --correction-table CT` | the MPC replica at USDF, ClickHouse, the correction table CT (read) |
-| 2. build | `ssp-build-sso INPUTS_DIR RUN_DIR` | files only |
+| 1. extract | `ssp-extract-sso-inputs INPUTS_DIR --correction-table CT --iers-a-store STORE` | the IERS-A download (datacenter.iers.org, then the USNO mirror) and its store STORE, the MPC replica at USDF, ClickHouse, the correction table CT (read) |
+| 2. build | `ssp-build-sso INPUTS_DIR RUN_DIR` | files only (the IERS-A file from INPUTS_DIR; astropy's downloads off) |
 | 3. deliver | `ssp-upload-sso CONFIG RUN_DIR [--dry-run \| --no-publish]` | GCS, Pub/Sub; writes `RUN_DIR/upload/` |
 | all of them | `ssp-sso-daily WORK_DIR [--upload CONFIG] [--dry-run]` | runs 1–3 in `WORK_DIR/<UTC date>/` (by hand; production runs on ssp-daily's schedule) |
 
@@ -56,7 +56,7 @@ The run happens in `WORK_DIR/<UTC date>/`. `--stamp NAME` uses a different name,
 
 | path | contents |
 |---|---|
-| `inputs/` | stage 1: `obs_sbn`, `mpc_orbits`, `current_identifications`, `numbered_identifications` (raw MPC, one snapshot), `dia_sources`, `ppdb_dia_sources` and `manifest.json` |
+| `inputs/` | stage 1: `obs_sbn`, `mpc_orbits`, `current_identifications`, `numbered_identifications` (raw MPC, one snapshot), `dia_sources`, `ppdb_dia_sources`, `finals2000A.all` (IERS-A, below) and `manifest.json` |
 | `run/delivery/` | stage 2: `<Table>.parquet` for five of the six tables; SSObservation as parts, a manifest and a sidecar (below); NearbySSO's sidecar `NearbySSO_internal.parquet` (below) |
 | `run/upload/` | stage 3: `SSObservation.parquet`, the parts combined into the one file that is uploaded, and its record `SSObservation.json` (below) |
 | `run/report.json` | the steps (status, time, peak memory of the largest process, commit; for `ssobservation` also `part_rows` and `internal_columns`; for `mpc` and `check`, `text_checks`), the tables (rows, md5; for NearbySSO also its sidecar and the sidecar's md5 and bytes; for SSObservation the manifest and its md5, the parts, the sidecar and the total rows and bytes), the checks, `deliverable`, and the uploads |
@@ -66,6 +66,7 @@ The run happens in `WORK_DIR/<UTC date>/`. `--stamp NAME` uses a different name,
 `ssp-sso-daily` stops at the first failing stage and exits with its status.
 
 - `--reuse-inputs DIR` skips the extract and builds from DIR.
+- `--iers-a-store DIR` goes to the extract (default: ssp-daily's store, `/sdf/home/m/mjuric/ssp_daily_data/iers-a`; below).
 - `--part-rows N` and `--internal-columns A,B,...` go to `ssp-build-sso` (below). Without them, its defaults apply.
 - `--text-checks` goes to `ssp-build-sso`: the JSON and ASCII checks, off by default (above).
 
@@ -100,10 +101,18 @@ The extract refuses a table it can't use (`CorrectionError`): one that is missin
 
 **Visits not built.** A DiaSource whose visit the table doesn't cover yet (its night has no table, or the visit is missing from the night's exposure log, typically a late raw) is NOT_BUILT. The extract gives it the visit time with `midpointMjdTai_flag` = True, logs a warning naming the visits, and goes on; the hourly table build re-checks recent nights and fixes it on a later day, once the raw has arrived. However many there are, they never fail the extract: they are flagged, counted and listed, and a later day's rebuild fixes them once the table covers them. The input manifest counts the omitted and the not-built visits, and lists the not-built ones; many of them means the table build is behind (ssp-daily's concern).
 
+## The IERS-A file
+
+The Earth-orientation data (UT1-UTC, polar motion) for the observer positions of SSObservation and NearbySSO is one of the day's inputs, `inputs/finals2000A.all` (`docs/design/iers-a.md`):
+
+- **The extract** (`--iers-a-store STORE`) downloads it first, before the MPC export, from astropy's `iers_auto_url`, then `iers_auto_url_mirror` (urllib, with the environment's proxy; never astropy's cache, nothing under `$HOME`). A good download replaces `STORE/finals2000A.all`. If both downloads fail, or the file is corrupt or older than the store's, the store's copy is used and the extract warns (`WARNING: IERS-A download failed ...`; past 30 days also `IERS-A is STALE ...`, with the days left). With no store copy, or one over 90 days old, the extract fails in seconds. The manifest's `files.iers_a` records `file`, `md5`, `rows`, `source`, `extracted_utc`, `predictions_start`, `age_days` and `reused` (true for the store's copy); ssp-daily alerts on `reused`. Without `--iers-a-store` no file is fetched (an existing entry is carried over by a `--force` rerun).
+- **The build** refuses inputs without `files.iers_a`, or with `age_days` over 90, and uses exactly that file in every step and its workers (`SSP_IERS_A_FILE`, with astropy's downloads off). `report.json`'s `iers_a` has its path, `md5`, `predictions_start`, `age_days` and `reused`. A time beyond the table's predictions (about a year ahead) is an error.
+- **Seeding or repairing the store**: copy a good `finals2000A.all` (e.g. one of a recent `inputs/`) to `STORE/finals2000A.all`.
+
 ## Running the stages separately
 
 ```bash
-ssp-extract-sso-inputs INPUTS_DIR              # --force to replace, --only/--skip STEP (with --force), --reuse NAME=PATH
+ssp-extract-sso-inputs INPUTS_DIR --iers-a-store STORE  # --force to replace, --only/--skip STEP (with --force), --reuse NAME=PATH
 ssp-build-sso INPUTS_DIR RUN_DIR --workers 32  # --from STEP to resume
 python -m ssp.delivery_check RUN_DIR/delivery  # the schema check alone (--text-checks: and ASCII)
 ssp-upload-sso dev RUN_DIR --dry-run           # builds run/upload/SSObservation.parquet; prints the planned objects and the Pub/Sub message

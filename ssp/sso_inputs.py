@@ -46,6 +46,19 @@ extracting it (hard-linked, or copied across filesystems; a path that is
 already the INPUTS_DIR file is used in place), and the manifest records it
 as reused. The four MPC files are one snapshot: reuse all four or none.
 
+``iers_a`` (only with ``--iers-a-store DIR``; docs/design/iers-a.md)
+    The IERS-A Earth-orientation file, ``finals2000A.all``, downloaded
+    (ssp.iers.acquire) before anything else is run, from astropy's
+    ``iers_auto_url`` then ``iers_auto_url_mirror``, into ``.partial``;
+    a good download replaces ``DIR/finals2000A.all`` (the store). When the
+    downloads fail, the store's copy is used, with a warning (stronger past
+    30 days); with no store copy, or one over 90 days old, the extract fails
+    before the MPC export. Recorded as the manifest's ``files.iers_a``. With
+    the flag, this step always runs, whatever ``--only``/``--skip``/
+    ``--reuse`` say. Without it, an ``iers_a`` entry of the previous
+    manifest is carried over (its md5 checked) like a step not run; inputs
+    without one stay without one, as before.
+
 Credentials: the MPC password from ``~/.pgpass`` (libpq), ClickHouse from
 ``SSP_CH_USER``/``SSP_CH_PASSWORD`` or ``~/.chpass``
 (``ssp.export.submittable.credentials``).
@@ -70,6 +83,8 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from ssp.delivery_contract import (
+    IERS_A_FILE,
+    IERS_A_NAME,
     INPUT_FILES,
     MANIFEST_FIELDS,
     MANIFEST_FILE,
@@ -87,6 +102,7 @@ MPC_USER = "rubin"
 
 from ssp.export.submittable import current_host  # noqa: E402 (the ClickHouse host, see there)
 from ssp.export import ppdb_tap  # noqa: E402
+from ssp import iers  # noqa: E402
 CH_PORT = 8123
 CH_DATABASE = "ssp"     # the database the ~/.chpass line is for
 
@@ -460,6 +476,12 @@ def _run(args, out):
         files["dia_sources"]["obs_sbn_md5"] = recorded_obs_md5(files["dia_sources"])
     if "dia_sources" not in steps and "mpc" not in steps:
         check_pairing(files, files["obs_sbn"], early=True)
+    iers_entry = None       # without --iers-a-store: the previous manifest's, checked
+    if not args.iers_a_store and prev_files.get(IERS_A_NAME) is not None:
+        iers_entry, path = dict(prev_files[IERS_A_NAME]), out / IERS_A_FILE
+        if not path.exists() or md5sum(path) != iers_entry.get("md5"):
+            raise ExtractError(f"{path} is missing or no longer matches the previous manifest's "
+                               f"{IERS_A_NAME} entry; give --iers-a-store DIR to fetch it again")
 
     # Run the steps, into .partial.
     tmp = out / PARTIAL
@@ -470,6 +492,19 @@ def _run(args, out):
 
     def path_of(name):
         return staged.get(name, out / INPUT_FILES[name][0])
+
+    if args.iers_a_store:     # first: cheap, and a hard failure stops the run early
+        print(f"\n=== {IERS_A_NAME} ===", flush=True)
+        t0 = time.time()
+        try:
+            iers_entry = iers.acquire(args.iers_a_store, tmp)
+        except iers.IERSError as e:
+            raise ExtractError(str(e)) from None
+        staged[IERS_A_NAME] = tmp / IERS_A_FILE
+        timings[IERS_A_NAME] = time.time() - t0
+        print(f"{IERS_A_NAME}: {iers_entry['rows']:,} rows, md5 {iers_entry['md5']}, predictions from "
+              f"{iers_entry['predictions_start']}, {iers_entry['age_days']} days old"
+              + (" (REUSED from the store)" if iers_entry["reused"] else ""), flush=True)
 
     for name, r in reuse.items():
         if not r.in_place:
@@ -514,6 +549,8 @@ def _run(args, out):
         "mpc_snapshot_utc": snapshot,
         "files": {name: files[name] for name in INPUT_FILES},
     }
+    if iers_entry is not None:
+        manifest["files"][IERS_A_NAME] = iers_entry
     # SHUTTER_MANIFEST_FIELD joins MANIFEST_FIELDS when the build requires it
     manifest.setdefault(SHUTTER_MANIFEST_FIELD[0], shutter)
     assert [k for k in manifest if k in MANIFEST_FIELDS] == list(MANIFEST_FIELDS)
@@ -570,6 +607,10 @@ def build_parser():
                                               "no manifest beside them gives it")
     p.add_argument("--force", action="store_true",
                    help="Redo inputs in a directory that already has a manifest")
+    p.add_argument("--iers-a-store", metavar="DIR", default=None,
+                   help="Download the IERS-A file (finals2000A.all) into INPUTS_DIR first, keeping the "
+                        "last good download in DIR and reusing it when the download fails (failing past "
+                        "90 days); the build requires it. Without it, no IERS-A file is fetched")
     g = p.add_argument_group("MPC replica")
     g.add_argument("--mpc-host", default=MPC_HOST, help="(default: %(default)s)")
     g.add_argument("--mpc-port", type=int, default=MPC_PORT, help="(default: %(default)s)")
