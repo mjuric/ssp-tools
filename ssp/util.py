@@ -1,12 +1,12 @@
 import numpy as np
 from astropy.time import Time
 import astropy.units as u
-from astropy.coordinates import get_sun, angular_separation
 import numpy.ma as ma
 from astropy.constants import R_earth
 from astropy.coordinates import (
     EarthLocation,
     solar_system_ephemeris,
+    get_body_barycentric,
     get_body_barycentric_posvel,
 )
 from astroquery.mpc import MPC
@@ -72,10 +72,28 @@ def packed_ascii_to_uint64_le(mpc_packed):
 SUN_SHIFT_STEP_S = 1.0
 
 
-def solar_elongation_ndarray(ra_deg, dec_deg, t, dt_s=None):
+def sun_barycentric_position(obstime: Time):
+    """The Sun's barycentric (ICRS) position from JPL DE440 at ``obstime``
+    [AU], a Quantity of shape (3, ...)."""
+    with solar_system_ephemeris.set("de440"):
+        return get_body_barycentric("sun", obstime).xyz.to(u.au)
+
+
+def _observer_sun_vectors(obscode, obstime):
+    """The geometric observer-to-Sun vector, r_sun - r_obs (ICRS, AU), of
+    shape (3, M) for the M times of ``obstime``."""
+    r_obs, _ = observatory_barycentric_posvel(obscode, obstime)
+    return sun_barycentric_position(obstime).to_value(u.au) - r_obs.to_value(u.au)
+
+
+def solar_elongation_ndarray(ra_deg, dec_deg, t, dt_s=None, obscode="X05"):
     """
-    Very fast computation of solar elongation (ICRS great-circle separation)
-    using astropy.coordinates.angular_separation.
+    Solar elongation: the angle between the target's direction (``ra_deg``,
+    ``dec_deg``, ICRS) and the geometric direction from the observatory to
+    the Sun, r_sun(t) - r_obs(t), with the Sun's barycentric position from
+    DE440 and the observatory's from observatory_barycentric_posvel (as
+    ssobservation.observer_states uses), both in ICRS
+    (docs/design/elongation-ssobject-nulls.md).
 
     Parameters
     ----------
@@ -88,52 +106,52 @@ def solar_elongation_ndarray(ra_deg, dec_deg, t, dt_s=None):
         midpoints) that the observation times differ from by ``dt_s``.
     dt_s : ndarray, optional
         The observation times minus ``t`` [s] (at most a second or so, e.g.
-        the shutter-motion correction). The Sun is then evaluated once per
-        unique ``t`` (and at ``t`` + SUN_SHIFT_STEP_S, for its motion) and
-        shifted linearly by ``dt_s``: the Sun moves ~0.04"/s, so the error
-        of the linear shift is far below a micro-arcsecond. Where ``dt_s``
-        is 0 the result is bitwise as without it.
+        the shutter-motion correction). The observer-to-Sun vector is then
+        evaluated once per unique ``t`` (and at ``t`` + SUN_SHIFT_STEP_S,
+        for its motion) and shifted linearly by ``dt_s``: its direction
+        moves ~0.04"/s (plus the observatory's diurnal motion, ~6e-4"/s),
+        so the error of the linear shift is far below a micro-arcsecond.
+        Where ``dt_s`` is 0 the result is bitwise as without it.
+    obscode : str
+        The MPC code of the observatory (Rubin, X05, by default).
 
     Returns
     -------
     elong_deg : ndarray
-        Solar elongation in degrees.
+        Solar elongation in degrees, in [0, 180].
     """
 
-    # Get Sun coordinates. get_sun is slow (~90 us per time), but sources
-    # from the same visit share one time, so evaluate it only once per
-    # unique time and broadcast (e.g. 730k sources -> 1,380 visit times).
+    # The Sun and the observatory cost ~0.1 ms per time, but sources from
+    # the same visit share one time, so evaluate them only once per unique
+    # time and broadcast (e.g. 730k sources -> 1,380 visit times).
     t = Time(t)
+    shape = t.shape
     _, first, inv = np.unique(
         np.stack([np.atleast_1d(t.jd1), np.atleast_1d(t.jd2)], axis=-1),
         axis=0, return_index=True, return_inverse=True,
     )
-    sun = get_sun(np.atleast_1d(t)[first]).icrs
-
-    # Extract Sun RA/Dec arrays (radian floats)
-    sun_ra = sun.ra.radian[inv.ravel()].reshape(t.shape)
-    sun_dec = sun.dec.radian[inv.ravel()].reshape(t.shape)
+    inv = inv.ravel()
+    tu = np.atleast_1d(t)[first]
+    s0 = _observer_sun_vectors(obscode, tu)                     # (3, M)
+    sun = s0[:, inv].reshape((3,) + shape)
 
     if dt_s is not None:
-        # the Sun's motion per second, at each unique reference time
-        t1 = np.atleast_1d(t)[first] + SUN_SHIFT_STEP_S * u.s
-        sun1 = get_sun(t1).icrs
-        dra = np.angle(np.exp(1j * (sun1.ra.radian - sun.ra.radian)))   # (wrapped to [-pi, pi])
-        rate_ra = (dra / SUN_SHIFT_STEP_S)[inv.ravel()].reshape(t.shape)
-        rate_dec = ((sun1.dec.radian - sun.dec.radian) / SUN_SHIFT_STEP_S)[inv.ravel()].reshape(t.shape)
-        dt_s = np.broadcast_to(np.asarray(dt_s, dtype=np.float64), t.shape)
-        sun_ra = sun_ra + rate_ra * dt_s
-        sun_dec = sun_dec + rate_dec * dt_s
+        # the vector's motion per second, at each unique reference time
+        s1 = _observer_sun_vectors(obscode, tu + SUN_SHIFT_STEP_S * u.s)
+        rate = ((s1 - s0) / SUN_SHIFT_STEP_S)[:, inv].reshape((3,) + shape)
+        dt_s = np.broadcast_to(np.asarray(dt_s, dtype=np.float64), shape)
+        sun = sun + rate * dt_s
 
-    # Convert input to radians
+    # The target's unit vector
     ra = np.radians(ra_deg)
     dec = np.radians(dec_deg)
+    cd = np.cos(dec)
+    p = np.stack(np.broadcast_arrays(cd * np.cos(ra), cd * np.sin(ra), np.sin(dec)))
 
-    # Fast great-circle angular separation
-    sep = angular_separation(ra, dec, sun_ra, sun_dec)
-
-    # Convert to degrees for return
-    return np.degrees(sep)
+    # The angle, robust at 0 and 180 deg: atan2(|p x s|, p . s)
+    cross = np.linalg.norm(np.cross(p, sun, axis=0), axis=0)
+    dot = np.sum(p * sun, axis=0)
+    return np.degrees(np.arctan2(cross, dot))
 
 
 def wrap_ra_deg(ra):

@@ -205,6 +205,13 @@ def _fake_observatory(obscode, obstime):
     return r * u.au, -r * 0.0172 * u.au / u.day
 
 
+def _fake_sun(obstime):
+    """A stand-in for util.sun_barycentric_position (no DE440): a Sun near
+    the barycentre."""
+    m = np.atleast_1d(obstime.tai.mjd) - 60800.0
+    return np.stack([0.004 + 0 * m, -0.002 + 1e-6 * m, 0.001 + 0 * m]) * u.au
+
+
 #: The object whose orbit has no usable covariance (NULL ellipse).
 NO_COV = "2024 BB2"
 
@@ -230,6 +237,7 @@ def offline(monkeypatch):
     monkeypatch.setattr(ssobservation, "compute_ephemerides_one", _fake_ephemerides)
     monkeypatch.setattr(ssobservation, "open_ephem", lambda: None)
     monkeypatch.setattr(ssobservation.util, "observatory_barycentric_posvel", _fake_observatory)
+    monkeypatch.setattr(ssobservation.util, "sun_barycentric_position", _fake_sun)
     monkeypatch.setattr(ssobservation, "_ellipse", _FakeEllipse())
 
 

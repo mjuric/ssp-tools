@@ -30,7 +30,7 @@ from ssp.ssobservation_contract import SHUTTER_INTERNAL, SSObservationDtype
 from ssp.ssobservation_parts import read_ssobservation
 
 from test_ssobservation_widened import (
-    _by_obsid, _fake_ephemerides, _FakeEllipse, _same, make_inputs, read_output,
+    _by_obsid, _fake_ephemerides, _fake_sun, _FakeEllipse, _same, make_inputs, read_output,
 )
 
 HAVE_ASSIST = bool(os.environ.get("SSP_ASSIST_PLANETS") and os.environ.get("SSP_ASSIST_ASTEROIDS"))
@@ -59,6 +59,7 @@ def offline(monkeypatch):
     monkeypatch.setattr(ssobservation, "compute_ephemerides_one", spy)
     monkeypatch.setattr(ssobservation, "open_ephem", lambda: None)
     monkeypatch.setattr(ssobservation.util, "observatory_barycentric_posvel", _circular_observatory)
+    monkeypatch.setattr(ssobservation.util, "sun_barycentric_position", _fake_sun)
     monkeypatch.setattr(ssobservation, "_ellipse", _FakeEllipse())
     return calls
 
@@ -224,13 +225,15 @@ def test_observer_states_interim_unchanged(monkeypatch):
 
 def _real_observatory_or_skip(monkeypatch):
     """The real util.observatory_barycentric_posvel, with X05's location
-    given (not fetched from the MPC) and DE440 only from the astropy cache."""
+    given (not fetched from the MPC) and DE440 (for the observatory and the
+    Sun) only from the astropy cache."""
     from astropy.utils.data import conf
     monkeypatch.setattr(conf, "allow_internet", False)
     loc = EarthLocation.from_geodetic(-70.749417 * u.deg, -30.244639 * u.deg, 2663 * u.m)
     monkeypatch.setattr(util, "earthlocation_from_obscode", lambda code: loc)
     try:
         util.observatory_barycentric_posvel("X05", Time([60800.0], format="mjd", scale="tai"))
+        util.sun_barycentric_position(Time([60800.0], format="mjd", scale="tai"))
     except Exception as e:      # (not cached)
         pytest.skip(f"DE440 not available offline: {e}")
 
@@ -248,7 +251,13 @@ def test_observer_states_shift_vs_exact_real(monkeypatch):
     assert dp < 5e-3 and dv < 5e-3, (dp, dv)
 
 
-def test_solar_elongation_shift_vs_exact():
+@pytest.mark.parametrize("real", [False, True])
+def test_solar_elongation_shift_vs_exact(monkeypatch, real):
+    if real:
+        _real_observatory_or_skip(monkeypatch)
+    else:
+        monkeypatch.setattr(util, "observatory_barycentric_posvel", _circular_observatory)
+        monkeypatch.setattr(util, "sun_barycentric_position", _fake_sun)
     t, tv, dt = _times(400)
     rng = np.random.default_rng(3)
     ra, dec = rng.uniform(0, 360, len(t)), rng.uniform(-80, 80, len(t))
