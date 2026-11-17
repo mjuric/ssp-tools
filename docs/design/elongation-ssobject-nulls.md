@@ -29,7 +29,10 @@ An independent QA of the 2026-11-16 delivery, built by 2f013b1, found two defect
 
 | Date | Decision |
 |---|---|
-| 2026-11-17 | **Elongation uses the geometric Sun direction from the observatory**: DE440 barycentric Sun minus the observatory's barycentric position, at the observation time, in ICRS. |
+| 2026-11-17 | ~~**Elongation uses the geometric Sun direction from the observatory**: DE440 barycentric Sun minus the observatory's barycentric position, at the observation time, in ICRS.~~ Superseded the same day (next row). |
+| 2026-11-17 | **Elongation is apparent, as Horizons' S-O-T.** The geometric directions to the Sun (DE440 Sun minus the observatory) and to the object (the observed `ra`, `dec`) are both aberrated by the observatory's barycentric velocity before taking the angle. It is the standard definition (Horizons, MPC), and it is the convention `phaseAngle` already follows: it matches Horizons' `phi` (`ssp.ephem_assist._phase_angle_deg`). Geometric elongation differs from it by up to 41″ (2v/c). The extra cost is negligible: the velocity comes with the position. |
+| 2026-11-17 | **The delivery check compares with the observed direction.** It compares `elongation` with the angle between the observed (`ra`, `dec`) and `topo − helio`, apparent in the same way, using the observatory's velocity relative to the Sun, `helio_v − topo_v`. The angle to `topo` would fail on rows whose orbit prediction is far from the observation (111 of 8.07 M on 2026-11-16, from 15 objects, off by 36″ to 178°). Their elongation is right. That count is still reported in the check's detail. |
+| 2026-11-17 | **The MPC tables' NaN stays.** `mpc_orbits` mirrors the replica: on 2026-11-16, `mean_anomaly`, `period` and `mean_anomaly_unc` had 246 NaN each, and `period_unc` 1,946. The no-NaN check covers SSObservation, SSObject and NearbySSO (and its sidecar) only. |
 | 2026-11-17 | **Earlier deliveries, and the int PPDB dataset, stay as they are.** The fix applies from the first run with the new pin. |
 | 2026-11-17 | **Approach approved:** NULL for NaN in SSObject, NULL flags for bands without observations, the Felis-derived Arrow schema, and new delivery checks for both defects. |
 
@@ -40,14 +43,15 @@ An independent QA of the 2026-11-16 delivery, built by 2f013b1, found two defect
 The Sun direction becomes `r_sun(t) − r_obs(t)`:
 - `r_sun` is the barycentric position of the Sun from DE440;
 - `r_obs` is the observatory's barycentric position, from `util.observatory_barycentric_posvel`, the same function `observer_states` uses;
-- the elongation is the angle between this vector and the unit vector of (`ra`, `dec`).
+- both that direction and the unit vector of (`ra`, `dec`) are aberrated, to first order in v/c, by `v_obs`, the observatory's barycentric velocity, which the same function returns. The rule is the one `ssp.ephem_assist._phase_angle_deg` applies: `u' = u + β − (u·β) u`, normalised, with `β = v_obs / c`;
+- the elongation is the angle between the two aberrated directions. This is the apparent elongation, Horizons' S-O-T.
 
 The rest stays as it is:
-- the Sun and the observatory are evaluated once per unique time;
+- the Sun and the observatory's position and velocity are evaluated once per unique time;
 - with `dt_s`, the direction is shifted linearly, as now;
 - the cost is of the same order.
 
-The result should agree with the elongation computed from the delivered `topo`/`helio` vectors to well under 1″. It applies the same way to rows without an orbit, which have no vectors.
+The result reproduces Horizons' S-O-T to about 0.2″, and it applies the same way to rows without an orbit, which have no vectors.
 
 ### 2. SSObject NULLs (`ssp.ssobject`)
 
@@ -59,7 +63,9 @@ The result should agree with the elongation computed from the delivered `topo`/`
 
 ### 3. Delivery checks (`ssp.delivery_check`)
 
-- **Elongation:** on SSObservation rows with non-NULL `topo_*` and `helio_*`, the elongation computed from the vectors must match `elongation` to within 0.01°. The check reports the count and the maximum difference.
+- **Elongation:** on SSObservation rows with non-NULL `topo_*` and `helio_*`, recompute the elongation from delivered columns and compare it with `elongation`; they must match to within 0.01°.
+  - The recomputed elongation is the angle between the observed (`ra`, `dec`) and `topo − helio`, both aberrated by `helio_v − topo_v` (the observatory's velocity relative to the Sun).
+  - The check reports the count and the maximum difference, plus, for information, the number of rows where the angle to `topo` would differ.
 - **No NaN:** no float column of any delivered table may hold a NaN. If a table from the MPC replica (`mpc_orbits`, the identifications) has NaN in real data, the work package reports it before deciding the scope.
 
 ## Loaders
@@ -70,7 +76,7 @@ The result should agree with the elongation computed from the delivered `topo`/`
 ## Validation
 
 **Tests (network-free):**
-- **Elongation:** `tests/data/elongation/horizons_sot.csv` gives 319 Horizons S-O-T values for 81 objects. The function must reproduce them to within 0.01°. The current code fails this test.
+- **Elongation:** `tests/data/elongation/horizons_sot.csv` gives 319 Horizons S-O-T values for 81 objects. The function, given Horizons' own RA and Dec, must reproduce them to within 0.001°. The current code fails this test.
 - **Elongation, other cases:**
   - the `dt_s` shift agrees with exact evaluation;
   - a case with known geometry, e.g. a target at the Sun's own position gives about 0°.
