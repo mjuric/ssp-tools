@@ -54,13 +54,54 @@ def test_elongation_bad_orbit_passes(tmp_path):
     write_ss(tmp_path, t)
     r = _ss_results(tmp_path)["elongation"]
     assert r.ok, r
-    assert "; 1 rows differ from angle(topo, topo - helio)" in r.detail
+    assert "; 1 rows differ from the angle to topo" in r.detail
 
 
 def _vectors(t, i):
     topo = np.array([[t[f"topo_{a}"][i].as_py() for a in "xyz"]])
     helio = np.array([[t[f"helio_{a}"][i].as_py() for a in "xyz"]])
     return topo, helio
+
+
+def test_elongation_from_vectors_aberrated():
+    """With the velocities: both directions aberrated by helio_v - topo_v
+    (the observatory's velocity relative to the Sun): the Sun along +x, the
+    observatory moving along +y at 30 km/s."""
+    v = 30.0
+    b = np.degrees(v / D.C_KM_S)
+    topo = np.array([[-2.0, 0, 0], [0, 2.0, 0], [1.0, 0, 0]])
+    helio = topo - np.array([1.0, 0, 0])
+    topo_v = np.array([[0, -v, 0]] * 3)          # (a target at rest relative to the Sun)
+    helio_v = np.zeros((3, 3))
+    got = D.elongation_from_vectors(topo, helio, topo_v=topo_v, helio_v=helio_v)
+    np.testing.assert_allclose(got, [180 - 2 * b, 90 - b, 0], rtol=0, atol=1e-6)
+    np.testing.assert_allclose(D.elongation_from_vectors(topo, helio), [180, 90, 0], rtol=0, atol=1e-12)
+
+
+def _with_velocity(t, v_kms):
+    """``t`` with the observatory moving at ``v_kms`` (3,) relative to the
+    Sun: helio_v - topo_v = v."""
+    n = len(t)
+    for k, a in enumerate("xyz"):
+        t = replace(t, f"helio_v{a}", pa.array(np.zeros(n), pa.float32()))
+        t = replace(t, f"topo_v{a}", pa.array(np.full(n, -v_kms[k]), pa.float32()))
+    return t
+
+
+@pytest.mark.parametrize("apparent,ok", [(True, True), (False, False)])
+def test_elongation_check_is_apparent(tmp_path, apparent, ok):
+    """Near opposition, with the observatory moving at 30 km/s across the
+    Sun's direction, the apparent and geometric elongations differ by ~41"
+    (over the 0.01 deg tolerance): the check takes the apparent one."""
+    t = _with_velocity(with_geometry(ss_table(), elong=[179.9] * 9), [0, 30.0, 0])
+    if apparent:
+        topo, helio = _vectors(t, 0)
+        e = D.elongation_from_vectors(topo, helio, ra=[0.0], dec=[0.0],
+                                      topo_v=[[0, -30.0, 0]], helio_v=[[0, 0, 0]])[0]
+        t = replace(t, "elongation", pa.array(np.full(9, e), pa.float32()))
+    write_ss(tmp_path, t)
+    r = _ss_results(tmp_path)["elongation"]
+    assert r.ok == ok, r
 
 
 def test_elongation_pass(tmp_path):

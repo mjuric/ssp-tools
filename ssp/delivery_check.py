@@ -25,9 +25,10 @@ SSObservation is delivered as parts plus a manifest and a sidecar
 (ssp.ssobservation_contract, "The partitioned delivery"):
 check_ssobservation_parts checks the partitioning, the manifest and the
 sidecar, and check_table runs on every part. check_elongation checks its
-``elongation`` against the angle between the observed direction (``ra``,
-``dec``) and the observer-to-Sun direction from the delivered vectors,
-``topo_* - helio_*``, to within ELONGATION_TOL_DEG, on every row with the
+``elongation`` against the apparent elongation from the delivered columns:
+the angle between the observed direction (``ra``, ``dec``) and the
+observer-to-Sun direction ``topo_* - helio_*``, both aberrated by
+``helio_v* - topo_v*``, to within ELONGATION_TOL_DEG, on every row with the
 vectors.
 
 NearbySSO is checked further by check_nearbysso: its sidecar
@@ -114,7 +115,10 @@ NAN_FREE_TABLES = ("SSObservation", "SSObject", "NearbySSO")
 ELONGATION_TOL_DEG = 0.01
 #: The columns check_elongation reads.
 ELONGATION_COLUMNS = ("elongation", "ra", "dec",
-                      "topo_x", "topo_y", "topo_z", "helio_x", "helio_y", "helio_z")
+                      "topo_x", "topo_y", "topo_z", "helio_x", "helio_y", "helio_z",
+                      "topo_vx", "topo_vy", "topo_vz", "helio_vx", "helio_vy", "helio_vz")
+#: The speed of light [km/s] (SSObservation's velocities are in km/s).
+C_KM_S = 299792.458
 
 
 def _is_string(t):
@@ -362,30 +366,48 @@ def _angle_deg(a, b):
     return np.degrees(np.arctan2(np.linalg.norm(np.cross(a, b), axis=1), np.einsum("ij,ij->i", a, b)))
 
 
-def elongation_from_vectors(topo, helio, ra=None, dec=None):
+def _aberrate(n, beta):
+    """Directions ``n`` (N, 3) aberrated to first order in v/c by ``beta``
+    (N, 3) = v / c: u' = u + beta - (u . beta) u, normalised, u = n / |n|
+    (the rule of ssp.ephem_assist._phase_angle_deg)."""
+    n = n / np.linalg.norm(n, axis=1, keepdims=True)
+    m = n + beta - np.einsum("ij,ij->i", n, beta)[:, None] * n
+    return m / np.linalg.norm(m, axis=1, keepdims=True)
+
+
+def elongation_from_vectors(topo, helio, ra=None, dec=None, topo_v=None, helio_v=None):
     """The elongation [deg] from topocentric and heliocentric position
     vectors (N, 3), in float64: the angle between the target's direction and
     the observer-to-Sun direction, ``topo - helio``. The target's direction
-    is (``ra``, ``dec``) [deg] if given, else ``topo``."""
+    is (``ra``, ``dec``) [deg] if given, else ``topo``. With the velocities
+    ``topo_v`` and ``helio_v`` [km/s] (N, 3), both directions are aberrated
+    by the observatory's velocity relative to the Sun, ``helio_v - topo_v``:
+    the apparent elongation, as SSObservation's (and Horizons' S-O-T)."""
     topo = np.asarray(topo, dtype=np.float64)
     sun = topo - np.asarray(helio, dtype=np.float64)
     target = topo if ra is None else _radec_unit(np.asarray(ra, np.float64), np.asarray(dec, np.float64))
+    if topo_v is not None:
+        beta = (np.asarray(helio_v, np.float64) - np.asarray(topo_v, np.float64)) / C_KM_S
+        target, sun = _aberrate(target, beta), _aberrate(sun, beta)
     return _angle_deg(target, sun)
 
 
 def check_elongation(files, tol_deg=ELONGATION_TOL_DEG):
     """CheckResult "elongation": in every SSObservation part of ``files``,
-    on every row with non-NULL topo_x..z and helio_x..z, ``elongation``
-    within ``tol_deg`` of the angle between the observed direction (``ra``,
-    ``dec``, which ``elongation`` is of) and the observer-to-Sun direction
-    from the vectors, ``topo - helio`` (elongation_from_vectors; a NULL
-    elongation there fails). The observed direction, not ``topo``'s: a row
-    whose orbit predicts its position badly (the observed-minus-predicted
-    separation is over 0.01 deg on ~100 of 8M rows in the 2026-11-16
-    delivery) would otherwise fail although its elongation is right; the
-    detail reports how many rows differ from angle(topo, topo - helio) by
-    more than ``tol_deg``, for information. Read a part's row group at a
-    time; reports the rows checked and the largest difference."""
+    on every row with non-NULL topo_* and helio_* (positions and
+    velocities), ``elongation`` within ``tol_deg`` of the apparent
+    elongation from the delivered columns: the angle between the observed
+    direction (``ra``, ``dec``, which ``elongation`` is of) and the
+    observer-to-Sun direction ``topo - helio``, both aberrated by the
+    observatory's velocity relative to the Sun, ``helio_v - topo_v``
+    (elongation_from_vectors; a NULL elongation there fails). The
+    observed direction, not ``topo``'s: a row whose orbit predicts its
+    position badly (the observed-minus-predicted separation is over 0.01
+    deg on ~100 of 8M rows in the 2026-11-16 delivery) would otherwise fail
+    although its elongation is right; the detail reports how many rows
+    differ from the same angle with ``topo``'s direction by more than
+    ``tol_deg``, for information. Read a part's row group at a time;
+    reports the rows checked and the largest difference."""
     n_checked, n_bad, n_topo, worst, examples = 0, 0, 0, 0.0, []
     vec = ELONGATION_COLUMNS[3:]
     for f in files:
@@ -402,15 +424,16 @@ def check_elongation(files, tol_deg=ELONGATION_TOL_DEG):
                 has &= _valid(t[c])
             if not has.any():
                 continue
-            topo = np.stack([_np(t[c], np.nan)[has] for c in vec[:3]], axis=1)
-            helio = np.stack([_np(t[c], np.nan)[has] for c in vec[3:]], axis=1)
+            topo, helio, topo_v, helio_v = (np.stack([_np(t[c], np.nan)[has] for c in vec[k:k + 3]], axis=1)
+                                            for k in (0, 3, 6, 9))
             ra, dec = (_np(t[c], np.nan)[has] for c in ("ra", "dec"))
-            want = elongation_from_vectors(topo, helio, ra, dec)
+            want = elongation_from_vectors(topo, helio, ra, dec, topo_v, helio_v)
             got = _np(t["elongation"], np.nan)[has].astype(np.float64)
             d = np.abs(got - want)
             d[~np.isfinite(d)] = np.inf
             with np.errstate(invalid="ignore"):
-                n_topo += int(np.sum(~(np.abs(got - elongation_from_vectors(topo, helio)) <= tol_deg)))
+                n_topo += int(np.sum(~(np.abs(got - elongation_from_vectors(
+                    topo, helio, topo_v=topo_v, helio_v=helio_v)) <= tol_deg)))
             n_checked += len(d)
             if len(d):
                 worst = max(worst, float(d.max()))
@@ -421,9 +444,9 @@ def check_elongation(files, tol_deg=ELONGATION_TOL_DEG):
                 for i in np.flatnonzero(bad)[:N_EXAMPLES - len(examples)]:
                     examples.append(f"{Path(f).name} row {first + rows[i]:,}: {got[i]:.6f} vs {want[i]:.6f}")
             del t
-    detail = (f"{n_checked:,} rows with topo/helio vectors; max |elongation - from (ra, dec) and the "
-              f"vectors| {worst:.3g} deg ({worst * 3600:.3g} arcsec); {n_topo:,} rows differ from "
-              f"angle(topo, topo - helio) by more than {tol_deg} deg (orbit residuals; not a failure)")
+    detail = (f"{n_checked:,} rows with topo/helio vectors; max |elongation - apparent from (ra, dec) "
+              f"and the vectors| {worst:.3g} deg ({worst * 3600:.3g} arcsec); {n_topo:,} rows differ from "
+              f"the angle to topo by more than {tol_deg} deg (orbit residuals; not a failure)")
     if n_bad:
         return CheckResult("elongation", False, f"{n_bad:,} rows differ by more than {tol_deg} deg; "
                            + detail + "; e.g. " + "; ".join(examples))

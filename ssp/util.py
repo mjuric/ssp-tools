@@ -79,46 +79,68 @@ def sun_barycentric_position(obstime: Time):
         return get_body_barycentric("sun", obstime).xyz.to(u.au)
 
 
+#: The speed of light [km/s].
+C_KM_S = 299792.458
+
+
+def aberrate(n, beta):
+    """The directions ``n`` (3, ...) aberrated, to first order in v/c, by
+    the observer's velocity ``beta`` = v / c (3, ...; broadcast against
+    ``n``): u' = u + beta - (u . beta) u, normalised, with u = n / |n| (the
+    rule of ssp.ephem_assist._phase_angle_deg)."""
+    n = n / np.linalg.norm(n, axis=0)
+    m = n + beta - np.sum(n * beta, axis=0) * n
+    return m / np.linalg.norm(m, axis=0)
+
+
 def _observer_sun_vectors(obscode, obstime):
-    """The geometric observer-to-Sun vector, r_sun - r_obs (ICRS, AU), of
-    shape (3, M) for the M times of ``obstime``."""
-    r_obs, _ = observatory_barycentric_posvel(obscode, obstime)
-    return sun_barycentric_position(obstime).to_value(u.au) - r_obs.to_value(u.au)
+    """The geometric observer-to-Sun vector, r_sun - r_obs (ICRS, AU), and
+    the observatory's barycentric velocity over c (v_obs / c), each of shape
+    (3, M) for the M times of ``obstime``."""
+    r_obs, v_obs = observatory_barycentric_posvel(obscode, obstime)
+    s = sun_barycentric_position(obstime).to_value(u.au) - r_obs.to_value(u.au)
+    return s, v_obs.to_value(u.km / u.s) / C_KM_S
 
 
 def solar_elongation_ndarray(ra_deg, dec_deg, t, dt_s=None, obscode="X05"):
     """
-    Solar elongation: the angle between the target's direction (``ra_deg``,
-    ``dec_deg``, ICRS) and the geometric direction from the observatory to
-    the Sun, r_sun(t) - r_obs(t), with the Sun's barycentric position from
-    DE440 and the observatory's from observatory_barycentric_posvel (as
-    ssobservation.observer_states uses), both in ICRS
-    (docs/design/elongation-ssobject-nulls.md).
+    The apparent (aberrated) solar elongation, as Horizons' S-O-T: the angle
+    between the target's direction (``ra_deg``, ``dec_deg``, ICRS) and the
+    direction from the observatory to the Sun, both aberrated by the
+    observatory's barycentric velocity (to first order in v/c: ``aberrate``)
+    (docs/design/elongation-ssobject-nulls.md). The geometric Sun direction
+    is r_sun(t) - r_obs(t), with the Sun's barycentric position from DE440
+    and the observatory's position and velocity from
+    observatory_barycentric_posvel (as ssobservation.observer_states uses),
+    in ICRS. The apparent elongation differs from the geometric one by up
+    to ~41" (2 v/c).
 
     Parameters
     ----------
     ra_deg : ndarray
-        Target RA in degrees (ICRS).
+        Target RA in degrees (ICRS; the observed, astrometric position).
     dec_deg : ndarray
         Target Dec in degrees (ICRS).
     t : astropy.time.Time
         Observation times; with ``dt_s``, reference times (e.g. the visit
         midpoints) that the observation times differ from by ``dt_s``.
+        Broadcast against ``ra_deg`` and ``dec_deg``.
     dt_s : ndarray, optional
         The observation times minus ``t`` [s] (at most a second or so, e.g.
-        the shutter-motion correction). The observer-to-Sun vector is then
-        evaluated once per unique ``t`` (and at ``t`` + SUN_SHIFT_STEP_S,
-        for its motion) and shifted linearly by ``dt_s``: its direction
-        moves ~0.04"/s (plus the observatory's diurnal motion, ~6e-4"/s),
-        so the error of the linear shift is far below a micro-arcsecond.
-        Where ``dt_s`` is 0 the result is bitwise as without it.
+        the shutter-motion correction), of ``t``'s shape. The observer-to-Sun
+        vector is then evaluated once per unique ``t`` (and at ``t`` +
+        SUN_SHIFT_STEP_S, for its motion) and shifted linearly by ``dt_s``:
+        its direction moves ~0.04"/s (plus the observatory's diurnal motion,
+        ~6e-4"/s), so the error of the linear shift is far below a
+        micro-arcsecond. The velocity (for the aberration) is shifted the
+        same way. Where ``dt_s`` is 0 the result is bitwise as without it.
     obscode : str
         The MPC code of the observatory (Rubin, X05, by default).
 
     Returns
     -------
     elong_deg : ndarray
-        Solar elongation in degrees, in [0, 180].
+        The apparent solar elongation in degrees, in [0, 180].
     """
 
     # The Sun and the observatory cost ~0.1 ms per time, but sources from
@@ -132,23 +154,35 @@ def solar_elongation_ndarray(ra_deg, dec_deg, t, dt_s=None, obscode="X05"):
     )
     inv = inv.ravel()
     tu = np.atleast_1d(t)[first]
-    s0 = _observer_sun_vectors(obscode, tu)                     # (3, M)
+    s0, beta0 = _observer_sun_vectors(obscode, tu)              # (3, M)
     sun = s0[:, inv].reshape((3,) + shape)
+    beta = beta0[:, inv].reshape((3,) + shape)
 
     if dt_s is not None:
         # the vector's motion per second, at each unique reference time
-        s1 = _observer_sun_vectors(obscode, tu + SUN_SHIFT_STEP_S * u.s)
+        # (and the velocity's: ~1e-10 c in a second, ~5 uas in 0.24 s)
+        s1, beta1 = _observer_sun_vectors(obscode, tu + SUN_SHIFT_STEP_S * u.s)
         rate = ((s1 - s0) / SUN_SHIFT_STEP_S)[:, inv].reshape((3,) + shape)
+        brate = ((beta1 - beta0) / SUN_SHIFT_STEP_S)[:, inv].reshape((3,) + shape)
         dt_s = np.broadcast_to(np.asarray(dt_s, dtype=np.float64), shape)
         sun = sun + rate * dt_s
+        beta = beta + brate * dt_s
 
-    # The target's unit vector
+    # The target's unit vector, broadcast with the times'
     ra = np.radians(ra_deg)
     dec = np.radians(dec_deg)
     cd = np.cos(dec)
     p = np.stack(np.broadcast_arrays(cd * np.cos(ra), cd * np.sin(ra), np.sin(dec)))
+    common = np.broadcast_shapes(p.shape[1:], shape)
 
-    # The angle, robust at 0 and 180 deg: atan2(|p x s|, p . s)
+    def _to_common(x):     # (3, *s) -> (3, *common), aligning s's trailing axes
+        return np.broadcast_to(x.reshape((3,) + (1,) * (len(common) - x.ndim + 1) + x.shape[1:]),
+                               (3,) + common)
+    p, sun, beta = (_to_common(x) for x in (p, sun, beta))
+
+    # Both directions aberrated; the angle, robust at 0 and 180 deg:
+    # atan2(|p x s|, p . s)
+    p, sun = aberrate(p, beta), aberrate(sun, beta)
     cross = np.linalg.norm(np.cross(p, sun, axis=0), axis=0)
     dot = np.sum(p * sun, axis=0)
     return np.degrees(np.arctan2(cross, dot))

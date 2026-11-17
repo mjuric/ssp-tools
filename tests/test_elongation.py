@@ -1,5 +1,7 @@
-"""ssp.util.solar_elongation_ndarray: the angle between the target and the
-geometric observer-to-Sun direction (docs/design/elongation-ssobject-nulls.md).
+"""ssp.util.solar_elongation_ndarray: the apparent (aberrated) solar
+elongation, as Horizons' S-O-T: the angle between the target and the
+observer-to-Sun direction, both aberrated by the observatory's velocity
+(docs/design/elongation-ssobject-nulls.md).
 
 The tests against JPL Horizons (tests/data/elongation/horizons_sot.csv) need
 DE440 in the astropy cache and are skipped without it (they never download);
@@ -18,10 +20,6 @@ from astropy.time import Time
 from ssp import util
 
 HORIZONS = Path(__file__).parent / "data" / "elongation" / "horizons_sot.csv"
-
-#: The speed of light [km/s].
-C_KMS = 299792.458
-
 
 def real_ephemeris_or_skip(monkeypatch):
     """The real Sun and observatory, with X05's location given (not fetched
@@ -57,35 +55,24 @@ def _angle_deg(a, b):
 # --------------------------------------------------------------------------
 
 def test_horizons_sot(monkeypatch):
-    """Horizons' S-O-T is the angle between the *apparent* (aberrated)
-    target and Sun, while SSObservation's elongation is the geometric one
-    (the owner's decision, 2026-11-17): they differ by up to ~41" (twice the
-    annual aberration). So: (1) the geometric elongation is within 0.012 deg
-    of S-O-T, and (2) aberrating both directions by the observatory's
-    barycentric velocity, our observer-to-Sun vector reproduces S-O-T to
-    the fixture's precision (0.001 deg), validating the Sun direction."""
+    """The apparent elongation, given Horizons' own RA and Dec, reproduces
+    Horizons' S-O-T (the apparent, aberrated one) to within 0.001 deg (the
+    observed residual is ~0.2", S-O-T's printed precision)."""
     real_ephemeris_or_skip(monkeypatch)
     d = pd.read_csv(HORIZONS)
     assert len(d) == 319
     t = Time(d["mjd_tai"].to_numpy(), format="mjd", scale="tai")
     elong = util.solar_elongation_ndarray(d["ra"].to_numpy(), d["dec"].to_numpy(), t)
     diff = elong - d["sot"].to_numpy()
-    assert np.max(np.abs(diff)) < 0.012, np.max(np.abs(diff))
-    # (and the geometric elongation is not the apparent one)
-    assert np.max(np.abs(diff)) > 0.005
+    assert np.max(np.abs(diff)) < 0.001, np.max(np.abs(diff))
 
-    # the same vectors, aberrated (to first order, as v/c ~ 1e-4)
-    r_obs, v_obs = util.observatory_barycentric_posvel("X05", t)
+    # sanity: the geometric angle (no aberration) differs by up to 2 v/c
+    # (~41"), and does differ
+    r_obs, _ = util.observatory_barycentric_posvel("X05", t)
     s = util.sun_barycentric_position(t).to_value(u.au) - r_obs.to_value(u.au)
-    beta = v_obs.to_value(u.km / u.s) / C_KMS
-    p = _unit(d["ra"].to_numpy(), d["dec"].to_numpy())
-
-    def aberrate(n):
-        m = n / np.linalg.norm(n, axis=0) + beta
-        return m / np.linalg.norm(m, axis=0)
-
-    apparent = _angle_deg(aberrate(p), aberrate(s))
-    assert np.max(np.abs(apparent - d["sot"].to_numpy())) < 0.001
+    geometric = _angle_deg(_unit(d["ra"].to_numpy(), d["dec"].to_numpy()), s)
+    dg = np.abs(geometric - elong) * 3600
+    assert 10 < np.max(dg) < 42, np.max(dg)
 
 
 def test_horizons_sot_shifted(monkeypatch):
@@ -106,9 +93,11 @@ def test_horizons_sot_shifted(monkeypatch):
 # --------------------------------------------------------------------------
 
 def _stand_in_observatory(obscode, obstime):
+    """At rest (no aberration): the known-geometry tests are of the Sun's
+    direction; test_aberration gives the observatory a velocity."""
     ph = 2 * np.pi * (obstime.tai.mjd - 60800.0) / 365.25
     r = np.stack([np.cos(ph), 0.917 * np.sin(ph), 0.398 * np.sin(ph)])
-    return r * u.au, -r * 0.0172 * u.au / u.day
+    return r * u.au, 0 * r * u.au / u.day
 
 
 def _stand_in_sun(obstime):
@@ -168,3 +157,70 @@ def test_scalar_and_shape(stand_ins):
     ra, dec = _radec(_sun_dir(Time([60810.0], format="mjd", scale="tai")))
     e = util.solar_elongation_ndarray(ra[0], dec[0], t)
     assert np.ndim(e) == 0 and e * 3.6e6 < 1.0
+
+
+def _fixed(monkeypatch, sun_dir, v_kms):
+    """A Sun at ``sun_dir`` [AU] from an observatory at the origin moving at
+    ``v_kms`` [km/s], at every time."""
+    def obs(obscode, obstime):
+        n = np.atleast_1d(obstime.tai.mjd).size
+        v = np.repeat(np.asarray(v_kms, float)[:, None], n, axis=1)
+        return np.zeros((3, n)) * u.au, (v * u.km / u.s).to(u.au / u.day)
+
+    def sun(obstime):
+        n = np.atleast_1d(obstime.tai.mjd).size
+        return np.repeat(np.asarray(sun_dir, float)[:, None], n, axis=1) * u.au
+    monkeypatch.setattr(util, "observatory_barycentric_posvel", obs)
+    monkeypatch.setattr(util, "sun_barycentric_position", sun)
+
+
+def test_aberration(monkeypatch):
+    """Sun along +x, the observatory moving along +y at 30 km/s (beta = v /
+    c): the Sun's apparent direction tilts towards +y by ~beta, the
+    antisolar point's too, and a target along +y (the apex) not at all."""
+    v = 30.0
+    b = np.degrees(v / util.C_KM_S)
+    _fixed(monkeypatch, [1.0, 0, 0], [0, v, 0])
+    t = Time(np.full(3, 60800.0), format="mjd", scale="tai")
+    e = util.solar_elongation_ndarray(np.array([0.0, 180.0, 90.0]), np.zeros(3), t)
+    # (first order: exact to ~beta^2 ~ 1e-8 rad)
+    np.testing.assert_allclose(e, [0.0, 180 - 2 * b, 90 - b], rtol=0, atol=1e-6)
+    assert 180 - e[1] > 40 / 3600                      # (~41")
+    # the velocity matters only through beta: at rest, geometric
+    _fixed(monkeypatch, [1.0, 0, 0], [0, 0, 0])
+    e = util.solar_elongation_ndarray(np.array([0.0, 180.0, 90.0]), np.zeros(3), t)
+    np.testing.assert_allclose(e, [0.0, 180.0, 90.0], rtol=0, atol=1e-12)
+
+
+def test_aberrate_rule():
+    """util.aberrate is ephem_assist._phase_angle_deg's rule."""
+    rng = np.random.default_rng(5)
+    n = rng.normal(size=(3, 50)) * 3
+    beta = rng.normal(size=(3, 50)) * 1e-4
+    got = util.aberrate(n, beta)
+    un = n / np.linalg.norm(n, axis=0)
+    want = un + beta - np.sum(un * beta, axis=0) * un
+    np.testing.assert_allclose(got, want / np.linalg.norm(want, axis=0), rtol=0, atol=1e-15)
+    np.testing.assert_allclose(np.linalg.norm(got, axis=0), 1.0, rtol=0, atol=1e-15)
+
+
+def test_broadcast_scalar_time_array_positions(stand_ins):
+    """A scalar time with array positions, and an array of times with a
+    scalar position, broadcast (as before the fix)."""
+    t1 = Time(60810.0, format="mjd", scale="tai")
+    ra, dec = np.array([10.0, 100.0, 250.0]), np.array([-5.0, 20.0, 60.0])
+    e = util.solar_elongation_ndarray(ra, dec, t1)
+    assert e.shape == (3,)
+    each = [util.solar_elongation_ndarray(r, d, t1) for r, d in zip(ra, dec)]
+    np.testing.assert_array_equal(e, each)
+    # and with dt_s (of the time's shape)
+    e2 = util.solar_elongation_ndarray(ra, dec, t1, dt_s=0.0)
+    np.testing.assert_array_equal(e2, e)
+
+    tt = Time(60810.0 + np.arange(4) * 3.0, format="mjd", scale="tai")
+    e = util.solar_elongation_ndarray(33.0, -12.0, tt)
+    assert e.shape == (4,)
+    each = [util.solar_elongation_ndarray(33.0, -12.0, tt[i]) for i in range(4)]
+    np.testing.assert_array_equal(e, each)
+    e2 = util.solar_elongation_ndarray(33.0, -12.0, tt, dt_s=np.zeros(4))
+    np.testing.assert_array_equal(e2, e)
