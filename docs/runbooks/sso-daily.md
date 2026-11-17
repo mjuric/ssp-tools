@@ -156,7 +156,7 @@ ssp-build-ssobject RUN_DIR/delivery RUN_DIR/delivery/mpc_orbits.parquet -o ssobj
 
 ## Open items with the DM-55678 owners
 
-1. Rebuilding the PPDB dataset from DM-55375's `ppdb.yaml`.
+1. Rebuilding the PPDB dataset from DM-55375's `ppdb.yaml` in prod (and dev) once lsst/sdm_schemas#549 is merged; int was rebuilt and loaded on 2026-10-13. Any later column change to the SS tables needs the same rebuild.
 2. The prod names.
 3. Whether naive (UTC wall-time) Parquet timestamps, which match the MPC's `timestamp without time zone`, load correctly into the PPDB's TIMESTAMP columns.
 
