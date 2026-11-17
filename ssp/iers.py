@@ -34,6 +34,7 @@ from ssp.delivery_contract import (
     IERS_A_ENV,
     IERS_A_FILE,
     IERS_A_MAX_AGE_DAYS,
+    IERS_A_MIN_PREDICTION_DAYS,
     IERS_A_STALE_DAYS,
 )
 
@@ -78,7 +79,8 @@ def count_lines(path):
 
 def read(path):
     """The IERS_A table of ``path`` (astropy ``IERS_A.read``). Raises
-    IERSError if it is missing, does not parse, or has no predicted rows."""
+    IERSError if it is missing, does not parse, has no predicted rows, or
+    its predictions span less than IERS_A_MIN_PREDICTION_DAYS (truncated)."""
     from astropy.utils import iers
 
     path = Path(path)
@@ -93,6 +95,10 @@ def read(path):
         raise IERSError(f"{path} has no IERS-A rows")
     if table.meta.get("predictive_index", len(table)) >= len(table):
         raise IERSError(f"{path} has no predicted rows")
+    span = float(table["MJD"][-1].value) - float(table.meta["predictive_mjd"])
+    if span < IERS_A_MIN_PREDICTION_DAYS:
+        raise IERSError(f"{path}'s predictions span only {span:.0f} days (at least "
+                        f"{IERS_A_MIN_PREDICTION_DAYS} expected): truncated?")
     return table
 
 
@@ -218,12 +224,20 @@ def _print(msg):
     print(msg, flush=True)
 
 
-def acquire(store_dir, staging_dir, now=utcnow, log=_print):
+def _stale_warning(what, age):
+    if age > IERS_A_STALE_DAYS:
+        _warn(f"IERS-A is STALE: {what} is {age} days old (over {IERS_A_STALE_DAYS}); runs will "
+              f"fail in {round(IERS_A_MAX_AGE_DAYS - age, 2)} days unless a newer file is downloaded")
+
+
+def acquire(store_dir, staging_dir, now=None, log=_print):
     """Put the day's IERS-A file in ``staging_dir/IERS_A_FILE`` and return
     its manifest entry (see the module docstring and docs/design/iers-a.md).
     Raises IERSError, with the store, the copy's age and the download error,
     when there is neither a good download nor a store copy within
-    IERS_A_MAX_AGE_DAYS."""
+    IERS_A_MAX_AGE_DAYS. ``now`` (a function returning an aware datetime;
+    default: utcnow) is the clock the ages are measured with."""
+    now = now or utcnow
     store_dir, staging_dir = Path(store_dir), Path(staging_dir)
     store = store_dir / IERS_A_FILE
     dest = staging_dir / IERS_A_FILE
@@ -244,23 +258,31 @@ def acquire(store_dir, staging_dir, now=utcnow, log=_print):
             start = predictions_start(read(part))
             if store_start is not None and start < store_start:
                 raise IERSError(f"its predictions start {start}, before the store copy's ({store_start})")
+            extracted = now()
+            age = age_days(start, extracted)
+            if age > IERS_A_MAX_AGE_DAYS:
+                raise IERSError(f"its predictions start {start}, {age} days ago, past the "
+                                f"{IERS_A_MAX_AGE_DAYS}-day limit")
         except Exception as e:      # any failure, a validation failure included
             errors.append(f"{url}: {type(e).__name__}: {e}")
             log(f"IERS-A: download from {url} failed: {type(e).__name__}: {e}")
             if part.exists():
                 part.unlink()
             continue
-        extracted = now()
         os.replace(part, dest)
+        # Owner decision 2026-11-17: a store that cannot be updated does not
+        # fail the run; the good download is used, with a loud warning.
         try:
             store_dir.mkdir(parents=True, exist_ok=True)
             copy_atomic(dest, store)
+            stored = f"store {store} updated"
         except OSError as e:
-            raise IERSError(f"IERS-A: downloaded {url}, but cannot update the store {store}: "
-                            f"{type(e).__name__}: {e}") from None
+            stored = f"store {store} NOT updated"
+            _warn(f"IERS-A: downloaded {url}, but cannot update the store {store}: {type(e).__name__}: "
+                  f"{e}; using the download, but later runs cannot reuse it until the store is fixed")
         entry = describe(dest, url, extracted, start, reused=False)
-        log(f"IERS-A: downloaded {url}: predictions from {start}, {entry['age_days']} days old; "
-            f"store {store} updated")
+        log(f"IERS-A: downloaded {url}: predictions from {start}, {entry['age_days']} days old; {stored}")
+        _stale_warning(f"the downloaded file ({url})", entry["age_days"])
         return entry
 
     error = "; ".join(errors)
@@ -281,7 +303,5 @@ def acquire(store_dir, staging_dir, now=utcnow, log=_print):
                         f"old (predictions from {store_start}), past the {IERS_A_MAX_AGE_DAYS}-day limit")
     _warn(f"IERS-A download failed ({error}); reusing the store's copy {store}, {age} days old "
           f"(predictions from {store_start})")
-    if age > IERS_A_STALE_DAYS:
-        _warn(f"IERS-A is STALE: the reused copy is {age} days old (over {IERS_A_STALE_DAYS}); runs will "
-              f"fail in {round(IERS_A_MAX_AGE_DAYS - age, 2)} days unless a download succeeds")
+    _stale_warning("the reused copy", age)
     return entry

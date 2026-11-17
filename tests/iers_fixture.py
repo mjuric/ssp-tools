@@ -24,7 +24,7 @@ def first_predicted(lines):
                 if len(line) > UT1_FLAG and (line[PM_FLAG] == "P" or line[UT1_FLAG] == "P"))
 
 
-def write_finals(path, before=40, after=40, promote=0, ut1_offset=0.0, predicted=True):
+def write_finals(path, before=40, after=200, promote=0, ut1_offset=0.0, predicted=True):
     """A finals2000A file at ``path``: ``before`` measured and ``after``
     predicted lines around the bundled file's first predicted one. With
     ``promote`` N, the first N predicted lines are marked measured, so the

@@ -23,6 +23,7 @@ uses exactly the file in the inputs, never the bundled table or a download.
 |---|---|
 | 2026-11-17 | Downloading `finals2000A.all` is a step of the extract; the file is one of the day's inputs, recorded in `manifest.json`. |
 | 2026-11-17 | The build always uses exactly that file. A manifest without `iers_a` fails the build. |
+| 2026-11-17 | A good download whose store cannot be updated does not fail the run: it is used, with a loud warning naming the store and the error (review round 1). |
 | 2026-11-17 | A failed download reuses the store's copy, with a warning every time, stronger past 30 days; past 90 days the run fails. The build accepts files up to 90 days old. |
 
 ## Outputs and inputs
@@ -72,25 +73,42 @@ predictions_start, age_days, reused}` (`IERS_A_REPORT_FIELDS`), next to
   `iers.conf.iers_auto_url`, then `iers.conf.iers_auto_url_mirror` (so
   `astropy.cfg` can change them), straight into a file: never astropy's
   cache, nothing under `$HOME`.
-- **Validation:** parses with `IERS_A.read`, has predicted rows, and its
-  `predictions_start` is not before the store copy's. A failure counts as a
-  failed download; its error goes into `source`.
+- **Validation:** parses with `IERS_A.read`; has predicted rows; its
+  predictions span at least 180 days (`IERS_A_MIN_PREDICTION_DAYS`;
+  finals2000A.all carries about a year), which catches a truncated
+  download that still parses; its `predictions_start` is not before the
+  store copy's; and it is at most 90 days old (review round 1: an old
+  download must not pass the extract and fail only in the build, after the
+  exports). A failure counts as a failed download: its error goes into
+  `source` (if the store is reused), the store is not touched, and the
+  mirror, then the store, are tried as usual. The span check is in
+  `ssp.iers.read`, so it also applies to the store's copy and in the build.
 - **Success:** the store is replaced atomically (a temporary file in DIR,
-  fsync, rename, fsync of DIR).
+  fsync, rename, fsync of DIR). A fresh download over 30 days old (possible
+  when the IERS has not published for a while) gets the same
+  `IERS-A is STALE` warning as a reused copy.
 - **Failure:** the store's copy is copied into staging (same way),
   `reused: true`, and a warning on stderr with the errors and `age_days`;
   past 30 days a second, `IERS-A is STALE`, warning with the days left
   before runs fail. No store copy, an unreadable one, or one over 90 days
   old: the extract fails (exit 1) with the store, the copy's age and the
-  download errors, before the MPC export. A store that cannot be written
-  after a good download also fails the extract.
+  download errors, before the MPC export. A good download whose store
+  cannot be updated does not fail the extract (owner decision 2026-11-17):
+  the download is used (`reused: false`), with a loud
+  `WARNING: IERS-A: downloaded <url>, but cannot update the store <path>:
+  <error>`.
 
 ### The build (`ssp.sso_build`, `ssp.iers.install`)
 
 - **Manifest check:** `files.iers_a` must be there, with the fields and
-  types above, the file present with its md5 and line count, readable by
-  `IERS_A.read`, its `predictions_start` as recorded, and `age_days` at
-  most 90. With an `IERS_A` table installed, astropy's own `auto_max_age`
+  types above (`file` exactly `finals2000A.all`, which also rules out
+  paths such as `../x`; `source`, `extracted_utc` and `predictions_start`
+  strings), the file present with its md5 and line count, readable by
+  `IERS_A.read` (with the 180-day span), its `predictions_start` as
+  recorded, and `age_days` at most 90. A manifest without the entry fails
+  with how to add the file to those inputs, which runs no other step and
+  keeps the other files: `ssp-extract-sso-inputs INPUTS_DIR --force --skip
+  mpc --skip dia_sources --skip ppdb_dia_sources --iers-a-store DIR`. With an `IERS_A` table installed, astropy's own `auto_max_age`
   check does not apply, so this is where the build enforces the limit. The
   age is the manifest's (at extraction), so rerunning a day reproduces it.
   The md5 is checked again after the builders (the `check` step's
@@ -127,8 +145,16 @@ ssp-daily's. `--iers-a-store DIR` changes it.
 Tests (network-free; the download is replaced; small files are cut from
 astropy's bundled table by `tests/iers_fixture.py`):
 
+- Every test is independent of the date it runs: the extract's clock
+  (`ssp.iers.utcnow`) is fixed relative to the test files' predictions, and
+  the build's age is the manifest's. (Checked by running them with the
+  default clock moved 150 days ahead.)
 - `tests/test_iers.py`: download success; mirror fallback; a corrupt, an
-  older-than-store and a no-predictions download treated as failures; store
+  older-than-store, a truncated (99-day span) and a no-predictions download
+  treated as failures; a download over 90 days old refused (store
+  untouched, then the mirror's newer file taken, with the STALE warning);
+  the STALE warning on a fresh download past 30 days; the 180-day span
+  boundary; store
   reuse; the 30- and 90-day thresholds (30, 30.01, 89.5, 90 pass; 90.01
   fails); no store copy, and an unreadable one; atomic store replacement (a
   copy failing half way leaves the old copy and no temporary file); the real

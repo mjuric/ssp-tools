@@ -429,21 +429,30 @@ def iers_a_path(inputs_dir, manifest):
     return Path(inputs_dir) / manifest["files"][IERS_A_NAME]["file"]
 
 
+#: How to add the IERS-A file to inputs extracted without it (runs no other
+#: step and keeps the other files).
+ADD_IERS_A = ("ssp-extract-sso-inputs INPUTS_DIR --force --skip mpc --skip dia_sources "
+              "--skip ppdb_dia_sources --iers-a-store DIR")
+
+
 def _validate_iers_a(inputs_dir, entry, todo):
     """The problems with the manifest's ``files.iers_a`` (owner decision: the
     build refuses inputs without one); adds the file to ``todo`` for its md5
     check."""
     if not isinstance(entry, dict):
         return [f"manifest lacks {IERS_A_NAME!r} (the IERS-A file, {IERS_A_FILE}): extract the inputs "
-                "with ssp-extract-sso-inputs --iers-a-store DIR"]
+                f"with --iers-a-store DIR, or add it to these with `{ADD_IERS_A}`"]
     missing = [k for k in IERS_A_MANIFEST_FIELDS if k not in entry]
     if missing:
         return [f"{IERS_A_NAME}: manifest entry lacks {missing}"]
     bad = []
-    if not isinstance(entry["file"], str) or not entry["file"]:
-        bad.append(f"file {entry['file']!r} is not a path")
+    if entry["file"] != IERS_A_FILE:
+        bad.append(f"file {entry['file']!r} is not {IERS_A_FILE!r}")
     if not isinstance(entry["md5"], str) or not _MD5_RE.fullmatch(entry["md5"]):
         bad.append(f"md5 {entry['md5']!r} is not an md5")
+    for k in ("source", "extracted_utc", "predictions_start"):
+        if not isinstance(entry[k], str):
+            bad.append(f"{k} {entry[k]!r} is not a string")
     if not isinstance(entry["rows"], int) or isinstance(entry["rows"], bool):
         bad.append(f"rows {entry['rows']!r} is not a line count")
     age = entry["age_days"]
@@ -497,8 +506,8 @@ def write_manifest(inputs_dir, files, producer="hand-made", mpc_snapshot_utc=Non
     """Write ``INPUTS_DIR/manifest.json`` for ``files`` ({name: file,
     relative to INPUTS_DIR}), with each file's rows and md5, and each
     DERIVED_FROM input recorded as built from the given parent (or from
-    ``<name>_<parent>_md5=``); and, with ``iers_a`` (an IERS-A file
-    relative to INPUTS_DIR), its ``files.iers_a`` entry (``reused`` false,
+    ``<name>_<parent>_md5=``); and, with ``iers_a`` (the IERS-A file,
+    INPUTS_DIR/IERS_A_FILE), its ``files.iers_a`` entry (``reused`` false,
     extracted a day after its predictions start; ``iers_a_entry=`` {...}
     overrides fields). For tests and for inputs from other sources; stage 1
     writes its own."""
@@ -514,6 +523,8 @@ def write_manifest(inputs_dir, files, producer="hand-made", mpc_snapshot_utc=Non
         if name in entries and parent in entries:
             entries[name][f"{parent}_md5"] = extra.pop(f"{name}_{parent}_md5", entries[parent]["md5"])
     if iers_a is not None:
+        if iers_a != IERS_A_FILE:
+            raise ValueError(f"the IERS-A file must be INPUTS_DIR/{IERS_A_FILE}, not {iers_a}")
         path = Path(inputs_dir) / iers_a
         start = _iers.predictions_start(_iers.read(path))
         when = (datetime.datetime.fromisoformat(start).replace(tzinfo=datetime.timezone.utc)

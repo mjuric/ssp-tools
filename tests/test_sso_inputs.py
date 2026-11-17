@@ -588,6 +588,11 @@ def iers_net(monkeypatch, tmp_path, stubs):
 
     monkeypatch.setattr(I, "urls", lambda: ["https://a.invalid/f", "https://b.invalid/f"])
     monkeypatch.setattr(I, "fetch", fetch)
+    # the clock, 5 days after the test files' predictions start (not the
+    # date the tests run)
+    start = datetime.datetime.fromisoformat(I.predictions_start(I.read(state["file"])))
+    now = start.replace(tzinfo=datetime.timezone.utc) + datetime.timedelta(days=5)
+    monkeypatch.setattr(I, "utcnow", lambda: now)
     monkeypatch.setattr(M, "export_mpc", export_mpc)
     return state
 
@@ -620,7 +625,8 @@ def test_iers_a_manifest_types(tmp_path, stubs, iers_net):
         assert type(e["reused"]) is bool
         assert type(e["age_days"]) in (int, float)
         assert type(e["source"]) is str
-    assert e["reused"] is True and e["source"].startswith(f"reused {store / IERS_A_FILE} (download failed: ")
+    assert e["reused"] is True and e["age_days"] == 5.0
+    assert e["source"].startswith(f"reused {store / IERS_A_FILE} (download failed: ")
     assert "no route to host" in e["source"]
     assert '"reused": true' in (tmp_path / "inputs" / MANIFEST_FILE).read_text()
 
@@ -650,6 +656,23 @@ def test_without_flag_no_iers_a(tmp_path, stubs, iers_net):
     m = run(tmp_path)
     assert IERS_A_NAME not in m["files"] and "iers" not in stubs["order"]
     assert not (tmp_path / "inputs" / IERS_A_FILE).exists()
+
+
+def test_add_iers_a_to_existing_inputs(tmp_path, stubs, iers_net, capsys):
+    """The command the build's error gives adds the file to inputs extracted
+    without it, running nothing else and keeping the other files."""
+    from ssp import sso_build as B
+
+    first = run(tmp_path)
+    with pytest.raises(B.ManifestError) as ex:
+        B.validate_manifest(tmp_path / "inputs")
+    cmd = ex.value.args[0].split("`")[1].split()
+    assert cmd[:2] == ["ssp-extract-sso-inputs", "INPUTS_DIR"] and cmd[-2:] == ["--iers-a-store", "DIR"]
+    m = run(tmp_path, *cmd[2:-1], str(tmp_path / "store"))
+    assert stubs["mpc"] == 1 and stubs["dia_sources"] == 1 and stubs["ppdb_dia_sources"] == 1
+    assert {k: v for k, v in m["files"].items() if k != IERS_A_NAME} == first["files"]
+    assert m["files"][IERS_A_NAME]["reused"] is False
+    assert_valid(tmp_path, m)
 
 
 def test_iers_a_with_only_and_carry_over(tmp_path, stubs, iers_net):

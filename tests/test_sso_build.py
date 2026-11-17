@@ -1376,9 +1376,9 @@ def test_e2e_non_clickhouse_source(e2e, tmp_path):
         if name in ("ppdb_dia_sources", "obs_sbn"):
             t = t.take(np.random.default_rng(1).permutation(t.num_rows))
         pq.write_table(t, src / f, row_group_size=1000)
-    copy_bundled(src / "eop.txt")
+    copy_bundled(src / IERS_A_FILE)
     B.write_manifest(src, files, producer="a hand-made source", ppdb_dia_sources_source="a CSV dump",
-                     iers_a="eop.txt")
+                     iers_a=IERS_A_FILE)
     rep2 = B.build(src, tmp_path / "run", workers=E2E_WORKERS)
     for s in BUILD_STEPS[:-1]:
         assert rep2["steps"][s]["status"] == "ok", (s, rep2["steps"][s])
@@ -1447,20 +1447,43 @@ def test_manifest_iers_a_in_files(tmp_path):
 
 
 @pytest.mark.parametrize("edit, match", [
-    (lambda m: m["files"].pop("iers_a"), "manifest lacks 'iers_a'.*--iers-a-store"),
+    (lambda m: m["files"].pop("iers_a"),
+     "manifest lacks 'iers_a'.*`ssp-extract-sso-inputs INPUTS_DIR --force --skip mpc --skip dia_sources "
+     "--skip ppdb_dia_sources --iers-a-store DIR`"),
     (lambda m: m["files"]["iers_a"].update(md5="0" * 32), "iers_a: md5"),
-    (lambda m: m["files"]["iers_a"].update(rows=3), "iers_a: 80 lines, the manifest says 3"),
+    (lambda m: m["files"]["iers_a"].update(rows=3), "iers_a: 240 lines, the manifest says 3"),
     (lambda m: m["files"]["iers_a"].update(age_days=90.01), "over the 90-day limit"),
     (lambda m: m["files"]["iers_a"].update(age_days="5"), "age_days '5' is not a number"),
     (lambda m: m["files"]["iers_a"].update(reused="false"), "reused 'false' is not a boolean"),
     (lambda m: m["files"]["iers_a"].update(predictions_start="2020-01-01"), "the manifest says 2020-01-01"),
     (lambda m: m["files"]["iers_a"].pop("source"), r"iers_a: manifest entry lacks \['source'\]"),
-    (lambda m: m["files"]["iers_a"].update(file="nope.all"), "nope.all does not exist"),
+    (lambda m: m["files"]["iers_a"].update(file="nope.all"), "file 'nope.all' is not 'finals2000A.all'"),
+    (lambda m: m["files"]["iers_a"].update(file="../finals2000A.all"), "is not 'finals2000A.all'"),
+    (lambda m: m["files"]["iers_a"].update(source=None), "source None is not a string"),
+    (lambda m: m["files"]["iers_a"].update(extracted_utc=5), "extracted_utc 5 is not a string"),
+    (lambda m: m["files"]["iers_a"].update(predictions_start=61294),
+     "predictions_start 61294 is not a string"),
 ])
 def test_manifest_iers_a_failures(tmp_path, edit, match):
     write_inputs(tmp_path)
     _edit_manifest(tmp_path, edit)
     with pytest.raises(B.ManifestError, match=match):
+        B.validate_manifest(tmp_path)
+
+
+def test_manifest_iers_a_file_missing(tmp_path):
+    write_inputs(tmp_path)
+    (tmp_path / IERS_A_FILE).unlink()
+    with pytest.raises(B.ManifestError, match="finals2000A.all does not exist"):
+        B.validate_manifest(tmp_path)
+
+
+def test_manifest_iers_a_truncated(tmp_path):
+    write_inputs(tmp_path)
+    write_finals(tmp_path / IERS_A_FILE, after=100)
+    md5 = B._md5(tmp_path / IERS_A_FILE)
+    _edit_manifest(tmp_path, lambda m: m["files"]["iers_a"].update(md5=md5, rows=140))
+    with pytest.raises(B.ManifestError, match="predictions span only 99 days"):
         B.validate_manifest(tmp_path)
 
 

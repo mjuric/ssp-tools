@@ -43,6 +43,16 @@ def net(monkeypatch, tmp_path):
     return state
 
 
+@pytest.fixture(autouse=True)
+def clock(monkeypatch, tmp_path):
+    """The extract's clock, fixed 5 days after the test files' predictions
+    start (they are cut from astropy's bundled table), so no test depends on
+    the date it runs."""
+    t = at(write_finals(tmp_path / "clock.all"), 5)()
+    monkeypatch.setattr(I, "utcnow", lambda: t)
+    return t
+
+
 def start_of(path):
     return I.predictions_start(I.read(path))
 
@@ -85,7 +95,7 @@ def test_download_success(tmp_path, net, dirs, capsys):
     assert e["reused"] is False and e["source"] == URL
     assert e["age_days"] == 2.5
     assert e["predictions_start"] == start_of(new)
-    assert e["rows"] == 80
+    assert e["rows"] == 240
     assert (staging / IERS_A_FILE).read_bytes() == new.read_bytes()
     assert e["md5"] == I.md5sum(new)
     assert (store / IERS_A_FILE).read_bytes() == new.read_bytes()     # the store filled
@@ -110,6 +120,7 @@ def test_mirror_fallback(tmp_path, net, dirs):
     ("corrupt", "not a readable IERS-A"),
     ("older", "before the store copy's"),
     ("no_predictions", "IERS-A"),
+    ("truncated", "predictions span only 99 days"),
 ])
 def test_bad_download_is_a_failure(tmp_path, net, dirs, capsys, bad, match):
     store, staging = dirs
@@ -120,6 +131,8 @@ def test_bad_download_is_a_failure(tmp_path, net, dirs, capsys, bad, match):
         (tmp_path / "bad.all").write_text("<html>Service unavailable</html>\n")
     elif bad == "older":
         write_finals(tmp_path / "bad.all")
+    elif bad == "truncated":
+        write_finals(tmp_path / "bad.all", promote=10, after=110)     # newer than the store, but cut
     else:
         write_finals(tmp_path / "bad.all", predicted=False)
     net["files"][URL] = net["files"][MIRROR] = tmp_path / "bad.all"
@@ -171,6 +184,65 @@ def test_age_thresholds(tmp_path, net, dirs, capsys, age, stale, fails):
         assert f"runs will fail in {round(90 - float(age), 2)} days" in err
 
 
+def test_old_download_is_a_failure(tmp_path, net, dirs, capsys):
+    """A download over 90 days old fails validation: the store is not
+    updated, the mirror is tried, then the store."""
+    store, staging = dirs
+    old = write_finals(tmp_path / "old.all")
+    net["files"][URL] = old
+    with pytest.raises(I.IERSError, match="has no copy") as ex:
+        I.acquire(store, staging, now=at(old, 90.5))
+    assert "past the 90-day limit" in str(ex.value) and URL in str(ex.value)
+    assert not (store / IERS_A_FILE).exists()
+    # the mirror's, newer, is taken (stale: warned)
+    net["files"][MIRROR] = newer = write_finals(tmp_path / "newer.all", promote=10)
+    e = I.acquire(store, staging, now=at(old, 90.5))
+    assert e["source"] == MIRROR and e["reused"] is False and e["age_days"] == 80.5
+    assert (store / IERS_A_FILE).read_bytes() == newer.read_bytes()
+    err = capsys.readouterr().err
+    assert "STALE: the downloaded file" in err and "runs will fail in 9.5 days" in err
+    # with a store copy: an old download is refused, the store's (newer)
+    # copy reused
+    e = I.acquire(store, staging, now=at(old, 95))
+    assert e["source"] == MIRROR and e["age_days"] == 85
+    net["files"][MIRROR] = old
+    e = I.acquire(store, staging, now=at(old, 95))
+    assert e["reused"] is True and "before the store copy" in e["source"]
+
+
+def test_fresh_download_stale_warning(tmp_path, net, dirs, capsys):
+    store, staging = dirs
+    net["files"][URL] = new = write_finals(tmp_path / "new.all")
+    assert I.acquire(store, staging, now=at(new, 30))["reused"] is False
+    assert "STALE" not in capsys.readouterr().err
+    assert I.acquire(store, staging, now=at(new, 31))["age_days"] == 31
+    assert "STALE: the downloaded file" in capsys.readouterr().err
+
+
+def test_truncated_file_refused():
+    """A file whose predictions span under IERS_A_MIN_PREDICTION_DAYS (a cut
+    download) does not read; one at 180 days does."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        I.read(write_finals(Path(d) / "a.all", after=181))
+        with pytest.raises(I.IERSError, match="span only 179 days"):
+            I.read(write_finals(Path(d) / "b.all", after=180))
+
+
+def test_unwritable_store_is_a_warning(tmp_path, net, dirs, capsys):
+    """A good download whose store cannot be created is used (reused false),
+    with a warning naming the store and the error."""
+    _, staging = dirs
+    (tmp_path / "file").write_text("x")
+    store = tmp_path / "file" / "store"            # its parent is a file
+    net["files"][URL] = new = write_finals(tmp_path / "new.all")
+    e = I.acquire(store, staging)
+    assert e["reused"] is False and e["md5"] == I.md5sum(new)
+    assert (staging / IERS_A_FILE).read_bytes() == new.read_bytes()
+    err = capsys.readouterr().err
+    assert f"cannot update the store {store / IERS_A_FILE}" in err and "NotADirectoryError" in err
+
+
 def test_no_store_copy_fails(tmp_path, net, dirs):
     store, staging = dirs
     with pytest.raises(I.IERSError, match=f"the store {store} has no copy") as ex:
@@ -191,7 +263,7 @@ def test_unreadable_store_copy(tmp_path, net, dirs):
     assert start_of(store / IERS_A_FILE) == start_of(tmp_path / "new.all")
 
 
-def test_store_replacement_is_atomic(tmp_path, net, dirs, monkeypatch):
+def test_store_replacement_is_atomic(tmp_path, net, dirs, monkeypatch, capsys):
     """The store is written through a temporary file and renamed: a copy that
     fails half way leaves the old copy whole and no temporary file."""
     store, staging = dirs
@@ -206,10 +278,15 @@ def test_store_replacement_is_atomic(tmp_path, net, dirs, monkeypatch):
         raise OSError("disk full")
 
     monkeypatch.setattr(I.shutil, "copyfileobj", broken)
-    with pytest.raises(I.IERSError, match="disk full"):
-        I.acquire(store, staging)
+    # (owner decision 2026-11-17: the run goes on with the download, warned)
+    e = I.acquire(store, staging)
+    assert e["reused"] is False and e["source"] == URL
+    assert (staging / IERS_A_FILE).read_bytes() == (tmp_path / "new.all").read_bytes()
     assert old.read_bytes() == before
     assert sorted(p.name for p in store.iterdir()) == [IERS_A_FILE]
+    err = capsys.readouterr().err
+    assert f"WARNING: IERS-A: downloaded {URL}, but cannot update the store {store / IERS_A_FILE}" in err
+    assert "disk full" in err
 
     monkeypatch.setattr(I.shutil, "copyfileobj", real)
     replaced = []

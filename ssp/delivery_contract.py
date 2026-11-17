@@ -127,6 +127,11 @@ IERS_A_MANIFEST_FIELDS = {
 #: a manifest whose age_days exceeds it.
 IERS_A_STALE_DAYS = 30
 IERS_A_MAX_AGE_DAYS = 90
+#: A usable file's predictions span at least this many days (from its first
+#: predicted row to its last row with predicted UT1-UTC and polar motion);
+#: finals2000A.all carries about a year. A shorter one (e.g. a truncated
+#: download) is refused.
+IERS_A_MIN_PREDICTION_DAYS = 180
 #: The build passes the file to every step subprocess in this environment
 #: variable; ssp.iers.install_from_env() installs it there.
 IERS_A_ENV = "SSP_IERS_A_FILE"
