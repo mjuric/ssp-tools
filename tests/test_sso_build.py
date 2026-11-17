@@ -26,6 +26,9 @@ from ssp import ssobservation_parts as SP
 from ssp.delivery_contract import (
     BUILD_STEPS,
     DELIVERY_TABLES,
+    IERS_A_ENV,
+    IERS_A_FILE,
+    IERS_A_NAME,
     INPUT_FILES,
     REPORT_FIELDS,
     REQUIRED_INPUT_COLUMNS,
@@ -39,6 +42,9 @@ from ssp.ssobservation_contract import (
     SSOBSERVATION_INTERNAL_DEFAULT,
     SSOBSERVATION_MANIFEST_FILE,
 )
+
+sys.path.insert(0, str(Path(__file__).parent))
+from iers_fixture import copy_bundled, write_finals
 
 SCHEMA = delivery_schema()
 UTC = datetime.timezone.utc
@@ -93,7 +99,8 @@ def write_inputs(d, n=4, files=None, **replace):
         (d / fname).parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(t, d / fname)
         names[name] = fname
-    return B.write_manifest(d, names, producer="test")
+    write_finals(d / IERS_A_FILE)
+    return B.write_manifest(d, names, producer="test", iers_a=IERS_A_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +110,7 @@ def write_inputs(d, n=4, files=None, **replace):
 def test_valid_manifest(tmp_path):
     m = write_inputs(tmp_path)
     assert B.validate_manifest(tmp_path) == m
-    assert set(m["files"]) == set(INPUT_FILES)
+    assert set(m["files"]) == set(INPUT_FILES) | {IERS_A_NAME}
 
 
 def _edit_manifest(d, fn):
@@ -1260,7 +1267,9 @@ def e2e(tmp_path_factory):
     (d / "in").mkdir()
     for name, t in tables.items():
         pq.write_table(t, d / "in" / INPUT_FILES[name][0])
-    B.write_manifest(d / "in", {n: INPUT_FILES[n][0] for n in INPUT_FILES}, producer="test subset")
+    copy_bundled(d / "in" / IERS_A_FILE)
+    B.write_manifest(d / "in", {n: INPUT_FILES[n][0] for n in INPUT_FILES}, producer="test subset",
+                     iers_a=IERS_A_FILE)
     rep = B.build(d / "in", d / "run", workers=E2E_WORKERS)
     return d, tables, rep
 
@@ -1367,7 +1376,9 @@ def test_e2e_non_clickhouse_source(e2e, tmp_path):
         if name in ("ppdb_dia_sources", "obs_sbn"):
             t = t.take(np.random.default_rng(1).permutation(t.num_rows))
         pq.write_table(t, src / f, row_group_size=1000)
-    B.write_manifest(src, files, producer="a hand-made source", ppdb_dia_sources_source="a CSV dump")
+    copy_bundled(src / IERS_A_FILE)
+    B.write_manifest(src, files, producer="a hand-made source", ppdb_dia_sources_source="a CSV dump",
+                     iers_a=IERS_A_FILE)
     rep2 = B.build(src, tmp_path / "run", workers=E2E_WORKERS)
     for s in BUILD_STEPS[:-1]:
         assert rep2["steps"][s]["status"] == "ok", (s, rep2["steps"][s])
@@ -1423,3 +1434,105 @@ def test_nearbysso_sidecar_kept_and_recorded(tmp_path):
     assert e["sidecar_md5"] == B._md5(d / NEARBYSSO_SIDECAR_FILE) and e["rows"] == 2
     assert [p.name for p in B.delivered_paths(tmp_path / "run", "NearbySSO")] == [
         "NearbySSO.parquet", NEARBYSSO_SIDECAR_FILE]
+
+
+# ---------------------------------------------------------------------------
+# The IERS-A file (docs/design/iers-a.md)
+# ---------------------------------------------------------------------------
+
+def test_manifest_iers_a_in_files(tmp_path):
+    m = write_inputs(tmp_path)
+    assert set(m["files"]) == set(INPUT_FILES) | {IERS_A_NAME}
+    assert m["files"][IERS_A_NAME]["reused"] is False
+
+
+@pytest.mark.parametrize("edit, match", [
+    (lambda m: m["files"].pop("iers_a"),
+     "manifest lacks 'iers_a'.*`ssp-extract-sso-inputs INPUTS_DIR --force --skip mpc --skip dia_sources "
+     "--skip ppdb_dia_sources --iers-a-store DIR`"),
+    (lambda m: m["files"]["iers_a"].update(md5="0" * 32), "iers_a: md5"),
+    (lambda m: m["files"]["iers_a"].update(rows=3), "iers_a: 240 lines, the manifest says 3"),
+    (lambda m: m["files"]["iers_a"].update(age_days=90.01), "over the 90-day limit"),
+    (lambda m: m["files"]["iers_a"].update(age_days="5"), "age_days '5' is not a number"),
+    (lambda m: m["files"]["iers_a"].update(reused="false"), "reused 'false' is not a boolean"),
+    (lambda m: m["files"]["iers_a"].update(predictions_start="2020-01-01"), "the manifest says 2020-01-01"),
+    (lambda m: m["files"]["iers_a"].pop("source"), r"iers_a: manifest entry lacks \['source'\]"),
+    (lambda m: m["files"]["iers_a"].update(file="nope.all"), "file 'nope.all' is not 'finals2000A.all'"),
+    (lambda m: m["files"]["iers_a"].update(file="../finals2000A.all"), "is not 'finals2000A.all'"),
+    (lambda m: m["files"]["iers_a"].update(source=None), "source None is not a string"),
+    (lambda m: m["files"]["iers_a"].update(extracted_utc=5), "extracted_utc 5 is not a string"),
+    (lambda m: m["files"]["iers_a"].update(predictions_start=61294),
+     "predictions_start 61294 is not a string"),
+])
+def test_manifest_iers_a_failures(tmp_path, edit, match):
+    write_inputs(tmp_path)
+    _edit_manifest(tmp_path, edit)
+    with pytest.raises(B.ManifestError, match=match):
+        B.validate_manifest(tmp_path)
+
+
+def test_manifest_iers_a_file_missing(tmp_path):
+    write_inputs(tmp_path)
+    (tmp_path / IERS_A_FILE).unlink()
+    with pytest.raises(B.ManifestError, match="finals2000A.all does not exist"):
+        B.validate_manifest(tmp_path)
+
+
+def test_manifest_iers_a_truncated(tmp_path):
+    write_inputs(tmp_path)
+    write_finals(tmp_path / IERS_A_FILE, after=100)
+    md5 = B._md5(tmp_path / IERS_A_FILE)
+    _edit_manifest(tmp_path, lambda m: m["files"]["iers_a"].update(md5=md5, rows=140))
+    with pytest.raises(B.ManifestError, match="predictions span only 99 days"):
+        B.validate_manifest(tmp_path)
+
+
+def test_manifest_iers_a_90_days_ok(tmp_path):
+    write_inputs(tmp_path)
+    _edit_manifest(tmp_path, lambda m: m["files"]["iers_a"].update(age_days=90))
+    B.validate_manifest(tmp_path)
+
+
+def test_manifest_iers_a_unreadable(tmp_path):
+    write_inputs(tmp_path)
+    (tmp_path / IERS_A_FILE).write_text("garbage\n")
+    md5 = B._md5(tmp_path / IERS_A_FILE)
+    _edit_manifest(tmp_path, lambda m: m["files"]["iers_a"].update(md5=md5, rows=1))
+    with pytest.raises(B.ManifestError, match="not a readable IERS-A"):
+        B.validate_manifest(tmp_path)
+
+
+def test_build_fails_without_iers_a(tmp_path):
+    write_inputs(tmp_path / "in")
+    _edit_manifest(tmp_path / "in", lambda m: m["files"].pop("iers_a"))
+    rep = B.build(tmp_path / "in", tmp_path / "run")
+    assert rep["deliverable"] is False and "manifest lacks 'iers_a'" in rep["error"]
+    assert all(s["status"] == "skipped" for s in rep["steps"].values())
+    assert B.main([str(tmp_path / "in"), str(tmp_path / "run2")]) == 1
+
+
+def test_build_passes_the_file_to_steps_and_reports_it(tmp_path, monkeypatch):
+    """Every step subprocess gets the file in IERS_A_ENV and runs through
+    _entry_point (which installs it); report.json records it."""
+    m = write_inputs(tmp_path / "in")
+    seen = []
+
+    def run_logged(cmd, log_path, env=None):
+        seen.append((cmd, (env or {}).get(IERS_A_ENV)))
+        Path(log_path).write_text("")
+        return 1, 0.0, None
+
+    monkeypatch.setattr(B, "run_logged", run_logged)
+    rep = B.build(tmp_path / "in", tmp_path / "run")
+    path = str((tmp_path / "in" / IERS_A_FILE).resolve())
+    (cmd, env_path), = seen               # (the first step failed: the build stops)
+    assert env_path == path
+    assert "install_from_env(required=True)" in cmd[2]
+    e = m["files"][IERS_A_NAME]
+    assert rep["iers_a"] == dict(file=path, md5=e["md5"], predictions_start=e["predictions_start"],
+                                 age_days=e["age_days"], reused=False)
+    assert rep["input_paths"][IERS_A_NAME] == path
+    assert json.loads((tmp_path / "run" / "report.json").read_text())["iers_a"] == rep["iers_a"]
+    for step in BUILD_STEPS:
+        argv, _ = B.step_command(step, tmp_path / "in", tmp_path / "run", m, 1)
+        assert "install_from_env(required=True)" in argv[2], step

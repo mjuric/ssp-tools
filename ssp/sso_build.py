@@ -8,7 +8,10 @@ ssp/delivery_contract.py. Files in, files out: no database access.
                   [--part-rows N] [--internal-columns A,B,...] [--text-checks]
 
 1. Validate ``INPUTS_DIR/manifest.json``: every input file present, with
-   the manifest's row count and md5, and the required columns.
+   the manifest's row count and md5, and the required columns; and the
+   IERS-A file (``files.iers_a``, required; docs/design/iers-a.md) present,
+   with its md5 and line count, readable, with the manifest's
+   ``predictions_start``, and at most IERS_A_MAX_AGE_DAYS old.
 2. Run the BUILD_STEPS, each as a subprocess with its log in
    ``RUN_DIR/logs/<step>.log`` and its wall time and peak RSS in the
    report:
@@ -33,6 +36,12 @@ ssp/delivery_contract.py. Files in, files out: no database access.
    ``*_json``/``*_jsonb`` columns and the delivery check's ``ascii``; it is
    recorded as ``text_checks`` in the report's ``steps.mpc`` and
    ``steps.check``. The builders' other outputs stay in ``RUN_DIR/work/``.
+   Every step subprocess gets the IERS-A file's path in IERS_A_ENV and
+   installs it before its ``main`` runs (``_entry_point``;
+   ssp.iers.install_from_env): astropy's downloads are off and that table
+   is the ``earth_orientation_table``, in the step and in its forked
+   workers. This process does not install it (it uses no Earth
+   orientation).
 3. ``RUN_DIR/report.json`` (REPORT_FIELDS), rewritten after every step, so
    a failed run shows how far it got. ``deliverable`` is true only if every
    step and check passed.
@@ -65,6 +74,12 @@ from .delivery_contract import (
     DELIVERY_DIR,
     DELIVERY_TABLES,
     DERIVED_FROM,
+    IERS_A_ENV,
+    IERS_A_FILE,
+    IERS_A_MANIFEST_FIELDS,
+    IERS_A_MAX_AGE_DAYS,
+    IERS_A_NAME,
+    IERS_A_REPORT_FIELDS,
     INPUT_FILES,
     MPC_SNAPSHOT,
     MANIFEST_FIELDS,
@@ -86,6 +101,7 @@ from .ssobservation_contract import (
     SSOBSERVATION_MANIFEST_FILE,
 )
 from .sso_upload import counts_as_upload
+from . import iers as _iers
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -369,6 +385,8 @@ def _validate_manifest(inputs_dir, workers):
                 problems.append(f"{name}: has some of the shutter-correction columns, but lacks {shutter}")
         todo.append((name, path, entry["md5"]))
 
+    problems += _validate_iers_a(inputs_dir, files.get(IERS_A_NAME), todo)
+
     with ThreadPoolExecutor(max(1, min(workers, len(todo) or 1))) as pool:
         md5s = list(pool.map(lambda t: _md5(t[1]), todo))
     for (name, path, want), got in zip(todo, md5s):
@@ -406,6 +424,69 @@ def _validate_manifest(inputs_dir, workers):
     return manifest
 
 
+def iers_a_path(inputs_dir, manifest):
+    """The path of the IERS-A file, from the manifest's ``files.iers_a``."""
+    return Path(inputs_dir) / manifest["files"][IERS_A_NAME]["file"]
+
+
+#: How to add the IERS-A file to inputs extracted without it (runs no other
+#: step and keeps the other files).
+ADD_IERS_A = ("ssp-extract-sso-inputs INPUTS_DIR --force --skip mpc --skip dia_sources "
+              "--skip ppdb_dia_sources --iers-a-store DIR")
+
+
+def _validate_iers_a(inputs_dir, entry, todo):
+    """The problems with the manifest's ``files.iers_a`` (owner decision: the
+    build refuses inputs without one); adds the file to ``todo`` for its md5
+    check."""
+    if not isinstance(entry, dict):
+        return [f"manifest lacks {IERS_A_NAME!r} (the IERS-A file, {IERS_A_FILE}): extract the inputs "
+                f"with --iers-a-store DIR, or add it to these with `{ADD_IERS_A}`"]
+    missing = [k for k in IERS_A_MANIFEST_FIELDS if k not in entry]
+    if missing:
+        return [f"{IERS_A_NAME}: manifest entry lacks {missing}"]
+    bad = []
+    if entry["file"] != IERS_A_FILE:
+        bad.append(f"file {entry['file']!r} is not {IERS_A_FILE!r}")
+    if not isinstance(entry["md5"], str) or not _MD5_RE.fullmatch(entry["md5"]):
+        bad.append(f"md5 {entry['md5']!r} is not an md5")
+    for k in ("source", "extracted_utc", "predictions_start"):
+        if not isinstance(entry[k], str):
+            bad.append(f"{k} {entry[k]!r} is not a string")
+    if not isinstance(entry["rows"], int) or isinstance(entry["rows"], bool):
+        bad.append(f"rows {entry['rows']!r} is not a line count")
+    age = entry["age_days"]
+    if not isinstance(age, (int, float)) or isinstance(age, bool):
+        bad.append(f"age_days {age!r} is not a number")
+    # With an IERS_A table installed, astropy's own auto_max_age check does
+    # not apply: this is where the build enforces the 90-day limit. The age is
+    # the manifest's (at extraction), so a rerun of a day reproduces it.
+    elif age > IERS_A_MAX_AGE_DAYS:
+        bad.append(f"age_days {age} is over the {IERS_A_MAX_AGE_DAYS}-day limit: the file is too stale "
+                   "to use")
+    if not isinstance(entry["reused"], bool):
+        bad.append(f"reused {entry['reused']!r} is not a boolean")
+    if bad:
+        return [f"{IERS_A_NAME}: malformed manifest entry: {'; '.join(bad)}"]
+    path = Path(inputs_dir) / entry["file"]
+    if not path.is_file():
+        return [f"{IERS_A_NAME}: {path} does not exist"]
+    problems = []
+    lines = _iers.count_lines(path)
+    if lines != entry["rows"]:
+        problems.append(f"{IERS_A_NAME}: {lines:,} lines, the manifest says {entry['rows']:,}")
+    try:
+        start = _iers.predictions_start(_iers.read(path))
+    except _iers.IERSError as e:
+        problems.append(f"{IERS_A_NAME}: {e}")
+    else:
+        if start != entry["predictions_start"]:
+            problems.append(f"{IERS_A_NAME}: {path}'s predictions start {start}, the manifest says "
+                            f"{entry['predictions_start']}")
+    todo.append((IERS_A_NAME, path, entry["md5"]))
+    return problems
+
+
 def recorded_parent_md5(entry, parent):
     """The md5 of the ``parent`` input a derived input's manifest ``entry``
     was built from (DERIVED_FROM): its ``<parent>_md5``, else (manifests
@@ -420,12 +501,16 @@ def recorded_parent_md5(entry, parent):
     return m.group(1) if m else None
 
 
-def write_manifest(inputs_dir, files, producer="hand-made", mpc_snapshot_utc=None, **extra):
+def write_manifest(inputs_dir, files, producer="hand-made", mpc_snapshot_utc=None, iers_a=None,
+                   **extra):
     """Write ``INPUTS_DIR/manifest.json`` for ``files`` ({name: file,
     relative to INPUTS_DIR}), with each file's rows and md5, and each
     DERIVED_FROM input recorded as built from the given parent (or from
-    ``<name>_<parent>_md5=``). For tests and for inputs from other sources;
-    stage 1 writes its own."""
+    ``<name>_<parent>_md5=``); and, with ``iers_a`` (the IERS-A file,
+    INPUTS_DIR/IERS_A_FILE), its ``files.iers_a`` entry (``reused`` false,
+    extracted a day after its predictions start; ``iers_a_entry=`` {...}
+    overrides fields). For tests and for inputs from other sources; stage 1
+    writes its own."""
     now = _utcnow()
     snapshot = mpc_snapshot_utc or now
     entries = {}
@@ -437,6 +522,16 @@ def write_manifest(inputs_dir, files, producer="hand-made", mpc_snapshot_utc=Non
     for name, parent in DERIVED_FROM.items():
         if name in entries and parent in entries:
             entries[name][f"{parent}_md5"] = extra.pop(f"{name}_{parent}_md5", entries[parent]["md5"])
+    if iers_a is not None:
+        if iers_a != IERS_A_FILE:
+            raise ValueError(f"the IERS-A file must be INPUTS_DIR/{IERS_A_FILE}, not {iers_a}")
+        path = Path(inputs_dir) / iers_a
+        start = _iers.predictions_start(_iers.read(path))
+        when = (datetime.datetime.fromisoformat(start).replace(tzinfo=datetime.timezone.utc)
+                + datetime.timedelta(days=1))
+        entries[IERS_A_NAME] = dict(_iers.describe(path, extra.pop("iers_a_source", "file"), when, start,
+                                                   reused=False), file=str(iers_a))
+        entries[IERS_A_NAME].update(extra.pop("iers_a_entry", {}))
     manifest = dict(created_utc=now, producer=producer, mpc_snapshot_utc=snapshot,
                     files=entries, **extra)
     _write_json(manifest, Path(inputs_dir) / MANIFEST_FILE)
@@ -816,8 +911,12 @@ def _ssobservation_input_dir(inputs_dir, run_dir, manifest):
 
 def _entry_point(module):
     """argv running ``module``'s main() (its console script; ssp.ssobject's
-    ``__main__`` block is something else)."""
-    return [sys.executable, "-c", f"import sys; from {module} import main; sys.exit(main())"]
+    ``__main__`` block is something else), after installing the IERS-A file
+    named in IERS_A_ENV (required: the build sets it for every step), so
+    that the step and its forked workers use exactly that table, with
+    downloads off."""
+    return [sys.executable, "-c", "import sys; from ssp.iers import install_from_env; "
+            f"install_from_env(required=True); from {module} import main; sys.exit(main())"]
 
 
 def nearbysso_correction_table(manifest):
@@ -1067,6 +1166,11 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
         manifest = validate_manifest(inputs_dir, workers=workers)
         report["inputs"] = manifest
         report["input_paths"] = {n: str(input_path(inputs_dir, manifest, n).resolve()) for n in INPUT_FILES}
+        iers_file = iers_a_path(inputs_dir, manifest).resolve()
+        report["input_paths"][IERS_A_NAME] = str(iers_file)
+        report["iers_a"] = dict(file=str(iers_file),
+                                **{k: manifest["files"][IERS_A_NAME][k] for k in IERS_A_REPORT_FIELDS})
+        step_env = dict(os.environ, **{IERS_A_ENV: str(iers_file)})
     except (ManifestError, OSError) as e:
         report["error"] = str(e)
         log(f"ERROR: {e}")
@@ -1104,7 +1208,7 @@ def build(inputs_dir, run_dir, from_step=None, workers=1, force_rebuild=False, a
             if error is None:
                 cmd, moves = step_command(step, inputs_dir, run_dir, manifest, workers,
                                           dict(options, text_checks=bool(text_checks)))
-                code, wall, rss = run_logged(cmd, log_path)
+                code, wall, rss = run_logged(cmd, log_path, env=step_env)
                 entry.update(wall_s=round(wall, 1), max_rss_gb=None if rss is None else round(rss, 3))
                 if code != 0:
                     error = f"exited {code}; see {log_path}"
@@ -1151,6 +1255,7 @@ def _inputs_changed(inputs_dir, manifest, workers):
     """None if every input still has its manifest md5 (hashed again, after
     the builders, so the check covers what they read), else the error."""
     now = input_md5s(inputs_dir, manifest, workers)
+    now[IERS_A_NAME] = _md5(iers_a_path(inputs_dir, manifest))
     changed = [n for n, md5 in now.items() if md5 != manifest["files"][n]["md5"]]
     if changed:
         return f"inputs changed during the build: {changed} no longer match the manifest's md5"
