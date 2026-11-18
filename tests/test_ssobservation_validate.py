@@ -479,13 +479,66 @@ def test_regression_fail(tmp_path, good):
     bad = ref.set_column(ref.column_names.index("ssObjectId"), "ssObjectId", pa.array([1, 1, 2, 3, 0, 0]))
     assert "ssObjectId: reference's where non-zero with an orbit, else NULL" in failed(
         V.check_regression(good, write(bad, tmp_path / "r4.parquet")))
-    i = ref.column_names.index("topoRange")
-    bad = ref.set_column(i, "topoRange", ref["topoRange"].cast(pa.float64()))
-    assert "ephemeris/geometry column types unchanged" in failed(
-        V.check_regression(good, write(bad, tmp_path / "r5.parquet")))
+    # (type changes the schema did not make)
+    for k, (c, typ) in enumerate((("phaseAngle", pa.float64()), ("topoRange", pa.string()))):
+        bad = ref.set_column(ref.column_names.index(c), c, ref[c].cast(typ))
+        assert "ephemeris/geometry column types unchanged (or as sdm_schemas d6e8100 retyped them)" in failed(
+            V.check_regression(good, write(bad, tmp_path / f"r5{k}.parquet"))), c
     bad = ref.append_column("ephFoo", pa.array([1.0] * N))
     assert "every reference ephemeris/geometry column present" in failed(
         V.check_regression(good, write(bad, tmp_path / "r6.parquet")))
+
+
+def legacy_ref(ref):
+    """``ref`` as a reference from before sdm_schemas d6e8100: the retyped
+    columns in their old types (float32 vectors and ranges, float64
+    offsets)."""
+    for c, (old, _) in V.PRECISION_RETYPED.items():
+        ref = ref.set_column(ref.column_names.index(c), c, ref[c].cast(old))
+    return ref
+
+
+def test_regression_legacy_reference(tmp_path, good):
+    """Against a pre-d6e8100 reference, the retyped columns may have the
+    old types, and they and the derived ones agree to float32 rounding."""
+    ref = legacy_ref(ref_from(table()))
+    r = V.check_regression(good, write(ref, tmp_path / "r.parquet"))
+    assert r.ok, r
+    # the derived columns may differ by float32 rounding; the vectors too
+    ulp = np.spacing(np.float32(2.5))
+    for k, c in enumerate(("helioRangeRate", "ephVmag", "topo_x")):
+        a = ref[c].to_numpy().copy()
+        a[1] += 3 * ulp
+        ok = ref.set_column(ref.column_names.index(c), c, pa.array(a))
+        assert V.check_regression(good, write(ok, tmp_path / f"ok{k}.parquet")).ok, c
+
+
+def test_regression_legacy_reference_fails(tmp_path, good):
+    """... but not by more than PRECISION_ULPS float32 ulps; and the other
+    columns are still compared bitwise."""
+    ref = legacy_ref(ref_from(table()))
+    for k, c in enumerate(("helioRangeRate", "topoRange", "topo_x", "ephOffsetDec", "phaseAngle")):
+        a = ref[c].to_numpy().copy()
+        a[1] = a[1] * (1 + 1e-5) if c != "phaseAngle" else np.nextafter(a[1], np.inf)
+        bad = ref.set_column(ref.column_names.index(c), c, pa.array(a))
+        assert "ephemeris/geometry columns bitwise equal (or to float32 rounding)" in failed(
+            V.check_regression(good, write(bad, tmp_path / f"b{k}.parquet"))), c
+    # a missing value against a present one
+    a = ref["ephVmag"].to_numpy().copy()
+    a[0] = np.nan
+    bad = ref.set_column(ref.column_names.index("ephVmag"), "ephVmag", pa.array(a))
+    assert "ephemeris/geometry columns bitwise equal (or to float32 rounding)" in failed(
+        V.check_regression(good, write(bad, tmp_path / "b_nan.parquet")))
+
+
+def test_float32_mismatch_scale():
+    """A range rate's difference is measured in ulps of the speed (its
+    scale), not of the rate, which may be near 0."""
+    rate = pa.array([1e-6, 3.0], pa.float32())
+    new = pa.array([1e-6 + 2e-7, 3.0], pa.float32())
+    speed = pa.array([30.0, 30.0], pa.float32())
+    assert V.float32_mismatch(new, rate)[0].tolist() == [True, False]
+    assert V.float32_mismatch(new, rate, speed)[0].tolist() == [False, False]
 
 
 def test_regression_ellipse_not_compared(tmp_path, good):

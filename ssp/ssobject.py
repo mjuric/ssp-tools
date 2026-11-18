@@ -20,7 +20,7 @@ import pyarrow.parquet as pq
 from functools import partial
 from . import photfit
 from . import util
-from . import schema
+from . import schema_ppdb
 from . import ssobservation_parts
 from .moid import MOIDSolver, earth_orbit
 from .delivery_contract import delivery_schema
@@ -308,7 +308,7 @@ def _ssobject_chunk(g0, g1):
     sss = _PARALLEL["sss"]
     idx_start, idx_end = _PARALLEL["idx_start"], _PARALLEL["idx_end"]
     callback = _PARALLEL["callback"]
-    out = np.zeros(g1 - g0, dtype=schema.SSObjectDtype)
+    out = np.zeros(g1 - g0, dtype=schema_ppdb.SSObjectDtype)
     for k, g in enumerate(range(g0, g1)):
         _entry(callback, out[k], sss, idx_start[g], idx_end[g])
     return out
@@ -387,7 +387,7 @@ def compute_ssobject(
     Returns
     -------
     numpy.ndarray
-        Array of ssObject records with dtype schema.ssObjectDtype,
+        Array of ssObject records with dtype schema_ppdb.SSObjectDtype,
         containing computed properties for each unique ssObjectId,
         including magnitudes, orbital elements, Tisserand J, and
         MOID-related values.
@@ -436,7 +436,7 @@ def compute_ssobject(
 
     # Pre-create the empty array
     totalNumObjects = np.unique(sss["ssObjectId"].to_numpy()).size
-    obj = np.zeros(totalNumObjects, dtype=schema.SSObjectDtype)
+    obj = np.zeros(totalNumObjects, dtype=schema_ppdb.SSObjectDtype)
 
     # compute per-object quantities
     callback = partial(
@@ -545,7 +545,7 @@ def ssobject_schema():
 
 def ssobject_table(obj):
     """The SSObject Arrow table (ssobject_schema) of ``obj``, a structured
-    array of schema.SSObjectDtype (compute_ssobject's result).
+    array of schema_ppdb.SSObjectDtype (compute_ssobject's result).
 
     In every float column, NaN is NULL (+-Inf is kept); every
     ``{band}_slope_fit_failed`` is NULL where ``{band}_nObs`` is 0. Every
