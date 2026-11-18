@@ -4,6 +4,7 @@ built from delivery_schema(), and SSObservation's partitioned delivery
 Network-free."""
 import shutil
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -71,7 +72,7 @@ def test_pass(tmp_path, table, text_checks):
     rs = results(table, write(tmp_path, table, make_table(table)), text_checks=text_checks)
     assert failed(rs) == [], rs
     assert set(rs) == {"file", "columns", "types", "nulls", "char lengths", "primary key"} | (
-        {"ascii"} if text_checks else set())
+        {"ascii"} if text_checks else set()) | ({"no NaN"} if table in D.NAN_FREE_TABLES else set())
 
 
 @pytest.mark.parametrize("table", ["SSObservation", "mpc_orbits"])
@@ -436,9 +437,25 @@ SID = [1, 1, 1, 2, 2, 3, None, None, None]
 NS = len(SID)
 
 
+def with_geometry(t, elong=None, dist=2.0):
+    """``t`` with the target at (ra, dec) = (0, 0), ``dist`` + 0, 1, ... AU
+    away, topo/helio vectors whose observer-to-Sun direction (topo - helio)
+    is at ``elong`` [deg] (default: 5 to 175) from it, and that elongation."""
+    n = len(t)
+    e = np.radians(np.linspace(5, 175, n) if elong is None else np.asarray(elong, float))
+    topo = np.stack([dist + np.arange(n), np.zeros(n), np.zeros(n)], axis=1)
+    helio = topo - np.stack([np.cos(e), np.sin(e), np.zeros(n)], axis=1)
+    for k, a in enumerate("xyz"):
+        t = replace(t, f"topo_{a}", pa.array(topo[:, k], pa.float32()))
+        t = replace(t, f"helio_{a}", pa.array(helio[:, k], pa.float32()))
+    t = replace(t, "ra", pa.array(np.zeros(n), pa.float64()))
+    t = replace(t, "dec", pa.array(np.zeros(n), pa.float64()))
+    return replace(t, "elongation", pa.array(np.degrees(e), pa.float32()))
+
+
 def ss_table(sid=SID):
     n = len(sid)
-    t = make_table("SSObservation", n)
+    t = with_geometry(make_table("SSObservation", n))
     t = replace(t, "ssObjectId", pa.array(sid, pa.int64()))
     t = replace(t, "midpointMjdTai", pa.array([61000.0 + i for i in range(n)], pa.float64()))
     return replace(t, "obsid", pa.array([f"obs{i:03d}" for i in range(n)], pa.string()))

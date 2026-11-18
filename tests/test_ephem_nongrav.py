@@ -382,11 +382,12 @@ def test_compute_ephemerides_passes_nongrav(monkeypatch, workers):
 def test_build_ssobservation_passes_nongrav(tmp_path, monkeypatch):
     """build_ssobservation reads each object's NonGrav from mpc_orbits'
     mpc_orb_jsonb and passes it to compute_ephemerides_one."""
-    from test_ssobservation_widened import OBJECTS, _FakeEllipse, _fake_observatory, make_inputs
+    from test_ssobservation_widened import OBJECTS, _FakeEllipse, _fake_observatory, _fake_sun, make_inputs
     rec = {}
     monkeypatch.setattr(ssobservation, "compute_ephemerides_one", _recording_fake(rec))
     monkeypatch.setattr(ssobservation, "open_ephem", lambda: None)
     monkeypatch.setattr(ssobservation.util, "observatory_barycentric_posvel", _fake_observatory)
+    monkeypatch.setattr(ssobservation.util, "sun_barycentric_position", _fake_sun)
     monkeypatch.setattr(ssobservation, "_ellipse", _FakeEllipse())
     make_inputs(tmp_path)
     t = pq.read_table(tmp_path / "mpc_orbits.parquet")

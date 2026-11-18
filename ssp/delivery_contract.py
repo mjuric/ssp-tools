@@ -274,11 +274,26 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 #   in nullable: false columns; the primary key unique and non-NULL; with
 #   text_checks (off by default; ssp-build-sso --text-checks), also every
 #   string column ASCII (Felis char/text; docs/design/mpc-orbits-ascii.md).
+#   For SSObservation, SSObject and NearbySSO (delivery_check's
+#   NAN_FREE_TABLES), also no NaN in any float column: a missing value is
+#   NULL (docs/design/elongation-ssobject-nulls.md). Not the MPC tables:
+#   mpc_orbits mirrors the replica's NaN.
 # check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES)
 #     -> dict[table, list[CheckResult]]
 #   Fails (a FAIL result) for a missing file. SSObservation is checked
 #   through its manifest (check_ssobservation_parts below) and check_table
-#   runs on every part.
+#   runs on every part; then check_elongation on all its parts.
+# check_elongation(part_files) -> CheckResult
+#   (docs/design/elongation-ssobject-nulls.md) On every row with non-NULL
+#   topo_* and helio_* (positions and velocities), ``elongation`` within
+#   its tolerance of the apparent elongation from the delivered columns
+#   (delivery_check.elongation_tolerance_arcsec: 1" plus twice the float32
+#   bound of the recomputed Sun direction plus light-time; ~1" nearby,
+#   ~6" at 90 AU): the
+#   angle between the observed (ra, dec) and topo - helio, both aberrated
+#   (first order in v/c) by helio_v - topo_v. Reports the rows checked, the
+#   largest difference, and (for information) the rows where the angle to
+#   topo's direction would differ by more than 0.01 deg.
 # check_ssobservation_parts(delivery_dir) -> list[CheckResult]
 #   The manifest has SSOBSERVATION_MANIFEST_FIELDS (format_version
 #   MANIFEST_FORMAT_VERSION)
@@ -304,7 +319,8 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 #   order; unmatched rows placed and within PLACEMENT_MARGIN_ARCSEC; rows
 #   without a placement flagged; times in their visit's night with a
 #   bounded spread per visit; day_obs and detector ranges; no (visit,
-#   designation) both matched and unmatched.
+#   designation) both matched and unmatched; no NaN in the sidecar's float
+#   columns.
 # CheckResult: a NamedTuple (name: str, ok: bool, detail: str).
 # CLI: python -m ssp.delivery_check DELIVERY_DIR [--tables ...]
 #   (exit 0 if every result is ok).
