@@ -1,6 +1,6 @@
 # Double-precision positions, ranges and arc
 
-Status: **approved** (2026-11-18); F-16 folded in, implementation in progress.
+Status: **approved** (2026-11-18); implemented, with F-16; merging to master.
 
 ## Context
 
@@ -139,7 +139,7 @@ Integrated 2026-11-18. The WP: 0c8829d, 3169e0c, 1079d0c (tolerance) and 6c8380e
   - On synthetic cases from 0.001 to 500 AU, the Sun's real shift equals the light-time term to 4 digits.
   - Its low findings (a NaN vector passed the elongation check, which the no-NaN check catches anyway; the bench's legacy mode accepted a column left float32; a test that didn't always tell the paths apart) were fixed. `ssp/schema.py`, now unused, is issue #125.
 
-**Tests.** The full suite passes: 1528 tests.
+**Tests.** The full suite passes: 1553 tests on the integrated branch, with F-16.
 
 **Real data.** 2026-11-17 was rebuilt from its inputs with master a34126d (base) and with the WP (new), one after the other, at 32 workers.
 
@@ -193,3 +193,23 @@ Worst fraction by distance, new build: 0–2 AU 0.086, 2–5 AU 0.111, 5–10 AU
 The delivered 11-17 run predates the elongation and NULL fix (a34126d), so it also fails those checks. That says nothing about this change; the base rebuild is the float32 comparison. No 11-18 delivery existed yet.
 
 The bench regression check (`bench/ssobservation_validate.py`) passes new against base. It allows a pre-d6e8100 reference 8 float32 ulps on the retyped and D1 columns; the largest seen is 4.
+
+**F-16.** The WP is 4723e1c, 2de7170 (a safety factor of 2 on the tangent-plane terms, added after the integrator's review) and 7989fd1 (review fixes). PR #127, merged into this branch as e567dd6.
+
+- **Tolerance:** within 1°, \|hypot(ξ, η) − s\| ≤ s · (4·2⁻²⁴ + 2·(\|tan δ\|·\|η\|/2 + (1 + tan²δ)·s²/8)) + 1e-9″, with ξ = `ephOffsetRa`, η = `ephOffsetDec`, s = `ephOffset` (η and s in radians inside the bracket) and δ = `ephDec`. Beyond 1°, only \|η\| ≤ s and \|ξ\| ≤ 180·3600·\|cos δ\|. A non-finite value or a negative `ephOffset` fails.
+- **Review:** an independent review checked the derivation by brute force in extended precision, about 9M cases with \|dec\| up to 89.9999° and separations from 1 mas to 1°.
+  - Without the safety factor the bound is never exceeded (at most 0.99999 of it).
+  - Correct rows, rounded to float32, reach at most 0.498 of the tolerance.
+  - An unwrapped straddle fails at about 2× the bound, at any declination.
+  - Its one gap (a negative or infinite `ephOffset` passed) was fixed.
+- **Real data:** the 2026-11-17 inputs, rebuilt with F-16, compared with the precision-only build.
+  - Only `ephOffsetRa`, `ephOffsetAlongTrack` and `ephOffsetCrossTrack` change, on 2025 NO124's 18 rows. For the first row: `ephOffsetRa` +609,750 → −568,486″, along 634,014 → −508,193″, cross −19,868 → −309,013″.
+  - Every other column and table is bitwise equal.
+  - The delivery check passes 6/6. Offsets: 8,067,401 rows in the tangent plane, at most 0.482 of the tolerance (at 69.7″); 18 rows beyond it, at most 0.99 of the bounds.
+  - The same check fails the build without F-16 on exactly the 18 NO124 rows, at 1.04.
+
+  | ephOffset | Rows | Max relative \|hypot − ephOffset\| | Worst fraction |
+  |---|---|---|---|
+  | < 1″ | 8,064,803 | 9.96e-7 | 0.473 |
+  | 1–60″ | 2,513 | 1.49e-5 | 0.478 |
+  | 1′–1° | 85 | 6.23e-5 | 0.482 |
