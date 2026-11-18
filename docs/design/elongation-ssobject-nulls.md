@@ -63,7 +63,7 @@ The result reproduces Horizons' S-O-T to about 0.2″, and it applies the same w
 
 ### 3. Delivery checks (`ssp.delivery_check`)
 
-- **Elongation:** on SSObservation rows with non-NULL `topo_*` and `helio_*`, recompute the elongation from delivered columns and compare it with `elongation`; they must match to within 0.01°.
+- **Elongation:** on SSObservation rows with non-NULL `topo_*` and `helio_*`, recompute the elongation from delivered columns and compare it with `elongation`; they must match to within each row's tolerance: 1″, plus twice the float32 rounding bound of the recomputed Sun direction, plus the Sun's motion over the light-time. That is about 1″ nearby and 6″ at 90 AU (owner, 2026-11-17; first specified as 0.01°).
   - The recomputed elongation is the angle between the observed (`ra`, `dec`) and `topo − helio`, both aberrated by `helio_v − topo_v` (the observatory's velocity relative to the Sun).
   - The check reports the count and the maximum difference, plus, for information, the number of rows where the angle to `topo` would differ.
 - **No NaN:** no float column of any delivered table may hold a NaN. If a table from the MPC replica (`mpc_orbits`, the identifications) has NaN in real data, the work package reports it before deciding the scope.
@@ -132,13 +132,13 @@ SSObject:
 - The non-nullable fields are exactly the 15 Felis `nullable: false` columns.
 
 `delivery_check`, all 6 tables pass:
-- The elongation check covers 8,067,419 rows. The largest difference is 2.68″, against a 0.01° limit: it comes from the float32 vectors of objects at 66–89 AU, and from light-time.
+- The elongation check covers 8,067,419 rows. The largest difference is 2.68″, at most 0.50 of its row's tolerance: it comes from the float32 vectors of objects at 66–89 AU, and from light-time. By distance, the largest differences are 0.11″ under 2 AU, 0.19″ at 2–5 AU, 0.86″ at 10–30 AU and 1.6″ at 30–60 AU.
 - 111 rows, from 15 objects, are more than 0.01° from the angle computed with `topo`. The check reports them for information. Their orbit predictions are 36″ to 178° from the observations.
 - The original delivery fails both new checks: elongation on 8,067,171 rows, and SSObject no-NaN in 51 columns.
-- A geometric elongation fails the elongation check on 2.96 M rows, so the check tells the two definitions apart.
+- A geometric elongation fails the elongation check on 8.05 M of 8.07 M rows, against 2.96 M with a flat 0.01°.
 
 Cost:
 - `solar_elongation_ndarray` on 8.1 M rows takes 16.8 s, against 17.6 s before.
 - The ssobservation step's peak RSS rises by about 0.2–0.7 GB, from 14.4 GB.
 
-**Open (optional).** The elongation check's tolerance could be tightened to about 5″. That would still pass 2026-11-16, and would also catch a geometric/apparent mix-up.
+**Tolerance tightened (owner, 2026-11-17).** The flat 0.01° became the per-row tolerance above (5da3228). A flat 5″ was rejected because the float32 error grows with distance and would fail correct rows beyond about 130 AU.
