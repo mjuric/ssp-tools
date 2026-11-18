@@ -125,27 +125,89 @@ def test_elongation_tolerance(tmp_path, off, ok):
     assert worst == pytest.approx(abs(off), abs=3e-5)
 
 
-def test_elongation_tolerance_grows_with_distance():
-    """1" plus the float32 bound and light-time: ~1" nearby, ~6" at 90 AU
-    (where the delivered float32 vectors are good to ~2")."""
+def _tol(d, dtype):
+    """The tolerance [arcsec] of a row ``d`` AU away, 1 AU from the Sun
+    (at 90 deg from it), for vectors stored as ``dtype``."""
+    topo = np.array([[d, 0.0, 0.0]])
+    return D.elongation_tolerance_arcsec(topo, topo - np.array([[0.0, 1.0, 0.0]]), D.unit_roundoff(dtype))[0]
+
+
+def test_unit_roundoff():
+    assert D.unit_roundoff(np.float32) == 2.0 ** -24
+    assert D.unit_roundoff(np.float64) == 2.0 ** -53
+    assert D.unit_roundoff(pa.float32()) == 2.0 ** -24
+    assert D.unit_roundoff(pa.float64()) == 2.0 ** -53
+
+
+def test_vector_unit_roundoff():
+    """The stored position columns' type sets it: the largest if they
+    differ (and a non-float column counts as float32)."""
+    t = ss_table()
+    assert D.vector_unit_roundoff(t.schema) == 2.0 ** -53
+    assert D.vector_unit_roundoff(with_geometry(t, vtype=pa.float32()).schema) == 2.0 ** -24
+    assert D.vector_unit_roundoff(replace(t, "helio_z", t["helio_z"].cast(pa.float32())).schema) == 2.0 ** -24
+    # (a non-float position column raises: check_delivery makes that a FAIL)
+    ints = pa.array(np.zeros(len(t), np.int64))
+    with pytest.raises(ValueError):
+        D.vector_unit_roundoff(replace(t, "topo_x", ints).schema)
+    # (the velocities do not count)
+    assert D.vector_unit_roundoff(replace(t, "topo_vx", t["topo_vx"].cast(pa.float16())).schema) == 2.0 ** -53
+
+
+def test_elongation_tolerance_float32_vectors():
+    """1" plus the float32 bound and the Sun's motion over the light-time:
+    ~1" nearby, ~7" at 90 AU (where float32 vectors are good to ~4")."""
     def tol(d):
-        topo = np.array([[d, 0.0, 0.0]])
-        return D.elongation_tolerance_arcsec(topo, topo - np.array([[0.0, 1.0, 0.0]]))[0]
+        return _tol(d, np.float32)
     assert 1.0 < tol(1.0) < 1.1
-    assert 5.0 < tol(90.0) < 7.0
+    assert 7.0 < tol(90.0) < 8.0
     assert tol(1.0) < tol(10.0) < tol(40.0) < tol(90.0)
 
 
-@pytest.mark.parametrize("dist,ok", [(2.0, False), (90.0, True)])
-def test_elongation_3arcsec_off_far_and_near(tmp_path, dist, ok):
-    """A 3" difference fails for a nearby object but is within the float32
-    precision of a distant one's vectors."""
+def test_elongation_tolerance_float64_vectors():
+    """With float64 vectors the rounding term vanishes: 1" plus the Sun's
+    motion over both light-time legs, object-to-observer and Sun-to-object
+    (at most 16 m/s x 499 s/AU x (|topo| + |helio|), seen from 1 AU), ~3"
+    at 90 AU."""
+    def tol(d):
+        return _tol(d, np.float64)
+    lt = 0.016 * 499.004784 / 149597870.7 * np.degrees(3600.0)   # [arcsec per AU of path, seen from 1 AU]
+    for d in (1.0, 10.0, 90.0):
+        # (|topo| = d, |helio| = hypot(d, 1); + ~1e-8" of float64 rounding)
+        assert tol(d) == pytest.approx(1.0 + lt * (d + np.hypot(d, 1.0)), rel=1e-7)
+    assert 1.0 < tol(1.0) < 1.03
+    assert 2.9 < tol(90.0) < 3.1
+    assert tol(1.0) < tol(10.0) < tol(40.0) < tol(90.0)
+    # the float32 rounding term is the difference
+    f32 = 2 * 2.0 ** -24 * (90.0 + np.hypot(90.0, 1.0)) * np.degrees(3600.0)
+    assert _tol(90.0, np.float32) - tol(90.0) == pytest.approx(f32, rel=1e-6)
+
+
+@pytest.mark.parametrize("vtype,dist,ok", [
+    (pa.float32(), 2.0, False), (pa.float32(), 90.0, True),
+    (pa.float64(), 2.0, False), (pa.float64(), 90.0, False)])
+def test_elongation_4arcsec_off_far_and_near(tmp_path, vtype, dist, ok):
+    """A 4" difference fails for a nearby object; for a distant one (90
+    AU) it is within the precision of float32 vectors (a delivery from
+    before sdm_schemas d6e8100; ~7.4" there), but not of float64 ones
+    (~3", from light-time)."""
     t = ss_table()
-    t = with_geometry(t, dist=dist)
-    t = _set(t, "elongation", 0, t["elongation"][0].as_py() + 3.0 / 3600)
+    t = with_geometry(t, dist=dist, vtype=vtype)
+    t = _set(t, "elongation", 0, t["elongation"][0].as_py() + 4.0 / 3600)
     write_ss(tmp_path, t)
     r = _ss_results(tmp_path)["elongation"]
     assert r.ok == ok, r
+    assert f"rows with topo/helio vectors ({vtype})" in r.detail
+
+
+@pytest.mark.parametrize("vtype", [pa.float32(), pa.float64()])
+def test_elongation_2_5arcsec_off_far(tmp_path, vtype):
+    """At 90 AU 2.5" is within either tolerance (~3" with float64
+    vectors, from the Sun's motion over both light-time legs)."""
+    t = with_geometry(ss_table(), dist=90.0, vtype=vtype)
+    t = _set(t, "elongation", 0, t["elongation"][0].as_py() + 2.5 / 3600)
+    write_ss(tmp_path, t)
+    assert _ss_results(tmp_path)["elongation"].ok
 
 
 def test_elongation_wrong_sun_fails(tmp_path):
@@ -192,6 +254,202 @@ def test_elongation_near_0_and_180(tmp_path):
     t = with_geometry(ss_table(), elong=[0.0, 0.001, 179.999, 180.0, 90, 1, 2, 3, 4])
     write_ss(tmp_path, t)
     assert _ss_results(tmp_path)["elongation"].ok
+
+
+def test_elongation_non_float_vector_fails(tmp_path):
+    t = replace(ss_table(), "topo_x", pa.array(np.arange(9), pa.int64()))
+    write_ss(tmp_path, t)
+    r = _ss_results(tmp_path)["elongation"]
+    assert not r.ok and r.detail.startswith("cannot check (ValueError"), r
+
+
+def test_elongation_nan_vector_fails(tmp_path):
+    """A NaN (not NULL) vector component fails the check (its tolerance is
+    NaN), at an infinite fraction of the tolerance."""
+    t = ss_table()[:5]
+    topo_x = t["topo_x"].to_numpy().copy()
+    topo_x[0] = np.nan
+    t = replace(t, "topo_x", pa.array(topo_x))
+    write_ss(tmp_path, t)
+    r = _ss_results(tmp_path)["elongation"]
+    assert not r.ok, r
+    assert r.detail.startswith("1 rows differ by more than their tolerance"), r
+    assert "at most inf of the row's tolerance" in r.detail
+
+
+def test_elongation_no_files():
+    r = D.check_elongation([])
+    assert r.ok and r.detail.startswith("0 rows with topo/helio vectors; "), r
+
+
+# --------------------------------------------------------------------------
+# check_offsets (F-16 of docs/design/precision-doubles.md)
+# --------------------------------------------------------------------------
+
+def _with_offsets(t, ra_off, dec_off, dec=None, sep=None):
+    """``t`` with the given ephOffsetRa/Dec [arcsec] (lists, None = NULL),
+    ephDec [deg] (default 0) and ephOffset (default: their exact
+    great-circle separation, from a prediction at RA 10 deg)."""
+    from ssp.util import sky_separation_arcsec
+    n = len(t)
+    dec = np.zeros(n) if dec is None else np.asarray(dec, float)
+    if sep is None:
+        sep = []
+        for x, y, d in zip(ra_off, dec_off, dec):
+            if x is None or y is None:
+                sep.append(None)
+            else:
+                ra2 = 10.0 + x / 3600 / np.cos(np.radians(d))
+                sep.append(float(sky_separation_arcsec(10.0, d, ra2, d + y / 3600)))
+    t = replace(t, "ephOffsetRa", pa.array(ra_off, pa.float32()))
+    t = replace(t, "ephOffsetDec", pa.array(dec_off, pa.float32()))
+    t = replace(t, "ephDec", pa.array(dec, pa.float64()))
+    return replace(t, "ephOffset", pa.array(sep, pa.float32()))
+
+
+def _offsets_result(tmp_path, t):
+    write_ss(tmp_path, t)
+    return _ss_results(tmp_path)["offsets"]
+
+
+#: Nine rows: 1 mas to 50", at declinations up to 89 deg.
+OFF_RA = [0.001, 0.3, -1.2, 25.0, -40.0, 0.7, 3.0, -0.02, 0.5]
+OFF_DEC = [0.0, -0.4, 0.9, 30.0, 10.0, -0.1, 0.0, 0.03, -0.5]
+OFF_DECL = [0.0, 10.0, -30.0, 45.0, 60.0, -75.0, 85.0, -89.0, 89.0]
+
+
+def test_offsets_pass(tmp_path):
+    r = _offsets_result(tmp_path, _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL))
+    assert r.ok, r
+    assert r.detail.startswith("9 rows with the offsets; tangent plane (<= 1 deg): 9 rows, at most "), r
+    assert "; beyond it (bounds only): 0 rows" in r.detail
+
+
+def test_offsets_unwrapped_straddle_fails(tmp_path):
+    """An RA difference not wrapped across RA 0/360: 0.72" the short way
+    becomes 359.9998 deg x cos(dec) ~ 1.3e6"."""
+    ra = list(OFF_RA)
+    ra[2] = (360 - 0.0002) * 3600 * np.cos(np.radians(OFF_DECL[2]))
+    t = _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL)
+    t = replace(t, "ephOffsetRa", pa.array(ra, pa.float32()))
+    r = _offsets_result(tmp_path, t)
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+    assert "ephOffsetRa 1.1223" in r.detail
+    assert "beyond it (bounds only): 1 rows, at most 2 of the bounds" in r.detail
+    assert "tangent plane (<= 1 deg): 8 rows, at most " in r.detail
+
+
+@pytest.mark.parametrize("times,ok", [(0.5, True), (-0.5, True), (3.0, False), (-3.0, False)])
+def test_offsets_few_times_tolerance(tmp_path, times, ok):
+    """An ephOffset off by 3x the tolerance fails, by half of it passes, in
+    either direction. Row 6: 3" at dec 85, all in RA, where the baseline
+    residual is ~0 (eta = 0) and the tolerance ~2.5e-7 relative (mostly
+    its float32 term; the s^2 term, with tan^2(85) ~ 130, adds ~7e-9)."""
+    t = _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL)
+    sep = t["ephOffset"].to_numpy().astype(float)
+    tol = D.offsets_tolerance_arcsec(sep[6], OFF_DEC[6], OFF_DECL[6])
+    base = abs(np.hypot(np.float32(OFF_RA[6]), np.float32(OFF_DEC[6])) - sep[6])
+    assert base < 0.05 * tol and 2e-7 < tol / sep[6] < 3e-7
+    sep[6] += times * tol
+    r = _offsets_result(tmp_path, replace(t, "ephOffset", pa.array(sep, pa.float32())))
+    assert r.ok == ok, r
+    if not ok:
+        assert r.detail.startswith("1 rows outside;"), r
+
+
+COS20 = np.cos(np.radians(20.0))
+
+
+# (within the bounds; and an RA difference not wrapped)
+@pytest.mark.parametrize("ra_off,ok", [(-150 * 3600 * COS20, True), (-179.9 * 3600 * COS20, True),
+                                       (-200 * 3600 * COS20, False)])
+def test_offsets_large_separation_bounds(tmp_path, ra_off, ok):
+    """Beyond 1 deg only the bounds: |ephOffsetRa| <= 180 deg x cos(dec),
+    |ephOffsetDec| <= ephOffset (here the separation of the wrapped
+    difference, ~150 deg; the tangent-plane hypot is far from it)."""
+    from ssp.util import sky_separation_arcsec
+    t = _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL)
+    dec = np.array(OFF_DECL, float)
+    dec[0] = 20.0
+    ra = list(OFF_RA)
+    ra[0] = ra_off
+    dra = ((ra_off / 3600 / np.cos(np.radians(20.0))) + 180) % 360 - 180
+    sep = t["ephOffset"].to_numpy().astype(float)
+    sep[0] = sky_separation_arcsec(10.0, 20.0, 10.0 + dra, 20.0 - 2.0)
+    od = list(OFF_DEC)
+    od[0] = -2.0 * 3600
+    t = replace(t, "ephOffsetRa", pa.array(ra, pa.float32()))
+    t = replace(t, "ephOffsetDec", pa.array(od, pa.float32()))
+    t = replace(t, "ephDec", pa.array(dec))
+    t = replace(t, "ephOffset", pa.array(sep, pa.float32()))
+    r = _offsets_result(tmp_path, t)
+    assert r.ok == ok, r
+    assert "beyond it (bounds only): 1 rows, at most " in r.detail
+
+
+def test_offsets_dec_beyond_separation_fails(tmp_path):
+    """Beyond 1 deg: |ephOffsetDec| > ephOffset fails."""
+    t = _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL)
+    od = list(OFF_DEC)
+    od[0] = 3 * 3600.0
+    sep = t["ephOffset"].to_numpy().astype(float)
+    sep[0] = 2 * 3600.0
+    t = replace(t, "ephOffsetDec", pa.array(od, pa.float32()))
+    r = _offsets_result(tmp_path, replace(t, "ephOffset", pa.array(sep, pa.float32())))
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+
+
+@pytest.mark.parametrize("value", [-1.0, -5000.0, float("inf")])
+def test_offsets_negative_or_infinite_separation_fails(tmp_path, value):
+    t = _set(_with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL), "ephOffset", 4, value)
+    r = _offsets_result(tmp_path, t)
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+    assert "; 1 rows with a non-finite value or a negative ephOffset" in r.detail
+
+
+@pytest.mark.parametrize("col", ["ephOffsetRa", "ephOffsetDec", "ephDec"])
+def test_offsets_infinite_value_fails(tmp_path, col):
+    t = _set(_with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL), col, 4, float("-inf"))
+    r = _offsets_result(tmp_path, t)
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+
+
+def test_offsets_nulls_skipped(tmp_path):
+    ra, de = list(OFF_RA), list(OFF_DEC)
+    ra[1], de[2] = None, None
+    t = _with_offsets(ss_table(), ra, de, OFF_DECL)
+    # (an unwrapped value with a NULL separation is not checked either)
+    t = _set(_set(t, "ephOffsetRa", 3, 1.3e6), "ephOffset", 3, None)
+    r = _offsets_result(tmp_path, t)
+    assert r.ok and r.detail.startswith("6 rows with the offsets"), r
+
+
+@pytest.mark.parametrize("col", ["ephOffsetRa", "ephOffsetDec", "ephOffset"])
+def test_offsets_nan_fails(tmp_path, col):
+    t = _set(_with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL), col, 4, float("nan"))
+    r = _offsets_result(tmp_path, t)
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+    assert "; 1 rows with a non-finite value or a negative ephOffset" in r.detail
+
+
+def test_offsets_tolerance():
+    """The tangent-plane terms, times OFFSETS_TOL_SAFETY (2): |tan(dec)|
+    |dDec| / 2 dominates; float32 and the float64 floor otherwise."""
+    tol = D.offsets_tolerance_arcsec
+    assert D.OFFSETS_TOL_SAFETY == 2.0
+    assert tol(0.0, 0.0, 0.0) == D.OFFSETS_TOL_FLOOR_ARCSEC
+    want = 4 * 2.0 ** -24 + 1e-9 + 2 * np.radians(1 / 3600) ** 2 / 8
+    assert tol(1.0, 0.0, 0.0) == pytest.approx(want, rel=1e-12)
+    # 60" at dec 45, all in declination: 2 x |tan| x eta / 2 relative
+    assert tol(60.0, 60.0, 45.0) / 60 == pytest.approx(2 * np.radians(60 / 3600) / 2, rel=3e-3)
+    assert tol(60.0, 60.0, 80.0) > tol(60.0, 60.0, 45.0) > tol(60.0, 0.0, 45.0)
+
+
+def test_offsets_missing_columns(tmp_path):
+    write_ss(tmp_path)
+    t = ss_table().drop_columns(["ephOffsetDec"])
+    r = D.check_offsets([write(tmp_path, "x", t)])
+    assert not r.ok and "lacks ['ephOffsetDec']" in r.detail
 
 
 def test_elongation_missing_columns(tmp_path):

@@ -870,8 +870,8 @@ def test_end_to_end(tmp_path, synth, orbits, ephem, expected):
         for c in ("ephOffset", "ephRateRa", "ephRateDec"):
             np.testing.assert_allclose(grp[c], sss[c].astype(np.float32), rtol=1e-6, atol=1e-6,
                                        err_msg=f"{desig} {c}")
-        # (V goes through SSObservation's float32 columns: identical, as the
-        # noise is far below their precision)
+        # (V from the float64 ranges in both, then float32: identical, as
+        # the noise is far below float32 precision)
         np.testing.assert_array_equal(grp["ephVmag"], sss["ephVmag"], err_msg=f"{desig} ephVmag")
         # the tail angles, computed the same way (equal unless the integrator
         # noise straddles a float32 rounding boundary)
@@ -1123,7 +1123,8 @@ def _check_own_time_rows(res, path, orbits, ephem):
         # the rates, V and the tail angles: to float32 rounding
         for c, x in (("ephRateRa", e.mu_lon), ("ephRateDec", e.mu_lat)):
             np.testing.assert_allclose(grp[c], x.astype(np.float32), rtol=3e-7, err_msg=f"{desig} {c}")
-        helio, topo = e.helio_pos.astype(np.float32), e.topo_pos.astype(np.float32)
+        # (as SSObservation's ephVmag: from the float64 ranges)
+        helio, topo = e.helio_pos, e.topo_pos
         v = hg_V_mag(e.H, e.G, np.sqrt((helio ** 2).sum(0)), np.sqrt((topo ** 2).sum(0)), e.phase_angle)
         assert (np.abs(grp["ephVmag"] - v) <= 2 * np.spacing(grp["ephVmag"].to_numpy())).all(), desig
         for c, x in zip(("ephAntiSunPA", "ephAntiMotionPA"),

@@ -479,13 +479,112 @@ def test_regression_fail(tmp_path, good):
     bad = ref.set_column(ref.column_names.index("ssObjectId"), "ssObjectId", pa.array([1, 1, 2, 3, 0, 0]))
     assert "ssObjectId: reference's where non-zero with an orbit, else NULL" in failed(
         V.check_regression(good, write(bad, tmp_path / "r4.parquet")))
-    i = ref.column_names.index("topoRange")
-    bad = ref.set_column(i, "topoRange", ref["topoRange"].cast(pa.float64()))
-    assert "ephemeris/geometry column types unchanged" in failed(
-        V.check_regression(good, write(bad, tmp_path / "r5.parquet")))
+    # (type changes the schema did not make)
+    for k, (c, typ) in enumerate((("phaseAngle", pa.float64()), ("topoRange", pa.string()))):
+        bad = ref.set_column(ref.column_names.index(c), c, ref[c].cast(typ))
+        assert "ephemeris/geometry column types unchanged (or as sdm_schemas d6e8100 retyped them)" in failed(
+            V.check_regression(good, write(bad, tmp_path / f"r5{k}.parquet"))), c
     bad = ref.append_column("ephFoo", pa.array([1.0] * N))
     assert "every reference ephemeris/geometry column present" in failed(
         V.check_regression(good, write(bad, tmp_path / "r6.parquet")))
+
+
+def legacy_ref(ref):
+    """``ref`` as a reference from before sdm_schemas d6e8100: the retyped
+    columns in their old types (float32 vectors and ranges, float64
+    offsets)."""
+    for c, (old, _) in V.PRECISION_RETYPED.items():
+        ref = ref.set_column(ref.column_names.index(c), c, ref[c].cast(old))
+    return ref
+
+
+#: The retyped columns that are double since d6e8100.
+DOUBLES = [c for c, (_, new) in V.PRECISION_RETYPED.items() if new == pa.float64()]
+
+
+def table64():
+    """table(), its double vectors and ranges carrying float64 values (not
+    float32-representable ones), as a d6e8100 build has them."""
+    d = _values()
+    for c in DOUBLES:
+        d[c] = [None if v is None else v + 1e-9 for v in d[c]]
+    return table(d)
+
+
+@pytest.fixture
+def good64(tmp_path):
+    return write_ss(table64(), tmp_path / "SSObservation64")
+
+
+def test_regression_legacy_reference(tmp_path, good64):
+    """Against a pre-d6e8100 reference, the retyped columns may have the
+    old types, and they and the derived ones agree to float32 rounding."""
+    ref = legacy_ref(ref_from(table64()))
+    r = V.check_regression(good64, write(ref, tmp_path / "r.parquet"))
+    assert r.ok, r
+    # the derived columns may differ by float32 rounding; the vectors too
+    ulp = np.spacing(np.float32(2.5))
+    for k, c in enumerate(("helioRangeRate", "ephVmag", "topo_x")):
+        a = ref[c].to_numpy().copy()
+        a[1] += 6 * ulp
+        ok = ref.set_column(ref.column_names.index(c), c, pa.array(a))
+        assert V.check_regression(good64, write(ok, tmp_path / f"ok{k}.parquet")).ok, c
+
+
+def test_regression_legacy_reference_fails(tmp_path, good64):
+    """... but not by more than PRECISION_ULPS float32 ulps; and the other
+    columns are still compared bitwise."""
+    ref = legacy_ref(ref_from(table64()))
+    for k, c in enumerate(("helioRangeRate", "topoRange", "topo_x", "ephOffsetDec", "phaseAngle")):
+        a = ref[c].to_numpy().copy()
+        a[1] = a[1] * (1 + 1e-5) if c != "phaseAngle" else np.nextafter(a[1], np.inf)
+        bad = ref.set_column(ref.column_names.index(c), c, pa.array(a))
+        assert "ephemeris/geometry columns bitwise equal (or to float32 rounding)" in failed(
+            V.check_regression(good64, write(bad, tmp_path / f"b{k}.parquet"))), c
+    # a missing value against a present one
+    a = ref["ephVmag"].to_numpy().copy()
+    a[0] = np.nan
+    bad = ref.set_column(ref.column_names.index("ephVmag"), "ephVmag", pa.array(a))
+    assert "ephemeris/geometry columns bitwise equal (or to float32 rounding)" in failed(
+        V.check_regression(good64, write(bad, tmp_path / "b_nan.parquet")))
+
+
+@pytest.mark.parametrize("c", ["topo_x", "helioRange", "ephOffsetRa"])
+def test_regression_legacy_new_keeps_old_type_fails(tmp_path, c):
+    """Against a pre-d6e8100 reference, a new build that left a retyped
+    column in its old type fails the type check."""
+    t = table64()
+    t = t.set_column(t.column_names.index(c), c, t[c].cast(V.PRECISION_RETYPED[c][0]))
+    new = write_ss(t, tmp_path / "SSObservation")
+    ref = legacy_ref(ref_from(table64()))
+    assert "ephemeris/geometry column types unchanged (or as sdm_schemas d6e8100 retyped them)" in failed(
+        V.check_regression(new, write(ref, tmp_path / "r.parquet")))
+
+
+def test_regression_legacy_upcast_float32_fails(tmp_path, good64):
+    """A new build whose doubles are upcast float32 (every value equal to
+    its float32 rounding) fails, though its types are right."""
+    ref = legacy_ref(ref_from(table64()))
+    upcast = write_ss(table(), tmp_path / "SSObservation32")     # (1.5, 2.5, ...: float32 values)
+    r = V.check_regression(upcast, write(ref, tmp_path / "r.parquet"))
+    assert failed(r) == {"retyped doubles carry float64 values (not upcast float32)"}
+    assert V.check_regression(good64, write(ref, tmp_path / "r2.parquet")).ok
+
+
+def test_upcast_fraction():
+    assert V.upcast_fraction(pa.array([1.5, 2.5, None, float("nan")])) == 1.0
+    assert V.upcast_fraction(pa.array([1.5 + 1e-9, 2.5, None])) == 0.5
+    assert V.upcast_fraction(pa.array([None], pa.float64())) == 0.0
+
+
+def test_float32_mismatch_scale():
+    """A range rate's difference is measured in ulps of the speed (its
+    scale), not of the rate, which may be near 0."""
+    rate = pa.array([1e-6, 3.0], pa.float32())
+    new = pa.array([1e-6 + 2e-7, 3.0], pa.float32())
+    speed = pa.array([30.0, 30.0], pa.float32())
+    assert V.float32_mismatch(new, rate)[0].tolist() == [True, False]
+    assert V.float32_mismatch(new, rate, speed)[0].tolist() == [False, False]
 
 
 def test_regression_ellipse_not_compared(tmp_path, good):

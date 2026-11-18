@@ -424,13 +424,41 @@ def test_along_cross_track_in_ssobservation(tmp_path, offline):
     for c in ("ephOffsetAlongTrack", "ephOffsetCrossTrack"):
         assert sss[c].is_valid().equals(has), c                # NULL exactly without an orbit
     t = sss.filter(has)
-    along, cross = along_cross_track(*(t[c].to_numpy() for c in
+    along, cross = along_cross_track(*(t[c].to_numpy().astype(np.float64) for c in
                                        ("ephOffsetRa", "ephOffsetDec", "ephRateRa", "ephRateDec")))
-    # (from the float64 rates, so to the float32 rates' precision)
+    # (from the float64 offsets and rates, so to the float32 offsets' and
+    # rates' precision)
     np.testing.assert_allclose(t["ephOffsetAlongTrack"].to_numpy(), along, rtol=1e-6, atol=1e-9)
     np.testing.assert_allclose(t["ephOffsetCrossTrack"].to_numpy(), cross, rtol=1e-6, atol=1e-9)
-    off2 = t["ephOffsetRa"].to_numpy()**2 + t["ephOffsetDec"].to_numpy()**2
+    # (a rotation: the stored offsets' norm, in float64)
+    off_ra, off_dec = (t[c].to_numpy().astype(np.float64) for c in ("ephOffsetRa", "ephOffsetDec"))
+    off2 = off_ra**2 + off_dec**2
     np.testing.assert_allclose(along**2 + cross**2, off2, rtol=1e-12)
+
+
+#: sdm_schemas d6e8100's retyped SSObservation columns, and their Arrow types.
+PRECISION_TYPES = {**{f"{p}_{a}": pa.float64() for p in ("helio", "topo") for a in "xyz"},
+                   "helioRange": pa.float64(), "topoRange": pa.float64(),
+                   "ephOffsetRa": pa.float32(), "ephOffsetDec": pa.float32()}
+
+
+def test_precision_written_types_and_values(tmp_path, offline):
+    """The written parts have d6e8100's types for the retyped columns; the
+    doubles carry float64 values (not upcast float32), and the ranges are
+    the norms of the float64 vectors."""
+    sss, _, _ = _build(tmp_path)
+    schema = ssobservation_parts.parquet_schema(tmp_path)
+    for c, typ in PRECISION_TYPES.items():
+        assert schema.field(c).type == typ, c
+    t = sss.filter(sss["ephRa"].is_valid())
+    assert t.num_rows >= 5
+    for c, typ in PRECISION_TYPES.items():
+        if typ == pa.float64():
+            x = t[c].to_numpy()
+            assert (x != x.astype(np.float32)).mean() > 0.9, c
+    for pre in ("helio", "topo"):
+        x, y, z = (t[f"{pre}_{a}"].to_numpy() for a in "xyz")
+        assert np.array_equal(t[f"{pre}Range"].to_numpy(), np.sqrt(x ** 2 + y ** 2 + z ** 2)), pre
 
 
 def test_tail_angles_in_ssobservation(tmp_path, offline):

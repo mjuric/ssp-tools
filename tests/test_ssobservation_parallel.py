@@ -155,6 +155,165 @@ def test_tail_angles_from_the_ephresult(fake_ephem):
     assert np.isfinite(s).all() and np.isfinite(m).all()
 
 
+# --------------------------------------------------------------------------
+# Precision (docs/design/precision-doubles.md): every derived value is
+# computed from the float64 EphResult and offsets, then rounded once, to its
+# column's type
+# --------------------------------------------------------------------------
+
+def _entry_and_ephresult(n_obj=1, seed=6, min_rows=5):
+    """One object's compute_ssobservation_entry (fake ephemerides), the
+    EphResult it got, and its DiaSources."""
+    from astropy.time import Time
+    sss, obs_state, dia_eph, mpcorb = _tables(n_obj=n_obj, seed=seed)
+    compute_ssobservation_entry(sss, obs_state, mpcorb, dia_eph, None)
+    row = mpcorb.loc[sss["designation"][0]]
+    dia = dia_eph[obs_state["dia_index"]]
+    e = _fake_ephemerides(None, Time(dia["midpointMjdTai"], format="mjd", scale="tai"), None, None, row=row,
+                          obs_pos=obs_state["obs_pos"].T, obs_vel=obs_state["obs_vel"].T)
+    assert len(sss) >= min_rows
+    return sss, e, dia
+
+
+def _norm64(v):
+    return np.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+
+
+def test_precision_column_types():
+    """The working dtype has sdm_schemas d6e8100's types: double vectors
+    and ranges, float offsets (and float velocities, rates, V)."""
+    for c in ("helio_x", "helio_y", "helio_z", "topo_x", "topo_y", "topo_z", "helioRange", "topoRange"):
+        assert WORK_DTYPE[c] == np.float64, c
+    for c in ("ephOffsetRa", "ephOffsetDec", "ephOffsetAlongTrack", "ephOffsetCrossTrack", "helioRangeRate",
+              "topoRangeRate", "helio_vtot", "topo_vtot", "helio_vx", "topo_vz", "ephVmag", "phaseAngle"):
+        assert WORK_DTYPE[c] == np.float32, c
+
+
+def test_vectors_and_ranges_are_float64(fake_ephem):
+    """helio/topo x/y/z are the EphResult's float64 vectors, not upcast
+    float32; the ranges are their float64 norms."""
+    sss, e, _ = _entry_and_ephresult()
+    for pre, pos in (("helio", e.helio_pos), ("topo", e.topo_pos)):
+        for i, c in enumerate("xyz"):
+            x = sss[f"{pre}_{c}"]
+            assert x.dtype == np.float64 and np.array_equal(x, pos[i]), (pre, c)
+            assert (x != x.astype(np.float32)).all(), (pre, c)
+        r = sss[f"{pre}Range"]
+        assert r.dtype == np.float64 and np.array_equal(r, _norm64(pos)), pre
+        assert (r != r.astype(np.float32)).all(), pre
+        np.testing.assert_allclose(r, np.linalg.norm(pos, axis=0), rtol=4e-16, atol=0)
+
+
+def test_derived_from_float64(fake_ephem):
+    """The range rates, the speeds and ephVmag: computed from the float64
+    vectors and velocities, then rounded once to float32 (bitwise). Over
+    enough rows (several objects), the old path (float32 inputs, float32
+    arithmetic) gives different values for each, so the test tells them
+    apart."""
+    from ssp.photfit import hg_V_mag
+
+    def norm32(v):
+        v = v.astype(np.float32)
+        return np.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+
+    n_rows, old_differs = 0, dict.fromkeys(("helioRangeRate", "topoRangeRate", "helio_vtot", "topo_vtot",
+                                            "ephVmag"), 0)
+    for seed in range(6, 26):
+        sss, e, _ = _entry_and_ephresult(seed=seed, min_rows=1)
+        n_rows += len(sss)
+        r = {"helio": _norm64(e.helio_pos), "topo": _norm64(e.topo_pos)}
+        r32 = {"helio": norm32(e.helio_pos), "topo": norm32(e.topo_pos)}
+        for pre, pos, vel in (("helio", e.helio_pos, e.helio_vel), ("topo", e.topo_pos, e.topo_vel)):
+            rate = (vel[0] * pos[0] + vel[1] * pos[1] + vel[2] * pos[2]) / r[pre]
+            assert sss[f"{pre}RangeRate"].tobytes() == rate.astype(np.float32).tobytes(), (seed, pre)
+            assert sss[f"{pre}_vtot"].tobytes() == _norm64(vel).astype(np.float32).tobytes(), (seed, pre)
+            p32, v32 = pos.astype(np.float32), vel.astype(np.float32)
+            rate32 = (v32[0] * p32[0] + v32[1] * p32[1] + v32[2] * p32[2]) / r32[pre]
+            old_differs[f"{pre}RangeRate"] += int(np.sum(rate32 != sss[f"{pre}RangeRate"]))
+            old_differs[f"{pre}_vtot"] += int(np.sum(norm32(vel) != sss[f"{pre}_vtot"]))
+        v = hg_V_mag(e.H, e.G, r["helio"], r["topo"], e.phase_angle)
+        assert sss["ephVmag"].tobytes() == v.astype(np.float32).tobytes(), seed
+        v32 = hg_V_mag(e.H, e.G, r32["helio"], r32["topo"], e.phase_angle).astype(np.float32)
+        old_differs["ephVmag"] += int(np.sum(v32 != sss["ephVmag"]))
+    assert n_rows >= 200
+    assert all(n > 0 for n in old_differs.values()), old_differs
+
+
+def test_along_cross_track_from_float64_offsets(fake_ephem):
+    """ephOffsetRa/Dec are float32 roundings of the float64 offsets, and
+    the along/cross-track offsets are computed from the float64 offsets
+    (and rates): unchanged by the offsets' float32 storage."""
+    sss, e, dia = _entry_and_ephresult()
+    off_dec = (dia["dec"] - sss["ephDec"]) * 3600
+    dra = dia["ra"] - sss["ephRa"]
+    dra = np.where(dra >= 180, dra - 360, np.where(dra < -180, dra + 360, dra))   # (the short way round)
+    off_ra = dra * np.cos(np.deg2rad(sss["ephDec"])) * 3600
+    assert sss["ephOffsetRa"].tobytes() == off_ra.astype(np.float32).tobytes()
+    assert sss["ephOffsetDec"].tobytes() == off_dec.astype(np.float32).tobytes()
+    along, cross = ssobservation.along_cross_track(off_ra, off_dec, e.mu_lon, e.mu_lat)
+    assert sss["ephOffsetAlongTrack"].tobytes() == along.astype(np.float32).tobytes()
+    assert sss["ephOffsetCrossTrack"].tobytes() == cross.astype(np.float32).tobytes()
+
+
+@pytest.mark.parametrize("ra_obs,ra_eph", [(359.9999, 0.0001), (0.0001, 359.9999)])
+def test_offsets_across_ra_0(monkeypatch, ra_obs, ra_eph):
+    """F-16: an observation and a prediction on opposite sides of RA 0/360
+    get the short-way offset, -+0.0002 deg x cos(dec), not ~360 deg; at
+    several declinations, up to |dec| 89; the along/cross-track offsets
+    agree (a rotation of it by the rate's direction)."""
+    decs = np.array([0.0, 30.0, -45.0, 60.0, -75.0, 85.0, -89.0])
+    n = len(decs)
+    mu_lon, mu_lat = np.full(n, 0.3), np.full(n, -0.4)
+
+    def straddle(provID, ephTimes, mpcorb, ephem, row=None, obs_pos=None, obs_vel=None, nongrav=None):
+        e = _fake_ephemerides(provID, ephTimes, mpcorb, ephem, row=row, obs_pos=obs_pos, obs_vel=obs_vel)
+        e.ra_deg, e.dec_deg = np.full(n, ra_eph), decs.copy()
+        e.mu_lon, e.mu_lat, e.mu_total = mu_lon, mu_lat, np.hypot(mu_lon, mu_lat)
+        return e
+    monkeypatch.setattr(ssobservation, "compute_ephemerides_one", straddle)
+    sss = np.zeros(n, dtype=SSS_DTYPE)
+    sss["ssObjectId"] = 7
+    sss["designation"] = "2025 A0007"
+    dia = np.zeros(n, dtype=[(c, np.float64) for c in ("midpointMjdTai", "ra", "dec")])
+    dia["midpointMjdTai"] = 60800.0 + np.arange(n)
+    dia["ra"], dia["dec"] = ra_obs, decs + 0.5 / 3600          # (and 0.5" north)
+    obs = np.zeros(n, dtype=OBS_DTYPE)
+    obs["dia_index"] = np.arange(n)
+    obs["obs_pos"] = [1.0, 0.0, 0.0]
+    mpcorb = pd.DataFrame(dict(
+        unpacked_primary_provisional_designation=["2025 A0007"], q=[2.0], e=[0.1], i=[5.0], node=[0.0],
+        argperi=[0.0], peri_time=[60000.0], epoch_mjd=[60800.0], h=[15.0], g=[0.15],
+    )).set_index("unpacked_primary_provisional_designation", drop=False)
+    compute_ssobservation_entry(sss, obs, mpcorb, dia, None)
+    # independently: the short way round is 0.0002 deg, westward if the
+    # observation is at 359.9999
+    sign = -1.0 if ra_obs > 180 else 1.0
+    want_ra = sign * 0.0002 * 3600 * np.cos(np.radians(decs))
+    np.testing.assert_allclose(sss["ephOffsetRa"], want_ra, rtol=1e-6, atol=0)
+    np.testing.assert_allclose(sss["ephOffsetDec"], 0.5, rtol=1e-6)
+    assert np.all(np.abs(sss["ephOffsetRa"]) < 0.73)
+    # the great-circle separation agrees (tangent plane, tiny separation)
+    np.testing.assert_allclose(np.hypot(sss["ephOffsetRa"].astype(float), sss["ephOffsetDec"].astype(float)),
+                               sss["ephOffset"], rtol=2e-6)
+    # along/cross-track: the offset rotated into the rate's frame
+    v = np.hypot(mu_lon, mu_lat)
+    want_along = (want_ra * mu_lon + 0.5 * mu_lat) / v
+    want_cross = (-want_ra * mu_lat + 0.5 * mu_lon) / v
+    np.testing.assert_allclose(sss["ephOffsetAlongTrack"], want_along, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(sss["ephOffsetCrossTrack"], want_cross, rtol=1e-5, atol=1e-6)
+
+
+def test_wrap_dra_deg():
+    from ssp.util import wrap_dra_deg
+    d = np.array([0.0, -0.0, 1e-9, 179.999, 180.0, 359.9998, -359.9998, -180.0, -180.000001, np.nan])
+    w = wrap_dra_deg(d)
+    np.testing.assert_allclose(w[:9], [0, 0, 1e-9, 179.999, -180.0, -0.0002, 0.0002, -180.0, 179.999999],
+                               rtol=0, atol=1e-9)
+    assert np.isnan(w[9])
+    # values in range are bitwise unchanged
+    assert w[:4].tobytes() == d[:4].tobytes() and w[7] == -180.0
+
+
 class _FakeEllipse:
     """A stand-in for ssp.ssobservation_ellipse: records the inputs it gets
     (serial runs only: forked workers record in their own copy), counts one
@@ -236,12 +395,14 @@ def test_ellipse_inputs(recorded_ephem, fake_ellipse):
         # ones compute_ephemerides_one got)
         assert np.array_equal(call["obs_pos"], obs_state["obs_pos"][rows]), d
         assert np.array_equal(call["obs_pos"], recorded_ephem[d]["obs_pos"].T), d
-        # (EphResult.topo_pos.T in float64, not the float32 topo_x/y/z)
+        # (EphResult.topo_pos.T in float64, not a float32 rounding of it;
+        # the float64 topo_x/y/z columns store the same values)
         tp = call["topo_pos"]
         assert tp.dtype == np.float64 and tp.shape == (rows.sum(), 3), d
         assert np.array_equal(tp, recorded_ephem[d]["topo_pos"].T), d
-        f32 = np.stack([sss[c][rows] for c in ("topo_x", "topo_y", "topo_z")], axis=1).astype(np.float64)
-        assert not np.array_equal(tp, f32), d
+        assert not np.array_equal(tp, tp.astype(np.float32).astype(np.float64)), d
+        stored = np.stack([sss[c][rows] for c in ("topo_x", "topo_y", "topo_z")], axis=1)
+        assert stored.dtype == np.float64 and np.array_equal(tp, stored), d
 
 
 @pytest.mark.parametrize("workers", [1, 3])

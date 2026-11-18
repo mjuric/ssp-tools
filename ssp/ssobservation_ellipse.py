@@ -142,8 +142,8 @@ def ephemeris_ellipse(orbit, t_assist, obs_pos, topo_pos, ephem):
     precise pass's object - observer vectors [AU] (``EphResult.topo_pos.T``).
     The times need not be sorted, and may repeat.
 
-    Pass the precise pass's float64 ``topo_pos``, not SSObservation's float32
-    ``topo_x/y/z``: a short arc's position covariance is a cigar along the
+    Pass the precise pass's float64 ``topo_pos``, not a float32-rounded
+    vector: a short arc's position covariance is a cigar along the
     line of sight (sigma ~0.1 AU radially against ~1e-6 AU across), so the
     projection is sensitive to the direction. The float32 rounding (~3e-8
     relative) changes such ellipses by up to ~1e-3, and the geometric

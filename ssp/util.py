@@ -201,6 +201,18 @@ def wrap_ra_deg(ra):
     return ra
 
 
+def wrap_dra_deg(dra):
+    """An RA difference [deg] wrapped to [-180, 180): the short way round,
+    across RA 0/360. ``dra`` must be in [-540, 540), e.g. the difference of
+    two RAs in [0, 360): only one 360 is added or subtracted. Values already
+    in range are returned bitwise unchanged (360 is added or subtracted only
+    where needed: no (x + 180) % 360 - 180 rounding of every value)."""
+    dra = np.array(dra, dtype=np.float64)
+    dra[dra >= 180.0] -= 360.0
+    dra[dra < -180.0] += 360.0
+    return dra
+
+
 _DEG2RAD = u.deg.to(u.rad)
 _RAD2DEG = u.rad.to(u.deg)
 _DEG2ARCSEC = u.deg.to(u.arcsec)

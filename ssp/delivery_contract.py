@@ -282,18 +282,38 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 #     -> dict[table, list[CheckResult]]
 #   Fails (a FAIL result) for a missing file. SSObservation is checked
 #   through its manifest (check_ssobservation_parts below) and check_table
-#   runs on every part; then check_elongation on all its parts.
+#   runs on every part; then check_elongation and check_offsets on all its
+#   parts.
 # check_elongation(part_files) -> CheckResult
 #   (docs/design/elongation-ssobject-nulls.md) On every row with non-NULL
 #   topo_* and helio_* (positions and velocities), ``elongation`` within
 #   its tolerance of the apparent elongation from the delivered columns
-#   (delivery_check.elongation_tolerance_arcsec: 1" plus twice the float32
-#   bound of the recomputed Sun direction plus light-time; ~1" nearby,
-#   ~6" at 90 AU): the
+#   (delivery_check.elongation_tolerance_arcsec: 1" plus twice the rounding
+#   bound of the recomputed Sun direction, by the stored vectors' type
+#   (2**-24 for float32, 2**-53 for float64), plus the Sun's motion over
+#   both light-time legs, object-to-observer and Sun-to-object (topo - helio
+#   is the Sun as the object saw it); ~1" nearby, and at 90 AU ~7" for
+#   float32 vectors, ~3" for float64): the
 #   angle between the observed (ra, dec) and topo - helio, both aberrated
 #   (first order in v/c) by helio_v - topo_v. Reports the rows checked, the
 #   largest difference, and (for information) the rows where the angle to
 #   topo's direction would differ by more than 0.01 deg.
+# check_offsets(part_files) -> CheckResult
+#   (docs/design/precision-doubles.md, F-16) On every row with non-NULL
+#   ephOffsetRa, ephOffsetDec, ephOffset and ephDec: where the separation
+#   and the RA difference are within 1 deg (the tangent plane),
+#   |hypot(ephOffsetRa, ephOffsetDec) - ephOffset| within
+#   delivery_check.offsets_tolerance_arcsec: ephOffset x (4 x 2**-24 for the
+#   float32 columns + 2 x (|tan(ephDec)| |ephOffsetDec| / 2 + (1 +
+#   tan^2(ephDec)) ephOffset^2 / 8), angles in radians) + 1e-9" (float64
+#   floor). The factor 2 (OFFSETS_TOL_SAFETY): the tangent-plane bound is
+#   near the true leading term, and the check is for gross errors (an
+#   unwrapped RA difference is off by 1e3-1e6"), so it leaves room for
+#   what the derivation misses. Beyond:
+#   |ephOffsetDec| <= ephOffset and |ephOffsetRa| <= 180 deg x |cos(ephDec)|.
+#   A NaN fails. Catches an RA difference not wrapped across RA 0/360.
+#   Reports the rows checked, the worst fraction of the tolerance and its
+#   separation, and the rows beyond the tangent plane.
 # check_ssobservation_parts(delivery_dir) -> list[CheckResult]
 #   The manifest has SSOBSERVATION_MANIFEST_FIELDS (format_version
 #   MANIFEST_FORMAT_VERSION)

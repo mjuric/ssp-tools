@@ -28,7 +28,9 @@ Subcommands::
               integrations may differ at ~1e-11 deg (both counts
               reported); non-null exactly where there is an orbit; in
               [0, 360); and SSObservation's angles recomputed from its own
-              float32 helio_* / topo_* columns. A pair whose SSObservation
+              helio_* / topo_* columns (float32 velocities; the positions
+              float32 before sdm_schemas d6e8100, float64 since, which the
+              float32 tolerance also covers). A pair whose SSObservation
               midpointMjdTai differs from NearbySSO's time (the shutter
               correction, docs/design/shutter-timing.md) also gets the
               time-shift allowance of bench/time_shift.py on top; pairs at
@@ -760,7 +762,9 @@ def consistency(ssobservation, nearbysso, dia_sources=None, sidecar=None):
             msg += f" (e.g. SSObservation {sv[k].tolist()} vs NearbySSO {nv[k].tolist()})"
         checks.append((not bad.any(), msg))
 
-    # 3. recomputation from SSObservation's own float32 vectors
+    # 3. recomputation from SSObservation's own vectors (the float32 bound:
+    #    the velocities are float32, and so were the positions before
+    #    sdm_schemas d6e8100)
     hp = np.array([_f(s, f"helio_{c}") for c in "xyz"])
     hv = np.array([_f(s, f"helio_v{c}") for c in "xyz"])
     tp = np.array([_f(s, f"topo_{c}") for c in "xyz"])
