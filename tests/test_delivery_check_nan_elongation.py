@@ -321,8 +321,8 @@ OFF_DECL = [0.0, 10.0, -30.0, 45.0, 60.0, -75.0, 85.0, -89.0, 89.0]
 def test_offsets_pass(tmp_path):
     r = _offsets_result(tmp_path, _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL))
     assert r.ok, r
-    assert r.detail.startswith("9 rows with the offsets; at most "), r
-    assert "; 0 rows beyond the tangent-plane regime" in r.detail
+    assert r.detail.startswith("9 rows with the offsets; tangent plane (<= 1 deg): 9 rows, at most "), r
+    assert "; beyond it (bounds only): 0 rows" in r.detail
 
 
 def test_offsets_unwrapped_straddle_fails(tmp_path):
@@ -334,18 +334,23 @@ def test_offsets_unwrapped_straddle_fails(tmp_path):
     t = replace(t, "ephOffsetRa", pa.array(ra, pa.float32()))
     r = _offsets_result(tmp_path, t)
     assert not r.ok and r.detail.startswith("1 rows outside;"), r
-    assert "ephOffsetRa 1.1223" in r.detail and "at most 2 of the tolerance" in r.detail
+    assert "ephOffsetRa 1.1223" in r.detail
+    assert "beyond it (bounds only): 1 rows, at most 2 of the bounds" in r.detail
+    assert "tangent plane (<= 1 deg): 8 rows, at most " in r.detail
 
 
-@pytest.mark.parametrize("times,ok", [(0.5, True), (3.0, False)])
+@pytest.mark.parametrize("times,ok", [(0.5, True), (-0.5, True), (3.0, False), (-3.0, False)])
 def test_offsets_few_times_tolerance(tmp_path, times, ok):
-    """An ephOffset off by 3x the tolerance fails, by half of it passes
-    (row 4: ~41" at dec 60, where the tolerance is ~8e-5 relative)."""
+    """An ephOffset off by 3x the tolerance fails, by half of it passes, in
+    either direction. Row 6: 3" at dec 85, all in RA, where the baseline
+    residual is ~0 (eta = 0) and the tolerance ~2.5e-7 relative (mostly
+    its float32 term; the s^2 term, with tan^2(85) ~ 130, adds ~7e-9)."""
     t = _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL)
     sep = t["ephOffset"].to_numpy().astype(float)
-    tol = D.offsets_tolerance_arcsec(sep[4], OFF_DEC[4], OFF_DECL[4])
-    assert 5e-5 < tol / sep[4] < 2e-4
-    sep[4] += times * tol
+    tol = D.offsets_tolerance_arcsec(sep[6], OFF_DEC[6], OFF_DECL[6])
+    base = abs(np.hypot(np.float32(OFF_RA[6]), np.float32(OFF_DEC[6])) - sep[6])
+    assert base < 0.05 * tol and 2e-7 < tol / sep[6] < 3e-7
+    sep[6] += times * tol
     r = _offsets_result(tmp_path, replace(t, "ephOffset", pa.array(sep, pa.float32())))
     assert r.ok == ok, r
     if not ok:
@@ -379,7 +384,7 @@ def test_offsets_large_separation_bounds(tmp_path, ra_off, ok):
     t = replace(t, "ephOffset", pa.array(sep, pa.float32()))
     r = _offsets_result(tmp_path, t)
     assert r.ok == ok, r
-    assert "1 rows beyond the tangent-plane regime" in r.detail
+    assert "beyond it (bounds only): 1 rows, at most " in r.detail
 
 
 def test_offsets_dec_beyond_separation_fails(tmp_path):
@@ -391,6 +396,21 @@ def test_offsets_dec_beyond_separation_fails(tmp_path):
     sep[0] = 2 * 3600.0
     t = replace(t, "ephOffsetDec", pa.array(od, pa.float32()))
     r = _offsets_result(tmp_path, replace(t, "ephOffset", pa.array(sep, pa.float32())))
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+
+
+@pytest.mark.parametrize("value", [-1.0, -5000.0, float("inf")])
+def test_offsets_negative_or_infinite_separation_fails(tmp_path, value):
+    t = _set(_with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL), "ephOffset", 4, value)
+    r = _offsets_result(tmp_path, t)
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+    assert "; 1 rows with a non-finite value or a negative ephOffset" in r.detail
+
+
+@pytest.mark.parametrize("col", ["ephOffsetRa", "ephOffsetDec", "ephDec"])
+def test_offsets_infinite_value_fails(tmp_path, col):
+    t = _set(_with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL), col, 4, float("-inf"))
+    r = _offsets_result(tmp_path, t)
     assert not r.ok and r.detail.startswith("1 rows outside;"), r
 
 
@@ -409,7 +429,7 @@ def test_offsets_nan_fails(tmp_path, col):
     t = _set(_with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL), col, 4, float("nan"))
     r = _offsets_result(tmp_path, t)
     assert not r.ok and r.detail.startswith("1 rows outside;"), r
-    assert "at most inf of the tolerance" in r.detail
+    assert "; 1 rows with a non-finite value or a negative ephOffset" in r.detail
 
 
 def test_offsets_tolerance():

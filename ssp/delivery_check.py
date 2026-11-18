@@ -595,12 +595,16 @@ def check_offsets(files):
     |hypot(ephOffsetRa, ephOffsetDec) - ephOffset| within
     offsets_tolerance_arcsec; beyond it, |ephOffsetDec| <= ephOffset and
     |ephOffsetRa| <= 180 deg x |cos(ephDec)| (each with the same float32 and
-    float64 allowances). A NaN fails. An RA difference not wrapped across
-    RA 0/360 gives |ephOffsetRa| ~ 360 deg x cos(dec) at a small separation,
-    and fails either way. Reports the rows checked, the worst fraction of
-    the tolerance (or of the bound) and its separation, and the rows beyond
-    the tangent-plane regime."""
-    n_checked, n_bad, n_far, worst, worst_sep, examples = 0, 0, 0, 0.0, 0.0, []
+    float64 allowances). A non-finite value (NaN, inf) in any of the four
+    columns, or a negative ephOffset, fails. An RA difference not wrapped
+    across RA 0/360 gives |ephOffsetRa| ~ 360 deg x cos(dec) at a small
+    separation, and fails either way. Reports the rows checked and, for each
+    regime apart (the tangent plane, and beyond it), its rows and its worst
+    fraction of the tolerance (or of the bounds) with that row's separation;
+    and the rows with an invalid value."""
+    n_checked, n_bad, n_invalid, examples = 0, 0, 0, []
+    # per regime: [rows, worst fraction, its separation]
+    regime = {"tangent": [0, 0.0, None], "far": [0, 0.0, None]}
     lim = OFFSETS_TANGENT_MAX_DEG * 3600
     slack = 1 + OFFSETS_TOL_ROUNDING_UNITS * 2.0 ** -24
     for f in files:
@@ -619,9 +623,10 @@ def check_offsets(files):
                 continue
             xi, eta, sep, dec = (_np(t[c], np.nan)[has].astype(np.float64) for c in OFFSETS_COLUMNS)
             cosd = np.abs(np.cos(np.radians(dec)))
+            invalid = ~(np.isfinite(xi) & np.isfinite(eta) & np.isfinite(sep) & np.isfinite(dec)) | (sep < 0)
             with np.errstate(invalid="ignore", divide="ignore"):
-                tangent = (sep <= lim) & (np.abs(xi) <= lim * cosd)
-                far = ~tangent
+                tangent = (sep <= lim) & (np.abs(xi) <= lim * cosd) & ~invalid
+                far = ~tangent & ~invalid
                 frac = np.full(len(sep), np.inf)
                 # the tangent-plane regime
                 tol = offsets_tolerance_arcsec(sep, eta, dec)
@@ -630,13 +635,16 @@ def check_offsets(files):
                 f_dec = np.abs(eta) / (sep * slack + OFFSETS_TOL_FLOOR_ARCSEC)
                 f_ra = np.abs(xi) / (180 * 3600 * cosd * slack + OFFSETS_TOL_FLOOR_ARCSEC)
                 frac[far] = np.maximum(f_dec, f_ra)[far]
-            frac[np.isnan(frac)] = np.inf
+            frac[np.isnan(frac) | invalid] = np.inf
             n_checked += len(sep)
-            n_far += int(far.sum())
-            if len(frac):
-                i = int(np.argmax(frac))
-                if frac[i] >= worst:
-                    worst, worst_sep = float(frac[i]), float(sep[i])
+            n_invalid += int(invalid.sum())
+            for name, m in (("tangent", tangent), ("far", far)):
+                r = regime[name]
+                r[0] += int(m.sum())
+                if m.any():
+                    i = np.flatnonzero(m)[int(np.argmax(frac[m]))]
+                    if r[2] is None or frac[i] >= r[1]:
+                        r[1], r[2] = float(frac[i]), float(sep[i])
             bad = ~(frac <= 1.0)
             if bad.any():
                 n_bad += int(bad.sum())
@@ -646,9 +654,13 @@ def check_offsets(files):
                                     f"ephOffsetDec {eta[i]:.6g}, ephOffset {sep[i]:.6g} arcsec, "
                                     f"ephDec {dec[i]:.6g}")
             del t
-    detail = (f"{n_checked:,} rows with the offsets; at most {worst:.3g} of the tolerance (at ephOffset "
-              f"{worst_sep:.4g} arcsec); {n_far:,} rows beyond the tangent-plane regime "
-              f"(> {OFFSETS_TANGENT_MAX_DEG:g} deg; bounds only)")
+    def worst(name, what):
+        n, w, s = regime[name]
+        return f"{n:,} rows" + (f", at most {w:.3g} of {what} (at ephOffset {s:.4g} arcsec)" if n else "")
+    detail = (f"{n_checked:,} rows with the offsets; tangent plane (<= {OFFSETS_TANGENT_MAX_DEG:g} deg): "
+              f"{worst('tangent', 'the tolerance')}; beyond it (bounds only): {worst('far', 'the bounds')}"
+              + (f"; {n_invalid:,} rows with a non-finite value or a negative ephOffset"
+                 if n_invalid else ""))
     if n_bad:
         return CheckResult("offsets", False, f"{n_bad:,} rows outside; " + detail + "; e.g. "
                            + "; ".join(examples))
