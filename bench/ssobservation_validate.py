@@ -166,9 +166,12 @@ PRECISION_DERIVED = {
     "helioRangeRate": "helio_vtot", "topoRangeRate": "topo_vtot",
 }
 #: Against a pre-change reference, a retyped or derived column agrees to
-#: this many float32 ulps of its scale (the old float32 arithmetic rounded
-#: each value a few times).
-PRECISION_ULPS = 4
+#: this many float32 ulps of its scale. The old code computed the ranges,
+#: speeds and range rates in float32 arithmetic from float32 inputs, each
+#: rounding adding up to half an ulp: a range rate's dot product, sum and
+#: division up to ~3-6 ulps of the speed (4 seen on 2026-11-17, 8.1M rows;
+#: the ranges, speeds and V 2).
+PRECISION_ULPS = 8
 
 #: Tolerance of the recomputed along/cross-track offsets, in float32 epsilons
 #: times |ephOffset|: the inputs' (float32 rates) and the output's rounding.

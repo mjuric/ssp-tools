@@ -508,7 +508,7 @@ def test_regression_legacy_reference(tmp_path, good):
     ulp = np.spacing(np.float32(2.5))
     for k, c in enumerate(("helioRangeRate", "ephVmag", "topo_x")):
         a = ref[c].to_numpy().copy()
-        a[1] += 3 * ulp
+        a[1] += 6 * ulp
         ok = ref.set_column(ref.column_names.index(c), c, pa.array(a))
         assert V.check_regression(good, write(ok, tmp_path / f"ok{k}.parquet")).ok, c
 
