@@ -282,7 +282,8 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 #     -> dict[table, list[CheckResult]]
 #   Fails (a FAIL result) for a missing file. SSObservation is checked
 #   through its manifest (check_ssobservation_parts below) and check_table
-#   runs on every part; then check_elongation on all its parts.
+#   runs on every part; then check_elongation and check_offsets on all its
+#   parts.
 # check_elongation(part_files) -> CheckResult
 #   (docs/design/elongation-ssobject-nulls.md) On every row with non-NULL
 #   topo_* and helio_* (positions and velocities), ``elongation`` within
@@ -297,6 +298,22 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 #   (first order in v/c) by helio_v - topo_v. Reports the rows checked, the
 #   largest difference, and (for information) the rows where the angle to
 #   topo's direction would differ by more than 0.01 deg.
+# check_offsets(part_files) -> CheckResult
+#   (docs/design/precision-doubles.md, F-16) On every row with non-NULL
+#   ephOffsetRa, ephOffsetDec, ephOffset and ephDec: where the separation
+#   and the RA difference are within 1 deg (the tangent plane),
+#   |hypot(ephOffsetRa, ephOffsetDec) - ephOffset| within
+#   delivery_check.offsets_tolerance_arcsec: ephOffset x (4 x 2**-24 for the
+#   float32 columns + 2 x (|tan(ephDec)| |ephOffsetDec| / 2 + (1 +
+#   tan^2(ephDec)) ephOffset^2 / 8), angles in radians) + 1e-9" (float64
+#   floor). The factor 2 (OFFSETS_TOL_SAFETY): the tangent-plane bound is
+#   near the true leading term, and the check is for gross errors (an
+#   unwrapped RA difference is off by 1e3-1e6"), so it leaves room for
+#   what the derivation misses. Beyond:
+#   |ephOffsetDec| <= ephOffset and |ephOffsetRa| <= 180 deg x |cos(ephDec)|.
+#   A NaN fails. Catches an RA difference not wrapped across RA 0/360.
+#   Reports the rows checked, the worst fraction of the tolerance and its
+#   separation, and the rows beyond the tangent plane.
 # check_ssobservation_parts(delivery_dir) -> list[CheckResult]
 #   The manifest has SSOBSERVATION_MANIFEST_FIELDS (format_version
 #   MANIFEST_FORMAT_VERSION)

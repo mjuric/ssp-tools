@@ -282,6 +282,176 @@ def test_elongation_no_files():
     assert r.ok and r.detail.startswith("0 rows with topo/helio vectors; "), r
 
 
+# --------------------------------------------------------------------------
+# check_offsets (F-16 of docs/design/precision-doubles.md)
+# --------------------------------------------------------------------------
+
+def _with_offsets(t, ra_off, dec_off, dec=None, sep=None):
+    """``t`` with the given ephOffsetRa/Dec [arcsec] (lists, None = NULL),
+    ephDec [deg] (default 0) and ephOffset (default: their exact
+    great-circle separation, from a prediction at RA 10 deg)."""
+    from ssp.util import sky_separation_arcsec
+    n = len(t)
+    dec = np.zeros(n) if dec is None else np.asarray(dec, float)
+    if sep is None:
+        sep = []
+        for x, y, d in zip(ra_off, dec_off, dec):
+            if x is None or y is None:
+                sep.append(None)
+            else:
+                ra2 = 10.0 + x / 3600 / np.cos(np.radians(d))
+                sep.append(float(sky_separation_arcsec(10.0, d, ra2, d + y / 3600)))
+    t = replace(t, "ephOffsetRa", pa.array(ra_off, pa.float32()))
+    t = replace(t, "ephOffsetDec", pa.array(dec_off, pa.float32()))
+    t = replace(t, "ephDec", pa.array(dec, pa.float64()))
+    return replace(t, "ephOffset", pa.array(sep, pa.float32()))
+
+
+def _offsets_result(tmp_path, t):
+    write_ss(tmp_path, t)
+    return _ss_results(tmp_path)["offsets"]
+
+
+#: Nine rows: 1 mas to 50", at declinations up to 89 deg.
+OFF_RA = [0.001, 0.3, -1.2, 25.0, -40.0, 0.7, 3.0, -0.02, 0.5]
+OFF_DEC = [0.0, -0.4, 0.9, 30.0, 10.0, -0.1, 0.0, 0.03, -0.5]
+OFF_DECL = [0.0, 10.0, -30.0, 45.0, 60.0, -75.0, 85.0, -89.0, 89.0]
+
+
+def test_offsets_pass(tmp_path):
+    r = _offsets_result(tmp_path, _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL))
+    assert r.ok, r
+    assert r.detail.startswith("9 rows with the offsets; tangent plane (<= 1 deg): 9 rows, at most "), r
+    assert "; beyond it (bounds only): 0 rows" in r.detail
+
+
+def test_offsets_unwrapped_straddle_fails(tmp_path):
+    """An RA difference not wrapped across RA 0/360: 0.72" the short way
+    becomes 359.9998 deg x cos(dec) ~ 1.3e6"."""
+    ra = list(OFF_RA)
+    ra[2] = (360 - 0.0002) * 3600 * np.cos(np.radians(OFF_DECL[2]))
+    t = _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL)
+    t = replace(t, "ephOffsetRa", pa.array(ra, pa.float32()))
+    r = _offsets_result(tmp_path, t)
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+    assert "ephOffsetRa 1.1223" in r.detail
+    assert "beyond it (bounds only): 1 rows, at most 2 of the bounds" in r.detail
+    assert "tangent plane (<= 1 deg): 8 rows, at most " in r.detail
+
+
+@pytest.mark.parametrize("times,ok", [(0.5, True), (-0.5, True), (3.0, False), (-3.0, False)])
+def test_offsets_few_times_tolerance(tmp_path, times, ok):
+    """An ephOffset off by 3x the tolerance fails, by half of it passes, in
+    either direction. Row 6: 3" at dec 85, all in RA, where the baseline
+    residual is ~0 (eta = 0) and the tolerance ~2.5e-7 relative (mostly
+    its float32 term; the s^2 term, with tan^2(85) ~ 130, adds ~7e-9)."""
+    t = _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL)
+    sep = t["ephOffset"].to_numpy().astype(float)
+    tol = D.offsets_tolerance_arcsec(sep[6], OFF_DEC[6], OFF_DECL[6])
+    base = abs(np.hypot(np.float32(OFF_RA[6]), np.float32(OFF_DEC[6])) - sep[6])
+    assert base < 0.05 * tol and 2e-7 < tol / sep[6] < 3e-7
+    sep[6] += times * tol
+    r = _offsets_result(tmp_path, replace(t, "ephOffset", pa.array(sep, pa.float32())))
+    assert r.ok == ok, r
+    if not ok:
+        assert r.detail.startswith("1 rows outside;"), r
+
+
+COS20 = np.cos(np.radians(20.0))
+
+
+# (within the bounds; and an RA difference not wrapped)
+@pytest.mark.parametrize("ra_off,ok", [(-150 * 3600 * COS20, True), (-179.9 * 3600 * COS20, True),
+                                       (-200 * 3600 * COS20, False)])
+def test_offsets_large_separation_bounds(tmp_path, ra_off, ok):
+    """Beyond 1 deg only the bounds: |ephOffsetRa| <= 180 deg x cos(dec),
+    |ephOffsetDec| <= ephOffset (here the separation of the wrapped
+    difference, ~150 deg; the tangent-plane hypot is far from it)."""
+    from ssp.util import sky_separation_arcsec
+    t = _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL)
+    dec = np.array(OFF_DECL, float)
+    dec[0] = 20.0
+    ra = list(OFF_RA)
+    ra[0] = ra_off
+    dra = ((ra_off / 3600 / np.cos(np.radians(20.0))) + 180) % 360 - 180
+    sep = t["ephOffset"].to_numpy().astype(float)
+    sep[0] = sky_separation_arcsec(10.0, 20.0, 10.0 + dra, 20.0 - 2.0)
+    od = list(OFF_DEC)
+    od[0] = -2.0 * 3600
+    t = replace(t, "ephOffsetRa", pa.array(ra, pa.float32()))
+    t = replace(t, "ephOffsetDec", pa.array(od, pa.float32()))
+    t = replace(t, "ephDec", pa.array(dec))
+    t = replace(t, "ephOffset", pa.array(sep, pa.float32()))
+    r = _offsets_result(tmp_path, t)
+    assert r.ok == ok, r
+    assert "beyond it (bounds only): 1 rows, at most " in r.detail
+
+
+def test_offsets_dec_beyond_separation_fails(tmp_path):
+    """Beyond 1 deg: |ephOffsetDec| > ephOffset fails."""
+    t = _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL)
+    od = list(OFF_DEC)
+    od[0] = 3 * 3600.0
+    sep = t["ephOffset"].to_numpy().astype(float)
+    sep[0] = 2 * 3600.0
+    t = replace(t, "ephOffsetDec", pa.array(od, pa.float32()))
+    r = _offsets_result(tmp_path, replace(t, "ephOffset", pa.array(sep, pa.float32())))
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+
+
+@pytest.mark.parametrize("value", [-1.0, -5000.0, float("inf")])
+def test_offsets_negative_or_infinite_separation_fails(tmp_path, value):
+    t = _set(_with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL), "ephOffset", 4, value)
+    r = _offsets_result(tmp_path, t)
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+    assert "; 1 rows with a non-finite value or a negative ephOffset" in r.detail
+
+
+@pytest.mark.parametrize("col", ["ephOffsetRa", "ephOffsetDec", "ephDec"])
+def test_offsets_infinite_value_fails(tmp_path, col):
+    t = _set(_with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL), col, 4, float("-inf"))
+    r = _offsets_result(tmp_path, t)
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+
+
+def test_offsets_nulls_skipped(tmp_path):
+    ra, de = list(OFF_RA), list(OFF_DEC)
+    ra[1], de[2] = None, None
+    t = _with_offsets(ss_table(), ra, de, OFF_DECL)
+    # (an unwrapped value with a NULL separation is not checked either)
+    t = _set(_set(t, "ephOffsetRa", 3, 1.3e6), "ephOffset", 3, None)
+    r = _offsets_result(tmp_path, t)
+    assert r.ok and r.detail.startswith("6 rows with the offsets"), r
+
+
+@pytest.mark.parametrize("col", ["ephOffsetRa", "ephOffsetDec", "ephOffset"])
+def test_offsets_nan_fails(tmp_path, col):
+    t = _set(_with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL), col, 4, float("nan"))
+    r = _offsets_result(tmp_path, t)
+    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+    assert "; 1 rows with a non-finite value or a negative ephOffset" in r.detail
+
+
+def test_offsets_tolerance():
+    """The tangent-plane terms, times OFFSETS_TOL_SAFETY (2): |tan(dec)|
+    |dDec| / 2 dominates; float32 and the float64 floor otherwise."""
+    tol = D.offsets_tolerance_arcsec
+    assert D.OFFSETS_TOL_SAFETY == 2.0
+    assert tol(0.0, 0.0, 0.0) == D.OFFSETS_TOL_FLOOR_ARCSEC
+    want = 4 * 2.0 ** -24 + 1e-9 + 2 * np.radians(1 / 3600) ** 2 / 8
+    assert tol(1.0, 0.0, 0.0) == pytest.approx(want, rel=1e-12)
+    # 60" at dec 45, all in declination: 2 x |tan| x eta / 2 relative
+    assert tol(60.0, 60.0, 45.0) / 60 == pytest.approx(2 * np.radians(60 / 3600) / 2, rel=3e-3)
+    assert tol(60.0, 60.0, 80.0) > tol(60.0, 60.0, 45.0) > tol(60.0, 0.0, 45.0)
+
+
+def test_offsets_missing_columns(tmp_path):
+    write_ss(tmp_path)
+    t = ss_table().drop_columns(["ephOffsetDec"])
+    r = D.check_offsets([write(tmp_path, "x", t)])
+    assert not r.ok and "lacks ['ephOffsetDec']" in r.detail
+
+
 def test_elongation_missing_columns(tmp_path):
     write_ss(tmp_path)
     t = ss_table().drop_columns(["topo_y"])
