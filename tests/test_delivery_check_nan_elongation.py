@@ -337,13 +337,19 @@ def test_offsets_unwrapped_straddle_fails(tmp_path):
     assert "ephOffsetRa 1.1223" in r.detail and "at most 2 of the tolerance" in r.detail
 
 
-def test_offsets_wrong_by_more_than_tolerance_fails(tmp_path):
-    """A 1e-4 relative error at 30" fails (the tolerance there is ~1e-5)."""
+@pytest.mark.parametrize("times,ok", [(0.5, True), (3.0, False)])
+def test_offsets_few_times_tolerance(tmp_path, times, ok):
+    """An ephOffset off by 3x the tolerance fails, by half of it passes
+    (row 4: ~41" at dec 60, where the tolerance is ~8e-5 relative)."""
     t = _with_offsets(ss_table(), OFF_RA, OFF_DEC, OFF_DECL)
     sep = t["ephOffset"].to_numpy().astype(float)
-    sep[4] *= 1 + 1e-4
+    tol = D.offsets_tolerance_arcsec(sep[4], OFF_DEC[4], OFF_DECL[4])
+    assert 5e-5 < tol / sep[4] < 2e-4
+    sep[4] += times * tol
     r = _offsets_result(tmp_path, replace(t, "ephOffset", pa.array(sep, pa.float32())))
-    assert not r.ok and r.detail.startswith("1 rows outside;"), r
+    assert r.ok == ok, r
+    if not ok:
+        assert r.detail.startswith("1 rows outside;"), r
 
 
 COS20 = np.cos(np.radians(20.0))
@@ -407,14 +413,15 @@ def test_offsets_nan_fails(tmp_path, col):
 
 
 def test_offsets_tolerance():
-    """The tangent-plane term |tan(dec)| |dDec| / 2 dominates; float32 and
-    the float64 floor otherwise."""
+    """The tangent-plane terms, times OFFSETS_TOL_SAFETY (2): |tan(dec)|
+    |dDec| / 2 dominates; float32 and the float64 floor otherwise."""
     tol = D.offsets_tolerance_arcsec
+    assert D.OFFSETS_TOL_SAFETY == 2.0
     assert tol(0.0, 0.0, 0.0) == D.OFFSETS_TOL_FLOOR_ARCSEC
-    want = 4 * 2.0 ** -24 + 1e-9 + np.radians(1 / 3600) ** 2 / 8
+    want = 4 * 2.0 ** -24 + 1e-9 + 2 * np.radians(1 / 3600) ** 2 / 8
     assert tol(1.0, 0.0, 0.0) == pytest.approx(want, rel=1e-12)
-    # 60" at dec 45, all in declination: |tan| x eta / 2 relative
-    assert tol(60.0, 60.0, 45.0) / 60 == pytest.approx(np.radians(60 / 3600) / 2, rel=3e-3)
+    # 60" at dec 45, all in declination: 2 x |tan| x eta / 2 relative
+    assert tol(60.0, 60.0, 45.0) / 60 == pytest.approx(2 * np.radians(60 / 3600) / 2, rel=3e-3)
     assert tol(60.0, 60.0, 80.0) > tol(60.0, 60.0, 45.0) > tol(60.0, 0.0, 45.0)
 
 

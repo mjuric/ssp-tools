@@ -157,6 +157,12 @@ OFFSETS_TANGENT_MAX_DEG = 1.0
 #: hypot(ephOffsetRa, ephOffsetDec) is off by <= 1 and ephOffset by <= 1;
 #: twice that.
 OFFSETS_TOL_ROUNDING_UNITS = 4.0
+#: check_offsets' safety factor on the tangent-plane terms of
+#: offsets_tolerance_arcsec: their bound is close to the true leading term
+#: (real rows reach ~0.95 of it), so this leaves room for what the
+#: derivation misses; the check is for gross errors (an unwrapped RA
+#: difference is off by 1e3-1e6").
+OFFSETS_TOL_SAFETY = 2.0
 #: ... and its absolute floor [arcsec]: the float64 rounding of the RA/Dec
 #: differences and of Vincenty's formula (~1e-15 rad x a few; it matters
 #: only for separations of milliarcseconds and below).
@@ -570,11 +576,14 @@ def offsets_tolerance_arcsec(sep, off_dec, dec):
     with Vincenty over all declinations to 89.999 deg, separations and RA
     differences up to 1 deg). Plus the float32 storage of the three columns
     (OFFSETS_TOL_ROUNDING_UNITS) and the float64 floor
-    (OFFSETS_TOL_FLOOR_ARCSEC)."""
+    (OFFSETS_TOL_FLOOR_ARCSEC). The two tangent-plane terms are multiplied
+    by OFFSETS_TOL_SAFETY: the first is near the true leading term, and the
+    check is for gross errors, not for effects the derivation misses."""
     s = np.radians(np.asarray(sep, np.float64) / 3600)
     eta = np.radians(np.abs(np.asarray(off_dec, np.float64)) / 3600)
     t = np.tan(np.radians(np.asarray(dec, np.float64)))
-    rel = OFFSETS_TOL_ROUNDING_UNITS * 2.0 ** -24 + np.abs(t) * eta / 2 + (1 + t * t) * s * s / 8
+    tangent = np.abs(t) * eta / 2 + (1 + t * t) * s * s / 8
+    rel = OFFSETS_TOL_ROUNDING_UNITS * 2.0 ** -24 + OFFSETS_TOL_SAFETY * tangent
     return np.asarray(sep, np.float64) * rel + OFFSETS_TOL_FLOOR_ARCSEC
 
 

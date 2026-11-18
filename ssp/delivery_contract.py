@@ -304,8 +304,12 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 #   and the RA difference are within 1 deg (the tangent plane),
 #   |hypot(ephOffsetRa, ephOffsetDec) - ephOffset| within
 #   delivery_check.offsets_tolerance_arcsec: ephOffset x (4 x 2**-24 for the
-#   float32 columns + |tan(ephDec)| |ephOffsetDec| / 2 + (1 + tan^2(ephDec))
-#   ephOffset^2 / 8, angles in radians) + 1e-9" (float64 floor). Beyond:
+#   float32 columns + 2 x (|tan(ephDec)| |ephOffsetDec| / 2 + (1 +
+#   tan^2(ephDec)) ephOffset^2 / 8), angles in radians) + 1e-9" (float64
+#   floor). The factor 2 (OFFSETS_TOL_SAFETY): the tangent-plane bound is
+#   near the true leading term, and the check is for gross errors (an
+#   unwrapped RA difference is off by 1e3-1e6"), so it leaves room for
+#   what the derivation misses. Beyond:
 #   |ephOffsetDec| <= ephOffset and |ephOffsetRa| <= 180 deg x |cos(ephDec)|.
 #   A NaN fails. Catches an RA difference not wrapped across RA 0/360.
 #   Reports the rows checked, the worst fraction of the tolerance and its
