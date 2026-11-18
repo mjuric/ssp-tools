@@ -1,12 +1,12 @@
 import numpy as np
 from astropy.time import Time
 import astropy.units as u
-from astropy.coordinates import get_sun, angular_separation
 import numpy.ma as ma
 from astropy.constants import R_earth
 from astropy.coordinates import (
     EarthLocation,
     solar_system_ephemeris,
+    get_body_barycentric,
     get_body_barycentric_posvel,
 )
 from astroquery.mpc import MPC
@@ -72,68 +72,120 @@ def packed_ascii_to_uint64_le(mpc_packed):
 SUN_SHIFT_STEP_S = 1.0
 
 
-def solar_elongation_ndarray(ra_deg, dec_deg, t, dt_s=None):
+def sun_barycentric_position(obstime: Time):
+    """The Sun's barycentric (ICRS) position from JPL DE440 at ``obstime``
+    [AU], a Quantity of shape (3, ...)."""
+    with solar_system_ephemeris.set("de440"):
+        return get_body_barycentric("sun", obstime).xyz.to(u.au)
+
+
+#: The speed of light [km/s].
+C_KM_S = 299792.458
+
+
+def aberrate(n, beta):
+    """The directions ``n`` (3, ...) aberrated, to first order in v/c, by
+    the observer's velocity ``beta`` = v / c (3, ...; broadcast against
+    ``n``): u' = u + beta - (u . beta) u, normalised, with u = n / |n| (the
+    rule of ssp.ephem_assist._phase_angle_deg)."""
+    n = n / np.linalg.norm(n, axis=0)
+    m = n + beta - np.sum(n * beta, axis=0) * n
+    return m / np.linalg.norm(m, axis=0)
+
+
+def _observer_sun_vectors(obscode, obstime):
+    """The geometric observer-to-Sun vector, r_sun - r_obs (ICRS, AU), and
+    the observatory's barycentric velocity over c (v_obs / c), each of shape
+    (3, M) for the M times of ``obstime``."""
+    r_obs, v_obs = observatory_barycentric_posvel(obscode, obstime)
+    s = sun_barycentric_position(obstime).to_value(u.au) - r_obs.to_value(u.au)
+    return s, v_obs.to_value(u.km / u.s) / C_KM_S
+
+
+def solar_elongation_ndarray(ra_deg, dec_deg, t, dt_s=None, obscode="X05"):
     """
-    Very fast computation of solar elongation (ICRS great-circle separation)
-    using astropy.coordinates.angular_separation.
+    The apparent (aberrated) solar elongation, as Horizons' S-O-T: the angle
+    between the target's direction (``ra_deg``, ``dec_deg``, ICRS) and the
+    direction from the observatory to the Sun, both aberrated by the
+    observatory's barycentric velocity (to first order in v/c: ``aberrate``)
+    (docs/design/elongation-ssobject-nulls.md). The geometric Sun direction
+    is r_sun(t) - r_obs(t), with the Sun's barycentric position from DE440
+    and the observatory's position and velocity from
+    observatory_barycentric_posvel (as ssobservation.observer_states uses),
+    in ICRS. The apparent elongation differs from the geometric one by up
+    to ~41" (2 v/c).
 
     Parameters
     ----------
     ra_deg : ndarray
-        Target RA in degrees (ICRS).
+        Target RA in degrees (ICRS; the observed, astrometric position).
     dec_deg : ndarray
         Target Dec in degrees (ICRS).
     t : astropy.time.Time
         Observation times; with ``dt_s``, reference times (e.g. the visit
         midpoints) that the observation times differ from by ``dt_s``.
+        Broadcast against ``ra_deg`` and ``dec_deg``.
     dt_s : ndarray, optional
         The observation times minus ``t`` [s] (at most a second or so, e.g.
-        the shutter-motion correction). The Sun is then evaluated once per
-        unique ``t`` (and at ``t`` + SUN_SHIFT_STEP_S, for its motion) and
-        shifted linearly by ``dt_s``: the Sun moves ~0.04"/s, so the error
-        of the linear shift is far below a micro-arcsecond. Where ``dt_s``
-        is 0 the result is bitwise as without it.
+        the shutter-motion correction), of ``t``'s shape. The observer-to-Sun
+        vector is then evaluated once per unique ``t`` (and at ``t`` +
+        SUN_SHIFT_STEP_S, for its motion) and shifted linearly by ``dt_s``:
+        its direction moves ~0.04"/s (plus the observatory's diurnal motion,
+        ~6e-4"/s), so the error of the linear shift is far below a
+        micro-arcsecond. The velocity (for the aberration) is shifted the
+        same way. Where ``dt_s`` is 0 the result is bitwise as without it.
+    obscode : str
+        The MPC code of the observatory (Rubin, X05, by default).
 
     Returns
     -------
     elong_deg : ndarray
-        Solar elongation in degrees.
+        The apparent solar elongation in degrees, in [0, 180].
     """
 
-    # Get Sun coordinates. get_sun is slow (~90 us per time), but sources
-    # from the same visit share one time, so evaluate it only once per
-    # unique time and broadcast (e.g. 730k sources -> 1,380 visit times).
+    # The Sun and the observatory cost ~0.1 ms per time, but sources from
+    # the same visit share one time, so evaluate them only once per unique
+    # time and broadcast (e.g. 730k sources -> 1,380 visit times).
     t = Time(t)
+    shape = t.shape
     _, first, inv = np.unique(
         np.stack([np.atleast_1d(t.jd1), np.atleast_1d(t.jd2)], axis=-1),
         axis=0, return_index=True, return_inverse=True,
     )
-    sun = get_sun(np.atleast_1d(t)[first]).icrs
-
-    # Extract Sun RA/Dec arrays (radian floats)
-    sun_ra = sun.ra.radian[inv.ravel()].reshape(t.shape)
-    sun_dec = sun.dec.radian[inv.ravel()].reshape(t.shape)
+    inv = inv.ravel()
+    tu = np.atleast_1d(t)[first]
+    s0, beta0 = _observer_sun_vectors(obscode, tu)              # (3, M)
+    sun = s0[:, inv].reshape((3,) + shape)
+    beta = beta0[:, inv].reshape((3,) + shape)
 
     if dt_s is not None:
-        # the Sun's motion per second, at each unique reference time
-        t1 = np.atleast_1d(t)[first] + SUN_SHIFT_STEP_S * u.s
-        sun1 = get_sun(t1).icrs
-        dra = np.angle(np.exp(1j * (sun1.ra.radian - sun.ra.radian)))   # (wrapped to [-pi, pi])
-        rate_ra = (dra / SUN_SHIFT_STEP_S)[inv.ravel()].reshape(t.shape)
-        rate_dec = ((sun1.dec.radian - sun.dec.radian) / SUN_SHIFT_STEP_S)[inv.ravel()].reshape(t.shape)
-        dt_s = np.broadcast_to(np.asarray(dt_s, dtype=np.float64), t.shape)
-        sun_ra = sun_ra + rate_ra * dt_s
-        sun_dec = sun_dec + rate_dec * dt_s
+        # the vector's motion per second, at each unique reference time
+        # (and the velocity's: ~1e-10 c in a second, ~5 uas in 0.24 s)
+        s1, beta1 = _observer_sun_vectors(obscode, tu + SUN_SHIFT_STEP_S * u.s)
+        rate = ((s1 - s0) / SUN_SHIFT_STEP_S)[:, inv].reshape((3,) + shape)
+        brate = ((beta1 - beta0) / SUN_SHIFT_STEP_S)[:, inv].reshape((3,) + shape)
+        dt_s = np.broadcast_to(np.asarray(dt_s, dtype=np.float64), shape)
+        sun = sun + rate * dt_s
+        beta = beta + brate * dt_s
 
-    # Convert input to radians
+    # The target's unit vector, broadcast with the times'
     ra = np.radians(ra_deg)
     dec = np.radians(dec_deg)
+    cd = np.cos(dec)
+    p = np.stack(np.broadcast_arrays(cd * np.cos(ra), cd * np.sin(ra), np.sin(dec)))
+    common = np.broadcast_shapes(p.shape[1:], shape)
 
-    # Fast great-circle angular separation
-    sep = angular_separation(ra, dec, sun_ra, sun_dec)
+    def _to_common(x):     # (3, *s) -> (3, *common), aligning s's trailing axes
+        return np.broadcast_to(x.reshape((3,) + (1,) * (len(common) - x.ndim + 1) + x.shape[1:]),
+                               (3,) + common)
+    p, sun, beta = (_to_common(x) for x in (p, sun, beta))
 
-    # Convert to degrees for return
-    return np.degrees(sep)
+    # Both directions aberrated; the angle, robust at 0 and 180 deg:
+    # atan2(|p x s|, p . s)
+    p, sun = aberrate(p, beta), aberrate(sun, beta)
+    cross = np.linalg.norm(np.cross(p, sun, axis=0), axis=0)
+    dot = np.sum(p * sun, axis=0)
+    return np.degrees(np.arctan2(cross, dot))
 
 
 def wrap_ra_deg(ra):

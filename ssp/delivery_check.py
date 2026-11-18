@@ -12,6 +12,9 @@ builders. Per table it checks
     as a value, and non-NULL in its ``nullable: false`` columns (NearbySSO's
     key has a nullable diaSourceId, NULL on its unmatched rows);
   * char lengths: string values no longer than the column's ``length``;
+  * NaN: none in any float column, for NAN_FREE_TABLES (a missing value
+    is NULL; docs/design/elongation-ssobject-nulls.md). The MPC tables
+    (mpc_orbits) are not checked: their NaN come from the MPC replica;
   * ASCII, only with ``text_checks`` (``--text-checks``; off by default,
     as it reads every string, about 20-40 s for mpc_orbits.mpc_orb_jsonb):
     every value of every string column ASCII (Felis char/text is VOTable
@@ -21,13 +24,18 @@ builders. Per table it checks
 SSObservation is delivered as parts plus a manifest and a sidecar
 (ssp.ssobservation_contract, "The partitioned delivery"):
 check_ssobservation_parts checks the partitioning, the manifest and the
-sidecar, and check_table runs on every part.
+sidecar, and check_table runs on every part. check_elongation checks its
+``elongation`` against the apparent elongation from the delivered columns:
+the angle between the observed direction (``ra``, ``dec``) and the
+observer-to-Sun direction ``topo_* - helio_*``, both aberrated by
+``helio_v* - topo_v*``, to within ELONGATION_TOL_DEG, on every row with the
+vectors.
 
 NearbySSO is checked further by check_nearbysso: its sidecar
 (NearbySSO_internal.parquet), the NULL pattern of matched and unmatched
-rows, the row order, the margin, the times and the visits
-(ssp.nearbysso._contract, "Unmatched predictions, detector placement and
-corrected times").
+rows, the row order, the margin, the times and the visits, and no NaN in
+the sidecar's float columns (ssp.nearbysso._contract, "Unmatched
+predictions, detector placement and corrected times").
 
 Columns are read one at a time (per part), to bound memory; everything is
 Arrow.
@@ -96,6 +104,21 @@ TIMESTAMP_TYPES = ("timestamp",)
 
 #: How many offending values to quote in a detail.
 N_EXAMPLES = 3
+
+#: The tables whose float columns may hold no NaN (a missing value is NULL;
+#: docs/design/elongation-ssobject-nulls.md). Not the MPC tables: mpc_orbits
+#: has NaN from the MPC replica (an open question).
+NAN_FREE_TABLES = ("SSObservation", "SSObject", "NearbySSO")
+
+#: The largest difference [deg] check_elongation allows between
+#: SSObservation's elongation and the one from its topo/helio vectors.
+ELONGATION_TOL_DEG = 0.01
+#: The columns check_elongation reads.
+ELONGATION_COLUMNS = ("elongation", "ra", "dec",
+                      "topo_x", "topo_y", "topo_z", "helio_x", "helio_y", "helio_z",
+                      "topo_vx", "topo_vy", "topo_vz", "helio_vx", "helio_vy", "helio_vz")
+#: The speed of light [km/s] (SSObservation's velocities are in km/s).
+C_KM_S = 299792.458
 
 
 def _is_string(t):
@@ -302,7 +325,132 @@ def check_table(table, parquet_path, schema_dir=SCHEMA_DIR, text_checks=False):
                           nullable=[k for k in keys if spec.get(k, {}).get("nullable", True) is not False]))
     if text_checks:
         res.append(_check_ascii(pf, arrow))
+    if table in NAN_FREE_TABLES:
+        res.append(_check_nan(pf, arrow))
     return res
+
+
+def _nan_counts(pf, columns):
+    """{column: number of NaN} of ``columns`` of ParquetFile ``pf``, read a
+    column and a row group at a time (to bound memory); only those with any."""
+    out = {}
+    for c in columns:
+        n = 0
+        for rg in range(pf.num_row_groups):
+            col = pf.read_row_group(rg, columns=[c])[c]
+            n += pc.sum(pc.cast(pc.is_nan(col), pa.int64())).as_py() or 0
+            del col
+        if n:
+            out[c] = n
+    return out
+
+
+def _check_nan(pf, arrow):
+    """CheckResult "no NaN": no NaN in any float column of ParquetFile
+    ``pf`` (a missing value is NULL)."""
+    cols = [f.name for f in arrow if pa.types.is_floating(f.type)]
+    bad = _nan_counts(pf, cols)
+    return CheckResult("no NaN", not bad,
+                       "NaN in " + "; ".join(f"{c} ({n:,})" for c, n in bad.items()) if bad
+                       else f"no NaN in the {len(cols)} float columns")
+
+
+def _radec_unit(ra_deg, dec_deg):
+    ra, dec = np.radians(ra_deg), np.radians(dec_deg)
+    return np.stack([np.cos(dec) * np.cos(ra), np.cos(dec) * np.sin(ra), np.sin(dec)], axis=1)
+
+
+def _angle_deg(a, b):
+    """The angle [deg] between the rows of ``a`` and ``b`` (N, 3), robust
+    near 0 and 180: atan2(|a x b|, a . b)."""
+    return np.degrees(np.arctan2(np.linalg.norm(np.cross(a, b), axis=1), np.einsum("ij,ij->i", a, b)))
+
+
+def _aberrate(n, beta):
+    """Directions ``n`` (N, 3) aberrated to first order in v/c by ``beta``
+    (N, 3) = v / c: u' = u + beta - (u . beta) u, normalised, u = n / |n|
+    (the rule of ssp.ephem_assist._phase_angle_deg)."""
+    n = n / np.linalg.norm(n, axis=1, keepdims=True)
+    m = n + beta - np.einsum("ij,ij->i", n, beta)[:, None] * n
+    return m / np.linalg.norm(m, axis=1, keepdims=True)
+
+
+def elongation_from_vectors(topo, helio, ra=None, dec=None, topo_v=None, helio_v=None):
+    """The elongation [deg] from topocentric and heliocentric position
+    vectors (N, 3), in float64: the angle between the target's direction and
+    the observer-to-Sun direction, ``topo - helio``. The target's direction
+    is (``ra``, ``dec``) [deg] if given, else ``topo``. With the velocities
+    ``topo_v`` and ``helio_v`` [km/s] (N, 3), both directions are aberrated
+    by the observatory's velocity relative to the Sun, ``helio_v - topo_v``:
+    the apparent elongation, as SSObservation's (and Horizons' S-O-T)."""
+    topo = np.asarray(topo, dtype=np.float64)
+    sun = topo - np.asarray(helio, dtype=np.float64)
+    target = topo if ra is None else _radec_unit(np.asarray(ra, np.float64), np.asarray(dec, np.float64))
+    if topo_v is not None:
+        beta = (np.asarray(helio_v, np.float64) - np.asarray(topo_v, np.float64)) / C_KM_S
+        target, sun = _aberrate(target, beta), _aberrate(sun, beta)
+    return _angle_deg(target, sun)
+
+
+def check_elongation(files, tol_deg=ELONGATION_TOL_DEG):
+    """CheckResult "elongation": in every SSObservation part of ``files``,
+    on every row with non-NULL topo_* and helio_* (positions and
+    velocities), ``elongation`` within ``tol_deg`` of the apparent
+    elongation from the delivered columns: the angle between the observed
+    direction (``ra``, ``dec``, which ``elongation`` is of) and the
+    observer-to-Sun direction ``topo - helio``, both aberrated by the
+    observatory's velocity relative to the Sun, ``helio_v - topo_v``
+    (elongation_from_vectors; a NULL elongation there fails). The
+    observed direction, not ``topo``'s: a row whose orbit predicts its
+    position badly (the observed-minus-predicted separation is over 0.01
+    deg on ~100 of 8M rows in the 2026-11-16 delivery) would otherwise fail
+    although its elongation is right; the detail reports how many rows
+    differ from the same angle with ``topo``'s direction by more than
+    ``tol_deg``, for information. Read a part's row group at a time;
+    reports the rows checked and the largest difference."""
+    n_checked, n_bad, n_topo, worst, examples = 0, 0, 0, 0.0, []
+    vec = ELONGATION_COLUMNS[3:]
+    for f in files:
+        pf = pq.ParquetFile(f)
+        missing = [c for c in ELONGATION_COLUMNS if c not in pf.schema_arrow.names]
+        if missing:
+            return CheckResult("elongation", False, f"{Path(f).name} lacks {missing}")
+        offset = 0
+        for rg in range(pf.num_row_groups):
+            t = pf.read_row_group(rg, columns=list(ELONGATION_COLUMNS))
+            first, offset = offset, offset + len(t)
+            has = np.ones(len(t), bool)
+            for c in vec:
+                has &= _valid(t[c])
+            if not has.any():
+                continue
+            topo, helio, topo_v, helio_v = (np.stack([_np(t[c], np.nan)[has] for c in vec[k:k + 3]], axis=1)
+                                            for k in (0, 3, 6, 9))
+            ra, dec = (_np(t[c], np.nan)[has] for c in ("ra", "dec"))
+            want = elongation_from_vectors(topo, helio, ra, dec, topo_v, helio_v)
+            got = _np(t["elongation"], np.nan)[has].astype(np.float64)
+            d = np.abs(got - want)
+            d[~np.isfinite(d)] = np.inf
+            with np.errstate(invalid="ignore"):
+                n_topo += int(np.sum(~(np.abs(got - elongation_from_vectors(
+                    topo, helio, topo_v=topo_v, helio_v=helio_v)) <= tol_deg)))
+            n_checked += len(d)
+            if len(d):
+                worst = max(worst, float(d.max()))
+            bad = d > tol_deg
+            if bad.any():
+                n_bad += int(bad.sum())
+                rows = np.flatnonzero(has)
+                for i in np.flatnonzero(bad)[:N_EXAMPLES - len(examples)]:
+                    examples.append(f"{Path(f).name} row {first + rows[i]:,}: {got[i]:.6f} vs {want[i]:.6f}")
+            del t
+    detail = (f"{n_checked:,} rows with topo/helio vectors; max |elongation - apparent from (ra, dec) "
+              f"and the vectors| {worst:.3g} deg ({worst * 3600:.3g} arcsec); {n_topo:,} rows differ from "
+              f"the angle to topo by more than {tol_deg} deg (orbit residuals; not a failure)")
+    if n_bad:
+        return CheckResult("elongation", False, f"{n_bad:,} rows differ by more than {tol_deg} deg; "
+                           + detail + "; e.g. " + "; ".join(examples))
+    return CheckResult("elongation", True, detail + f"; within {tol_deg} deg")
 
 
 def _check_key(pf, keys, got, nrows, nullable=()):
@@ -1035,6 +1183,12 @@ def check_nearbysso(delivery_dir):
     res.append(CheckResult("sidecar nulls", not probs, "; ".join(probs) or
                            f"none in {sorted(NEARBYSSO_SIDECAR_NONNULL)}; placement NULL together "
                            f"({int((~placed).sum()):,} rows), finite"))
+    fl = [c for c in want if pa.types.is_floating(s.schema.field(c).type)]
+    nan = {c: int(pc.sum(pc.cast(pc.is_nan(sc[c]), pa.int64())).as_py() or 0) for c in fl}
+    nan = {c: k for c, k in nan.items() if k}
+    res.append(CheckResult("sidecar no NaN", not nan,
+                           "NaN in " + "; ".join(f"{c} ({k:,})" for c, k in nan.items()) if nan
+                           else f"no NaN in the {len(fl)} float columns"))
 
     # the key, row for row (NULL == NULL)
     probs = []
@@ -1236,6 +1390,11 @@ def check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES, 
                     rs = [CheckResult("file", False, f"{f}: cannot check ({type(e).__name__}: {e})")]
                 for r in rs:
                     res.append(CheckResult(f"{r.name} [{f.name}]", r.ok, r.detail))
+            if files:
+                try:
+                    res.append(check_elongation(files))
+                except Exception as e:      # a safety net: a FAIL, never a crash
+                    res.append(CheckResult("elongation", False, f"cannot check ({type(e).__name__}: {e})"))
             out[table] = res
             continue
         path = Path(delivery_dir) / f"{table}.parquet"

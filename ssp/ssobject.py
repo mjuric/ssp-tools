@@ -7,15 +7,23 @@ its points span less than 2 deg in phase angle; H is then refit at a
 fiducial G12 (0.5). See ``compute_ssobject`` for the details. Every value
 is a function of the set of an object's SSObservation rows, whatever their
 order.
+
+SSObject is written (``write_ssobject``) with the Arrow schema derived from
+Felis (``ssobject_schema``): NaN, how the working array marks a value it has
+none for, is written as NULL, and so is ``{band}_slope_fit_failed`` for a
+band without observations (docs/design/elongation-ssobject-nulls.md).
 """
 import pandas as pd
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 from functools import partial
 from . import photfit
 from . import util
 from . import schema
 from . import ssobservation_parts
 from .moid import MOIDSolver, earth_orbit
+from .delivery_contract import delivery_schema
 import argparse
 import os
 import sys
@@ -136,7 +144,8 @@ def fit_band(
     fixed-G12 fit's. If clipping leaves one point, H, HErr come from it
     (nObsUsed 1, Chi2 NaN). Only if no point is usable or none survives
     clipping are H, HErr and G12 NaN (nObsUsed 0). slope_fit_failed is
-    set in either case. (NaN is how SSObject stores NULL.)
+    set in either case. (NaN here is written to SSObject as NULL:
+    write_ssobject.)
 
     With ``fixedG12`` set, G12 isn't fit and these rules don't apply:
     the fit is the fixed-G12 one, and slope_fit_failed is set only if
@@ -236,7 +245,8 @@ def compute_ssobject_entry(
         inBand = bandCol == band
         df = {col: arr[inBand] for col, arr in fitCols.items()}
 
-        # set defaults for this band (equivalents of NULL)
+        # set defaults for this band (NaN: NULL, as write_ssobject writes it;
+        # {band}_slope_fit_failed is NULL too where {band}_nObs is 0)
         row[f'{band}_Chi2'] = np.nan
         row[f'{band}_G12'] = np.nan
         row[f'{band}_G12Err'] = np.nan
@@ -360,8 +370,8 @@ def compute_ssobject(
         Chi2 come from the fixed-G12 fit; one point left after clipping
         gives H from that point (nObsUsed 1, Chi2 NaN). Only if no point
         is usable, or none survives clipping, are H, HErr and G12 NaN
-        (nObsUsed 0); the flag is set either way. (SSObject stores NULL
-        as NaN.) With
+        (nObsUsed 0); the flag is set either way. (NaN in the returned
+        array is NULL in SSObject: write_ssobject.) With
         ``fixedG12`` set G12 isn't fit, and the flag means the fixed fit
         failed. Each fit is a function of the set of its band's points,
         whatever their order.
@@ -514,6 +524,64 @@ def compute_ssobject(
                 row["MOIDEarthTrueAnomalyObject"] = trueObject
 
     return obj
+
+#
+# Writing SSObject
+#
+
+def ssobject_columns():
+    """SSObject's Felis columns (ssp.delivery_contract.delivery_schema), in
+    order."""
+    return delivery_schema()["SSObject"]
+
+
+def ssobject_schema():
+    """The Arrow schema of SSObject, derived from Felis (as
+    ssp.sso_build.arrow_schema): its columns in order, their types, and
+    non-nullable exactly for the ``nullable: false`` columns."""
+    from .sso_build import arrow_schema
+    return arrow_schema(ssobject_columns())
+
+
+def ssobject_table(obj):
+    """The SSObject Arrow table (ssobject_schema) of ``obj``, a structured
+    array of schema.SSObjectDtype (compute_ssobject's result).
+
+    In every float column, NaN is NULL (+-Inf is kept); every
+    ``{band}_slope_fit_failed`` is NULL where ``{band}_nObs`` is 0. Every
+    other value is as in ``obj``, bitwise. Raises ValueError
+    (ssp.sso_build.ShapeError) if a column is missing from ``obj``, a value
+    can't be cast without loss, or a non-nullable column has a NULL."""
+    from .sso_build import cast_column
+    cols = ssobject_columns()
+    missing = [c["name"] for c in cols if c["name"] not in (obj.dtype.names or ())]
+    extra = sorted(set(obj.dtype.names or ()) - {c["name"] for c in cols})
+    if missing or extra:
+        raise ValueError(f"SSObject columns: missing {missing}, unexpected {extra}")
+    arrays = []
+    for c in cols:
+        name = c["name"]
+        col = obj[name]
+        kind = col.dtype.kind
+        if kind in "SU":
+            if kind == "S":
+                col = np.char.decode(col, "utf-8")
+            arr = pa.array(np.char.rstrip(col, "\x00"), type=pa.string())
+        elif kind == "f":
+            arr = pa.array(col, mask=np.isnan(col))
+        elif name.endswith("_slope_fit_failed"):
+            arr = pa.array(col, mask=obj[name[:1] + "_nObs"] == 0)
+        else:
+            arr = pa.array(col)
+        arrays.append(cast_column(f"SSObject column {name!r}", arr, c))
+    return pa.Table.from_arrays(arrays, schema=ssobject_schema())
+
+
+def write_ssobject(obj, path):
+    """Write ``obj`` (compute_ssobject's array) to the Parquet file ``path``,
+    as ssobject_table."""
+    pq.write_table(ssobject_table(obj), path)
+
 
 def main():
     """
@@ -672,7 +740,7 @@ still accepted; that file is not read.
 
         # Save result
         print(f"Saving {len(obj):,} SSObject rows to {args.output}...")
-        util.struct_to_parquet(obj, args.output)
+        write_ssobject(obj, args.output)
 
         print(f"Success! Created SSObject with {len(obj):,} objects")
         print(f"Row size: {obj.dtype.itemsize:,} bytes, Total size: {obj.nbytes:,} bytes")
@@ -711,6 +779,6 @@ if __name__ == "__main__":
     #
     # Save
     #
-    util.struct_to_parquet(obj, f"{output_dir}/ssobject.parquet")
+    write_ssobject(obj, f"{output_dir}/ssobject.parquet")
 
     print(f"row_length={obj.dtype.itemsize:,} bytes, rows={len(obj):,}, {obj.nbytes:,} bytes total")
