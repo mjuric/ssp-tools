@@ -104,4 +104,41 @@ The result reproduces Horizons' S-O-T to about 0.2″, and it applies the same w
 
 ## Record
 
-(To be filled in after integration.)
+Integrated 2026-11-17: WP PR #123, merged into this branch as 034a611.
+
+**Review.** An independent review ran in two rounds.
+- Round 1 found two low-severity items, both fixed: scalar and array inputs no longer broadcast against each other, and the documentation was out of date.
+- Round 2 found nothing.
+- The reviewer computed everything independently, with jplephem DE440, erfa for the site, and `erfa.ab` for exact aberration:
+  - production agrees with it to 5e-4″;
+  - Horizons' S-O-T to 0.18″ (its printed precision) on the 319 fixture rows.
+
+**Tests.** The full suite passes: 1501 tests. Run offline (no network, no ASSIST), 1410 pass and 85 skip.
+
+**Real data.** 2026-11-16 was rebuilt on a scratch root with `ssp-build-sso --workers 32`, using the same inputs plus the 2026-11-17 IERS-A file. It was rebuilt twice, once with the new code and once with the old code (c181bb5).
+
+SSObservation:
+- `elongation` is the only column that differs, on all 8,129,545 rows. The sidecar is identical.
+- Old minus new: median 89.6°, range −64° to 174°.
+
+Elongation, against independent computations:
+- Apparent minus geometric: up to ±41.6″, median |diff| 35″.
+- A sample of 12,000 rows, against the reviewer's independent apparent elongation: at most 0.028″, i.e. float32 resolution.
+- A sample of 20,004 rows, against astropy (`get_body('sun')` in the site's GCRS): at most 0.42″.
+
+SSObject:
+- 7,515,591 NaN became NULL, and all 10,166,119 finite float values are bitwise equal.
+- 699,781 `slope_fit_failed` flags are NULL, exactly where `nObs` = 0; the other 1,098,359 are unchanged.
+- The non-nullable fields are exactly the 15 Felis `nullable: false` columns.
+
+`delivery_check`, all 6 tables pass:
+- The elongation check covers 8,067,419 rows. The largest difference is 2.68″, against a 0.01° limit: it comes from the float32 vectors of objects at 66–89 AU, and from light-time.
+- 111 rows, from 15 objects, are more than 0.01° from the angle computed with `topo`. The check reports them for information. Their orbit predictions are 36″ to 178° from the observations.
+- The original delivery fails both new checks: elongation on 8,067,171 rows, and SSObject no-NaN in 51 columns.
+- A geometric elongation fails the elongation check on 2.96 M rows, so the check tells the two definitions apart.
+
+Cost:
+- `solar_elongation_ndarray` on 8.1 M rows takes 16.8 s, against 17.6 s before.
+- The ssobservation step's peak RSS rises by about 0.2–0.7 GB, from 14.4 GB.
+
+**Open (optional).** The elongation check's tolerance could be tightened to about 5″. That would still pass 2026-11-16, and would also catch a geometric/apparent mix-up.
