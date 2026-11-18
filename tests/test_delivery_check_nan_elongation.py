@@ -125,27 +125,89 @@ def test_elongation_tolerance(tmp_path, off, ok):
     assert worst == pytest.approx(abs(off), abs=3e-5)
 
 
-def test_elongation_tolerance_grows_with_distance():
-    """1" plus the float32 bound and light-time: ~1" nearby, ~6" at 90 AU
-    (where the delivered float32 vectors are good to ~2")."""
+def _tol(d, dtype):
+    """The tolerance [arcsec] of a row ``d`` AU away, 1 AU from the Sun
+    (at 90 deg from it), for vectors stored as ``dtype``."""
+    topo = np.array([[d, 0.0, 0.0]])
+    return D.elongation_tolerance_arcsec(topo, topo - np.array([[0.0, 1.0, 0.0]]), D.unit_roundoff(dtype))[0]
+
+
+def test_unit_roundoff():
+    assert D.unit_roundoff(np.float32) == 2.0 ** -24
+    assert D.unit_roundoff(np.float64) == 2.0 ** -53
+    assert D.unit_roundoff(pa.float32()) == 2.0 ** -24
+    assert D.unit_roundoff(pa.float64()) == 2.0 ** -53
+
+
+def test_vector_unit_roundoff():
+    """The stored position columns' type sets it: the largest if they
+    differ (and a non-float column counts as float32)."""
+    t = ss_table()
+    assert D.vector_unit_roundoff(t.schema) == 2.0 ** -53
+    assert D.vector_unit_roundoff(with_geometry(t, vtype=pa.float32()).schema) == 2.0 ** -24
+    assert D.vector_unit_roundoff(replace(t, "helio_z", t["helio_z"].cast(pa.float32())).schema) == 2.0 ** -24
+    # (a non-float position column raises: check_delivery makes that a FAIL)
+    ints = pa.array(np.zeros(len(t), np.int64))
+    with pytest.raises(ValueError):
+        D.vector_unit_roundoff(replace(t, "topo_x", ints).schema)
+    # (the velocities do not count)
+    assert D.vector_unit_roundoff(replace(t, "topo_vx", t["topo_vx"].cast(pa.float16())).schema) == 2.0 ** -53
+
+
+def test_elongation_tolerance_float32_vectors():
+    """1" plus the float32 bound and the Sun's motion over the light-time:
+    ~1" nearby, ~7" at 90 AU (where float32 vectors are good to ~4")."""
     def tol(d):
-        topo = np.array([[d, 0.0, 0.0]])
-        return D.elongation_tolerance_arcsec(topo, topo - np.array([[0.0, 1.0, 0.0]]))[0]
+        return _tol(d, np.float32)
     assert 1.0 < tol(1.0) < 1.1
-    assert 5.0 < tol(90.0) < 7.0
+    assert 7.0 < tol(90.0) < 8.0
     assert tol(1.0) < tol(10.0) < tol(40.0) < tol(90.0)
 
 
-@pytest.mark.parametrize("dist,ok", [(2.0, False), (90.0, True)])
-def test_elongation_3arcsec_off_far_and_near(tmp_path, dist, ok):
-    """A 3" difference fails for a nearby object but is within the float32
-    precision of a distant one's vectors."""
+def test_elongation_tolerance_float64_vectors():
+    """With float64 vectors the rounding term vanishes: 1" plus the Sun's
+    motion over both light-time legs, object-to-observer and Sun-to-object
+    (at most 16 m/s x 499 s/AU x (|topo| + |helio|), seen from 1 AU), ~3"
+    at 90 AU."""
+    def tol(d):
+        return _tol(d, np.float64)
+    lt = 0.016 * 499.004784 / 149597870.7 * np.degrees(3600.0)   # [arcsec per AU of path, seen from 1 AU]
+    for d in (1.0, 10.0, 90.0):
+        # (|topo| = d, |helio| = hypot(d, 1); + ~1e-8" of float64 rounding)
+        assert tol(d) == pytest.approx(1.0 + lt * (d + np.hypot(d, 1.0)), rel=1e-7)
+    assert 1.0 < tol(1.0) < 1.03
+    assert 2.9 < tol(90.0) < 3.1
+    assert tol(1.0) < tol(10.0) < tol(40.0) < tol(90.0)
+    # the float32 rounding term is the difference
+    f32 = 2 * 2.0 ** -24 * (90.0 + np.hypot(90.0, 1.0)) * np.degrees(3600.0)
+    assert _tol(90.0, np.float32) - tol(90.0) == pytest.approx(f32, rel=1e-6)
+
+
+@pytest.mark.parametrize("vtype,dist,ok", [
+    (pa.float32(), 2.0, False), (pa.float32(), 90.0, True),
+    (pa.float64(), 2.0, False), (pa.float64(), 90.0, False)])
+def test_elongation_4arcsec_off_far_and_near(tmp_path, vtype, dist, ok):
+    """A 4" difference fails for a nearby object; for a distant one (90
+    AU) it is within the precision of float32 vectors (a delivery from
+    before sdm_schemas d6e8100; ~7.4" there), but not of float64 ones
+    (~3", from light-time)."""
     t = ss_table()
-    t = with_geometry(t, dist=dist)
-    t = _set(t, "elongation", 0, t["elongation"][0].as_py() + 3.0 / 3600)
+    t = with_geometry(t, dist=dist, vtype=vtype)
+    t = _set(t, "elongation", 0, t["elongation"][0].as_py() + 4.0 / 3600)
     write_ss(tmp_path, t)
     r = _ss_results(tmp_path)["elongation"]
     assert r.ok == ok, r
+    assert f"rows with topo/helio vectors ({vtype})" in r.detail
+
+
+@pytest.mark.parametrize("vtype", [pa.float32(), pa.float64()])
+def test_elongation_2_5arcsec_off_far(tmp_path, vtype):
+    """At 90 AU 2.5" is within either tolerance (~3" with float64
+    vectors, from the Sun's motion over both light-time legs)."""
+    t = with_geometry(ss_table(), dist=90.0, vtype=vtype)
+    t = _set(t, "elongation", 0, t["elongation"][0].as_py() + 2.5 / 3600)
+    write_ss(tmp_path, t)
+    assert _ss_results(tmp_path)["elongation"].ok
 
 
 def test_elongation_wrong_sun_fails(tmp_path):
@@ -192,6 +254,32 @@ def test_elongation_near_0_and_180(tmp_path):
     t = with_geometry(ss_table(), elong=[0.0, 0.001, 179.999, 180.0, 90, 1, 2, 3, 4])
     write_ss(tmp_path, t)
     assert _ss_results(tmp_path)["elongation"].ok
+
+
+def test_elongation_non_float_vector_fails(tmp_path):
+    t = replace(ss_table(), "topo_x", pa.array(np.arange(9), pa.int64()))
+    write_ss(tmp_path, t)
+    r = _ss_results(tmp_path)["elongation"]
+    assert not r.ok and r.detail.startswith("cannot check (ValueError"), r
+
+
+def test_elongation_nan_vector_fails(tmp_path):
+    """A NaN (not NULL) vector component fails the check (its tolerance is
+    NaN), at an infinite fraction of the tolerance."""
+    t = ss_table()[:5]
+    topo_x = t["topo_x"].to_numpy().copy()
+    topo_x[0] = np.nan
+    t = replace(t, "topo_x", pa.array(topo_x))
+    write_ss(tmp_path, t)
+    r = _ss_results(tmp_path)["elongation"]
+    assert not r.ok, r
+    assert r.detail.startswith("1 rows differ by more than their tolerance"), r
+    assert "at most inf of the row's tolerance" in r.detail
+
+
+def test_elongation_no_files():
+    r = D.check_elongation([])
+    assert r.ok and r.detail.startswith("0 rows with topo/helio vectors; "), r
 
 
 def test_elongation_missing_columns(tmp_path):

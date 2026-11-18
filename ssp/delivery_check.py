@@ -29,8 +29,9 @@ sidecar, and check_table runs on every part. check_elongation checks its
 the angle between the observed direction (``ra``, ``dec``) and the
 observer-to-Sun direction ``topo_* - helio_*``, both aberrated by
 ``helio_v* - topo_v*``, to within elongation_tolerance_arcsec (1" plus
-the float32 precision of the delivered vectors), on every row with the
-vectors.
+the rounding of the delivered vectors, by their stored type, float32 or
+float64, plus the Sun's motion over the light-time), on every row with
+the vectors.
 
 NearbySSO is checked further by check_nearbysso: its sidecar
 (NearbySSO_internal.parquet), the NULL pattern of matched and unmatched
@@ -112,17 +113,23 @@ N_EXAMPLES = 3
 NAN_FREE_TABLES = ("SSObservation", "SSObject", "NearbySSO")
 
 #: check_elongation's tolerance on each row (elongation_tolerance_arcsec):
-#: ELONGATION_TOL_FLOOR_ARCSEC, plus ELONGATION_TOL_F32_FACTOR times the
-#: float32 rounding bound of the observer-to-Sun direction recomputed from
-#: the delivered vectors, plus the Sun's barycentric motion over the
-#: light-time (topo and helio are at the emission epoch). ~1" for nearby
-#: objects, ~6" at 90 AU; on 2026-11-16 the largest residual was 0.52 of it
-#: (docs/design/elongation-ssobject-nulls.md, Record).
+#: ELONGATION_TOL_FLOOR_ARCSEC, plus ELONGATION_TOL_ROUNDING_FACTOR times the
+#: rounding bound of the observer-to-Sun direction recomputed from the
+#: delivered vectors, by the unit roundoff of their stored type (2**-24 for
+#: float32, 2**-53 for float64: the same code checks deliveries of either),
+#: plus the Sun's barycentric motion over both light-time legs: topo -
+#: helio is Sun(t - tau - tau_refl) - observer(t), the Sun as the object
+#: saw it (ssp.ephem_assist._apparent_sun), with tau the object-to-observer
+#: and tau_refl the Sun-to-object light time, while ``elongation`` is to
+#: the Sun at t. With float32 vectors ~1" for nearby objects, ~7" at 90 AU;
+#: with float64 vectors (since docs/design/precision-doubles.md) ~1"
+#: nearby, ~3" at 90 AU (docs/design/precision-doubles.md, Record).
 ELONGATION_TOL_FLOOR_ARCSEC = 1.0
-ELONGATION_TOL_F32_FACTOR = 2.0
+ELONGATION_TOL_ROUNDING_FACTOR = 2.0
 #: The Sun's barycentric speed, an upper bound [AU/day] (it stays under
 #: ~16 m/s), times the light-time per AU [day]: the Sun's displacement
-#: over the light-time, per AU of topocentric distance.
+#: over the light-time, per AU of light path (|topo| + |helio|: tau +
+#: tau_refl).
 _SUN_LT_AU_PER_AU = (0.016 * 86400 / 149597870.7) * (499.004784 / 86400)
 #: Rows whose elongation differs from the angle to ``topo`` (the predicted
 #: direction) by more than this [deg] are counted, for information.
@@ -131,6 +138,8 @@ ELONGATION_TOPO_INFO_DEG = 0.01
 ELONGATION_COLUMNS = ("elongation", "ra", "dec",
                       "topo_x", "topo_y", "topo_z", "helio_x", "helio_y", "helio_z",
                       "topo_vx", "topo_vy", "topo_vz", "helio_vx", "helio_vy", "helio_vz")
+#: The position columns, whose stored type sets the tolerance's rounding term.
+ELONGATION_VECTOR_COLUMNS = ELONGATION_COLUMNS[3:9]
 #: The speed of light [km/s] (SSObservation's velocities are in km/s).
 C_KM_S = 299792.458
 
@@ -406,13 +415,37 @@ def elongation_from_vectors(topo, helio, ra=None, dec=None, topo_v=None, helio_v
     return _angle_deg(target, sun)
 
 
-def elongation_tolerance_arcsec(topo, helio):
+def unit_roundoff(dtype):
+    """The unit roundoff of float type ``dtype`` (a NumPy dtype or an Arrow
+    type): 2**-24 for float32, 2**-53 for float64."""
+    if isinstance(dtype, pa.DataType):
+        dtype = dtype.to_pandas_dtype()
+    return float(np.finfo(dtype).eps) / 2
+
+
+def vector_unit_roundoff(schema):
+    """The unit roundoff of the stored topo_x/y/z and helio_x/y/z columns of
+    Arrow ``schema`` (unit_roundoff; the largest, if their types differ).
+    A column that is not floating point (which the type check also fails)
+    raises ValueError; check_delivery reports that as an elongation FAIL."""
+    u = 0.0
+    for c in ELONGATION_VECTOR_COLUMNS:
+        u = max(u, unit_roundoff(schema.field(c).type))
+    return u
+
+
+def elongation_tolerance_arcsec(topo, helio, roundoff):
     """check_elongation's tolerance [arcsec] on each row of the (N, 3)
-    vectors ``topo`` and ``helio`` [AU] (see ELONGATION_TOL_FLOOR_ARCSEC)."""
+    vectors ``topo`` and ``helio`` [AU], stored with unit roundoff
+    ``roundoff`` (unit_roundoff of their type): the floor, the rounding of
+    topo - helio, and the Sun's displacement over the light path |topo| +
+    |helio| (see ELONGATION_TOL_FLOOR_ARCSEC)."""
     nt = np.linalg.norm(topo, axis=1)
+    nh = np.linalg.norm(helio, axis=1)
     ns = np.linalg.norm(topo - helio, axis=1)
-    f32 = 2.0 ** -24 * (nt + np.linalg.norm(helio, axis=1))   # |rounding error| of topo - helio
-    rad = (ELONGATION_TOL_F32_FACTOR * f32 + _SUN_LT_AU_PER_AU * nt) / ns
+    rnd = roundoff * (nt + nh)           # |rounding error| of topo - helio
+    lt = _SUN_LT_AU_PER_AU * (nt + nh)   # the Sun's displacement over tau + tau_refl
+    rad = (ELONGATION_TOL_ROUNDING_FACTOR * rnd + lt) / ns
     return ELONGATION_TOL_FLOOR_ARCSEC + np.degrees(rad) * 3600
 
 
@@ -433,14 +466,18 @@ def check_elongation(files):
     differ from the same angle with ``topo``'s direction by more than
     ELONGATION_TOPO_INFO_DEG, for information. Read a part's row group at
     a time; reports the rows checked and the largest difference, also as a
-    fraction of the row's tolerance."""
+    fraction of the row's tolerance, and the vectors' stored types (whose
+    unit roundoff sets the tolerance's rounding term)."""
     n_checked, n_bad, n_topo, worst, worst_frac, examples = 0, 0, 0, 0.0, 0.0, []
+    types = set()
     vec = ELONGATION_COLUMNS[3:]
     for f in files:
         pf = pq.ParquetFile(f)
         missing = [c for c in ELONGATION_COLUMNS if c not in pf.schema_arrow.names]
         if missing:
             return CheckResult("elongation", False, f"{Path(f).name} lacks {missing}")
+        roundoff = vector_unit_roundoff(pf.schema_arrow)
+        types.update(str(pf.schema_arrow.field(c).type) for c in ELONGATION_VECTOR_COLUMNS)
         offset = 0
         for rg in range(pf.num_row_groups):
             t = pf.read_row_group(rg, columns=list(ELONGATION_COLUMNS))
@@ -461,11 +498,16 @@ def check_elongation(files):
                 n_topo += int(np.sum(~(np.abs(got - elongation_from_vectors(
                     topo, helio, topo_v=topo_v, helio_v=helio_v)) <= ELONGATION_TOPO_INFO_DEG)))
             n_checked += len(d)
-            tol = elongation_tolerance_arcsec(topo, helio) / 3600
+            tol = elongation_tolerance_arcsec(topo, helio, roundoff) / 3600
+            # (a NaN vector component gives a NaN want, d inf, and a NaN
+            # tolerance: bad, at fraction inf)
+            with np.errstate(invalid="ignore"):
+                frac = d / tol
+            frac[np.isnan(frac)] = np.inf
             if len(d):
                 worst = max(worst, float(d.max()))
-                worst_frac = max(worst_frac, float((d / tol).max()))
-            bad = d > tol
+                worst_frac = max(worst_frac, float(frac.max()))
+            bad = ~(d <= tol)
             if bad.any():
                 n_bad += int(bad.sum())
                 rows = np.flatnonzero(has)
@@ -473,7 +515,9 @@ def check_elongation(files):
                     examples.append(f"{Path(f).name} row {first + rows[i]:,}: {got[i]:.6f} vs {want[i]:.6f} "
                                     f"(tolerance {tol[i] * 3600:.2f} arcsec)")
             del t
-    detail = (f"{n_checked:,} rows with topo/helio vectors; max |elongation - apparent from (ra, dec) "
+    typestr = f" ({'/'.join(sorted(types))})" if types else ""
+    detail = (f"{n_checked:,} rows with topo/helio vectors{typestr}; "
+              f"max |elongation - apparent from (ra, dec) "
               f"and the vectors| {worst:.3g} deg ({worst * 3600:.3g} arcsec), at most {worst_frac:.2f} of "
               f"the row's tolerance; {n_topo:,} rows differ from the angle to topo by more than "
               f"{ELONGATION_TOPO_INFO_DEG} deg (orbit residuals; not a failure)")
@@ -482,7 +526,8 @@ def check_elongation(files):
                            + detail + "; e.g. " + "; ".join(examples))
     return CheckResult("elongation", True,
                        detail + f"; within the tolerance ({ELONGATION_TOL_FLOOR_ARCSEC:g} arcsec + "
-                       f"{ELONGATION_TOL_F32_FACTOR:g}x the vectors' float32 bound + light-time)")
+                       f"{ELONGATION_TOL_ROUNDING_FACTOR:g}x the vectors' rounding bound, by their "
+                       "stored type, + the Sun's motion over tau + tau_refl)")
 
 
 def _check_key(pf, keys, got, nrows, nullable=()):

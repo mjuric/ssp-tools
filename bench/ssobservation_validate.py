@@ -35,7 +35,10 @@ Subcommands (each prints a text report, optionally also to ``--out FILE``)::
       ephRateRa/Dec by the contract's formula (also run by conformance)
   regression NEW_SSOBSERVATION REF_SSOBSERVATION
       the ephemeris/geometry columns bitwise equal to today's SSObservation
-      (except the computed ellipse and along/cross-track columns)
+      (except the computed ellipse and along/cross-track columns); against
+      a reference from before sdm_schemas d6e8100 (float32 vectors and
+      ranges, float64 offsets), the retyped columns and those derived from
+      them to within PRECISION_ULPS float32 ulps
   ssobject-permutation SSOBSERVATION [DIA] MPCORB [--max-objects N]
       ssp-build-ssobject, run as a black box on copies of SSObservation with
       the rows of each object permuted, must write byte-identical SSObject
@@ -142,8 +145,41 @@ TRACK_COLUMNS = ("ephOffsetAlongTrack", "ephOffsetCrossTrack")
 TRACK_INPUTS = ("ephOffsetRa", "ephOffsetDec", "ephRateRa", "ephRateDec")
 REGRESSION_EXCLUDED = (*ELLIPSE_COLUMNS, *TRACK_COLUMNS)
 
+#: The columns sdm_schemas d6e8100 retyped (docs/design/precision-doubles.md):
+#: column -> (its Arrow type before, after). A reference with the "before"
+#: type is from before the change.
+PRECISION_RETYPED = {
+    **{f"{p}_{a}": (pa.float32(), pa.float64()) for p in ("helio", "topo") for a in "xyz"},
+    "helioRange": (pa.float32(), pa.float64()),
+    "topoRange": (pa.float32(), pa.float64()),
+    "ephOffsetRa": (pa.float64(), pa.float32()),
+    "ephOffsetDec": (pa.float64(), pa.float32()),
+}
+#: Columns whose types did not change, but which are computed from the
+#: float64 vectors since that change instead of from their float32
+#: rounding (the design's D1): against a pre-change reference they differ
+#: at float32 rounding. The value is the column whose magnitude scales the
+#: allowed difference (a range rate's error is relative to the speed, not to
+#: the rate, which may be near 0), or None for the column itself.
+PRECISION_DERIVED = {
+    "helio_vtot": None, "topo_vtot": None, "ephVmag": None,
+    "helioRangeRate": "helio_vtot", "topoRangeRate": "topo_vtot",
+}
+#: Against a pre-change reference, a retyped or derived column agrees to
+#: this many float32 ulps of its scale. The old code computed the ranges,
+#: speeds and range rates in float32 arithmetic from float32 inputs, each
+#: rounding adding up to half an ulp: a range rate's dot product, sum and
+#: division up to ~3-6 ulps of the speed (4 seen on 2026-11-17, 8.1M rows;
+#: the ranges, speeds and V 2).
+PRECISION_ULPS = 8
+#: A retyped double column with more than this fraction of its (non-missing)
+#: values exactly float32-representable is upcast float32, not float64 (on
+#: 2026-11-17 none of 8M values were).
+UPCAST_MAX_FRACTION = 0.5
+
 #: Tolerance of the recomputed along/cross-track offsets, in float32 epsilons
-#: times |ephOffset|: the inputs' (float32 rates) and the output's rounding.
+#: times |ephOffset|: the inputs' (float32 offsets, since sdm_schemas
+#: d6e8100, and float32 rates) and the output's rounding.
 TRACK_EPS = 8
 #: along^2 + cross^2 vs ephOffset^2: gated on rows with ephOffset at most
 #: this [arcsec] (beyond, the tangent-plane offsets and the great-circle
@@ -344,6 +380,39 @@ def bitwise_mismatch(actual, expected):
         repr_diff = int(np.sum(miss_a & miss_e & (va != ve)))
         return mism, repr_diff
     return compare(actual, expected), 0
+
+
+def upcast_fraction(col):
+    """The fraction of ``col``'s non-missing values that equal their float32
+    rounding (0 for none)."""
+    x, v, _ = to_np(col)
+    x = x[v & ~np.isnan(x)].astype(np.float64)
+    if not len(x):
+        return 0.0
+    with np.errstate(over="ignore"):
+        return float(np.mean(x.astype(np.float32).astype(np.float64) == x))
+
+
+def float32_mismatch(actual, expected, scale=None):
+    """``(mismatch mask, max |diff| in ulps)``: ``actual`` within
+    PRECISION_ULPS float32 ulps of ``expected`` (each in any float type),
+    ulps of |``scale``| (a column) if given, else of the larger value; both
+    missing (NULL or NaN) counts as equal, one missing as a mismatch."""
+    a, va, _ = to_np(actual)
+    e, ve, _ = to_np(expected)
+    a, e = a.astype(np.float64), e.astype(np.float64)
+    miss_a, miss_e = ~va | np.isnan(a), ~ve | np.isnan(e)
+    if scale is None:
+        mag = np.maximum(np.abs(a), np.abs(e))
+    else:
+        mag = np.abs(to_np(scale)[0].astype(np.float64))
+    ulp = np.spacing(np.nan_to_num(mag).astype(np.float32)).astype(np.float64)
+    both = ~miss_a & ~miss_e
+    with np.errstate(invalid="ignore", divide="ignore"):
+        d = np.where(both, np.abs(a - e) / ulp, 0.0)
+    d[both & ~np.isfinite(d)] = np.inf
+    mism = np.where(both, ~(d <= PRECISION_ULPS), miss_a != miss_e)
+    return mism, float(d.max()) if len(d) else 0.0
 
 
 # --------------------------------------------------------------------------
@@ -1253,18 +1322,49 @@ def check_regression(new, ref, rep=None):
     rt = rt.take(pa.array(idx[keep]))
     keys = n_obsid[keep]
 
-    bad, type_bad, repr_diff = [], [], 0
+    # A reference from before sdm_schemas d6e8100: any retyped column with
+    # its old type. Its retyped columns may then have the old type, and they
+    # and the derived ones are compared to float32 rounding, not bitwise.
+    def typ(t, c):
+        return _flat(t[c]).type
+    legacy = sorted(c for c in cols if c in PRECISION_RETYPED and typ(rt, c) == PRECISION_RETYPED[c][0])
+    if legacy:
+        rep.info(f"reference from before sdm_schemas d6e8100 (old types of {', '.join(legacy)}): those and "
+                 f"{', '.join(PRECISION_DERIVED)} compared to {PRECISION_ULPS} float32 ulps")
+    bad, type_bad, near, upcast, repr_diff = [], [], [], [], 0
     for c in cols:
-        if nt.schema.field(c).type != rt.schema.field(c).type:
-            type_bad.append(f"{c}: {nt.schema.field(c).type} vs {rt.schema.field(c).type}")
+        tn, tr = typ(nt, c), typ(rt, c)
+        if legacy and c in PRECISION_RETYPED:
+            # (the new build must have the new type, whatever the reference's)
+            ok = tn == PRECISION_RETYPED[c][1] and tr in PRECISION_RETYPED[c]
+        else:
+            ok = tn == tr
+        if not ok:
+            type_bad.append(f"{c}: {tn} vs {tr}")
             continue
-        mism, rd = bitwise_mismatch(nt[c], rt[c])
-        repr_diff += rd
+        if legacy and (c in PRECISION_RETYPED or c in PRECISION_DERIVED):
+            scale = PRECISION_DERIVED.get(c)
+            mism, worst = float32_mismatch(nt[c], rt[c], rt[scale] if scale in rt.column_names else None)
+            near.append(f"{c} {worst:.2g}")
+            if c in PRECISION_RETYPED and PRECISION_RETYPED[c][1] == pa.float64():
+                frac = upcast_fraction(nt[c])
+                if frac > UPCAST_MAX_FRACTION:
+                    upcast.append(f"{c}: {frac:.1%} of values are float32 values")
+        else:
+            mism, rd = bitwise_mismatch(nt[c], rt[c])
+            repr_diff += rd
         if mism.any():
             bad.append(_diff(c, keys, mism, nt[c], rt[c]))
-    rep.check("ephemeris/geometry column types unchanged", not type_bad, "; ".join(type_bad))
-    rep.check("ephemeris/geometry columns bitwise equal", not bad,
+    rep.check("ephemeris/geometry column types unchanged (or as sdm_schemas d6e8100 retyped them)",
+              not type_bad, "; ".join(type_bad))
+    if legacy:
+        rep.check("retyped doubles carry float64 values (not upcast float32)", not upcast,
+                  "; ".join(upcast) if upcast else
+                  f"at most {UPCAST_MAX_FRACTION:.0%} of each column's values equal float32(x)")
+    rep.check("ephemeris/geometry columns bitwise equal" + (" (or to float32 rounding)" if legacy else ""),
+              not bad,
               f"{len(cols)} columns x {len(keys):,} rows"
+              + (f"; max |diff| in float32 ulps: {', '.join(near)}" if near else "")
               + (f"; {len(bad)} differ:\n" + "\n".join(bad) if bad else ""))
     if repr_diff:
         rep.info(f"NULL vs NaN (both missing, counted equal): {repr_diff:,} cells")
@@ -1988,7 +2088,8 @@ def main(argv=None):
     p.add_argument("--sep-gate", type=float, default=TRACK_SEP_GATE_ARCSEC,
                    help="gate along^2+cross^2 ~ ephOffset^2 on rows with ephOffset <= this [arcsec]")
     p.add_argument("--sep-rtol", type=float, default=TRACK_SEP_RTOL)
-    p = add("regression", "ephemeris/geometry bitwise equal to today's SSObservation")
+    p = add("regression", "ephemeris/geometry bitwise equal to today's SSObservation "
+                          "(to float32 rounding where sdm_schemas d6e8100 retyped them)")
     p.add_argument("new")
     p.add_argument("ref")
     p = add("ellipse", "the error ellipse against NearbySSO")

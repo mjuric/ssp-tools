@@ -448,10 +448,11 @@ def process_orbit(i, w, ephem, stage_t):
         stage_t["ellipse"] += time.perf_counter() - t3
         return None, c, None
 
-    # V exactly as SSObservation computes it: from its float32 helio/topo
-    # columns (and its float64 phase angle)
-    helio = e.helio_pos[:, k].astype(np.float32)
-    topo = e.topo_pos[:, k].astype(np.float32)
+    # V exactly as SSObservation computes ephVmag: from the float64 helio
+    # and topo ranges, the norms of the float64 vectors (and the float64
+    # phase angle)
+    helio = e.helio_pos[:, k]
+    topo = e.topo_pos[:, k]
     helio_r = np.sqrt(helio[0] ** 2 + helio[1] ** 2 + helio[2] ** 2)
     topo_r = np.sqrt(topo[0] ** 2 + topo[1] ** 2 + topo[2] ** 2)
 

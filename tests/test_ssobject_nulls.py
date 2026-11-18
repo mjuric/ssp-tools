@@ -11,7 +11,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
-from ssp import schema, ssobject
+from ssp import schema_ppdb, ssobject
 from ssp.delivery_check import check_table
 from ssp.delivery_contract import delivery_schema
 from ssp.ssobject import compute_ssobject, ssobject_schema, ssobject_table, write_ssobject
@@ -35,7 +35,7 @@ def _bits(a):
 
 def _check_against(obj, t):
     assert t.schema.equals(ssobject_schema())
-    assert t.column_names == list(schema.SSObjectDtype.names)
+    assert t.column_names == list(schema_ppdb.SSObjectDtype.names)
     for name in t.column_names:
         col, ref = t[name].combine_chunks(), obj[name]
         if ref.dtype.kind == "f":
@@ -138,3 +138,30 @@ def test_cli_writes_nulls(tmp_path, monkeypatch, ref):
     for name in t.column_names:
         if pa.types.is_floating(t.schema.field(name).type):
             assert not pc.any(pc.is_nan(t[name])).as_py(), name
+
+
+def test_arc_is_float64_with_subsecond_precision(tmp_path):
+    """arc is float64 (sdm_schemas d6e8100): over ten years it keeps
+    sub-second precision (float32 would round it to ~21 s), in the array
+    and in the written file."""
+    sss, orbits = _tables(n_obj=12, seed=4)
+    assert schema_ppdb.SSObjectDtype["arc"] == np.float64
+    # (an object's primary rows: SSObject is computed from those)
+    prim = sss["primary"].to_numpy(dtype=bool)
+    oid = sss["ssObjectId"][prim].value_counts().index[0]
+    rows = np.flatnonzero((sss["ssObjectId"] == oid).to_numpy() & prim)
+    span = 3652.5 + 0.25 / 86400                  # ten years and a quarter second [d]
+    t = sss["midpointMjdTai"].to_numpy(dtype=np.float64, copy=True)
+    t[rows] = 60800.0 + np.linspace(0.0, span, rows.size)
+    sss["midpointMjdTai"] = t
+    obj = compute_ssobject(sss, orbits)
+    arc = obj["arc"][obj["ssObjectId"] == oid][0]
+    assert obj["arc"].dtype == np.float64
+    assert arc == np.ptp(t[rows])
+    assert abs(arc - span) * 86400 < 1e-3
+    assert abs(float(np.float32(arc)) - span) * 86400 > 0.2       # (float32 loses the quarter second)
+    p = tmp_path / "SSObject.parquet"
+    write_ssobject(obj, p)
+    w = pq.read_table(p)
+    assert w.schema.field("arc").type == pa.float64()
+    assert np.array_equal(w["arc"].to_numpy(), obj["arc"])

@@ -218,6 +218,11 @@ def load_nongravs(mpc_orbits_path, designations):
     return nongravs, n_errors
 
 
+def _norm(v):
+    """The norms of the columns of a (3, N) float64 array."""
+    return np.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+
+
 def compute_ssobservation_entry(sss, assoc, mpcorb, dia, ephem, covs=None, nongravs=None):
     """Fill the ephemeris-derived SSObservation columns (EPH_FIELDS) for one
     object.
@@ -271,59 +276,43 @@ def compute_ssobservation_entry(sss, assoc, mpcorb, dia, ephem, covs=None, nongr
     sss["ephRa"] = util.wrap_ra_deg(e.ra_deg)
     sss["ephDec"] = e.dec_deg
 
-    sss["ephOffsetDec"] = (dia["dec"] - sss["ephDec"]) * 3600
-    sss["ephOffsetRa"] = (dia["ra"] - sss["ephRa"]) * np.cos(np.deg2rad(sss["ephDec"])) * 3600
+    # Every derived value is computed from float64 arrays (the ephemeris and
+    # the float64 offsets), then stored, so each is rounded once, to its
+    # column's type (docs/design/precision-doubles.md, D1).
+    off_dec = (dia["dec"] - sss["ephDec"]) * 3600
+    off_ra = (dia["ra"] - sss["ephRa"]) * np.cos(np.deg2rad(sss["ephDec"])) * 3600
+    sss["ephOffsetDec"] = off_dec
+    sss["ephOffsetRa"] = off_ra
     sss["ephOffset"] = util.sky_separation_arcsec(sss["ephRa"], sss["ephDec"], dia["ra"], dia["dec"])
     # along/cross-track [arcsec]: from the float64 offsets and rates (not
-    # the float32-stored rates); NaN (NULL) where the rate is 0
+    # the float32-stored offsets and rates); NaN (NULL) where the rate is 0
     sss["ephOffsetAlongTrack"], sss["ephOffsetCrossTrack"] = along_cross_track(
-        sss["ephOffsetRa"], sss["ephOffsetDec"], e.mu_lon, e.mu_lat)
+        off_ra, off_dec, e.mu_lon, e.mu_lat)
 
-    # Compute heliocentric position components
-    sss["helio_x"] = e.helio_pos[0]
-    sss["helio_y"] = e.helio_pos[1]
-    sss["helio_z"] = e.helio_pos[2]
-    sss["helioRange"] = np.sqrt(sss["helio_x"] ** 2 + sss["helio_y"] ** 2 + sss["helio_z"] ** 2)
-
-    # Compute heliocentric velocity components
-    sss["helio_vx"] = e.helio_vel[0]
-    sss["helio_vy"] = e.helio_vel[1]
-    sss["helio_vz"] = e.helio_vel[2]
-    sss["helio_vtot"] = np.sqrt(sss["helio_vx"] ** 2 + sss["helio_vy"] ** 2 + sss["helio_vz"] ** 2)
-
-    # Compute heliocentric radial velocity: dot product of velocity
-    # and unit position vector
-    sss["helioRangeRate"] = (
-        sss["helio_vx"] * sss["helio_x"] + sss["helio_vy"] * sss["helio_y"] + sss["helio_vz"] * sss["helio_z"]
-    ) / sss["helioRange"]
-
-    # Compute topocentric position components
-    sss["topo_x"] = e.topo_pos[0]
-    sss["topo_y"] = e.topo_pos[1]
-    sss["topo_z"] = e.topo_pos[2]
-    sss["topoRange"] = np.sqrt(sss["topo_x"] ** 2 + sss["topo_y"] ** 2 + sss["topo_z"] ** 2)
-
-    # Compute topocentric velocity components
-    sss["topo_vx"] = e.topo_vel[0]
-    sss["topo_vy"] = e.topo_vel[1]
-    sss["topo_vz"] = e.topo_vel[2]
-    sss["topo_vtot"] = np.sqrt(sss["topo_vx"] ** 2 + sss["topo_vy"] ** 2 + sss["topo_vz"] ** 2)
-
-    # Compute topocentric radial velocity: dot product of velocity
-    # and unit position vector
-    sss["topoRangeRate"] = (
-        sss["topo_vx"] * sss["topo_x"] + sss["topo_vy"] * sss["topo_y"] + sss["topo_vz"] * sss["topo_z"]
-    ) / sss["topoRange"]
+    # Heliocentric and topocentric positions (float64 columns), ranges
+    # (float64), velocities, speeds and range rates (float32 columns, from
+    # the float64 vectors). The range rate is the velocity's component
+    # along the unit position vector.
+    helio_range = _norm(e.helio_pos)
+    topo_range = _norm(e.topo_pos)
+    for pre, pos, vel, rng in (("helio", e.helio_pos, e.helio_vel, helio_range),
+                               ("topo", e.topo_pos, e.topo_vel, topo_range)):
+        for i, c in enumerate("xyz"):
+            sss[f"{pre}_{c}"] = pos[i]
+            sss[f"{pre}_v{c}"] = vel[i]
+        sss[f"{pre}Range"] = rng
+        sss[f"{pre}_vtot"] = _norm(vel)
+        sss[f"{pre}RangeRate"] = (vel[0] * pos[0] + vel[1] * pos[1] + vel[2] * pos[2]) / rng
 
     sss["phaseAngle"] = e.phase_angle
 
-    sss["ephVmag"] = hg_V_mag(e.H, e.G, sss["helioRange"], sss["topoRange"], e.phase_angle)
+    sss["ephVmag"] = hg_V_mag(e.H, e.G, helio_range, topo_range, e.phase_angle)
 
     # The predicted position's error ellipse, at the observation times (TDB
     # days since J2000, as compute_ephemerides_one integrates in; astropy
     # caches ephTimes.tdb), from the same observer positions, along the
-    # precise pass's float64 line of sight (e.topo_pos, not the float32
-    # topo_x/y/z: see ssp.ssobservation_ellipse.ephemeris_ellipse).
+    # precise pass's float64 line of sight (e.topo_pos: see
+    # ssp.ssobservation_ellipse.ephemeris_ellipse).
     orbit = covs.get(provID) if covs is not None else None
     if orbit is None:
         for c in ELLIPSE_COLUMNS:
