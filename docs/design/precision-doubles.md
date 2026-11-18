@@ -1,6 +1,6 @@
 # Double-precision positions, ranges and arc
 
-Status: **approved** (2026-11-18); implemented, awaiting the master merge.
+Status: **approved** (2026-11-18); F-16 folded in, implementation in progress.
 
 ## Context
 
@@ -50,10 +50,30 @@ The request came through the ssp-daily session. It times the pin with River's ta
 |---|---|
 | 2026-11-18 | **The schema change** (above), in sdm_schemas d6e8100. Relayed by ssp-daily. |
 | 2026-11-18 | **Design approved** as written, with D1 and D2. River loads the new types from 2026-11-18 (ssp-daily PR #37), and mppdb casts float32 files up, so the pin has no timing constraint. |
+| 2026-11-18 | **F-16 fix approved** (wrap the RA difference, a new offsets-vs-separation check, a straddling test). Relayed by ssp-daily; folded into this branch. |
 | 2026-11-18 | **Release:** earlier deliveries stay as they are; the owner approves the master merge; ssp-daily times the pin. Relayed by ssp-daily. |
 | 2026-11-18 | **D1, approved. Derived values computed from the float64 ephemeris.** The range rates, `ephVmag`, NearbySSO's `vmag`, and through the ranges SSObject's fits, would be computed from the float64 vectors instead of float32-rounded ones. Their stored values would change at the float32 rounding level, and the fits by about that much. Otherwise the new double ranges would be upcast float32, and V would be computed from less precise inputs than the ones delivered. |
 | 2026-11-18 | **D2, approved. The elongation check's tolerance.** The rounding term uses the epsilon of the stored type: 2⁻²⁴ for float32 vectors, 2⁻⁵³ for float64. The same code then checks both old and new deliveries correctly. For new deliveries the tolerance becomes 1″ plus the light-time term, about 1″ nearby and up to ~2″ at 90 AU. |
 | *pending the owner's confirmation* | **D2 amended: the light-time term covers both legs.** `helio_*` is relative to the Sun as the object saw it (`ephem_assist._apparent_sun`, at t − τ − τ_refl), so `topo − helio` is the Sun's position delayed by τ + τ_refl, not τ alone. The term becomes 16 m/s × 499 s/AU × (\|topo\| + \|helio\|) instead of × \|topo\|. The tolerance for float64 vectors is ~1.03″ nearby and ~2.98″ at 90 AU (D2 above said ~2″); for float32 deliveries it is ~7.4″ at 90 AU (was ~6″). Found in the WP's real-data check: with \|topo\| alone, the new build used 0.74 of the tolerance at 89 AU, and would fail beyond ~190 AU. |
+
+## F-16: `ephOffsetRa` across RA 0/360 (folded in 2026-11-18)
+
+A QA finding, F-16, relayed by ssp-daily with the owner's approval of the fix. `ssp/ssobservation.py` computes `ephOffsetRa = (ra − ephRa) · cos(ephDec) · 3600` without wrapping `ra − ephRa`.
+- **The bug:** an observation and a prediction on opposite sides of RA 0/360 get about ±1.3e6″ instead of a few arcsec.
+- **What else it affects:** `ephOffsetAlongTrack`/`CrossTrack` come from `ephOffsetRa`, so they are wrong in the same rows. `ephOffset`, an independent Vincenty separation, is right.
+- **Today it is latent:** on 2026-11-17 no row straddles RA 0.
+- **Rows that change:** wrapping changes only 2025 NO124's 18 rows. Its orbit predicts positions 174–178° from the observations (finding F-12). `ephOffsetRa` there goes from about +6.1e5″ to about −5.7e5″; at that separation the tangent-plane offsets have no meaning either way.
+- **Why the current check misses it:** the delivery check's along/cross-track test (along² + cross² = offsetRa² + offsetDec²) can't see it, because both sides are wrong together.
+- **Packaged here** because it touches the same lines, and PR #124 was not yet merged.
+
+Changes:
+- **Wrap:** `ra − ephRa` to [−180°, 180°) before the cos(dec) factor.
+- **New delivery check:** `hypot(ephOffsetRa, ephOffsetDec)` must agree with `ephOffset`, within a tolerance that covers:
+  - the tangent-plane approximation, which grows with the separation and with |tan dec|;
+  - the float32 storage of the offsets and of `ephOffset`.
+
+  Measured on the new 2026-11-17 build: below 1″ the relative difference is at most 1.0e-6, at 1–60″ at most 1.5e-5, and at 1′–1° at most 6.2e-5. Above about 1°, where the approximation itself fails, the check only requires the offsets to stay within the half-sky bound (|ephOffsetRa| ≤ 180° · 3600). That still catches an unwrapped difference wherever the separation is small.
+- **Test:** a synthetic object straddling RA 0/360 (e.g. 359.9999° and 0.0001°).
 
 ## Changes
 
