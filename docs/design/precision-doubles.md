@@ -1,6 +1,6 @@
 # Double-precision positions, ranges and arc
 
-Status: **approved** (2026-11-18); implementation in progress.
+Status: **approved** (2026-11-18); implemented, awaiting the master merge.
 
 ## Context
 
@@ -53,6 +53,7 @@ The request came through the ssp-daily session. It times the pin with River's ta
 | 2026-11-18 | **Release:** earlier deliveries stay as they are; the owner approves the master merge; ssp-daily times the pin. Relayed by ssp-daily. |
 | 2026-11-18 | **D1, approved. Derived values computed from the float64 ephemeris.** The range rates, `ephVmag`, NearbySSO's `vmag`, and through the ranges SSObject's fits, would be computed from the float64 vectors instead of float32-rounded ones. Their stored values would change at the float32 rounding level, and the fits by about that much. Otherwise the new double ranges would be upcast float32, and V would be computed from less precise inputs than the ones delivered. |
 | 2026-11-18 | **D2, approved. The elongation check's tolerance.** The rounding term uses the epsilon of the stored type: 2⁻²⁴ for float32 vectors, 2⁻⁵³ for float64. The same code then checks both old and new deliveries correctly. For new deliveries the tolerance becomes 1″ plus the light-time term, about 1″ nearby and up to ~2″ at 90 AU. |
+| *pending the owner's confirmation* | **D2 amended: the light-time term covers both legs.** `helio_*` is relative to the Sun as the object saw it (`ephem_assist._apparent_sun`, at t − τ − τ_refl), so `topo − helio` is the Sun's position delayed by τ + τ_refl, not τ alone. The term becomes 16 m/s × 499 s/AU × (\|topo\| + \|helio\|) instead of × \|topo\|. The tolerance for float64 vectors is ~1.03″ nearby and ~2.98″ at 90 AU (D2 above said ~2″); for float32 deliveries it is ~7.4″ at 90 AU (was ~6″). Found in the WP's real-data check: with \|topo\| alone, the new build used 0.74 of the tolerance at 89 AU, and would fail beyond ~190 AU. |
 
 ## Changes
 
@@ -98,3 +99,76 @@ The request came through the ssp-daily session. It times the pin with River's ta
   - record the results here;
   - merge to master after the owner's approval;
   - send the master commit to ssp-daily.
+
+## Record
+
+Integrated 2026-11-18. The WP: 0c8829d, 3169e0c, 1079d0c (tolerance) and 6c8380e (review fixes); PR #126, merged into this branch as 9edd638.
+
+**Review.**
+- The integrator's review found the one-leg light-time term (D2 amended, above). The fix was verified on real data: on 3,000 rows at 40–89 AU, the check's residual tracks the Sun's motion over τ + τ_refl (correlation 0.9993, slope 1.017). With that motion removed, the maximum residual drops from 1.26″ to 0.04″, the float32 rounding of `elongation`.
+- An independent review, in two rounds, found no correctness bugs; round 2 found nothing.
+  - It recomputed, on 450,000 rows of the new build, in its own code:
+    - the ranges equal the norms of the stored vectors, bitwise;
+    - the speeds and range rates agree within 1.24 float32 ulps (the velocities are float32);
+    - `ephVmag` from mpc_orbits' H and G within 0.52 ulps;
+    - along/cross-track within 1.1e-7 × `ephOffset`.
+  - None of the 450,000 rows has a vector or range equal to its float32 rounding, so the doubles are genuine.
+  - On 7 objects, from 0.047 to 76 AU, an independent ephemeris run agrees bitwise on `helio_*` and to ≤ 8e-15 AU on `topo_*`.
+  - The Sun's barycentric speed from DE440 is at most 14.61 m/s over 2025–2036, so the 16 m/s bound holds.
+  - On synthetic cases from 0.001 to 500 AU, the Sun's real shift equals the light-time term to 4 digits.
+  - Its low findings (a NaN vector passed the elongation check, which the no-NaN check catches anyway; the bench's legacy mode accepted a column left float32; a test that didn't always tell the paths apart) were fixed. `ssp/schema.py`, now unused, is issue #125.
+
+**Tests.** The full suite passes: 1528 tests.
+
+**Real data.** 2026-11-17 was rebuilt from its inputs with master a34126d (base) and with the WP (new), one after the other, at 32 workers.
+
+| Step | Wall (s), base → new | Peak RSS (GB), base → new |
+|---|---|---|
+| mpc | 45.8 → 45.4 | 5.78 → 5.79 |
+| ssobservation | 312 → 334 | 13.52 → 14.02 |
+| ssobject | 74.3 → 74.2 | 2.95 → 3.07 |
+| nearbysso | 452 → 461 | 11.24 → 11.03 |
+| check | 77 → 83 | 5.36 → 5.28 |
+| whole build | 16m18s → 16m52s | |
+
+SSObservation, 8,129,545 rows, 8,067,419 of them with an orbit:
+- **The vectors:** float32 of the new values equals the old ones bitwise.
+- **The ranges:** float32 of the new values differs from the old on 2.2M rows, by at most 2 ulps, the error of the old float32 arithmetic.
+- **The offsets:** float32 of the old doubles equals the new values bitwise.
+- **D1 columns,** values changed and largest change:
+
+  | Column | Values changed | Largest change |
+  |---|---|---|
+  | `topoRangeRate` | 4.71M | 7.6e-6 km/s (4 ulps of `topo_vtot`) |
+  | `helioRangeRate` | 6.81M | 3.8e-6 km/s (2 ulps of `helio_vtot`) |
+  | `topo_vtot` | 2.29M | 2 ulps |
+  | `helio_vtot` | 1.99M | 2 ulps |
+  | `ephVmag` | 2.75M | 3.8e-6 mag |
+
+- **Along/cross-track:** unchanged.
+- **The other 166 columns and the sidecar:** bitwise equal.
+- **Size:** 3.33 → 3.52 GB (+5.7%).
+
+SSObject, 299,690 rows:
+- `arc` equals max − min of `midpointMjdTai` exactly, and float32 of it equals the old value.
+- **The fits move with the ranges:** p99.9 \|ΔH\| is 1.9e-6, the largest ΔH 2.5e-5. Changes are larger only on degenerate fits, e.g. the H/G12 covariance by up to 0.12 absolute, 5e-4 relative.
+- The other 43 columns are bitwise equal.
+
+NearbySSO:
+- `vmag` changed on 1.43M of 4.17M rows, by at most 2 ulps.
+- On 249,186 rows matched to SSObservation, it equals `ephVmag` bitwise on 247,418, and within 1 ulp on the rest, which come from separate integrations.
+- The other 16 columns and the sidecar are bitwise equal.
+- mpc_orbits and the identification tables are identical.
+
+`delivery_check` with the new code:
+
+| Build | Result | Elongation: largest difference, worst fraction of tolerance |
+|---|---|---|
+| new (float64 vectors) | 6/6 pass | 1.458″ at 89.02 AU; at most 0.497 |
+| base (float32 vectors) | fails only the types: the 10 retyped SSObservation columns and SSObject `arc` | 2.682″ at 88.95 AU; at most 0.439 |
+
+Worst fraction by distance, new build: 0–2 AU 0.086, 2–5 AU 0.111, 5–10 AU 0.148, 10–30 AU 0.337, 30–60 AU 0.442, 60+ AU 0.497.
+
+The delivered 11-17 run predates the elongation and NULL fix (a34126d), so it also fails those checks. That says nothing about this change; the base rebuild is the float32 comparison. No 11-18 delivery existed yet.
+
+The bench regression check (`bench/ssobservation_validate.py`) passes new against base. It allows a pre-d6e8100 reference 8 float32 ulps on the retyped and D1 columns; the largest seen is 4.
