@@ -172,9 +172,14 @@ PRECISION_DERIVED = {
 #: division up to ~3-6 ulps of the speed (4 seen on 2026-11-17, 8.1M rows;
 #: the ranges, speeds and V 2).
 PRECISION_ULPS = 8
+#: A retyped double column with more than this fraction of its (non-missing)
+#: values exactly float32-representable is upcast float32, not float64 (on
+#: 2026-11-17 none of 8M values were).
+UPCAST_MAX_FRACTION = 0.5
 
 #: Tolerance of the recomputed along/cross-track offsets, in float32 epsilons
-#: times |ephOffset|: the inputs' (float32 rates) and the output's rounding.
+#: times |ephOffset|: the inputs' (float32 offsets, since sdm_schemas
+#: d6e8100, and float32 rates) and the output's rounding.
 TRACK_EPS = 8
 #: along^2 + cross^2 vs ephOffset^2: gated on rows with ephOffset at most
 #: this [arcsec] (beyond, the tangent-plane offsets and the great-circle
@@ -375,6 +380,17 @@ def bitwise_mismatch(actual, expected):
         repr_diff = int(np.sum(miss_a & miss_e & (va != ve)))
         return mism, repr_diff
     return compare(actual, expected), 0
+
+
+def upcast_fraction(col):
+    """The fraction of ``col``'s non-missing values that equal their float32
+    rounding (0 for none)."""
+    x, v, _ = to_np(col)
+    x = x[v & ~np.isnan(x)].astype(np.float64)
+    if not len(x):
+        return 0.0
+    with np.errstate(over="ignore"):
+        return float(np.mean(x.astype(np.float32).astype(np.float64) == x))
 
 
 def float32_mismatch(actual, expected, scale=None):
@@ -1315,16 +1331,25 @@ def check_regression(new, ref, rep=None):
     if legacy:
         rep.info(f"reference from before sdm_schemas d6e8100 (old types of {', '.join(legacy)}): those and "
                  f"{', '.join(PRECISION_DERIVED)} compared to {PRECISION_ULPS} float32 ulps")
-    bad, type_bad, near, repr_diff = [], [], [], 0
+    bad, type_bad, near, upcast, repr_diff = [], [], [], [], 0
     for c in cols:
         tn, tr = typ(nt, c), typ(rt, c)
-        if tn != tr and not (legacy and c in PRECISION_RETYPED and (tr, tn) == PRECISION_RETYPED[c]):
+        if legacy and c in PRECISION_RETYPED:
+            # (the new build must have the new type, whatever the reference's)
+            ok = tn == PRECISION_RETYPED[c][1] and tr in PRECISION_RETYPED[c]
+        else:
+            ok = tn == tr
+        if not ok:
             type_bad.append(f"{c}: {tn} vs {tr}")
             continue
         if legacy and (c in PRECISION_RETYPED or c in PRECISION_DERIVED):
             scale = PRECISION_DERIVED.get(c)
             mism, worst = float32_mismatch(nt[c], rt[c], rt[scale] if scale in rt.column_names else None)
             near.append(f"{c} {worst:.2g}")
+            if c in PRECISION_RETYPED and PRECISION_RETYPED[c][1] == pa.float64():
+                frac = upcast_fraction(nt[c])
+                if frac > UPCAST_MAX_FRACTION:
+                    upcast.append(f"{c}: {frac:.1%} of values are float32 values")
         else:
             mism, rd = bitwise_mismatch(nt[c], rt[c])
             repr_diff += rd
@@ -1332,6 +1357,10 @@ def check_regression(new, ref, rep=None):
             bad.append(_diff(c, keys, mism, nt[c], rt[c]))
     rep.check("ephemeris/geometry column types unchanged (or as sdm_schemas d6e8100 retyped them)",
               not type_bad, "; ".join(type_bad))
+    if legacy:
+        rep.check("retyped doubles carry float64 values (not upcast float32)", not upcast,
+                  "; ".join(upcast) if upcast else
+                  f"at most {UPCAST_MAX_FRACTION:.0%} of each column's values equal float32(x)")
     rep.check("ephemeris/geometry columns bitwise equal" + (" (or to float32 rounding)" if legacy else ""),
               not bad,
               f"{len(cols)} columns x {len(keys):,} rows"

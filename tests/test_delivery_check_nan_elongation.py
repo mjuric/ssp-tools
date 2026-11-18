@@ -146,8 +146,10 @@ def test_vector_unit_roundoff():
     assert D.vector_unit_roundoff(t.schema) == 2.0 ** -53
     assert D.vector_unit_roundoff(with_geometry(t, vtype=pa.float32()).schema) == 2.0 ** -24
     assert D.vector_unit_roundoff(replace(t, "helio_z", t["helio_z"].cast(pa.float32())).schema) == 2.0 ** -24
+    # (a non-float position column raises: check_delivery makes that a FAIL)
     ints = pa.array(np.zeros(len(t), np.int64))
-    assert D.vector_unit_roundoff(replace(t, "topo_x", ints).schema) == 2.0 ** -24
+    with pytest.raises(ValueError):
+        D.vector_unit_roundoff(replace(t, "topo_x", ints).schema)
     # (the velocities do not count)
     assert D.vector_unit_roundoff(replace(t, "topo_vx", t["topo_vx"].cast(pa.float16())).schema) == 2.0 ** -53
 
@@ -252,6 +254,32 @@ def test_elongation_near_0_and_180(tmp_path):
     t = with_geometry(ss_table(), elong=[0.0, 0.001, 179.999, 180.0, 90, 1, 2, 3, 4])
     write_ss(tmp_path, t)
     assert _ss_results(tmp_path)["elongation"].ok
+
+
+def test_elongation_non_float_vector_fails(tmp_path):
+    t = replace(ss_table(), "topo_x", pa.array(np.arange(9), pa.int64()))
+    write_ss(tmp_path, t)
+    r = _ss_results(tmp_path)["elongation"]
+    assert not r.ok and r.detail.startswith("cannot check (ValueError"), r
+
+
+def test_elongation_nan_vector_fails(tmp_path):
+    """A NaN (not NULL) vector component fails the check (its tolerance is
+    NaN), at an infinite fraction of the tolerance."""
+    t = ss_table()[:5]
+    topo_x = t["topo_x"].to_numpy().copy()
+    topo_x[0] = np.nan
+    t = replace(t, "topo_x", pa.array(topo_x))
+    write_ss(tmp_path, t)
+    r = _ss_results(tmp_path)["elongation"]
+    assert not r.ok, r
+    assert r.detail.startswith("1 rows differ by more than their tolerance"), r
+    assert "at most inf of the row's tolerance" in r.detail
+
+
+def test_elongation_no_files():
+    r = D.check_elongation([])
+    assert r.ok and r.detail.startswith("0 rows with topo/helio vectors; "), r
 
 
 def test_elongation_missing_columns(tmp_path):

@@ -426,12 +426,11 @@ def unit_roundoff(dtype):
 def vector_unit_roundoff(schema):
     """The unit roundoff of the stored topo_x/y/z and helio_x/y/z columns of
     Arrow ``schema`` (unit_roundoff; the largest, if their types differ).
-    A column that is not floating point (which the type check fails) counts
-    as float32's."""
+    A column that is not floating point (which the type check also fails)
+    raises ValueError; check_delivery reports that as an elongation FAIL."""
     u = 0.0
     for c in ELONGATION_VECTOR_COLUMNS:
-        t = schema.field(c).type
-        u = max(u, unit_roundoff(t) if pa.types.is_floating(t) else 2.0 ** -24)
+        u = max(u, unit_roundoff(schema.field(c).type))
     return u
 
 
@@ -500,10 +499,15 @@ def check_elongation(files):
                     topo, helio, topo_v=topo_v, helio_v=helio_v)) <= ELONGATION_TOPO_INFO_DEG)))
             n_checked += len(d)
             tol = elongation_tolerance_arcsec(topo, helio, roundoff) / 3600
+            # (a NaN vector component gives a NaN want, d inf, and a NaN
+            # tolerance: bad, at fraction inf)
+            with np.errstate(invalid="ignore"):
+                frac = d / tol
+            frac[np.isnan(frac)] = np.inf
             if len(d):
                 worst = max(worst, float(d.max()))
-                worst_frac = max(worst_frac, float((d / tol).max()))
-            bad = d > tol
+                worst_frac = max(worst_frac, float(frac.max()))
+            bad = ~(d <= tol)
             if bad.any():
                 n_bad += int(bad.sum())
                 rows = np.flatnonzero(has)
@@ -511,7 +515,8 @@ def check_elongation(files):
                     examples.append(f"{Path(f).name} row {first + rows[i]:,}: {got[i]:.6f} vs {want[i]:.6f} "
                                     f"(tolerance {tol[i] * 3600:.2f} arcsec)")
             del t
-    detail = (f"{n_checked:,} rows with topo/helio vectors ({'/'.join(sorted(types))}); "
+    typestr = f" ({'/'.join(sorted(types))})" if types else ""
+    detail = (f"{n_checked:,} rows with topo/helio vectors{typestr}; "
               f"max |elongation - apparent from (ra, dec) "
               f"and the vectors| {worst:.3g} deg ({worst * 3600:.3g} arcsec), at most {worst_frac:.2f} of "
               f"the row's tolerance; {n_topo:,} rows differ from the angle to topo by more than "

@@ -161,7 +161,7 @@ def test_tail_angles_from_the_ephresult(fake_ephem):
 # column's type
 # --------------------------------------------------------------------------
 
-def _entry_and_ephresult(n_obj=1, seed=6):
+def _entry_and_ephresult(n_obj=1, seed=6, min_rows=5):
     """One object's compute_ssobservation_entry (fake ephemerides), the
     EphResult it got, and its DiaSources."""
     from astropy.time import Time
@@ -171,7 +171,7 @@ def _entry_and_ephresult(n_obj=1, seed=6):
     dia = dia_eph[obs_state["dia_index"]]
     e = _fake_ephemerides(None, Time(dia["midpointMjdTai"], format="mjd", scale="tai"), None, None, row=row,
                           obs_pos=obs_state["obs_pos"].T, obs_vel=obs_state["obs_vel"].T)
-    assert len(sss) >= 5
+    assert len(sss) >= min_rows
     return sss, e, dia
 
 
@@ -206,16 +206,37 @@ def test_vectors_and_ranges_are_float64(fake_ephem):
 
 def test_derived_from_float64(fake_ephem):
     """The range rates, the speeds and ephVmag: computed from the float64
-    vectors and velocities, then rounded once to float32 (bitwise)."""
+    vectors and velocities, then rounded once to float32 (bitwise). Over
+    enough rows (several objects), the old path (float32 inputs, float32
+    arithmetic) gives different values for each, so the test tells them
+    apart."""
     from ssp.photfit import hg_V_mag
-    sss, e, _ = _entry_and_ephresult()
-    r = {"helio": _norm64(e.helio_pos), "topo": _norm64(e.topo_pos)}
-    for pre, pos, vel in (("helio", e.helio_pos, e.helio_vel), ("topo", e.topo_pos, e.topo_vel)):
-        rate = (vel[0] * pos[0] + vel[1] * pos[1] + vel[2] * pos[2]) / r[pre]
-        assert sss[f"{pre}RangeRate"].tobytes() == rate.astype(np.float32).tobytes(), pre
-        assert sss[f"{pre}_vtot"].tobytes() == _norm64(vel).astype(np.float32).tobytes(), pre
-    v = hg_V_mag(e.H, e.G, r["helio"], r["topo"], e.phase_angle)
-    assert sss["ephVmag"].tobytes() == v.astype(np.float32).tobytes()
+
+    def norm32(v):
+        v = v.astype(np.float32)
+        return np.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+
+    n_rows, old_differs = 0, dict.fromkeys(("helioRangeRate", "topoRangeRate", "helio_vtot", "topo_vtot",
+                                            "ephVmag"), 0)
+    for seed in range(6, 26):
+        sss, e, _ = _entry_and_ephresult(seed=seed, min_rows=1)
+        n_rows += len(sss)
+        r = {"helio": _norm64(e.helio_pos), "topo": _norm64(e.topo_pos)}
+        r32 = {"helio": norm32(e.helio_pos), "topo": norm32(e.topo_pos)}
+        for pre, pos, vel in (("helio", e.helio_pos, e.helio_vel), ("topo", e.topo_pos, e.topo_vel)):
+            rate = (vel[0] * pos[0] + vel[1] * pos[1] + vel[2] * pos[2]) / r[pre]
+            assert sss[f"{pre}RangeRate"].tobytes() == rate.astype(np.float32).tobytes(), (seed, pre)
+            assert sss[f"{pre}_vtot"].tobytes() == _norm64(vel).astype(np.float32).tobytes(), (seed, pre)
+            p32, v32 = pos.astype(np.float32), vel.astype(np.float32)
+            rate32 = (v32[0] * p32[0] + v32[1] * p32[1] + v32[2] * p32[2]) / r32[pre]
+            old_differs[f"{pre}RangeRate"] += int(np.sum(rate32 != sss[f"{pre}RangeRate"]))
+            old_differs[f"{pre}_vtot"] += int(np.sum(norm32(vel) != sss[f"{pre}_vtot"]))
+        v = hg_V_mag(e.H, e.G, r["helio"], r["topo"], e.phase_angle)
+        assert sss["ephVmag"].tobytes() == v.astype(np.float32).tobytes(), seed
+        v32 = hg_V_mag(e.H, e.G, r32["helio"], r32["topo"], e.phase_angle).astype(np.float32)
+        old_differs["ephVmag"] += int(np.sum(v32 != sss["ephVmag"]))
+    assert n_rows >= 200
+    assert all(n > 0 for n in old_differs.values()), old_differs
 
 
 def test_along_cross_track_from_float64_offsets(fake_ephem):
