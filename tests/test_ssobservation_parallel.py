@@ -245,12 +245,73 @@ def test_along_cross_track_from_float64_offsets(fake_ephem):
     (and rates): unchanged by the offsets' float32 storage."""
     sss, e, dia = _entry_and_ephresult()
     off_dec = (dia["dec"] - sss["ephDec"]) * 3600
-    off_ra = (dia["ra"] - sss["ephRa"]) * np.cos(np.deg2rad(sss["ephDec"])) * 3600
+    dra = dia["ra"] - sss["ephRa"]
+    dra = np.where(dra >= 180, dra - 360, np.where(dra < -180, dra + 360, dra))   # (the short way round)
+    off_ra = dra * np.cos(np.deg2rad(sss["ephDec"])) * 3600
     assert sss["ephOffsetRa"].tobytes() == off_ra.astype(np.float32).tobytes()
     assert sss["ephOffsetDec"].tobytes() == off_dec.astype(np.float32).tobytes()
     along, cross = ssobservation.along_cross_track(off_ra, off_dec, e.mu_lon, e.mu_lat)
     assert sss["ephOffsetAlongTrack"].tobytes() == along.astype(np.float32).tobytes()
     assert sss["ephOffsetCrossTrack"].tobytes() == cross.astype(np.float32).tobytes()
+
+
+@pytest.mark.parametrize("ra_obs,ra_eph", [(359.9999, 0.0001), (0.0001, 359.9999)])
+def test_offsets_across_ra_0(monkeypatch, ra_obs, ra_eph):
+    """F-16: an observation and a prediction on opposite sides of RA 0/360
+    get the short-way offset, -+0.0002 deg x cos(dec), not ~360 deg; at
+    several declinations, up to |dec| 89; the along/cross-track offsets
+    agree (a rotation of it by the rate's direction)."""
+    decs = np.array([0.0, 30.0, -45.0, 60.0, -75.0, 85.0, -89.0])
+    n = len(decs)
+    mu_lon, mu_lat = np.full(n, 0.3), np.full(n, -0.4)
+
+    def straddle(provID, ephTimes, mpcorb, ephem, row=None, obs_pos=None, obs_vel=None, nongrav=None):
+        e = _fake_ephemerides(provID, ephTimes, mpcorb, ephem, row=row, obs_pos=obs_pos, obs_vel=obs_vel)
+        e.ra_deg, e.dec_deg = np.full(n, ra_eph), decs.copy()
+        e.mu_lon, e.mu_lat, e.mu_total = mu_lon, mu_lat, np.hypot(mu_lon, mu_lat)
+        return e
+    monkeypatch.setattr(ssobservation, "compute_ephemerides_one", straddle)
+    sss = np.zeros(n, dtype=SSS_DTYPE)
+    sss["ssObjectId"] = 7
+    sss["designation"] = "2025 A0007"
+    dia = np.zeros(n, dtype=[(c, np.float64) for c in ("midpointMjdTai", "ra", "dec")])
+    dia["midpointMjdTai"] = 60800.0 + np.arange(n)
+    dia["ra"], dia["dec"] = ra_obs, decs + 0.5 / 3600          # (and 0.5" north)
+    obs = np.zeros(n, dtype=OBS_DTYPE)
+    obs["dia_index"] = np.arange(n)
+    obs["obs_pos"] = [1.0, 0.0, 0.0]
+    mpcorb = pd.DataFrame(dict(
+        unpacked_primary_provisional_designation=["2025 A0007"], q=[2.0], e=[0.1], i=[5.0], node=[0.0],
+        argperi=[0.0], peri_time=[60000.0], epoch_mjd=[60800.0], h=[15.0], g=[0.15],
+    )).set_index("unpacked_primary_provisional_designation", drop=False)
+    compute_ssobservation_entry(sss, obs, mpcorb, dia, None)
+    # independently: the short way round is 0.0002 deg, westward if the
+    # observation is at 359.9999
+    sign = -1.0 if ra_obs > 180 else 1.0
+    want_ra = sign * 0.0002 * 3600 * np.cos(np.radians(decs))
+    np.testing.assert_allclose(sss["ephOffsetRa"], want_ra, rtol=1e-6, atol=0)
+    np.testing.assert_allclose(sss["ephOffsetDec"], 0.5, rtol=1e-6)
+    assert np.all(np.abs(sss["ephOffsetRa"]) < 0.73)
+    # the great-circle separation agrees (tangent plane, tiny separation)
+    np.testing.assert_allclose(np.hypot(sss["ephOffsetRa"].astype(float), sss["ephOffsetDec"].astype(float)),
+                               sss["ephOffset"], rtol=2e-6)
+    # along/cross-track: the offset rotated into the rate's frame
+    v = np.hypot(mu_lon, mu_lat)
+    want_along = (want_ra * mu_lon + 0.5 * mu_lat) / v
+    want_cross = (-want_ra * mu_lat + 0.5 * mu_lon) / v
+    np.testing.assert_allclose(sss["ephOffsetAlongTrack"], want_along, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(sss["ephOffsetCrossTrack"], want_cross, rtol=1e-5, atol=1e-6)
+
+
+def test_wrap_dra_deg():
+    from ssp.util import wrap_dra_deg
+    d = np.array([0.0, -0.0, 1e-9, 179.999, 180.0, 359.9998, -359.9998, -180.0, -180.000001, np.nan])
+    w = wrap_dra_deg(d)
+    np.testing.assert_allclose(w[:9], [0, 0, 1e-9, 179.999, -180.0, -0.0002, 0.0002, -180.0, 179.999999],
+                               rtol=0, atol=1e-9)
+    assert np.isnan(w[9])
+    # values in range are bitwise unchanged
+    assert w[:4].tobytes() == d[:4].tobytes() and w[7] == -180.0
 
 
 class _FakeEllipse:

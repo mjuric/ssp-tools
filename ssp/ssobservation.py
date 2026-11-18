@@ -280,7 +280,9 @@ def compute_ssobservation_entry(sss, assoc, mpcorb, dia, ephem, covs=None, nongr
     # the float64 offsets), then stored, so each is rounded once, to its
     # column's type (docs/design/precision-doubles.md, D1).
     off_dec = (dia["dec"] - sss["ephDec"]) * 3600
-    off_ra = (dia["ra"] - sss["ephRa"]) * np.cos(np.deg2rad(sss["ephDec"])) * 3600
+    # (the RA difference wrapped to [-180, 180): across RA 0/360 the short
+    # way round, F-16 of docs/design/precision-doubles.md)
+    off_ra = util.wrap_dra_deg(dia["ra"] - sss["ephRa"]) * np.cos(np.deg2rad(sss["ephDec"])) * 3600
     sss["ephOffsetDec"] = off_dec
     sss["ephOffsetRa"] = off_ra
     sss["ephOffset"] = util.sky_separation_arcsec(sss["ephRa"], sss["ephDec"], dia["ra"], dia["dec"])

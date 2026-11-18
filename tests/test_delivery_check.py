@@ -461,6 +461,10 @@ def ss_table(sid=SID):
     t = with_geometry(make_table("SSObservation", n))
     t = replace(t, "ssObjectId", pa.array(sid, pa.int64()))
     t = replace(t, "midpointMjdTai", pa.array([61000.0 + i for i in range(n)], pa.float64()))
+    # offsets consistent with the separation (check_offsets): a 3-4-5 triangle
+    t = replace(t, "ephOffsetRa", pa.array([0.6 * i for i in range(n)], pa.float32()))
+    t = replace(t, "ephOffsetDec", pa.array([0.8 * i for i in range(n)], pa.float32()))
+    t = replace(t, "ephOffset", pa.array([float(i) for i in range(n)], pa.float32()))
     return replace(t, "obsid", pa.array([f"obs{i:03d}" for i in range(n)], pa.string()))
 
 

@@ -31,7 +31,10 @@ observer-to-Sun direction ``topo_* - helio_*``, both aberrated by
 ``helio_v* - topo_v*``, to within elongation_tolerance_arcsec (1" plus
 the rounding of the delivered vectors, by their stored type, float32 or
 float64, plus the Sun's motion over the light-time), on every row with
-the vectors.
+the vectors. check_offsets checks the tangent-plane offsets ``ephOffsetRa``
+and ``ephOffsetDec`` against the great-circle ``ephOffset``
+(offsets_tolerance_arcsec): it catches an RA difference not wrapped across
+RA 0/360 (F-16 of docs/design/precision-doubles.md).
 
 NearbySSO is checked further by check_nearbysso: its sidecar
 (NearbySSO_internal.parquet), the NULL pattern of matched and unmatched
@@ -140,6 +143,26 @@ ELONGATION_COLUMNS = ("elongation", "ra", "dec",
                       "topo_vx", "topo_vy", "topo_vz", "helio_vx", "helio_vy", "helio_vz")
 #: The position columns, whose stored type sets the tolerance's rounding term.
 ELONGATION_VECTOR_COLUMNS = ELONGATION_COLUMNS[3:9]
+#: check_offsets: the tangent-plane regime, where hypot(ephOffsetRa,
+#: ephOffsetDec) must agree with ephOffset (offsets_tolerance_arcsec): the
+#: separation and the (wrapped) RA difference both at most this [deg].
+#: Beyond it the tangent-plane offsets have no meaning, and only their
+#: bounds are checked: |ephOffsetDec| <= ephOffset (a great circle is never
+#: shorter than its declination change) and |ephOffsetRa| <= 180 deg x
+#: |cos(ephDec)| (the RA difference wrapped to [-180, 180)).
+OFFSETS_TANGENT_MAX_DEG = 1.0
+#: check_offsets' allowance for the float32 storage of ephOffsetRa,
+#: ephOffsetDec and ephOffset, in float32 unit roundoffs (2**-24) relative to
+#: the separation: each value is rounded once (half an ulp relative), so
+#: hypot(ephOffsetRa, ephOffsetDec) is off by <= 1 and ephOffset by <= 1;
+#: twice that.
+OFFSETS_TOL_ROUNDING_UNITS = 4.0
+#: ... and its absolute floor [arcsec]: the float64 rounding of the RA/Dec
+#: differences and of Vincenty's formula (~1e-15 rad x a few; it matters
+#: only for separations of milliarcseconds and below).
+OFFSETS_TOL_FLOOR_ARCSEC = 1e-9
+#: The columns check_offsets reads.
+OFFSETS_COLUMNS = ("ephOffsetRa", "ephOffsetDec", "ephOffset", "ephDec")
 #: The speed of light [km/s] (SSObservation's velocities are in km/s).
 C_KM_S = 299792.458
 
@@ -528,6 +551,100 @@ def check_elongation(files):
                        detail + f"; within the tolerance ({ELONGATION_TOL_FLOOR_ARCSEC:g} arcsec + "
                        f"{ELONGATION_TOL_ROUNDING_FACTOR:g}x the vectors' rounding bound, by their "
                        "stored type, + the Sun's motion over tau + tau_refl)")
+
+
+def offsets_tolerance_arcsec(sep, off_dec, dec):
+    """check_offsets' tolerance [arcsec] on |hypot(ephOffsetRa, ephOffsetDec)
+    - ephOffset|, in the tangent-plane regime (OFFSETS_TANGENT_MAX_DEG), for
+    rows of separation ``sep`` [arcsec], ``off_dec`` (ephOffsetDec) [arcsec]
+    and predicted declination ``dec`` [deg].
+
+    With xi = dRA cos(dec) and eta = dDec (dec the predicted one, as
+    ephOffsetRa uses), the great-circle separation s satisfies
+    s^2 = dRA^2 cos(dec) cos(dec + eta) + eta^2 + O(s^4), and
+    cos(dec) cos(dec + eta) = cos^2(dec) (1 - tan(dec) eta - eta^2 / 2 + ...),
+    so |hypot(xi, eta) - s| / s <= |tan(dec)| |eta| / 2 + O(s^2) (radians).
+    The O(s^2) term is that of a separation along a parallel, xi^2
+    tan^2(dec) / 24, plus the like for the curvature: bounded here by
+    (1 + tan^2(dec)) s^2 / 8 (3x the 1/24 seen in a brute-force comparison
+    with Vincenty over all declinations to 89.999 deg, separations and RA
+    differences up to 1 deg). Plus the float32 storage of the three columns
+    (OFFSETS_TOL_ROUNDING_UNITS) and the float64 floor
+    (OFFSETS_TOL_FLOOR_ARCSEC)."""
+    s = np.radians(np.asarray(sep, np.float64) / 3600)
+    eta = np.radians(np.abs(np.asarray(off_dec, np.float64)) / 3600)
+    t = np.tan(np.radians(np.asarray(dec, np.float64)))
+    rel = OFFSETS_TOL_ROUNDING_UNITS * 2.0 ** -24 + np.abs(t) * eta / 2 + (1 + t * t) * s * s / 8
+    return np.asarray(sep, np.float64) * rel + OFFSETS_TOL_FLOOR_ARCSEC
+
+
+def check_offsets(files):
+    """CheckResult "offsets": in every SSObservation part of ``files``, on
+    every row with non-NULL ephOffsetRa, ephOffsetDec and ephOffset (and
+    ephDec), the tangent-plane offsets against the great-circle separation:
+    within OFFSETS_TANGENT_MAX_DEG (separation and RA difference),
+    |hypot(ephOffsetRa, ephOffsetDec) - ephOffset| within
+    offsets_tolerance_arcsec; beyond it, |ephOffsetDec| <= ephOffset and
+    |ephOffsetRa| <= 180 deg x |cos(ephDec)| (each with the same float32 and
+    float64 allowances). A NaN fails. An RA difference not wrapped across
+    RA 0/360 gives |ephOffsetRa| ~ 360 deg x cos(dec) at a small separation,
+    and fails either way. Reports the rows checked, the worst fraction of
+    the tolerance (or of the bound) and its separation, and the rows beyond
+    the tangent-plane regime."""
+    n_checked, n_bad, n_far, worst, worst_sep, examples = 0, 0, 0, 0.0, 0.0, []
+    lim = OFFSETS_TANGENT_MAX_DEG * 3600
+    slack = 1 + OFFSETS_TOL_ROUNDING_UNITS * 2.0 ** -24
+    for f in files:
+        pf = pq.ParquetFile(f)
+        missing = [c for c in OFFSETS_COLUMNS if c not in pf.schema_arrow.names]
+        if missing:
+            return CheckResult("offsets", False, f"{Path(f).name} lacks {missing}")
+        offset = 0
+        for rg in range(pf.num_row_groups):
+            t = pf.read_row_group(rg, columns=list(OFFSETS_COLUMNS))
+            first, offset = offset, offset + len(t)
+            has = np.ones(len(t), bool)
+            for c in OFFSETS_COLUMNS:
+                has &= _valid(t[c])
+            if not has.any():
+                continue
+            xi, eta, sep, dec = (_np(t[c], np.nan)[has].astype(np.float64) for c in OFFSETS_COLUMNS)
+            cosd = np.abs(np.cos(np.radians(dec)))
+            with np.errstate(invalid="ignore", divide="ignore"):
+                tangent = (sep <= lim) & (np.abs(xi) <= lim * cosd)
+                far = ~tangent
+                frac = np.full(len(sep), np.inf)
+                # the tangent-plane regime
+                tol = offsets_tolerance_arcsec(sep, eta, dec)
+                frac[tangent] = (np.abs(np.hypot(xi, eta) - sep) / tol)[tangent]
+                # beyond it: the bounds
+                f_dec = np.abs(eta) / (sep * slack + OFFSETS_TOL_FLOOR_ARCSEC)
+                f_ra = np.abs(xi) / (180 * 3600 * cosd * slack + OFFSETS_TOL_FLOOR_ARCSEC)
+                frac[far] = np.maximum(f_dec, f_ra)[far]
+            frac[np.isnan(frac)] = np.inf
+            n_checked += len(sep)
+            n_far += int(far.sum())
+            if len(frac):
+                i = int(np.argmax(frac))
+                if frac[i] >= worst:
+                    worst, worst_sep = float(frac[i]), float(sep[i])
+            bad = ~(frac <= 1.0)
+            if bad.any():
+                n_bad += int(bad.sum())
+                rows = np.flatnonzero(has)
+                for i in np.flatnonzero(bad)[:N_EXAMPLES - len(examples)]:
+                    examples.append(f"{Path(f).name} row {first + rows[i]:,}: ephOffsetRa {xi[i]:.6g}, "
+                                    f"ephOffsetDec {eta[i]:.6g}, ephOffset {sep[i]:.6g} arcsec, "
+                                    f"ephDec {dec[i]:.6g}")
+            del t
+    detail = (f"{n_checked:,} rows with the offsets; at most {worst:.3g} of the tolerance (at ephOffset "
+              f"{worst_sep:.4g} arcsec); {n_far:,} rows beyond the tangent-plane regime "
+              f"(> {OFFSETS_TANGENT_MAX_DEG:g} deg; bounds only)")
+    if n_bad:
+        return CheckResult("offsets", False, f"{n_bad:,} rows outside; " + detail + "; e.g. "
+                           + "; ".join(examples))
+    return CheckResult("offsets", True, detail + "; hypot(ephOffsetRa, ephOffsetDec) vs ephOffset within "
+                       "the tangent-plane and float32 allowance")
 
 
 def _check_key(pf, keys, got, nrows, nullable=()):
@@ -1472,6 +1589,10 @@ def check_delivery(delivery_dir, schema_dir=SCHEMA_DIR, tables=DELIVERY_TABLES, 
                     res.append(check_elongation(files))
                 except Exception as e:      # a safety net: a FAIL, never a crash
                     res.append(CheckResult("elongation", False, f"cannot check ({type(e).__name__}: {e})"))
+                try:
+                    res.append(check_offsets(files))
+                except Exception as e:      # a safety net: a FAIL, never a crash
+                    res.append(CheckResult("offsets", False, f"cannot check ({type(e).__name__}: {e})"))
             out[table] = res
             continue
         path = Path(delivery_dir) / f"{table}.parquet"
