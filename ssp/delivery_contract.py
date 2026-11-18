@@ -289,8 +289,10 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 #   its tolerance of the apparent elongation from the delivered columns
 #   (delivery_check.elongation_tolerance_arcsec: 1" plus twice the rounding
 #   bound of the recomputed Sun direction, by the stored vectors' type
-#   (2**-24 for float32, 2**-53 for float64), plus light-time; ~1" nearby,
-#   and at 90 AU ~6" for float32 vectors, ~2" for float64): the
+#   (2**-24 for float32, 2**-53 for float64), plus the Sun's motion over
+#   both light-time legs, object-to-observer and Sun-to-object (topo - helio
+#   is the Sun as the object saw it); ~1" nearby, and at 90 AU ~7" for
+#   float32 vectors, ~3" for float64): the
 #   angle between the observed (ra, dec) and topo - helio, both aberrated
 #   (first order in v/c) by helio_v - topo_v. Reports the rows checked, the
 #   largest difference, and (for information) the rows where the angle to

@@ -153,26 +153,28 @@ def test_vector_unit_roundoff():
 
 
 def test_elongation_tolerance_float32_vectors():
-    """1" plus the float32 bound and light-time: ~1" nearby, ~6" at 90 AU
-    (where float32 vectors are good to ~2")."""
+    """1" plus the float32 bound and the Sun's motion over the light-time:
+    ~1" nearby, ~7" at 90 AU (where float32 vectors are good to ~4")."""
     def tol(d):
         return _tol(d, np.float32)
     assert 1.0 < tol(1.0) < 1.1
-    assert 5.0 < tol(90.0) < 7.0
+    assert 7.0 < tol(90.0) < 8.0
     assert tol(1.0) < tol(10.0) < tol(40.0) < tol(90.0)
 
 
 def test_elongation_tolerance_float64_vectors():
-    """With float64 vectors the rounding term vanishes: 1" plus the
-    light-time term (the Sun's motion over the light-time, at most 16 m/s
-    x 499 s/AU x d, seen from 1 AU), ~2" at 90 AU."""
+    """With float64 vectors the rounding term vanishes: 1" plus the Sun's
+    motion over both light-time legs, object-to-observer and Sun-to-object
+    (at most 16 m/s x 499 s/AU x (|topo| + |helio|), seen from 1 AU), ~3"
+    at 90 AU."""
     def tol(d):
         return _tol(d, np.float64)
-    lt = 0.016 * 499.004784 / 149597870.7 * np.degrees(3600.0)   # [arcsec per AU of d, seen from 1 AU]
+    lt = 0.016 * 499.004784 / 149597870.7 * np.degrees(3600.0)   # [arcsec per AU of path, seen from 1 AU]
     for d in (1.0, 10.0, 90.0):
-        assert tol(d) == pytest.approx(1.0 + lt * d, rel=1e-7)   # (+ ~1e-8" of float64 rounding)
-    assert 1.0 < tol(1.0) < 1.02
-    assert 1.9 < tol(90.0) < 2.1
+        # (|topo| = d, |helio| = hypot(d, 1); + ~1e-8" of float64 rounding)
+        assert tol(d) == pytest.approx(1.0 + lt * (d + np.hypot(d, 1.0)), rel=1e-7)
+    assert 1.0 < tol(1.0) < 1.03
+    assert 2.9 < tol(90.0) < 3.1
     assert tol(1.0) < tol(10.0) < tol(40.0) < tol(90.0)
     # the float32 rounding term is the difference
     f32 = 2 * 2.0 ** -24 * (90.0 + np.hypot(90.0, 1.0)) * np.degrees(3600.0)
@@ -182,13 +184,14 @@ def test_elongation_tolerance_float64_vectors():
 @pytest.mark.parametrize("vtype,dist,ok", [
     (pa.float32(), 2.0, False), (pa.float32(), 90.0, True),
     (pa.float64(), 2.0, False), (pa.float64(), 90.0, False)])
-def test_elongation_3arcsec_off_far_and_near(tmp_path, vtype, dist, ok):
-    """A 3" difference fails for a nearby object; for a distant one it is
-    within the precision of float32 vectors (a delivery from before
-    sdm_schemas d6e8100), but not of float64 ones."""
+def test_elongation_4arcsec_off_far_and_near(tmp_path, vtype, dist, ok):
+    """A 4" difference fails for a nearby object; for a distant one (90
+    AU) it is within the precision of float32 vectors (a delivery from
+    before sdm_schemas d6e8100; ~7.4" there), but not of float64 ones
+    (~3", from light-time)."""
     t = ss_table()
     t = with_geometry(t, dist=dist, vtype=vtype)
-    t = _set(t, "elongation", 0, t["elongation"][0].as_py() + 3.0 / 3600)
+    t = _set(t, "elongation", 0, t["elongation"][0].as_py() + 4.0 / 3600)
     write_ss(tmp_path, t)
     r = _ss_results(tmp_path)["elongation"]
     assert r.ok == ok, r
@@ -196,11 +199,11 @@ def test_elongation_3arcsec_off_far_and_near(tmp_path, vtype, dist, ok):
 
 
 @pytest.mark.parametrize("vtype", [pa.float32(), pa.float64()])
-def test_elongation_1_5arcsec_off_far(tmp_path, vtype):
-    """At 90 AU 1.5" is within either tolerance (~2" with float64
-    vectors, from light-time)."""
+def test_elongation_2_5arcsec_off_far(tmp_path, vtype):
+    """At 90 AU 2.5" is within either tolerance (~3" with float64
+    vectors, from the Sun's motion over both light-time legs)."""
     t = with_geometry(ss_table(), dist=90.0, vtype=vtype)
-    t = _set(t, "elongation", 0, t["elongation"][0].as_py() + 1.5 / 3600)
+    t = _set(t, "elongation", 0, t["elongation"][0].as_py() + 2.5 / 3600)
     write_ss(tmp_path, t)
     assert _ss_results(tmp_path)["elongation"].ok
 

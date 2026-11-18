@@ -30,7 +30,8 @@ the angle between the observed direction (``ra``, ``dec``) and the
 observer-to-Sun direction ``topo_* - helio_*``, both aberrated by
 ``helio_v* - topo_v*``, to within elongation_tolerance_arcsec (1" plus
 the rounding of the delivered vectors, by their stored type, float32 or
-float64, plus light-time), on every row with the vectors.
+float64, plus the Sun's motion over the light-time), on every row with
+the vectors.
 
 NearbySSO is checked further by check_nearbysso: its sidecar
 (NearbySSO_internal.parquet), the NULL pattern of matched and unmatched
@@ -116,16 +117,19 @@ NAN_FREE_TABLES = ("SSObservation", "SSObject", "NearbySSO")
 #: rounding bound of the observer-to-Sun direction recomputed from the
 #: delivered vectors, by the unit roundoff of their stored type (2**-24 for
 #: float32, 2**-53 for float64: the same code checks deliveries of either),
-#: plus the Sun's barycentric motion over the light-time (topo and helio
-#: are at the emission epoch). With float32 vectors ~1" for nearby objects,
-#: ~6" at 90 AU (on 2026-11-16 the largest residual was 0.52 of it,
-#: docs/design/elongation-ssobject-nulls.md, Record); with float64 vectors
-#: (since docs/design/precision-doubles.md) ~1" nearby, ~2" at 90 AU.
+#: plus the Sun's barycentric motion over both light-time legs: topo -
+#: helio is Sun(t - tau - tau_refl) - observer(t), the Sun as the object
+#: saw it (ssp.ephem_assist._apparent_sun), with tau the object-to-observer
+#: and tau_refl the Sun-to-object light time, while ``elongation`` is to
+#: the Sun at t. With float32 vectors ~1" for nearby objects, ~7" at 90 AU;
+#: with float64 vectors (since docs/design/precision-doubles.md) ~1"
+#: nearby, ~3" at 90 AU (docs/design/precision-doubles.md, Record).
 ELONGATION_TOL_FLOOR_ARCSEC = 1.0
 ELONGATION_TOL_ROUNDING_FACTOR = 2.0
 #: The Sun's barycentric speed, an upper bound [AU/day] (it stays under
 #: ~16 m/s), times the light-time per AU [day]: the Sun's displacement
-#: over the light-time, per AU of topocentric distance.
+#: over the light-time, per AU of light path (|topo| + |helio|: tau +
+#: tau_refl).
 _SUN_LT_AU_PER_AU = (0.016 * 86400 / 149597870.7) * (499.004784 / 86400)
 #: Rows whose elongation differs from the angle to ``topo`` (the predicted
 #: direction) by more than this [deg] are counted, for information.
@@ -434,12 +438,15 @@ def vector_unit_roundoff(schema):
 def elongation_tolerance_arcsec(topo, helio, roundoff):
     """check_elongation's tolerance [arcsec] on each row of the (N, 3)
     vectors ``topo`` and ``helio`` [AU], stored with unit roundoff
-    ``roundoff`` (unit_roundoff of their type; see
-    ELONGATION_TOL_FLOOR_ARCSEC)."""
+    ``roundoff`` (unit_roundoff of their type): the floor, the rounding of
+    topo - helio, and the Sun's displacement over the light path |topo| +
+    |helio| (see ELONGATION_TOL_FLOOR_ARCSEC)."""
     nt = np.linalg.norm(topo, axis=1)
+    nh = np.linalg.norm(helio, axis=1)
     ns = np.linalg.norm(topo - helio, axis=1)
-    rnd = roundoff * (nt + np.linalg.norm(helio, axis=1))   # |rounding error| of topo - helio
-    rad = (ELONGATION_TOL_ROUNDING_FACTOR * rnd + _SUN_LT_AU_PER_AU * nt) / ns
+    rnd = roundoff * (nt + nh)           # |rounding error| of topo - helio
+    lt = _SUN_LT_AU_PER_AU * (nt + nh)   # the Sun's displacement over tau + tau_refl
+    rad = (ELONGATION_TOL_ROUNDING_FACTOR * rnd + lt) / ns
     return ELONGATION_TOL_FLOOR_ARCSEC + np.degrees(rad) * 3600
 
 
@@ -515,7 +522,7 @@ def check_elongation(files):
     return CheckResult("elongation", True,
                        detail + f"; within the tolerance ({ELONGATION_TOL_FLOOR_ARCSEC:g} arcsec + "
                        f"{ELONGATION_TOL_ROUNDING_FACTOR:g}x the vectors' rounding bound, by their "
-                       "stored type, + light-time)")
+                       "stored type, + the Sun's motion over tau + tau_refl)")
 
 
 def _check_key(pf, keys, got, nrows, nullable=()):
