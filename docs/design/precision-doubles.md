@@ -1,6 +1,6 @@
 # Double-precision positions, ranges and arc
 
-Status: **draft**, awaiting the owner's approval.
+Status: **approved** (2026-11-18); implementation in progress.
 
 ## Context
 
@@ -49,9 +49,10 @@ The request came through the ssp-daily session. It times the pin with River's ta
 | Date | Decision |
 |---|---|
 | 2026-11-18 | **The schema change** (above), in sdm_schemas d6e8100. Relayed by ssp-daily. |
+| 2026-11-18 | **Design approved** as written, with D1 and D2. River loads the new types from 2026-11-18 (ssp-daily PR #37), and mppdb casts float32 files up, so the pin has no timing constraint. |
 | 2026-11-18 | **Release:** earlier deliveries stay as they are; the owner approves the master merge; ssp-daily times the pin. Relayed by ssp-daily. |
-| *open* | **D1. Derived values computed from the float64 ephemeris.** The range rates, `ephVmag`, NearbySSO's `vmag`, and through the ranges SSObject's fits, would be computed from the float64 vectors instead of float32-rounded ones. Their stored values would change at the float32 rounding level, and the fits by about that much. *Recommended:* yes. Otherwise the new double ranges would be upcast float32, and V would be computed from less precise inputs than the ones delivered. |
-| *open* | **D2. The elongation check's tolerance.** The rounding term uses the epsilon of the stored type: 2⁻²⁴ for float32 vectors, 2⁻⁵³ for float64. The same code then checks both old and new deliveries correctly. For new deliveries the tolerance becomes 1″ plus the light-time term, about 1″ nearby and up to ~2″ at 90 AU. *Recommended:* yes. |
+| 2026-11-18 | **D1, approved. Derived values computed from the float64 ephemeris.** The range rates, `ephVmag`, NearbySSO's `vmag`, and through the ranges SSObject's fits, would be computed from the float64 vectors instead of float32-rounded ones. Their stored values would change at the float32 rounding level, and the fits by about that much. Otherwise the new double ranges would be upcast float32, and V would be computed from less precise inputs than the ones delivered. |
+| 2026-11-18 | **D2, approved. The elongation check's tolerance.** The rounding term uses the epsilon of the stored type: 2⁻²⁴ for float32 vectors, 2⁻⁵³ for float64. The same code then checks both old and new deliveries correctly. For new deliveries the tolerance becomes 1″ plus the light-time term, about 1″ nearby and up to ~2″ at 90 AU. |
 
 ## Changes
 
