@@ -286,7 +286,10 @@ def delivery_schema(schema_dir=SCHEMA_DIR):
 # check_elongation(part_files) -> CheckResult
 #   (docs/design/elongation-ssobject-nulls.md) On every row with non-NULL
 #   topo_* and helio_* (positions and velocities), ``elongation`` within
-#   0.01 deg of the apparent elongation from the delivered columns: the
+#   its tolerance of the apparent elongation from the delivered columns
+#   (delivery_check.elongation_tolerance_arcsec: 1" plus twice the float32
+#   bound of the recomputed Sun direction plus light-time; ~1" nearby,
+#   ~6" at 90 AU): the
 #   angle between the observed (ra, dec) and topo - helio, both aberrated
 #   (first order in v/c) by helio_v - topo_v. Reports the rows checked, the
 #   largest difference, and (for information) the rows where the angle to

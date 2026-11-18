@@ -437,13 +437,13 @@ SID = [1, 1, 1, 2, 2, 3, None, None, None]
 NS = len(SID)
 
 
-def with_geometry(t, elong=None):
-    """``t`` with the target at (ra, dec) = (0, 0), topo/helio vectors whose
-    observer-to-Sun direction (topo - helio) is at ``elong`` [deg] (default:
-    5 to 175) from it, and that elongation."""
+def with_geometry(t, elong=None, dist=2.0):
+    """``t`` with the target at (ra, dec) = (0, 0), ``dist`` + 0, 1, ... AU
+    away, topo/helio vectors whose observer-to-Sun direction (topo - helio)
+    is at ``elong`` [deg] (default: 5 to 175) from it, and that elongation."""
     n = len(t)
     e = np.radians(np.linspace(5, 175, n) if elong is None else np.asarray(elong, float))
-    topo = np.stack([2.0 + np.arange(n), np.zeros(n), np.zeros(n)], axis=1)
+    topo = np.stack([dist + np.arange(n), np.zeros(n), np.zeros(n)], axis=1)
     helio = topo - np.stack([np.cos(e), np.sin(e), np.zeros(n)], axis=1)
     for k, a in enumerate("xyz"):
         t = replace(t, f"topo_{a}", pa.array(topo[:, k], pa.float32()))

@@ -92,7 +92,7 @@ def _with_velocity(t, v_kms):
 def test_elongation_check_is_apparent(tmp_path, apparent, ok):
     """Near opposition, with the observatory moving at 30 km/s across the
     Sun's direction, the apparent and geometric elongations differ by ~41"
-    (over the 0.01 deg tolerance): the check takes the apparent one."""
+    (over the ~1" tolerance): the check takes the apparent one."""
     t = _with_velocity(with_geometry(ss_table(), elong=[179.9] * 9), [0, 30.0, 0])
     if apparent:
         topo, helio = _vectors(t, 0)
@@ -111,17 +111,41 @@ def test_elongation_pass(tmp_path):
     assert r.detail.startswith("9 rows with topo/helio vectors")
 
 
-@pytest.mark.parametrize("off,ok", [(0.005, True), (0.02, False), (-0.5, False)])
+@pytest.mark.parametrize("off,ok", [(0.5 / 3600, True), (2.0 / 3600, False), (-0.5, False)])
 def test_elongation_tolerance(tmp_path, off, ok):
+    """Nearby (2-10 AU) the tolerance is ~1": 0.5" passes, 2" fails."""
     t = ss_table()
     t = _set(t, "elongation", 4, t["elongation"][4].as_py() + off)
     write_ss(tmp_path, t)
     r = _ss_results(tmp_path)["elongation"]
     assert r.ok == ok, r
     if not ok:
-        assert r.detail.startswith("1 rows differ by more than 0.01 deg")
+        assert r.detail.startswith("1 rows differ by more than their tolerance")
     worst = float(r.detail.split("the vectors| ")[1].split(" deg")[0])
-    assert worst == pytest.approx(abs(off), abs=1e-4)
+    assert worst == pytest.approx(abs(off), abs=3e-5)
+
+
+def test_elongation_tolerance_grows_with_distance():
+    """1" plus the float32 bound and light-time: ~1" nearby, ~6" at 90 AU
+    (where the delivered float32 vectors are good to ~2")."""
+    def tol(d):
+        topo = np.array([[d, 0.0, 0.0]])
+        return D.elongation_tolerance_arcsec(topo, topo - np.array([[0.0, 1.0, 0.0]]))[0]
+    assert 1.0 < tol(1.0) < 1.1
+    assert 5.0 < tol(90.0) < 7.0
+    assert tol(1.0) < tol(10.0) < tol(40.0) < tol(90.0)
+
+
+@pytest.mark.parametrize("dist,ok", [(2.0, False), (90.0, True)])
+def test_elongation_3arcsec_off_far_and_near(tmp_path, dist, ok):
+    """A 3" difference fails for a nearby object but is within the float32
+    precision of a distant one's vectors."""
+    t = ss_table()
+    t = with_geometry(t, dist=dist)
+    t = _set(t, "elongation", 0, t["elongation"][0].as_py() + 3.0 / 3600)
+    write_ss(tmp_path, t)
+    r = _ss_results(tmp_path)["elongation"]
+    assert r.ok == ok, r
 
 
 def test_elongation_wrong_sun_fails(tmp_path):

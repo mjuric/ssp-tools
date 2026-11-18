@@ -28,7 +28,8 @@ sidecar, and check_table runs on every part. check_elongation checks its
 ``elongation`` against the apparent elongation from the delivered columns:
 the angle between the observed direction (``ra``, ``dec``) and the
 observer-to-Sun direction ``topo_* - helio_*``, both aberrated by
-``helio_v* - topo_v*``, to within ELONGATION_TOL_DEG, on every row with the
+``helio_v* - topo_v*``, to within elongation_tolerance_arcsec (1" plus
+the float32 precision of the delivered vectors), on every row with the
 vectors.
 
 NearbySSO is checked further by check_nearbysso: its sidecar
@@ -107,12 +108,25 @@ N_EXAMPLES = 3
 
 #: The tables whose float columns may hold no NaN (a missing value is NULL;
 #: docs/design/elongation-ssobject-nulls.md). Not the MPC tables: mpc_orbits
-#: has NaN from the MPC replica (an open question).
+#: keeps the MPC replica's NaN (owner, 2026-11-17).
 NAN_FREE_TABLES = ("SSObservation", "SSObject", "NearbySSO")
 
-#: The largest difference [deg] check_elongation allows between
-#: SSObservation's elongation and the one from its topo/helio vectors.
-ELONGATION_TOL_DEG = 0.01
+#: check_elongation's tolerance on each row (elongation_tolerance_arcsec):
+#: ELONGATION_TOL_FLOOR_ARCSEC, plus ELONGATION_TOL_F32_FACTOR times the
+#: float32 rounding bound of the observer-to-Sun direction recomputed from
+#: the delivered vectors, plus the Sun's barycentric motion over the
+#: light-time (topo and helio are at the emission epoch). ~1" for nearby
+#: objects, ~6" at 90 AU; on 2026-11-16 the largest residual was 0.52 of it
+#: (docs/design/elongation-ssobject-nulls.md, Record).
+ELONGATION_TOL_FLOOR_ARCSEC = 1.0
+ELONGATION_TOL_F32_FACTOR = 2.0
+#: The Sun's barycentric speed, an upper bound [AU/day] (it stays under
+#: ~16 m/s), times the light-time per AU [day]: the Sun's displacement
+#: over the light-time, per AU of topocentric distance.
+_SUN_LT_AU_PER_AU = (0.016 * 86400 / 149597870.7) * (499.004784 / 86400)
+#: Rows whose elongation differs from the angle to ``topo`` (the predicted
+#: direction) by more than this [deg] are counted, for information.
+ELONGATION_TOPO_INFO_DEG = 0.01
 #: The columns check_elongation reads.
 ELONGATION_COLUMNS = ("elongation", "ra", "dec",
                       "topo_x", "topo_y", "topo_z", "helio_x", "helio_y", "helio_z",
@@ -392,11 +406,22 @@ def elongation_from_vectors(topo, helio, ra=None, dec=None, topo_v=None, helio_v
     return _angle_deg(target, sun)
 
 
-def check_elongation(files, tol_deg=ELONGATION_TOL_DEG):
+def elongation_tolerance_arcsec(topo, helio):
+    """check_elongation's tolerance [arcsec] on each row of the (N, 3)
+    vectors ``topo`` and ``helio`` [AU] (see ELONGATION_TOL_FLOOR_ARCSEC)."""
+    nt = np.linalg.norm(topo, axis=1)
+    ns = np.linalg.norm(topo - helio, axis=1)
+    f32 = 2.0 ** -24 * (nt + np.linalg.norm(helio, axis=1))   # |rounding error| of topo - helio
+    rad = (ELONGATION_TOL_F32_FACTOR * f32 + _SUN_LT_AU_PER_AU * nt) / ns
+    return ELONGATION_TOL_FLOOR_ARCSEC + np.degrees(rad) * 3600
+
+
+def check_elongation(files):
     """CheckResult "elongation": in every SSObservation part of ``files``,
     on every row with non-NULL topo_* and helio_* (positions and
-    velocities), ``elongation`` within ``tol_deg`` of the apparent
-    elongation from the delivered columns: the angle between the observed
+    velocities), ``elongation`` within the row's tolerance
+    (elongation_tolerance_arcsec) of the apparent elongation from the
+    delivered columns: the angle between the observed
     direction (``ra``, ``dec``, which ``elongation`` is of) and the
     observer-to-Sun direction ``topo - helio``, both aberrated by the
     observatory's velocity relative to the Sun, ``helio_v - topo_v``
@@ -406,9 +431,10 @@ def check_elongation(files, tol_deg=ELONGATION_TOL_DEG):
     deg on ~100 of 8M rows in the 2026-11-16 delivery) would otherwise fail
     although its elongation is right; the detail reports how many rows
     differ from the same angle with ``topo``'s direction by more than
-    ``tol_deg``, for information. Read a part's row group at a time;
-    reports the rows checked and the largest difference."""
-    n_checked, n_bad, n_topo, worst, examples = 0, 0, 0, 0.0, []
+    ELONGATION_TOPO_INFO_DEG, for information. Read a part's row group at
+    a time; reports the rows checked and the largest difference, also as a
+    fraction of the row's tolerance."""
+    n_checked, n_bad, n_topo, worst, worst_frac, examples = 0, 0, 0, 0.0, 0.0, []
     vec = ELONGATION_COLUMNS[3:]
     for f in files:
         pf = pq.ParquetFile(f)
@@ -433,24 +459,30 @@ def check_elongation(files, tol_deg=ELONGATION_TOL_DEG):
             d[~np.isfinite(d)] = np.inf
             with np.errstate(invalid="ignore"):
                 n_topo += int(np.sum(~(np.abs(got - elongation_from_vectors(
-                    topo, helio, topo_v=topo_v, helio_v=helio_v)) <= tol_deg)))
+                    topo, helio, topo_v=topo_v, helio_v=helio_v)) <= ELONGATION_TOPO_INFO_DEG)))
             n_checked += len(d)
+            tol = elongation_tolerance_arcsec(topo, helio) / 3600
             if len(d):
                 worst = max(worst, float(d.max()))
-            bad = d > tol_deg
+                worst_frac = max(worst_frac, float((d / tol).max()))
+            bad = d > tol
             if bad.any():
                 n_bad += int(bad.sum())
                 rows = np.flatnonzero(has)
                 for i in np.flatnonzero(bad)[:N_EXAMPLES - len(examples)]:
-                    examples.append(f"{Path(f).name} row {first + rows[i]:,}: {got[i]:.6f} vs {want[i]:.6f}")
+                    examples.append(f"{Path(f).name} row {first + rows[i]:,}: {got[i]:.6f} vs {want[i]:.6f} "
+                                    f"(tolerance {tol[i] * 3600:.2f} arcsec)")
             del t
     detail = (f"{n_checked:,} rows with topo/helio vectors; max |elongation - apparent from (ra, dec) "
-              f"and the vectors| {worst:.3g} deg ({worst * 3600:.3g} arcsec); {n_topo:,} rows differ from "
-              f"the angle to topo by more than {tol_deg} deg (orbit residuals; not a failure)")
+              f"and the vectors| {worst:.3g} deg ({worst * 3600:.3g} arcsec), at most {worst_frac:.2f} of "
+              f"the row's tolerance; {n_topo:,} rows differ from the angle to topo by more than "
+              f"{ELONGATION_TOPO_INFO_DEG} deg (orbit residuals; not a failure)")
     if n_bad:
-        return CheckResult("elongation", False, f"{n_bad:,} rows differ by more than {tol_deg} deg; "
+        return CheckResult("elongation", False, f"{n_bad:,} rows differ by more than their tolerance; "
                            + detail + "; e.g. " + "; ".join(examples))
-    return CheckResult("elongation", True, detail + f"; within {tol_deg} deg")
+    return CheckResult("elongation", True,
+                       detail + f"; within the tolerance ({ELONGATION_TOL_FLOOR_ARCSEC:g} arcsec + "
+                       f"{ELONGATION_TOL_F32_FACTOR:g}x the vectors' float32 bound + light-time)")
 
 
 def _check_key(pf, keys, got, nrows, nullable=()):
