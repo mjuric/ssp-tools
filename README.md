@@ -384,7 +384,7 @@ Arguments:
 - `--hg12NSigmaClip` – reject points beyond this many sigma of an initial robust fit (default 10; `inf` to keep every point)
 - `--hg12FixedG12` – fix G12 to this value and fit only H (default: unset, G12 is fit)
 - `--hg12FiducialG12` – the G12 of the fixed-G12 refit where a band's slope fit fails (default: `--hg12FixedG12` if set, else 0.5, as in DP2)
-- `--hg12MinPhaseSpan` – a slope fit whose points span less than this phase angle (deg) fails (default 2)
+- `--hg12MinPhaseSpan` – a slope fit whose points span less than this phase angle (deg) fails (default 5)
 
 The tool performs:
 - Photometric fitting (H/G12 parameters) for each band (ugrizy). By default
@@ -395,12 +395,14 @@ The tool performs:
 - **Failed slope fits** (`{band}_slope_fit_failed`: "G12 fit failed in {band}
   band. G12 contains a fiducial value used to fit H."). A band's G12 fit fails
   when any of these holds:
-  1. the free G12 ends at a bound, within 1e-5 of 0 or 1;
+  1. the free G12 ends at a bound, within 1e-5 of 0 or 1, or at 0.2, the
+     corner of the G12 → (G1, G2) map, within 1e-5 (sparse low-phase fits
+     pile up there, and its `G12Err` is meaningless);
   2. the fit isn't invertible (JᵀJ singular): no finite result, or no
      finite `G12Err` with G12 inside (0, 1);
   3. fewer than 3 points are usable, or used after clipping (a band with
      fewer than 3 observations gets no free fit);
-  4. the points it uses span less than `--hg12MinPhaseSpan` (2°) in phase
+  4. the points it uses span less than `--hg12MinPhaseSpan` (5°) in phase
      angle.
 
   H is then refit with G12 fixed at the fiducial value (`--hg12FiducialG12`,

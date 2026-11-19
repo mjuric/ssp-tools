@@ -2,11 +2,11 @@
 
 Per object and band, an H/G12 fit of SSObservation's photometry (``fit_band``):
 a band's slope fit fails (``{band}_slope_fit_failed``) when the free G12
-ends at a bound, the fit isn't invertible, it uses fewer than 3 points, or
-its points span less than 2 deg in phase angle; H is then refit at a
-fiducial G12 (0.5). See ``compute_ssobject`` for the details. Every value
-is a function of the set of an object's SSObservation rows, whatever their
-order.
+ends at a bound or at the 0.2 corner, the fit isn't invertible, it uses
+fewer than 3 points, or its points span less than 5 deg in phase angle; H
+is then refit at a fiducial G12 (0.5). See ``compute_ssobject`` for the
+details. Every value is a function of the set of an object's SSObservation
+rows, whatever their order.
 
 SSObject is written (``write_ssobject``) with the Arrow schema derived from
 Felis (``ssobject_schema``): NaN, how the working array marks a value it has
@@ -109,11 +109,23 @@ FAIL_SINGULAR = 2     # J^T J singular: no finite result (other than FAIL_FEW), 
                       # non-finite G12Err with G12 inside (0, 1)
 FAIL_FEW = 4          # fewer than MIN_SLOPE_OBS usable points, or used (after clipping)
 FAIL_SPAN = 8         # the points used span less than minPhaseSpan in phase angle
-FAILURES = {"bound": FAIL_BOUND, "singular": FAIL_SINGULAR, "few": FAIL_FEW, "span": FAIL_SPAN}
+FAIL_CORNER = 16      # the free G12 ends at the 0.2 corner (within G12_BOUND_TOL)
+FAILURES = {"bound": FAIL_BOUND, "singular": FAIL_SINGULAR, "few": FAIL_FEW, "span": FAIL_SPAN,
+            "corner": FAIL_CORNER}
 
 #: A free G12 this close to 0 or 1 is at the bound: ~10x the bounded
 #: search's tolerance (its minima at a bound land within ~1e-6 of it).
 G12_BOUND_TOL = 1e-5
+#: The corner of the piecewise G12 -> (G1, G2) map (G3 peaks there). Free
+#: fits of sparse, low-phase data pile up on it (16.9% of River's r-band
+#: free fits), noise alone putting them there; its G12Err comes from a
+#: one-sided derivative and means nothing. A free G12 within G12_BOUND_TOL
+#: of it fails, as at a bound, and H is refit at the fiducial G12, which
+#: in simulations gives the better H in 65% of such cases (corner H is
+#: biased ~0.05 mag bright); cf. Vereš et al. 2015, Icarus 261, 34.
+#: (photfit._minimize_G12 checks 0.2 explicitly, so those minima land on
+#: it exactly.)
+G12_CORNER = 0.2
 #: The fewest points (after clipping) a slope fit may use.
 MIN_SLOPE_OBS = 3
 #: Fits clip outliers only if more than this many usable points are left
@@ -122,7 +134,10 @@ CLIP_MIN_OBS = 3
 #: The fiducial G12 of a failed slope fit (DP2's fixed value).
 FIDUCIAL_G12 = 0.5
 #: The smallest phase-angle span [deg] of the points a slope fit uses.
-MIN_PHASE_SPAN = 2.0
+#: In simulations, free fits (off the corner) over a 2-5 deg span recover
+#: G12 with a median error of 0.25, hardly better than a random guess
+#: (~0.29); 5-7.5 deg gives 0.22, 10-15 deg 0.13.
+MIN_PHASE_SPAN = 5.0
 
 
 def fit_band(
@@ -178,6 +193,8 @@ def fit_band(
         else:
             if min(res.G12, 1. - res.G12) <= G12_BOUND_TOL:
                 failures |= FAIL_BOUND
+            if abs(res.G12 - G12_CORNER) <= G12_BOUND_TOL:
+                failures |= FAIL_CORNER
             if res.nobs < MIN_SLOPE_OBS:
                 failures |= FAIL_FEW
             pa = phaseAngle[det["used"]]
@@ -355,13 +372,14 @@ def compute_ssobject(
         band. G12 contains a fiducial value used to fit H.") when:
 
         1. the free G12 ends at a bound, within G12_BOUND_TOL (1e-5) of
-           0 or 1;
+           0 or 1, or at the corner of the G12 -> (G1, G2) map, within
+           G12_BOUND_TOL of G12_CORNER (0.2);
         2. the fit isn't invertible (J^T J singular): no finite result,
            or no finite G12Err with G12 inside (0, 1);
         3. fewer than MIN_SLOPE_OBS (3) points are usable, or used after
            clipping;
         4. the points it uses span less than ``minPhaseSpan`` (default
-           2 deg) in phase angle.
+           5 deg) in phase angle.
 
         H is then refit with G12 fixed at ``fiducialG12`` (default
         ``fixedG12`` if set, else 0.5), clipping as the free fit does

@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 
 from ssp import photfit, ssobject
-from ssp.ssobject import (FAIL_BOUND, FAIL_FEW, FAIL_SINGULAR, FAIL_SPAN, compute_ssobject,
-                          fit_band)
+from ssp.ssobject import (FAIL_BOUND, FAIL_CORNER, FAIL_FEW, FAIL_SINGULAR, FAIL_SPAN,
+                          compute_ssobject, fit_band)
 
 from test_ssobject_parallel import _tables
 
@@ -68,6 +68,30 @@ def test_bound_tolerance(monkeypatch):
     assert fit_band(*data, **KW)["failures"] == FAIL_BOUND
     monkeypatch.setattr(photfit, "fitHG12", near(1 - 2 * ssobject.G12_BOUND_TOL))
     assert fit_band(*data, **KW)["failures"] == 0
+
+
+def test_corner():
+    # sparse, noisy points over 8 deg: the free fit sticks at the 0.2
+    # corner exactly, with a (meaningless) finite G12Err
+    data = _band(n=8, G12=0.15, lo=6.0, hi=14.0, seed=0, noise=0.03)
+    ref = photfit.fitHG12(*data, **KW)
+    assert ref.G12 == 0.2 and np.isfinite(ref.G12_err)
+    out = fit_band(*data, **KW)
+    assert out["failures"] == FAIL_CORNER
+    _assert_fallback(out, data)
+
+
+@pytest.mark.parametrize("dG,fails", [(-0.5, True), (0.5, True), (-2, False), (2, False)])
+def test_corner_tolerance(monkeypatch, dG, fails):
+    data = _band()
+    real = photfit.fitHG12
+
+    def fit(*a, **kw):
+        r = real(*a, **kw)
+        return r._replace(G12=ssobject.G12_CORNER + dG * ssobject.G12_BOUND_TOL) \
+            if kw.get("fixedG12") is None else r
+    monkeypatch.setattr(photfit, "fitHG12", fit)
+    assert fit_band(*data, **KW)["failures"] == (FAIL_CORNER if fails else 0)
 
 
 def test_singular(monkeypatch):
@@ -182,9 +206,10 @@ def test_fiducial_and_fixed():
     assert out["G12"] == 0.2 and out["H"] == ref.H and np.isnan(out["G12Err"])
 
 
-@pytest.mark.parametrize("case", ["bound", "few", "span", "good"])
+@pytest.mark.parametrize("case", ["bound", "few", "span", "corner", "good"])
 def test_fallback_is_order_independent(case):
     data = dict(bound=_band(G12=0.0, steep=0.01), few=_band(n=2), span=_band(n=12, lo=7.0, hi=8.0),
+                corner=_band(n=8, G12=0.15, lo=6.0, hi=14.0, seed=0, noise=0.03),
                 good=_band())[case]
     ref = fit_band(*data, **KW)
     rng = np.random.default_rng(3)
@@ -271,10 +296,18 @@ def test_span_is_of_the_points_used():
 
 def test_span_limit_is_strict():
     # points spanning exactly the limit pass; just under it, they fail
-    data = _band(n=20, lo=10.0, hi=12.0, noise=1e-4)
+    data = _band(n=20, lo=10.0, hi=15.0, noise=1e-4)
     out = fit_band(*data, **KW)
     assert out["failures"] == 0, out["failures"]
-    assert fit_band(*data, minPhaseSpan=np.nextafter(2.0, 3.0), **KW)["failures"] & FAIL_SPAN
+    assert fit_band(*data, minPhaseSpan=np.nextafter(5.0, 6.0), **KW)["failures"] & FAIL_SPAN
+
+
+def test_default_span_limit():
+    # the default MIN_PHASE_SPAN is 5 deg: 4.9 deg fails, 5.0 passes
+    assert ssobject.MIN_PHASE_SPAN == 5.0
+    out = fit_band(*_band(n=20, lo=10.0, hi=14.9, noise=1e-4), **KW)
+    assert out["failures"] == FAIL_SPAN and out["slope_fit_failed"]
+    assert fit_band(*_band(n=20, lo=10.0, hi=15.0, noise=1e-4), **KW)["failures"] == 0
 
 
 def test_magnitudes_are_float64_from_float32_flux():
