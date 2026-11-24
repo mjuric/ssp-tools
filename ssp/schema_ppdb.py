@@ -149,11 +149,11 @@ SSObservationDtype = np.dtype([
                                     # when trailFlux <= 0; computed on read. DiaSource (ppdb) trailMagErr;...
     ('trailRa', '<f8'),             # [deg] Right ascension of the trailed-model centroid, degrees. DiaSource
                                     # trailRa; no Source equivalent.
-    ('trailRaErr', '<f4'),          # [arcsec] Uncertainty of trailRa (of RA*cos(Dec)), arcsec. DiaSource
+    ('trailRaErr', '<f4'),          # [deg] Uncertainty of trailRa (of RA*cos(Dec)), degrees. DiaSource
                                     # trailRaErr (prompt and PPDB tables only); no Source equivalent.
     ('trailDec', '<f8'),            # [deg] Declination of the trailed-model centroid, degrees. DiaSource
                                     # trailDec; no Source equivalent.
-    ('trailDecErr', '<f4'),         # [arcsec] Uncertainty of trailDec, arcsec. DiaSource trailDecErr (prompt
+    ('trailDecErr', '<f4'),         # [deg] Uncertainty of trailDec, degrees. DiaSource trailDecErr (prompt
                                     # and PPDB tables only); no Source equivalent.
     ('trailLength', '<f4'),         # [arcsec] Maximum-likelihood trail length, arcsec. DiaSource
                                     # trailLength; no Source equivalent.

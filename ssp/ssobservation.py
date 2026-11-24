@@ -66,6 +66,10 @@ LINK_COLUMNS = ("obsid", "obssubid", "trksub", "trkid", "submission_id", "primar
 MEASURED_ON_COLUMNS = ("measuredOn", "processing", "processingTable")
 #: Block 4: the measurement, copied from dia_sources.parquet.
 MEASUREMENT_COLUMNS = _NAMES[_NAMES.index("visit"):_NAMES.index("glint_trail") + 1]
+#: Measurement columns that DiaSource holds in arcsec although the PPDB
+#: declares them in degrees (filled since visit 2026111100121; AP can't be
+#: changed): SSObservation has them in degrees, divided by 3600.
+ARCSEC_TO_DEG_COLUMNS = ("trailRaErr", "trailDecErr")
 #: The shutter-correction flags (docs/design/shutter-timing.md), copied
 #: with the corrected midpointMjdTai when dia_sources.parquet has the
 #: correction (all of SHUTTER_INPUT_COLUMNS). A dia_sources.parquet without
@@ -1190,6 +1194,8 @@ def build_ssobservation(input_dir, output_dir, max_objects=None, dia_sample_frac
                 pending[name] = arr
             if name in SSObservationDtype.names or name in SSOBSERVATION_INTERNAL_DTYPE:
                 columns[name] = cast_column(name, arr)
+            if name in ARCSEC_TO_DEG_COLUMNS:
+                columns[name] = pc.divide(columns[name], pa.scalar(3600, columns[name].type))
         del tbl
     if "matchMethod" not in internal_columns:
         pass

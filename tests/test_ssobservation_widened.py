@@ -543,6 +543,8 @@ def test_copied_columns(tmp_path, offline):
     sss, dia, _ = _build(tmp_path)
     s = _by_obsid(sss, dia["obsid"])
     for c in MEASUREMENT_COLUMNS + ssobservation.LINK_COLUMNS + ssobservation.MEASURED_ON_COLUMNS:
+        if c in ssobservation.ARCSEC_TO_DEG_COLUMNS:
+            continue                    # (converted: test_trail_errors_in_degrees)
         got = s[c].combine_chunks()
         if pa.types.is_dictionary(got.type):
             got = got.cast(pa.string())
@@ -550,6 +552,24 @@ def test_copied_columns(tmp_path, offline):
     # what isn't in SSObservationDtype is dropped
     for c in ssobservation.DIA_DROPPED:
         assert c not in sss.column_names
+
+
+def test_trail_errors_in_degrees(tmp_path, offline):
+    # DiaSource has trailRaErr/trailDecErr in arcsec; SSObservation in deg
+    sss, dia, _ = _build(tmp_path)
+    s = _by_obsid(sss, dia["obsid"])
+    assert ssobservation.ARCSEC_TO_DEG_COLUMNS == ("trailRaErr", "trailDecErr")
+    for c in ssobservation.ARCSEC_TO_DEG_COLUMNS:
+        got = s[c].combine_chunks()
+        assert got.type == pa.float32(), c
+        src = dia[c].combine_chunks()
+        assert np.array_equal(got.is_null().to_numpy(zero_copy_only=False),
+                              src.is_null().to_numpy(zero_copy_only=False)), c
+        ok = src.is_valid().to_numpy(zero_copy_only=False)
+        assert ok.any() and (~ok).any(), c                  # (both present)
+        g = got.to_numpy(zero_copy_only=False)[ok].astype(np.float64)
+        want = src.to_numpy(zero_copy_only=False)[ok] / 3600
+        np.testing.assert_allclose(g, want, rtol=2**-23, equal_nan=True, err_msg=c)
 
 
 def test_copied_nan_stays_nan_and_null_stays_null(tmp_path, offline):
