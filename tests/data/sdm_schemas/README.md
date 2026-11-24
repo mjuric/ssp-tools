@@ -1,6 +1,7 @@
 Copies of `lsst/sdm_schemas`' `python/lsst/sdm/schemas/sso_base.yaml` and `ppdb.yaml` from branch `tickets/DM-55375` (commit d6e8100; PR lsst/sdm_schemas#549): RFC-1188's SSObservation and NearbySSO, and the PPDB's Solar System tables, which `ppdb.yaml` takes from `sso_base.yaml` by `columnRefs`.
 
 - The SSObservation tests and the delivery checks read them.
+- **Deliberate local difference:** SSObservation `trailRaErr` and `trailDecErr` are in `deg` here (unit and description), not upstream's `arcsec`. DiaSource holds these two in arcsec although the PPDB declares them in degrees, and the build divides them by 3600 (`ssp.ssobservation.ARCSEC_TO_DEG_COLUMNS`). Upstream is to be changed to match; until then, re-apply this change after a refresh.
 - `ssp/schema_ppdb.py` was generated from `sso_base.yaml` (SSObservation, NearbySSO and SSObject).
 - Refresh all three when the schema changes:
 
