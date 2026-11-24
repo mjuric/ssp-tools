@@ -21,5 +21,12 @@ def test_inputs_and_steps():
     assert set(C.REQUIRED_INPUT_COLUMNS) == set(C.INPUT_FILES)
     assert set(C.MPC_SNAPSHOT) <= set(C.INPUT_FILES)
     assert C.BUILD_STEPS[-1] == "check"
-    assert C.UPLOAD_MESSAGE_FIELDS == ("bucket", "object_prefix", "uploaded_tables")
+    # dax_ppdb bigquery/sso/uploader.py and manifest.py (ec576a6)
+    assert C.UPLOAD_MESSAGE_FIELDS == ("bucket", "object_prefix")
+    assert (C.UPLOAD_TOPIC, C.UPLOAD_RESULT_SUBSCRIPTION) == ("load-sso-topic", "load-sso-result-sub")
+    assert C.UPLOAD_MANIFEST_FILE == "manifest.json"
+    assert C.UPLOAD_PART_FORMAT.format(3) == "part-00003.parquet"
+    assert C.UPLOAD_MANIFEST_FIELDS == ("uploaded_at", "tables")
+    assert C.UPLOAD_MANIFEST_ENTRY_FIELDS == ("row_count", "checksum", "size_bytes", "source_path")
+    assert not hasattr(C, "UPLOAD_DIR") and not hasattr(C, "UPLOAD_SSOBSERVATION_FILE")
     assert sorted(C.UPLOAD_TABLE_ORDER) == sorted(C.DELIVERY_TABLES)

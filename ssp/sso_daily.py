@@ -42,8 +42,14 @@ bin/), then on PATH. The first that fails stops the run, and its exit
 status is the wrapper's (128+N for a stage killed by signal N). Every
 command, its duration and its exit status are appended to DAY/daily.log.
 
-Run it at most once per load window when uploading: the loader silently
-drops an upload made while its previous load is still running (see
+The upload's exit status is passed through like any other stage's,
+including ssp-upload-sso's own codes (ssp.delivery_contract): 3
+(UPLOAD_EXIT_LOAD_FAILED), the load failed; 4 (UPLOAD_EXIT_LOAD_TIMEOUT),
+no load result within the wait (published; it may still load). daily.log
+names the stage that failed.
+
+Run it at most once per load window when uploading: the loader runs one
+load at a time, and the PPDB's docs say not to upload during a load (see
 ssp.sso_upload).
 """
 
