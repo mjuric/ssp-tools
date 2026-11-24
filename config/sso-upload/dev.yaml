@@ -1,15 +1,16 @@
 # ssp-upload-sso config: the PPDB dev environment (DM-55678).
 # From DM-55678 and lsst/idf_deploy environment/deployments/ppdb/services/
 # (gcs.tf: bucket "ppdb-${environment}-sso-ingest"; pubsub.tf: topic
-# "load-sso-topic"; the project is the ppdb project_factory's project_id).
+# "load-sso-topic" and subscription "load-sso-result-sub", fixed names in
+# dax_ppdb; the project is the ppdb project_factory's project_id).
 # Credentials: Google application-default credentials, intended to be the
 # sso-uploader service account (idf_deploy services/sso-uploader.tf:
-# roles/storage.objectUser on the bucket, roles/pubsub.publisher on the topic).
+# roles/storage.objectUser on the bucket, roles/pubsub.publisher on the topic,
+# roles/pubsub.subscriber on the result subscription).
 bucket_name: ppdb-dev-sso-ingest
-topic: load-sso-topic
-project: ppdb-dev-5c07          # the Pub/Sub topic's project
-# The complete set: the six tables of dax_ppdb's SSO_TABLES (DM-55375),
-# uploaded in that order whatever the order here. Uploading a subset needs
+project: ppdb-dev-5c07          # the Pub/Sub topic's and subscription's project
+# The complete set: the six tables of dax_ppdb's SSO_TABLES, uploaded in
+# that order whatever the order here. Uploading a subset needs
 # --allow-partial.
 tables:
   - SSObservation
