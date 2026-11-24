@@ -202,3 +202,13 @@ Avoid the daily build window. Never upload while another load runs.
 | mpc_orbits | 1,593,987 |
 | current_identifications | 2,118,484 |
 | numbered_identifications | 896,611 |
+
+**The prod upload** (owner's separate OK, 2026-11-23):
+- **Inputs:** the same 2026-11-23 delivery, from its own scratch copy at `/sdf/data/rubin/user/mjuric/scratch/sso-prod-upload/run`. The `sso-uploader@ppdb-prod-84a4` key.
+- **Target:** `ppdb-prod-sso-ingest`, prefix `20261124T042132401`; 11 parts in 6 tables, then `manifest.json`.
+- **Transfer:** 52 s. The chunked parts went at 160–350 MB/s.
+- **Totals:** 182 s wall clock, 1.2 GB peak memory.
+- **Message** 23458234086852019.
+- **Load:** succeeded after a 113.7 s wait, job `load_sso_replace_0a1749b8-63f2-4c88-91e5-7b1bdbc9bcaf`. Its transaction asserts each table's row count against the manifest, so the counts are the delivery's.
+- **No external check yet:** there is no prod PPDB TAP. `https://data.lsst.cloud/api/ppdbtap` returns 404, and data.lsst.cloud's discovery lists no `ppdbtap`. Its configuration is DM-57203, lsst-sqre/phalanx#7433, still open on 2026-11-23. Check prod's row counts once it's live.
+- **A possible error in that PR:** its BigQuery project is `ppdb-prod`, while the PPDB's prod project ID is `ppdb-prod-84a4` (int's config uses `ppdb-int-6c62`).
