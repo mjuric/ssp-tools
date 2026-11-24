@@ -104,7 +104,10 @@ upload differs:
   (SIGKILL, power loss) can leave an incomplete multipart upload. The
   bucket has no AbortIncompleteMultipartUpload lifecycle rule (only a
   30-day Delete rule, idf_deploy services/gcs.tf), so it must be aborted by
-  hand (docs/runbooks/sso-daily.md).
+  hand (docs/runbooks/sso-daily.md). And if the multipart upload's
+  completion landed but the library still raised, the part is a complete
+  object that is neither deleted nor listed in any manifest: delete it by
+  hand (the bucket's 30-day rule also removes it).
 - Interrupts: the library joins its thread pool, so a first Ctrl-C (or a
   failed part) waits for the parts already queued to finish before the
   abort and cleanup run; a second Ctrl-C stops at once (and may leave an
@@ -891,8 +894,16 @@ def _upload_one(bucket, bucket_name, name, written, precondition_failed, path=No
     """Upload a file (``path``) or the manifest (``data``) to ``name`` in one
     stream with if_generation_match=0. ``name`` is added to ``written``
     before the call: a call that fails (or is interrupted) after GCS took
-    the object may still have written it. A PreconditionFailed means the
-    object is someone else's: it is taken off ``written`` again."""
+    the object may still have written it.
+
+    A PreconditionFailed (412) may be our own write: the client retries,
+    and a retry after a first write that landed (its response lost) finds
+    the object there. The prefix was checked empty just before, so the
+    object is compared with ours (_is_ours): if it is ours, the write
+    succeeded; if it isn't, it is someone else's, taken off ``written``
+    (never deleted), and the upload fails. If the comparison itself fails,
+    the object stays in ``written`` (it can't be shown not to be ours) and
+    the upload fails."""
     uri = f"gs://{bucket_name}/{name}"
     written.append(name)
     try:
@@ -903,10 +914,43 @@ def _upload_one(bucket, bucket_name, name, written, precondition_failed, path=No
         else:
             blob.upload_from_string(data, content_type="application/json", if_generation_match=0)
     except precondition_failed as e:
+        try:
+            ours = _is_ours(bucket, name, path=path, data=data)
+        except Exception as e2:
+            raise SSOUploadError(f"{uri} already exists (412), and it can't be compared with "
+                                 f"{path or 'the manifest'} ({e2!r}); treating it as this upload's") from e
+        if ours:
+            _LOG.warning("%s: a 412 on a retry, but the object is ours (a first write landed); "
+                         "keeping it", uri)
+            return
         written.remove(name)
-        raise SSOUploadError(f"{uri} already exists; a naming collision for this upload prefix") from e
+        raise SSOUploadError(f"{uri} already exists and isn't ours; a naming collision for this "
+                             "upload prefix") from e
     except Exception as e:      # GoogleAPIError, GoogleAuthError, OSError, ...
         raise SSOUploadError(f"failed to upload {path or 'the manifest'} to {uri}: {e!r}") from e
+
+
+def _is_ours(bucket, name, path=None, data=None):
+    """Whether the object ``name`` is the file ``path`` (size and md5) or
+    the manifest ``data`` (its bytes). Raises if it can't be told."""
+    blob = bucket.blob(name)
+    if path is None:
+        want = data.encode() if isinstance(data, str) else data
+        return blob.download_as_bytes() == want
+    blob.reload()
+    if blob.md5_hash is None:
+        raise SSOUploadError(f"{name} has no MD5 to compare")
+    return blob.size == Path(path).stat().st_size and blob.md5_hash == _md5_b64(path)
+
+
+def _md5_b64(path, bufsize=1 << 22):
+    """A file's md5 as GCS gives it (``Blob.md5_hash``): base64 of the
+    digest."""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while chunk := f.read(bufsize):
+            h.update(chunk)
+    return base64.b64encode(h.digest()).decode("ascii")
 
 
 def _cleanup(bucket, bucket_name, names):
@@ -978,7 +1022,11 @@ def wait_for_load(project, object_prefix, timeout_s=WAIT_TIMEOUT_S, pull_timeout
                 response = subscriber.pull(subscription=sub, max_messages=PULL_MAX_MESSAGES,
                                            timeout=min(remaining, pull_timeout_s))
             except DeadlineExceeded:
-                continue            # nothing during this pull
+                # nothing during this pull; never spin on one that returns
+                # at once
+                if _monotonic() - t_pull < 1:
+                    _sleep(min(1.0, max(0.0, deadline - _monotonic())))
+                continue
             except Exception as e:
                 _LOG.error("can't read the load results from %s: %r", sub, e)
                 return done("timeout", error=f"can't read the load results from {sub}: {e!r}")

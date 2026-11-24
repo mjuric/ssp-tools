@@ -2,6 +2,7 @@
 
 The contract is the PPDB team's manifest upload (dax_ppdb DM-56960;
 docs/design/sso-upload-manifest.md)."""
+import base64
 import concurrent.futures
 import hashlib
 import itertools
@@ -106,12 +107,19 @@ class FakeBlob:
             raise self.store.exists_exc
         return self.name in self.store.objects
 
+    def download_as_bytes(self):
+        self.store.calls.append(("download", self.name))
+        if self.store.download_exc:
+            raise self.store.download_exc
+        return self.store.objects[self.name]
+
     def reload(self):
         self.store.calls.append(("reload", self.name))
         if self.store.reload_exc:
             raise self.store.reload_exc
         data = self.store.objects[self.name]
         self.size, self.crc32c = len(data), _crc32c(data)
+        self.md5_hash = base64.b64encode(hashlib.md5(data).digest()).decode()
         self.generation = self.store.generation(self.name)
         if self.store.after_reload:
             self.store.after_reload(self)
@@ -143,7 +151,7 @@ class FakeStorage:
     def __init__(self):
         self.objects, self.calls, self.buckets, self.lists = _Objects(), [], [], []
         self.fail_on, self.fail_delete, self.content_types = {}, set(), {}
-        self.exists_exc = self.reload_exc = self.after_reload = self.list_exc = None
+        self.exists_exc = self.reload_exc = self.after_reload = self.list_exc = self.download_exc = None
         self.delete_generations = []
 
     def generation(self, name):
@@ -254,6 +262,9 @@ class FakeSubscriber:
             self.clock.t += timeout
             raise DeadlineExceeded("no message")
         step = self.script.pop(0)
+        if isinstance(step, tuple) and isinstance(step[0], BaseException):     # (exc, seconds)
+            self.clock.t += step[1]
+            raise step[0]
         if isinstance(step, BaseException):
             self.clock.t += 1
             raise step
@@ -908,6 +919,84 @@ def test_failure_on_any_object_cleans_up(fakes, tmp_path, fixed_prefix, k, how):
     assert "upload" not in report(run) and fakes.sub.pulls == []
 
 
+def _theirs_after_the_prefix_check(st, monkeypatch, name):
+    """An object of someone else's appears at ``name`` just after the
+    prefix check."""
+    orig = FakeBucket.list_blobs
+
+    def then_theirs(self, prefix=None, max_results=None):
+        out = orig(self, prefix, max_results)
+        st.objects[name] = b"someone else's"
+        return out
+    monkeypatch.setattr(FakeBucket, "list_blobs", then_theirs)
+
+
+#: A single-stream part (NearbySSO) and the manifest.
+RETRIED = (f"{PREFIX}/NearbySSO/part-00000.parquet", f"{PREFIX}/manifest.json")
+
+
+@pytest.mark.parametrize("name", RETRIED)
+def test_412_on_a_retry_of_our_own_write(fakes, tmp_path, fixed_prefix, name, caplog):
+    """Our first write landed, its response was lost, the client's retry got
+    a 412: the object is ours (same bytes), so the write succeeded."""
+    from google.api_core.exceptions import PreconditionFailed
+    st, pub = fakes.st, fakes.pub
+    run = make_run(tmp_path)
+    st.fail_on[name] = ("after-write", PreconditionFailed("retry found it"))
+    rec = U.run("dev", run)
+    assert sorted(st.objects) == sorted(objects_of(PREFIX)) and st.deletes() == []
+    assert rec["published"] is True and len(pub.published) == 1
+    assert "the object is ours" in caplog.text
+    assert ("download" if name.endswith("manifest.json") else "reload", name) in st.calls
+
+
+@pytest.mark.parametrize("name", RETRIED)
+def test_412_ours_then_a_later_failure_cleans_it_up(fakes, tmp_path, fixed_prefix, monkeypatch, name):
+    """A write accepted as ours after a 412 is deleted by a later failure,
+    the manifest included: no manifest is left without its parts."""
+    from google.api_core.exceptions import PreconditionFailed, ServiceUnavailable
+    st = fakes.st
+    monkeypatch.setattr(U, "_publisher_client", lambda: FakePublisher(publish_exc=ServiceUnavailable("x")))
+    run = make_run(tmp_path)
+    st.fail_on[name] = ("after-write", PreconditionFailed("retry found it"))
+    with pytest.raises(U.SSOUploadError, match="failed to publish"):
+        U.run("dev", run)
+    assert st.objects == {}
+    assert st.deletes() == [f"{PREFIX}/manifest.json"] + part_objects(PREFIX)
+
+
+@pytest.mark.parametrize("name", RETRIED)
+def test_412_on_someone_elses_object(fakes, tmp_path, fixed_prefix, monkeypatch, name):
+    """A 412 on an object that isn't ours: a real collision. It is left
+    alone, ours are deleted, nothing is published."""
+    st, pub = fakes.st, fakes.pub
+    run = make_run(tmp_path)
+    _theirs_after_the_prefix_check(st, monkeypatch, name)
+    with pytest.raises(U.SSOUploadError, match="already exists and isn't ours"):
+        U.run("dev", run)
+    assert st.objects == {name: b"someone else's"}
+    assert name not in st.deletes() and pub.published == []
+    names = objects_of(PREFIX)
+    assert st.deletes() == names[:names.index(name)]
+
+
+@pytest.mark.parametrize("name", RETRIED)
+def test_412_that_cant_be_compared_is_treated_as_ours(fakes, tmp_path, fixed_prefix, name):
+    """The comparison fails: the object can't be shown not to be ours (the
+    prefix was empty), so it is cleaned up with the rest."""
+    from google.api_core.exceptions import PreconditionFailed, ServiceUnavailable
+    st, pub = fakes.st, fakes.pub
+    run = make_run(tmp_path)
+    st.fail_on[name] = ("after-write", PreconditionFailed("retry found it"))
+    st.reload_exc = st.download_exc = ServiceUnavailable("can't read it")
+    with pytest.raises(U.SSOUploadError, match="can't be compared"):
+        U.run("dev", run)
+    assert st.objects == {} and pub.published == []
+    assert name in st.deletes()
+    if name.endswith("manifest.json"):
+        assert st.deletes()[0] == name
+
+
 @pytest.mark.parametrize("exc", ["auth", "other"])
 def test_any_upload_error_is_wrapped(fakes, tmp_path, fixed_prefix, exc):
     from google.auth.exceptions import RefreshError
@@ -1166,6 +1255,15 @@ def test_wait_deadline_exceeded_then_result(fakes, tmp_path, fixed_prefix):
     fakes.sub.script = [DeadlineExceeded("nothing"), ours()]
     assert U.main(["dev", str(run)]) == 0
     assert len(fakes.sub.pulls) == 2
+
+
+def test_wait_never_spins_on_deadline_exceeded(fakes, tmp_path, fixed_prefix):
+    """A pull that raises DeadlineExceeded at once is spaced out too."""
+    from google.api_core.exceptions import DeadlineExceeded
+    run = make_run(tmp_path)
+    fakes.sub.script = [(DeadlineExceeded("at once"), 0.0)] * 3 + [ours()]
+    assert U.main(["dev", str(run)]) == 0
+    assert fakes.clock.slept == [1.0, 1.0, 1.0]
 
 
 def test_wait_never_spins(fakes, tmp_path, fixed_prefix):
