@@ -48,7 +48,7 @@ Both buckets exist. `storage.buckets.get` isn't granted, and isn't needed.
 | Parallel threshold | **`PARALLEL_MIN_BYTES` from 1 GiB to 128 MiB.** The four big SSObservation parts (0.87 GB each), `mpc_orbits` and NearbySSO go as parallel chunks (64 MiB × 16 threads, as measured in `sso-upload-parallel.md`). |
 | Waiting for the load | **Wait by default, for 5 minutes** (dax_ppdb's default), with `--wait-timeout S` and `--no-wait`. A failed load or a timeout exits non-zero, with distinct codes. |
 | Prod key | Read-only checks with `~/.ppdb-prod.google.token` (through `GOOGLE_APPLICATION_CREDENTIALS`, never printed) are allowed. A real prod upload needs a separate OK after int works. |
-| The design | *Pending approval.* |
+| The design | Approved (2026-11-23). |
 
 ## Outputs
 
