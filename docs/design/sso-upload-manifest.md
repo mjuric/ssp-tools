@@ -172,3 +172,33 @@ Avoid the daily build window. Never upload while another load runs.
 - **Merge** the branch to master with the owner's approval, then tell ssp-daily the commit to pin. The daily run's upload stays off (2026-10-11) until the owner decides otherwise.
 
 **Open, outside this work:** the 2026-11-14 int objects under the old layout expire under the bucket's 30-day rule, with nothing to do.
+
+## Results (2026-11-23)
+
+**The build.** WP-M, reviewed independently, fixed (ad35db4) and merged into `sso-manifest-upload` through PR #130 (c77abd8).
+- **Full suite:** 1608 passed, 1 skipped. The skip is the dax_ppdb-model test, since the venv has no pydantic; it passes with pydantic installed.
+- **Review findings, both fixed:**
+  - a 412 on a retried write of our own is now compared with ours (md5, or the manifest's bytes) before deciding whose it is;
+  - the wait no longer spins on an instant DeadlineExceeded.
+- **Documented:** a chunked part whose completion landed although the library raised is left as an orphan.
+
+**The manifest against the stack.** The dry run's `manifest.json` validates with dax_ppdb main's (ec576a6) own `sso.Manifest`, loaded from its source. dax_ppdb's `FileEntry.from_path` on SSObject and on SSObservation part 5 gives entries equal to ours.
+
+**The int upload** (owner's OK, 2026-11-23):
+- **Inputs:** the 2026-11-23 delivery, run from a scratch copy at `/sdf/data/rubin/user/mjuric/scratch/sso-int-upload/run` (`report.json` copied, delivery symlinked), so the production run directory isn't written. The `sso-uploader@ppdb-int-6c62` key.
+- **Prefix:** `20261124T040833029`; 11 parts in 6 tables, then `manifest.json`.
+- **Transfer:** 99 s. The chunked parts went at 68–269 MB/s (`mpc_orbits` 2.3 GB in 10.2 s); the single-stream parts at 4–11 MB/s.
+- **Totals:** 209 s wall clock, 1.2 GB peak memory, of which the md5, SHA-256 and row checks took about 20 s.
+- **Message** 22660230775866119.
+- **Load:** succeeded after a 93.6 s wait, job `load_sso_replace_9e7f115b-8935-408a-af0f-81151070ec8c`.
+
+**int's row counts** (data-int TAP, serial sync `COUNT(*)`), all equal to the delivery:
+
+| table | rows |
+|---|---|
+| SSObservation | 8,223,440 |
+| NearbySSO | 4,248,257 |
+| SSObject | 307,231 |
+| mpc_orbits | 1,593,987 |
+| current_identifications | 2,118,484 |
+| numbered_identifications | 896,611 |
