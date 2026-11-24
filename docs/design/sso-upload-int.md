@@ -1,5 +1,7 @@
 # ssp-upload-sso: the PPDB loader's layout, all six tables, and int
 
+> **Superseded** by [`sso-upload-manifest.md`](sso-upload-manifest.md) (2026-11-23): the PPDB's loader now reads a manifest and per-table parts, so the one-object-per-table layout and the combined SSObservation described here are gone.
+
 ## Context
 
 `ssp-upload-sso` (`ssp/sso_upload.py`, `docs/design/sso-delivery.md`) uploads a checked delivery to the PPDB's SSO ingestion (DM-55678). It was written before the PPDB side accepted NearbySSO and before anything was loaded in int. The owner is about to test a real upload to int, so it must match what the PPDB side does today.

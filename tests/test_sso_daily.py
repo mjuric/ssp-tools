@@ -79,10 +79,16 @@ def test_build_failure_skips_upload(stubs, tmp_path, monkeypatch):
     assert [c.split()[0] for c in stubs()] == [D.EXTRACT, D.BUILD]
 
 
-def test_upload_failure_is_the_exit_status(stubs, tmp_path, monkeypatch):
-    fail(monkeypatch, D.UPLOAD, 1)
-    assert D.main([str(tmp_path / "w"), "--upload", "dev", "--stamp", "a"]) == 1
+@pytest.mark.parametrize("rc", [1, 3, 4])
+def test_upload_failure_is_the_exit_status(stubs, tmp_path, monkeypatch, rc):
+    """ssp-upload-sso's codes pass through: 1 refused or failed, 3 the load
+    failed, 4 no load result within the wait."""
+    from ssp.delivery_contract import UPLOAD_EXIT_LOAD_FAILED, UPLOAD_EXIT_LOAD_TIMEOUT
+    assert (UPLOAD_EXIT_LOAD_FAILED, UPLOAD_EXIT_LOAD_TIMEOUT) == (3, 4)
+    fail(monkeypatch, D.UPLOAD, rc)
+    assert D.main([str(tmp_path / "w"), "--upload", "dev", "--stamp", "a"]) == rc
     assert [c.split()[0] for c in stubs()] == [D.EXTRACT, D.BUILD, D.UPLOAD]
+    assert f"upload: exit {rc}" in (tmp_path / "w" / "a" / "daily.log").read_text()
 
 
 def test_ssobservation_options_passed_to_build(stubs, tmp_path):

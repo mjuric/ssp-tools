@@ -179,66 +179,92 @@ REPORT_FIELDS = {
     "checks": "{check: {status: 'PASS'|'FAIL', report}}",
     "deliverable": "true only if every step and check passed; stage 3 refuses otherwise",
     "upload": "set by stage 3: {config, bucket, object_prefix, tables, message_id, dry_run, published, "
-              "utc, ssobservation, parallel}; ssobservation is the combined file uploaded as "
-              "SSObservation.parquet: "
-              "{file, rows, bytes, md5, manifest_md5} (UPLOAD_SSOBSERVATION_*); error, when the "
-              "publish wasn't confirmed (published null: the objects are kept); parallel, the chunked "
-              "uploads: {chunk_bytes, workers, min_bytes, tables} (null with --no-parallel)",
+              "utc, parallel, manifest, load}; manifest is the upload manifest written (for a dry run, "
+              "planned): {uploaded_at, tables: {Table: {part-NNNNN.parquet: {row_count, checksum "
+              "(SHA-256 hex), size_bytes, source_path}}}} (UPLOAD_MANIFEST_*); load is the load's "
+              "result, {status (UPLOAD_LOAD_STATUSES), job_id (succeeded) | error (failed; also a "
+              "timeout whose results couldn't be read), waited_s}, null while a published upload waits "
+              "for it; error, when the publish wasn't confirmed (published null: the objects are "
+              "kept); parallel, the chunked uploads: {chunk_bytes, workers, min_bytes, tables, parts} "
+              "(null with --no-parallel)",
 }
 
 # --------------------------------------------------------------------------
-# Stage 3: the upload (DM-55678 contract; mirrors lsst/dax_ppdb
-# bigquery/sso_uploader.py, tickets/DM-55375; docs/design/sso-upload-int.md)
+# Stage 3: the upload (DM-55678; the PPDB team's manifest contract, DM-56960:
+# lsst/dax_ppdb bigquery/sso/{uploader,manifest,loader}.py at ec576a6;
+# docs/design/sso-upload-manifest.md)
 # --------------------------------------------------------------------------
 #
 # Config (YAML; config/sso-upload/<env>.yaml):
 #   bucket_name: ppdb-int-sso-ingest
-#   topic: load-sso-topic
-#   project: ppdb-int-6c62          # the Pub/Sub topic's project
+#   project: ppdb-int-6c62          # of the topic and the subscription
 #   tables: [...]                   # optional; default UPLOAD_TABLE_ORDER
 #   parallel: true                  # optional; default true (--no-parallel)
-# Credentials: Google application-default credentials (the sso-uploader
-# service account: object-user access to the bucket, publish access to the
-# topic), e.g. GOOGLE_APPLICATION_CREDENTIALS pointing at its key.
+# The topic and the result subscription are fixed (UPLOAD_TOPIC,
+# UPLOAD_RESULT_SUBSCRIPTION); an old config's "topic" key is accepted only
+# if it is UPLOAD_TOPIC. Credentials: Google application-default credentials
+# (the sso-uploader service account: object-user access to the bucket,
+# publish access to the topic, subscriber access to the subscription), e.g.
+# GOOGLE_APPLICATION_CREDENTIALS pointing at its key.
 #
-# One object per table: the loader (lsst-dm/ppdb-cloud-functions load_sso)
-# reads exactly gs://<bucket>/<prefix>/<Table>.parquet. SSObservation's
-# manifest-listed parts are combined, after their md5 checks, into
-# RUN_DIR/UPLOAD_DIR/UPLOAD_SSOBSERVATION_FILE (the parts' schema, zstd, one
-# row group per part row group), with UPLOAD_SSOBSERVATION_RECORD next to it
-# ({file, rows, bytes, md5, manifest_md5}); it is kept, and reused only while
-# the record's manifest_md5 is the report's and the file's size and md5
-# match. It is uploaded as SSObservation.parquet. No manifest, part or
-# sidecar is ever uploaded.
+# Layout: a fresh prefix per upload, UPLOAD_PREFIX_FORMAT of the UTC time
+# with milliseconds (datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")[:-3]),
+# refused if any object is under it already. Each table's files go to
+# <prefix>/<Table>/UPLOAD_PART_FORMAT, numbered from 0 per table, the
+# tables in UPLOAD_TABLE_ORDER: one part for a single-file table, and one
+# per delivery part for SSObservation, in its manifest's (sorted) order.
+# No sidecar and no SSObservation manifest is ever uploaded. By default
+# (parallel; opt out with --no-parallel or parallel: false) a file of at
+# least ssp.sso_upload.PARALLEL_MIN_BYTES (128 MiB) goes as an XML multipart
+# upload in chunks over parallel streams (docs/design/sso-upload-parallel.md):
+# its object has a CRC32C, checked against the local file's, and no MD5; GCS
+# refuses preconditions on multipart uploads, so it is never-overwrite by a
+# check just before the upload plus the fresh prefix. Every other file goes
+# in one stream with if_generation_match=0 (never overwrite).
 #
-# Upload: a fresh prefix per upload, UPLOAD_PREFIX_FORMAT of the UTC time
-# with milliseconds (datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")[:-3]);
-# the tables in UPLOAD_TABLE_ORDER. By default (parallel; opt out with
-# --no-parallel or parallel: false) a file of at least PARALLEL_MIN_BYTES
-# goes as an XML multipart upload in chunks over parallel streams
-# (docs/design/sso-upload-parallel.md): its object has a CRC32C, checked
-# against the local file's, and no MD5; GCS refuses preconditions on
-# multipart uploads, so it is never-overwrite by a check just before the
-# upload plus the fresh prefix. Every other file goes in one stream with
-# if_generation_match=0 (never overwrite). On any failure, delete what this
-# upload wrote (and abort its incomplete multipart uploads) and fail. Then
-# publish one Pub/Sub message, JSON, exactly dax_ppdb SSOUploader's:
-#   {"bucket": <bucket>, "object_prefix": <prefix>,
-#    "uploaded_tables": [<Table>, ...]}   (in UPLOAD_TABLE_ORDER)
-# --no-publish uploads and stops before the message (no load starts; the
-# objects are kept; the record has published: false).
+# Then <prefix>/UPLOAD_MANIFEST_FILE, last, with if_generation_match=0, so
+# that its presence means the upload is complete: JSON, exactly dax_ppdb's
+# sso.Manifest (extra="forbid"; UPLOAD_MANIFEST_FIELDS,
+# UPLOAD_MANIFEST_ENTRY_FIELDS):
+#   {"uploaded_at": <ISO 8601 UTC>,
+#    "tables": {<Table>: {"part-00000.parquet": {"row_count": >= 1,
+#        "checksum": <SHA-256 hex>, "size_bytes": >= 1,
+#        "source_path": <absolute local path>}, ...}, ...}}
+# row_count comes from the file's Parquet metadata and must equal the
+# report's (per SSObservation part, its manifest's). A file with 0 rows
+# refuses the whole upload. On any failure up to the hand-over of the
+# message, delete what this upload wrote (the manifest first; and abort its
+# incomplete multipart uploads) and fail. Then publish one Pub/Sub message
+# to projects/<project>/topics/UPLOAD_TOPIC, JSON, exactly dax_ppdb's:
+#   {"bucket": <bucket>, "object_prefix": <prefix>}   (UPLOAD_MESSAGE_FIELDS)
+# and (unless --no-wait) wait for the load's result on
+# projects/<project>/subscriptions/UPLOAD_RESULT_SUBSCRIPTION, JSON
+# {object_prefix, status: succeeded | failed, job_id | error}; every message
+# pulled is acknowledged, and other prefixes' results are skipped.
+# --no-publish uploads the parts and the manifest and stops before the
+# message (no load starts; the objects are kept; the record has
+# published: false).
+#
+# Exit status of ssp-upload-sso (and of ssp-sso-daily --upload, which passes
+# it through): 0 loaded, or no wait asked for; 1 refused or failed;
+# UPLOAD_EXIT_LOAD_FAILED; UPLOAD_EXIT_LOAD_TIMEOUT (no result within the
+# wait: published, and it may still load).
 UPLOAD_PREFIX_FORMAT = "%Y%m%dT%H%M%S%f"   # then [:-3]: milliseconds
-UPLOAD_MESSAGE_FIELDS = ("bucket", "object_prefix", "uploaded_tables")
+UPLOAD_PART_FORMAT = "part-{:05d}.parquet"
+UPLOAD_MANIFEST_FILE = "manifest.json"
+UPLOAD_MANIFEST_FIELDS = ("uploaded_at", "tables")
+UPLOAD_MANIFEST_ENTRY_FIELDS = ("row_count", "checksum", "size_bytes", "source_path")
+UPLOAD_MESSAGE_FIELDS = ("bucket", "object_prefix")
+UPLOAD_TOPIC = "load-sso-topic"
+UPLOAD_RESULT_SUBSCRIPTION = "load-sso-result-sub"
+UPLOAD_LOAD_STATUSES = ("succeeded", "failed", "timeout", "not_waited")
+UPLOAD_EXIT_LOAD_FAILED = 3
+UPLOAD_EXIT_LOAD_TIMEOUT = 4
 
-#: dax_ppdb's SSO_TABLES order (tickets/DM-55375), which
-#: SSOUploader.from_directory uploads and lists in: the upload order.
+#: dax_ppdb's SSO_TABLES order (bigquery/schema/constants.py): the upload
+#: order, and the manifest's.
 UPLOAD_TABLE_ORDER = ("SSObservation", "NearbySSO", "SSObject",
                       "mpc_orbits", "current_identifications", "numbered_identifications")
-
-#: Where stage 3 keeps the combined SSObservation (RUN_DIR/UPLOAD_DIR).
-UPLOAD_DIR = "upload"
-UPLOAD_SSOBSERVATION_FILE = "SSObservation.parquet"
-UPLOAD_SSOBSERVATION_RECORD = "SSObservation.json"
 
 
 def delivery_schema(schema_dir=SCHEMA_DIR):

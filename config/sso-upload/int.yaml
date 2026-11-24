@@ -1,25 +1,25 @@
 # ssp-upload-sso config: the PPDB int environment (DM-55678).
 #
-# Source: lsst/idf_deploy @ 9f810ac (2026-10-01), environment/deployments/ppdb/:
-#   services/gcs.tf      bucket "ppdb-${var.environment}-sso-ingest", with
-#                        env/int-services.tfvars environment = "int"
-#   services/pubsub.tf   topic "load-sso-topic"
-#   project              ppdb-int-6c62 (the project_factory's random-suffixed id)
+# Source: lsst/idf_deploy @ 55a3dec, environment/deployments/ppdb/:
+#   env/int-services.tfvars    environment = "int"
+#   services/gcs.tf            bucket "ppdb-${var.environment}-sso-ingest"
+#   services/pubsub.tf         topic "load-sso-topic", subscription
+#                              "load-sso-result-sub" (fixed names in dax_ppdb)
+#   project                    ppdb-int-6c62 (the project_factory's random-suffixed id)
 # The PPDB loader developers loaded all six tables into data-int from this
-# bucket with dax_ppdb's ppdb-cli upload-sso-data (2026-10-13;
-# docs/design/sso-upload-int.md).
+# bucket (2026-10-13; docs/design/sso-upload-int.md); the manifest contract
+# is docs/design/sso-upload-manifest.md.
 #
 # Credentials: Google application-default credentials, the
 # sso-uploader@ppdb-int-6c62 service account (idf_deploy
 # services/sso-uploader.tf: roles/storage.objectUser on the bucket,
-# roles/pubsub.publisher on the topic), given by pointing
-# GOOGLE_APPLICATION_CREDENTIALS at its key. The key is never copied into
-# the repository.
+# roles/pubsub.publisher on the topic, roles/pubsub.subscriber on the result
+# subscription), given by pointing GOOGLE_APPLICATION_CREDENTIALS at its key.
+# The key is never copied into the repository.
 bucket_name: ppdb-int-sso-ingest
-topic: load-sso-topic
-project: ppdb-int-6c62          # the Pub/Sub topic's project
-# The complete set: the six tables of dax_ppdb's SSO_TABLES (DM-55375),
-# uploaded in that order whatever the order here. Uploading a subset needs
+project: ppdb-int-6c62          # the Pub/Sub topic's and subscription's project
+# The complete set: the six tables of dax_ppdb's SSO_TABLES, uploaded in
+# that order whatever the order here. Uploading a subset needs
 # --allow-partial.
 tables:
   - SSObservation

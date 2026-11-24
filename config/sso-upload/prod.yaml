@@ -1,22 +1,29 @@
-# ssp-upload-sso config: the PPDB prod environment -- a TEMPLATE, commented out.
+# ssp-upload-sso config: the PPDB prod environment (DM-55678).
 #
-# Source: lsst/idf_deploy @ 9f810ac (2026-10-01), environment/deployments/ppdb/.
-# There is no prod deployment there yet: .github/workflows/ppdb-prod-*-tf.yaml
-# refer to env/prod-services.tfvars, which doesn't exist. By the same
-# services/gcs.tf and pubsub.tf the names would be:
+# Source: lsst/idf_deploy @ 55a3dec, environment/deployments/ppdb/:
+#   env/prod-services.tfvars   environment = "prod"
+#   services/gcs.tf            bucket "ppdb-${var.environment}-sso-ingest"
+#   services/pubsub.tf         topic "load-sso-topic", subscription
+#                              "load-sso-result-sub" (fixed names in dax_ppdb)
+#   project                    ppdb-prod-84a4 (the project_factory's random-suffixed
+#                              id; verified 2026-11-23 from the sso-uploader key's project)
 #
-# bucket_name: ppdb-prod-sso-ingest     # TODO: confirm once prod is deployed
-# topic: load-sso-topic
-# project: TODO                         # the prod ppdb project id (random-suffixed,
-#                                       # like ppdb-dev-5c07 and ppdb-int-6c62)
-#
-# The complete set: the six tables of dax_ppdb's SSO_TABLES (DM-55375),
-# uploaded in that order whatever the order here. Uploading a subset needs
+# Credentials: Google application-default credentials, the
+# sso-uploader@ppdb-prod-84a4 service account (idf_deploy
+# services/sso-uploader.tf: roles/storage.objectUser on the bucket,
+# roles/pubsub.publisher on the topic, roles/pubsub.subscriber on the result
+# subscription), given by pointing GOOGLE_APPLICATION_CREDENTIALS at its key.
+# The key is never copied into the repository. A real prod upload needs the
+# owner's separate OK (docs/design/sso-upload-manifest.md).
+bucket_name: ppdb-prod-sso-ingest
+project: ppdb-prod-84a4         # the Pub/Sub topic's and subscription's project
+# The complete set: the six tables of dax_ppdb's SSO_TABLES, uploaded in
+# that order whatever the order here. Uploading a subset needs
 # --allow-partial.
-# tables:
-#   - SSObservation
-#   - NearbySSO
-#   - SSObject
-#   - mpc_orbits
-#   - current_identifications
-#   - numbered_identifications
+tables:
+  - SSObservation
+  - NearbySSO
+  - SSObject
+  - mpc_orbits
+  - current_identifications
+  - numbered_identifications
